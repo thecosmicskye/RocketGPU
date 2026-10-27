@@ -1704,6 +1704,54 @@ ROCKETGPU_HD bool BallWorldMeshManifoldsEmpty(const WorldSolverScratch& scratch)
     return true;
 }
 
+// Moves each car's world rows from its slot (CarWorldRowsOut) up behind the previous car's, and appends its order
+// groups: the shared rows and groups SolveCarWorldStaticContacts appends car by car in the WorldStepSoccar loop.
+ROCKETGPU_HD void PackCarWorldRows(
+    int count,
+    const CarWorldRowsOut* outs,
+    const WorldSolverScratchRows& rows,
+    int& split_row_count,
+    int& velocity_row_count,
+    int& friction_row_count,
+    int& group_count) {
+    for (int i = 0; i < count; ++i) {
+        const CarWorldRowsOut& out = outs[i];
+        const int split_from = i * kMaxCarWorldSplitContactRows;
+        const int velocity_shift = i * kMaxCarWorldVelocityContactRows - velocity_row_count;
+        const int friction_shift = i * kMaxCarWorldFrictionContactRows - friction_row_count;
+        for (int k = 0; split_from != split_row_count && k < out.split_row_count; ++k) {
+            rows.world_split_rows[split_row_count + k] = rows.world_split_rows[split_from + k];
+        }
+        for (int k = 0; velocity_shift != 0 && k < out.velocity_row_count; ++k) {
+            rows.world_velocity_rows[velocity_row_count + k] = rows.world_velocity_rows[velocity_row_count + velocity_shift + k];
+        }
+        for (int k = 0; (friction_shift != 0 || velocity_shift != 0) && k < out.friction_row_count; ++k) {
+            CarSharedFrictionContactRow& row = rows.world_friction_rows[friction_row_count + k];
+            if (friction_shift != 0) {
+                row = rows.world_friction_rows[friction_row_count + friction_shift + k];
+            }
+            row.normal_row_idx -= velocity_shift;
+        }
+        for (int g = 0; g < out.group_count && group_count < kMaxSharedContactOrderGroups; ++g) {
+            SharedContactOrderGroup group = out.groups[g];
+            if (group.normal_row_start >= 0) {
+                group.normal_row_start -= velocity_shift;
+            }
+            if (group.friction_row_start >= 0) {
+                group.friction_row_start -= friction_shift;
+            }
+            rows.shared_contact_order_groups[group_count++] = group;
+        }
+        split_row_count += out.split_row_count;
+        velocity_row_count += out.velocity_row_count;
+        friction_row_count += out.friction_row_count;
+    }
+}
+
+// WorldStepSoccar parts. Contacts runs up to the car-world rows and saves its locals (WorldStepCarry); a thread per
+// car then builds those rows (BuildCarWorldRowsForCar), and Rows packs them in car order and runs the rest.
+enum : int { kWorldStepWhole = 0, kWorldStepContacts = 1, kWorldStepRows = 2 };
+
 ROCKETGPU_HD void WorldStepSoccar(
     int env_idx,
     int base,
@@ -1730,7 +1778,8 @@ ROCKETGPU_HD void WorldStepSoccar(
     int32_t mesh_bvh_node_count = 0,
     const ArenaMeshBvhSubtreeInfo* mesh_bvh_subtrees = nullptr,
     int32_t mesh_bvh_subtree_count = 0,
-    const ArenaBroadphaseGrid& broadphase_grid = ArenaBroadphaseGrid{}) {
+    const ArenaBroadphaseGrid& broadphase_grid = ArenaBroadphaseGrid{},
+    int world_part = kWorldStepWhole) {
     const int solver_passes = WorldSolverPasses();
     const int world_substeps = DebugWorldSubsteps();
     const float sub_dt = dt / static_cast<float>(world_substeps);
@@ -1756,219 +1805,245 @@ ROCKETGPU_HD void WorldStepSoccar(
         return false;
     };
     for (int substep = 0; substep < world_substeps; ++substep) {
-        int pair_split_row_count = 0;
+        WorldStepCarry carry;
+        if (world_part == kWorldStepRows) {
+            carry = solver_scratch->world_step_carry;
+        } else {
+            carry.ball_sleeping = ShouldSleepBallAtTickStart(ball, mutator);
+        }
+        int& pair_split_row_count = carry.pair_split_row_count;
         int world_split_row_count = 0;
-        int pair_velocity_row_count = 0;
-        int pair_friction_row_count = 0;
+        int& pair_velocity_row_count = carry.pair_velocity_row_count;
+        int& pair_friction_row_count = carry.pair_friction_row_count;
         int world_velocity_row_count = 0;
         int world_friction_row_count = 0;
-        solver_scratch->shared_contact_order_group_count = 0;
-
-        for (int pair_idx = 0; pair_idx < kMaxCarCarPairSlots; ++pair_idx) {
-            CarCarPairCachedContact& slot = pair_contact_cache[pair_idx];
-            // Points are only written with slot.valid set (or cleared whole), so an invalid slot is already clear.
-            if (slot.valid == 0) {
-                continue;
-            }
-            slot.valid = 0;
-            slot.contact_count = 0;
-            for (int k = 0; k < kMaxCarCarCachedPoints; ++k) {
-                slot.contacts[k].valid = 0;
-                slot.contacts[k].tangent_valid = 0;
-            }
-        }
-        for (int i = 0; i < count; ++i) {
-            CalPreStepClampCarSpeed(cars[base + i], mutator);
-
-            pre_contact_cars[i] = MakePreContactCar(cars[base + i]);
-            const WheelRuntimeState* wheel_runtime_state = wheel_runtime_states ? &wheel_runtime_states[base + i] : nullptr;
-            deferred_linear_deltas[i] = ComputeDeferredLinearVelocityDelta(cars[base + i], wheel_runtime_state, mutator, sub_dt);
-
-            cars[base + i].ext_force_impulse_bt =
-                (cars[base + i].is_demoed || cars[base + i].just_respawned)
-                    ? ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f)
-                    : ComputeOfficialExternalForceImpulseBt(wheel_runtime_state, mutator, sub_dt);
-            cars[base + i].ext_force_impulse_bt_valid = 1;
-
-            cars[base + i].solve_delta_linear_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-            cars[base + i].solve_delta_angular = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-            {
-                ::rocketgpu::Vec3 ext_torque(0.0f, 0.0f, 0.0f);
-                if (wheel_runtime_state && !(cars[base + i].is_demoed || cars[base + i].just_respawned)) {
-                    ::rocketgpu::Vec3 inv_r0, inv_r1, inv_r2;
-                    BuildPreSolveInvInertiaTensorWorldBt(
-                        *wheel_runtime_state, car_configs[base + i], mutator.car_mass, inv_r0, inv_r1, inv_r2);
-                    ext_torque = VecMul3x3(wheel_runtime_state->accumulated_torque_bt, inv_r0, inv_r1, inv_r2) * sub_dt;
-                }
-                cars[base + i].ext_torque_impulse = ext_torque;
-            }
-            deferred_angular_deltas[i] = ComputeDeferredAngularVelocityDelta(
-                cars[base + i], car_configs[base + i], mutator.car_mass, wheel_runtime_state, sub_dt);
-        }
-
-        const bool ball_sleeping = ShouldSleepBallAtTickStart(ball, mutator);
+        int& split_row_count = carry.split_row_count;
+        int& normal_row_count = carry.normal_row_count;
+        int& friction_row_count = carry.friction_row_count;
+        BallCarReorderRowSpan* const ball_car_row_spans = carry.ball_car_row_spans;
+        int& ball_car_row_span_count = carry.ball_car_row_span_count;
+        int& sorted_manifold_count = carry.sorted_manifold_count;
+        Vec3& ball_solver_linear_velocity_bt = carry.ball_solver_linear_velocity_bt;
+        const bool ball_sleeping = carry.ball_sleeping;
+        bool& ball_awake_after_contact_rows = carry.ball_awake_after_contact_rows;
+        bool& ball_settled_skip = carry.ball_settled_skip;
+        bool& ball_settled_verify = carry.ball_settled_verify;
         const Vec3 sleeping_start_ball_external_linear_delta = ball_sleeping
             ? Vec3(0.0f, 0.0f, 0.0f)
             : Vec3(0.0f, 0.0f, mutator.gravity_z * sub_dt);
+        if (world_part != kWorldStepRows) {
+            solver_scratch->shared_contact_order_group_count = 0;
 
-        Vec3 ball_solver_linear_velocity_bt = ball.vel_bt;
-        // v3 Ball::on_hit reads the ball's state.phys velocity, synced at tick start (captured in the tick-start block,
-        // before any car pre-tick wheel push or heatseeker pre-tick) and before the Bullet step damps it.
-        const Vec3 cal_ball_start_vel = solver_scratch != nullptr ? solver_scratch->cal_ball_start_vel : ball.vel;
+            for (int pair_idx = 0; pair_idx < kMaxCarCarPairSlots; ++pair_idx) {
+                CarCarPairCachedContact& slot = pair_contact_cache[pair_idx];
+                // Points are only written with slot.valid set (or cleared whole), so an invalid slot is already clear.
+                if (slot.valid == 0) {
+                    continue;
+                }
+                slot.valid = 0;
+                slot.contact_count = 0;
+                for (int k = 0; k < kMaxCarCarCachedPoints; ++k) {
+                    slot.contacts[k].valid = 0;
+                    slot.contacts[k].tangent_valid = 0;
+                }
+            }
+            for (int i = 0; i < count; ++i) {
+                CalPreStepClampCarSpeed(cars[base + i], mutator);
 
-        if (!ball_sleeping) {
-            ball_solver_linear_velocity_bt = BulletDampedLinearVelocityFromBt(ball.vel_bt, mutator, sub_dt);
-            ApplyBulletLinearDampingBall(ball, mutator, sub_dt);
-        }
+                pre_contact_cars[i] = MakePreContactCar(cars[base + i]);
+                const WheelRuntimeState* wheel_runtime_state = wheel_runtime_states ? &wheel_runtime_states[base + i] : nullptr;
+                deferred_linear_deltas[i] = ComputeDeferredLinearVelocityDelta(cars[base + i], wheel_runtime_state, mutator, sub_dt);
 
-        for (int i = 0; i < count; ++i) {
-            RecordBallCarCollisionInfoIfOverlapping(
-                ball,
-                cars[base + i],
-                static_cast<uint32_t>(base + i + 1),
-                cars[base + i],
-                car_configs[base + i],
-                mutator,
-                current_tick,
-                ball,
-                &solver_scratch->ball_car_gjk_epa_scratch,
-                sub_dt,
-                env_idx,
-                i,
-                static_cast<int8_t>(teams[base + i]),
-                (i < 8) ? &solver_scratch->cal_start_vel[i] : nullptr,
-                (&cal_ball_start_vel));
-        }
+                cars[base + i].ext_force_impulse_bt =
+                    (cars[base + i].is_demoed || cars[base + i].just_respawned)
+                        ? ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f)
+                        : ComputeOfficialExternalForceImpulseBt(wheel_runtime_state, mutator, sub_dt);
+                cars[base + i].ext_force_impulse_bt_valid = 1;
 
-        int prebuilt_manifold_count = -1;
-        if (enable_car_car_collisions) {
-            const bool shared_rows_active =
-                pair_velocity_rows && pair_friction_rows;
-            const int car_car_passes = shared_rows_active ? 1 : solver_passes;
+                cars[base + i].solve_delta_linear_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+                cars[base + i].solve_delta_angular = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+                {
+                    ::rocketgpu::Vec3 ext_torque(0.0f, 0.0f, 0.0f);
+                    if (wheel_runtime_state && !(cars[base + i].is_demoed || cars[base + i].just_respawned)) {
+                        ::rocketgpu::Vec3 inv_r0, inv_r1, inv_r2;
+                        BuildPreSolveInvInertiaTensorWorldBt(
+                            *wheel_runtime_state, car_configs[base + i], mutator.car_mass, inv_r0, inv_r1, inv_r2);
+                        ext_torque = VecMul3x3(wheel_runtime_state->accumulated_torque_bt, inv_r0, inv_r1, inv_r2) * sub_dt;
+                    }
+                    cars[base + i].ext_torque_impulse = ext_torque;
+                }
+                deferred_angular_deltas[i] = ComputeDeferredAngularVelocityDelta(
+                    cars[base + i], car_configs[base + i], mutator.car_mass, wheel_runtime_state, sub_dt);
+            }
 
-            if (broadphase_grid.valid() && mesh_bvh_meshes != nullptr && mesh_bvh_mesh_count > 0) {
-                prebuilt_manifold_count = BuildBulletManifoldList(
+            ball_solver_linear_velocity_bt = ball.vel_bt;
+            // v3 Ball::on_hit reads the ball's state.phys velocity, synced at tick start (captured in the tick-start block,
+            // before any car pre-tick wheel push or heatseeker pre-tick) and before the Bullet step damps it.
+            const Vec3 cal_ball_start_vel = solver_scratch != nullptr ? solver_scratch->cal_ball_start_vel : ball.vel;
+
+            if (!ball_sleeping) {
+                ball_solver_linear_velocity_bt = BulletDampedLinearVelocityFromBt(ball.vel_bt, mutator, sub_dt);
+                ApplyBulletLinearDampingBall(ball, mutator, sub_dt);
+            }
+
+            for (int i = 0; i < count; ++i) {
+                RecordBallCarCollisionInfoIfOverlapping(
                     ball,
-                    count,
-                    cars + base,
-                    pre_contact_cars,
-                    car_configs + base,
-                    mutator.ball_radius,
+                    cars[base + i],
+                    static_cast<uint32_t>(base + i + 1),
+                    cars[base + i],
+                    car_configs[base + i],
+                    mutator,
+                    current_tick,
+                    ball,
+                    &solver_scratch->ball_car_gjk_epa_scratch,
                     sub_dt,
-                    broadphase_grid,
-                    mesh_bvh_meshes,
-                    mesh_bvh_mesh_count,
-                    rows.bullet_manifolds,
-                    kMaxBulletManifoldEntries,
-                    mutator.arena_collision != 0,
-                    solver_scratch,
-                    NativeSseMath(mutator));
+                    env_idx,
+                    i,
+                    static_cast<int8_t>(teams[base + i]),
+                    (i < 8) ? &solver_scratch->cal_start_vel[i] : nullptr,
+                    (&cal_ball_start_vel));
             }
-            int8_t pair_order_i[28];
-            int8_t pair_order_j[28];
-            int pair_order_count = 0;
-            uint8_t pair_listed[8][8] = {};
-            for (int e = 0; e < prebuilt_manifold_count; ++e) {
-                const BulletManifoldEntry& en = rows.bullet_manifolds[e];
-                if (en.kind != 3) {
-                    continue;
+
+            int prebuilt_manifold_count = -1;
+            if (enable_car_car_collisions) {
+                const bool shared_rows_active =
+                    pair_velocity_rows && pair_friction_rows;
+                const int car_car_passes = shared_rows_active ? 1 : solver_passes;
+
+                if (broadphase_grid.valid() && mesh_bvh_meshes != nullptr && mesh_bvh_mesh_count > 0) {
+                    prebuilt_manifold_count = BuildBulletManifoldList(
+                        ball,
+                        count,
+                        cars + base,
+                        pre_contact_cars,
+                        car_configs + base,
+                        mutator.ball_radius,
+                        sub_dt,
+                        broadphase_grid,
+                        mesh_bvh_meshes,
+                        mesh_bvh_mesh_count,
+                        rows.bullet_manifolds,
+                        kMaxBulletManifoldEntries,
+                        mutator.arena_collision != 0,
+                        solver_scratch,
+                        NativeSseMath(mutator));
                 }
-                const int pi = Min((int)en.body_a, (int)en.body_b);
-                const int pj = Max((int)en.body_a, (int)en.body_b);
-                if (pi < 0 || pj >= count || pj >= 8 || pi == pj || pair_listed[pi][pj]) {
-                    continue;
+                int8_t pair_order_i[28];
+                int8_t pair_order_j[28];
+                int pair_order_count = 0;
+                uint8_t pair_listed[8][8] = {};
+                for (int e = 0; e < prebuilt_manifold_count; ++e) {
+                    const BulletManifoldEntry& en = rows.bullet_manifolds[e];
+                    if (en.kind != 3) {
+                        continue;
+                    }
+                    const int pi = Min((int)en.body_a, (int)en.body_b);
+                    const int pj = Max((int)en.body_a, (int)en.body_b);
+                    if (pi < 0 || pj >= count || pj >= 8 || pi == pj || pair_listed[pi][pj]) {
+                        continue;
+                    }
+                    pair_listed[pi][pj] = 1;
+                    pair_order_i[pair_order_count] = static_cast<int8_t>(pi);
+                    pair_order_j[pair_order_count] = static_cast<int8_t>(pj);
+                    ++pair_order_count;
                 }
-                pair_listed[pi][pj] = 1;
-                pair_order_i[pair_order_count] = static_cast<int8_t>(pi);
-                pair_order_j[pair_order_count] = static_cast<int8_t>(pj);
-                ++pair_order_count;
-            }
-            for (int pi = 0; pi < count && pi < 8; ++pi) {
-                for (int pj = pi + 1; pj < count && pj < 8; ++pj) {
-                    if (!pair_listed[pi][pj] && pair_order_count < 28) {
-                        pair_order_i[pair_order_count] = static_cast<int8_t>(pi);
-                        pair_order_j[pair_order_count] = static_cast<int8_t>(pj);
-                        ++pair_order_count;
+                for (int pi = 0; pi < count && pi < 8; ++pi) {
+                    for (int pj = pi + 1; pj < count && pj < 8; ++pj) {
+                        if (!pair_listed[pi][pj] && pair_order_count < 28) {
+                            pair_order_i[pair_order_count] = static_cast<int8_t>(pi);
+                            pair_order_j[pair_order_count] = static_cast<int8_t>(pj);
+                            ++pair_order_count;
+                        }
                     }
                 }
-            }
-            for (int pass = 0; pass < car_car_passes; ++pass) {
-                for (int po = 0; po < pair_order_count; ++po) {
-                    const int i = pair_order_i[po];
-                    const int j = pair_order_j[po];
-                    {
-                        const int pair_velocity_rows_before = pair_velocity_row_count;
-                        const int pair_friction_rows_before = pair_friction_row_count;
-                        ResolveCarCarCollision(
-                            env_idx,
-                            cars[base + j], static_cast<uint32_t>(base + j + 1), teams[base + j],
-                            cars[base + i], static_cast<uint32_t>(base + i + 1), teams[base + i],
-                            car_configs[base + j], car_configs[base + i],
-                            mutator,
-                            pre_contact_cars[j],
-                            pre_contact_cars[i],
-                            deferred_linear_deltas[j],
-                            deferred_linear_deltas[i],
-                            deferred_angular_deltas[j],
-                            deferred_angular_deltas[i],
-                            sub_dt,
-                            enable_demos,
-                            j,
-                            i,
-                            pair_contact_cache,
-                            pair_split_rows,
-                            &pair_split_row_count,
-                            pair_velocity_rows,
-                            &pair_velocity_row_count,
-                            pair_friction_rows,
-                            &pair_friction_row_count,
-                            (&solver_scratch->cal_start_vel[j]),
-                            (&solver_scratch->cal_start_vel[i]),
-                            (i < j && j < 8)
-                                ? &solver_scratch->car_car_retained_manifolds[CarCarRetainedSlot(i, j)]
-                                : nullptr);
-                        if (pair_velocity_row_count > pair_velocity_rows_before) {
-                            AppendSharedContactOrderGroup(
-                                rows.shared_contact_order_groups,
-                                solver_scratch->shared_contact_order_group_count,
-                                SharedContactOrderBucket::Pair,
+                for (int pass = 0; pass < car_car_passes; ++pass) {
+                    for (int po = 0; po < pair_order_count; ++po) {
+                        const int i = pair_order_i[po];
+                        const int j = pair_order_j[po];
+                        {
+                            const int pair_velocity_rows_before = pair_velocity_row_count;
+                            const int pair_friction_rows_before = pair_friction_row_count;
+                            ResolveCarCarCollision(
+                                env_idx,
+                                cars[base + j], static_cast<uint32_t>(base + j + 1), teams[base + j],
+                                cars[base + i], static_cast<uint32_t>(base + i + 1), teams[base + i],
+                                car_configs[base + j], car_configs[base + i],
+                                mutator,
+                                pre_contact_cars[j],
+                                pre_contact_cars[i],
+                                deferred_linear_deltas[j],
+                                deferred_linear_deltas[i],
+                                deferred_angular_deltas[j],
+                                deferred_angular_deltas[i],
+                                sub_dt,
+                                enable_demos,
                                 j,
                                 i,
-                                j * 8 + i,
-                                pair_velocity_rows_before,
-                                pair_velocity_row_count - pair_velocity_rows_before,
-                                pair_friction_rows_before,
-                                pair_friction_row_count - pair_friction_rows_before,
-                                j * 100000 + 2000 + i);
+                                pair_contact_cache,
+                                pair_split_rows,
+                                &pair_split_row_count,
+                                pair_velocity_rows,
+                                &pair_velocity_row_count,
+                                pair_friction_rows,
+                                &pair_friction_row_count,
+                                (&solver_scratch->cal_start_vel[j]),
+                                (&solver_scratch->cal_start_vel[i]),
+                                (i < j && j < 8)
+                                    ? &solver_scratch->car_car_retained_manifolds[CarCarRetainedSlot(i, j)]
+                                    : nullptr);
+                            if (pair_velocity_row_count > pair_velocity_rows_before) {
+                                AppendSharedContactOrderGroup(
+                                    rows.shared_contact_order_groups,
+                                    solver_scratch->shared_contact_order_group_count,
+                                    SharedContactOrderBucket::Pair,
+                                    j,
+                                    i,
+                                    j * 8 + i,
+                                    pair_velocity_rows_before,
+                                    pair_velocity_row_count - pair_velocity_rows_before,
+                                    pair_friction_rows_before,
+                                    pair_friction_row_count - pair_friction_rows_before,
+                                    j * 100000 + 2000 + i);
+                            }
                         }
                     }
                 }
             }
-        }
-        if (should_stop_after_stage(1)) {
-            return;
-        }
-        int split_row_count = 0;
-        int normal_row_count = 0;
-        int friction_row_count = 0;
-
-        struct BallCarRowSpan {
-            int car_local_idx;
-            int normal_start;
-            int normal_count;
-            int friction_start;
-            int friction_count;
-            int split_start;
-            int split_count;
-        };
-        BallCarRowSpan ball_car_row_spans[8] = {};
-        int ball_car_row_span_count = 0;
-        for (int i = 0; i < count; ++i) {
-            const int normal_rows_before = normal_row_count;
-            const int friction_rows_before = friction_row_count;
-            const int split_rows_before = split_row_count;
-            if (i < kMaxBallCarRetainedManifolds) {
-                AppendBallCarContactRowsRetained(
+            if (should_stop_after_stage(1)) {
+                return;
+            }
+            for (int i = 0; i < count; ++i) {
+                const int normal_rows_before = normal_row_count;
+                const int friction_rows_before = friction_row_count;
+                const int split_rows_before = split_row_count;
+                if (i < kMaxBallCarRetainedManifolds) {
+                    AppendBallCarContactRowsRetained(
+                        ball,
+                        cars[base + i],
+                        static_cast<uint32_t>(base + i + 1),
+                        car_configs[base + i],
+                        mutator,
+                        current_tick,
+                        sleeping_start_ball_external_linear_delta,
+                        deferred_linear_deltas[i],
+                        deferred_angular_deltas[i],
+                        normal_rows,
+                        normal_row_count,
+                        friction_rows,
+                        friction_row_count,
+                        split_rows,
+                        split_row_count,
+                        i,
+                        sub_dt,
+                        env_idx,
+                        &solver_scratch->ball_car_gjk_epa_scratch,
+                        pre_contact_cars[i].is_demoed == 0,
+                        &ball_solver_linear_velocity_bt,
+                        static_cast<int8_t>(teams[base + i]),
+                        solver_scratch->ball_car_retained_manifolds[i]);
+                } else
+                AppendBallCarContactRows(
                     ball,
                     cars[base + i],
                     static_cast<uint32_t>(base + i + 1),
@@ -1990,192 +2065,174 @@ ROCKETGPU_HD void WorldStepSoccar(
                     &solver_scratch->ball_car_gjk_epa_scratch,
                     pre_contact_cars[i].is_demoed == 0,
                     &ball_solver_linear_velocity_bt,
-                    static_cast<int8_t>(teams[base + i]),
-                    solver_scratch->ball_car_retained_manifolds[i]);
-            } else
-            AppendBallCarContactRows(
-                ball,
-                cars[base + i],
-                static_cast<uint32_t>(base + i + 1),
-                car_configs[base + i],
-                mutator,
-                current_tick,
-                sleeping_start_ball_external_linear_delta,
-                deferred_linear_deltas[i],
-                deferred_angular_deltas[i],
-                normal_rows,
-                normal_row_count,
-                friction_rows,
-                friction_row_count,
-                split_rows,
-                split_row_count,
-                i,
-                sub_dt,
-                env_idx,
-                &solver_scratch->ball_car_gjk_epa_scratch,
-                pre_contact_cars[i].is_demoed == 0,
-                &ball_solver_linear_velocity_bt,
-                static_cast<int8_t>(teams[base + i]));
-            const int normal_rows_added = normal_row_count - normal_rows_before;
-            const int friction_rows_added = friction_row_count - friction_rows_before;
-            const int split_rows_added = split_row_count - split_rows_before;
-            if (normal_rows_added > 0 || friction_rows_added > 0 || split_rows_added > 0) {
-                if (ball_car_row_span_count < 8) {
-                    BallCarRowSpan& span = ball_car_row_spans[ball_car_row_span_count++];
-                    span.car_local_idx = i;
-                    span.normal_start = normal_rows_before;
-                    span.normal_count = normal_rows_added;
-                    span.friction_start = friction_rows_before;
-                    span.friction_count = friction_rows_added;
-                    span.split_start = split_rows_before;
-                    span.split_count = split_rows_added;
-                }
-            }
-        }
-        if (should_stop_after_stage(2)) {
-            return;
-        }
-
-        int sorted_manifold_count = 0;
-        if (broadphase_grid.valid() && mesh_bvh_meshes != nullptr && mesh_bvh_mesh_count > 0) {
-            const int built = prebuilt_manifold_count >= 0 ? prebuilt_manifold_count : BuildBulletManifoldList(
-                ball,
-                count,
-                cars + base,
-                pre_contact_cars,
-                car_configs + base,
-                mutator.ball_radius,
-                sub_dt,
-                broadphase_grid,
-                mesh_bvh_meshes,
-                mesh_bvh_mesh_count,
-                rows.bullet_manifolds,
-                kMaxBulletManifoldEntries,
-                mutator.arena_collision != 0,
-                solver_scratch,
-                NativeSseMath(mutator));
-            if (built > 1) {
-                int order[kMaxBulletManifoldEntries];
-                int island_ids[kMaxBulletManifoldEntries];
-                for (int i = 0; i < built; ++i) {
-                    order[i] = i;
-                    island_ids[i] = rows.bullet_manifolds[i].island_id;
-                }
-                QuickSortSharedContactOrderIndices(order, island_ids, 0, built - 1);
-
-                UninitArray<BulletManifoldEntry, kMaxBulletManifoldEntries> sorted;
-                for (int i = 0; i < built; ++i) {
-                    sorted[i] = rows.bullet_manifolds[order[i]];
-                }
-                for (int i = 0; i < built; ++i) {
-                    rows.bullet_manifolds[i] = sorted[i];
-                }
-            }
-            sorted_manifold_count = built;
-        }
-        solver_scratch->bullet_manifold_count = sorted_manifold_count;
-
-        const bool ball_awake_after_contact_rows =
-            !ball_sleeping || split_row_count > 0 || normal_row_count > 0 || friction_row_count > 0;
-
-        // Settled-ball fast path (see BallSettleStateEqual). Only a still ball with no ball-car rows, empty retained
-        // mesh manifolds and 1..kBallSettledMaxWorldEntries world entries is a candidate; anything else clears it.
-        bool ball_settled_skip = false;
-        bool ball_settled_verify = false;
-        if (solver_scratch != nullptr) {
-            int16_t settle_world_ids[kBallSettledMaxWorldEntries] = {};
-            int settle_world_count = 0;
-            bool settle_candidate =
-                !ball_sleeping && mutator.arena_collision != 0 &&
-                mutator.game_mode == static_cast<uint8_t>(Mode::Soccar) && !mutator.physics_events.windows &&
-                split_row_count == 0 && normal_row_count == 0 && friction_row_count == 0 &&
-                ball.vel.y == 0.0f && ball.vel.z == 0.0f &&
-                ball.ang_vel.x == 0.0f && ball.ang_vel.y == 0.0f && ball.ang_vel.z == 0.0f;
-            for (int e = 0; settle_candidate && e < sorted_manifold_count; ++e) {
-                const BulletManifoldEntry& en = rows.bullet_manifolds[e];
-                if (en.kind != 0) {
-                    continue;
-                }
-                if (settle_world_count >= kBallSettledMaxWorldEntries) {
-                    settle_candidate = false;
-                    break;
-                }
-                settle_world_ids[settle_world_count++] = en.static_id;
-            }
-            settle_candidate = settle_candidate && settle_world_count > 0 &&
-                BallWorldMeshManifoldsEmpty(*solver_scratch);
-            if (!settle_candidate) {
-                solver_scratch->ball_settled = 0;
-            } else {
-                bool inputs_match =
-                    solver_scratch->ball_settled != 0 &&
-                    solver_scratch->ball_settled_mutator_epoch == mutator.ball_settle_epoch &&
-                    SettleBitsEqual(solver_scratch->ball_settled_sub_dt, sub_dt) &&
-                    SettleBitsEqual(solver_scratch->ball_settled_solver_vel_bt, ball_solver_linear_velocity_bt) &&
-                    solver_scratch->ball_settled_world_entry_count == settle_world_count;
-                for (int k = 0; inputs_match && k < settle_world_count; ++k) {
-                    inputs_match = solver_scratch->ball_settled_world_entries[k] == settle_world_ids[k];
-                }
-                inputs_match = inputs_match && BallSettleStateEqual(ball, solver_scratch->ball_settled_state);
-                if (inputs_match) {
-                    ball_settled_skip = true;
-                } else {
-                    solver_scratch->ball_settled = 0;
-                    solver_scratch->ball_settled_mutator_epoch = mutator.ball_settle_epoch;
-                    solver_scratch->ball_settled_sub_dt = sub_dt;
-                    solver_scratch->ball_settled_solver_vel_bt = ball_solver_linear_velocity_bt;
-                    solver_scratch->ball_settled_world_entry_count = static_cast<uint8_t>(settle_world_count);
-                    for (int k = 0; k < kBallSettledMaxWorldEntries; ++k) {
-                        solver_scratch->ball_settled_world_entries[k] = settle_world_ids[k];
+                    static_cast<int8_t>(teams[base + i]));
+                const int normal_rows_added = normal_row_count - normal_rows_before;
+                const int friction_rows_added = friction_row_count - friction_rows_before;
+                const int split_rows_added = split_row_count - split_rows_before;
+                if (normal_rows_added > 0 || friction_rows_added > 0 || split_rows_added > 0) {
+                    if (ball_car_row_span_count < 8) {
+                        BallCarReorderRowSpan& span = ball_car_row_spans[ball_car_row_span_count++];
+                        span.car_local_idx = i;
+                        span.normal_start = normal_rows_before;
+                        span.normal_count = normal_rows_added;
+                        span.friction_start = friction_rows_before;
+                        span.friction_count = friction_rows_added;
+                        span.split_start = split_rows_before;
+                        span.split_count = split_rows_added;
                     }
-                    solver_scratch->ball_settled_state = ball;
-                    ball_settled_verify = true;
                 }
             }
-        }
+            if (should_stop_after_stage(2)) {
+                return;
+            }
 
-        if (!ball_sleeping && !ball_settled_skip && mutator.arena_collision) {
-            AppendBallWorldSpecialContactRows(
-                ball,
-                mutator,
-                sleeping_start_ball_external_linear_delta,
-                solver_scratch,
-                rows.bullet_manifolds,
-                split_rows,
-                split_row_count,
-                sub_dt,
-                normal_rows,
-                normal_row_count,
-                friction_rows,
-                friction_row_count,
-                mesh_triangles,
-                mesh_triangle_count,
-                mesh_bvh_quantization,
-                mesh_bvh_quantization_count,
-                mesh_bvh_meshes,
-                mesh_bvh_mesh_count,
-                mesh_bvh_nodes,
-                mesh_bvh_node_count,
-                mesh_bvh_subtrees,
-                mesh_bvh_subtree_count,
-                &ball_solver_linear_velocity_bt, env_idx);
-            if (mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker) && solver_scratch) {
-                for (int hs_idx = 0; hs_idx < solver_scratch->hs_world_normal_count; ++hs_idx) {
-                    if (HeatseekerOnWorldContact(ball, solver_scratch->hs_world_normals[hs_idx])) {
+            if (broadphase_grid.valid() && mesh_bvh_meshes != nullptr && mesh_bvh_mesh_count > 0) {
+                const int built = prebuilt_manifold_count >= 0 ? prebuilt_manifold_count : BuildBulletManifoldList(
+                    ball,
+                    count,
+                    cars + base,
+                    pre_contact_cars,
+                    car_configs + base,
+                    mutator.ball_radius,
+                    sub_dt,
+                    broadphase_grid,
+                    mesh_bvh_meshes,
+                    mesh_bvh_mesh_count,
+                    rows.bullet_manifolds,
+                    kMaxBulletManifoldEntries,
+                    mutator.arena_collision != 0,
+                    solver_scratch,
+                    NativeSseMath(mutator));
+                if (built > 1) {
+                    int order[kMaxBulletManifoldEntries];
+                    int island_ids[kMaxBulletManifoldEntries];
+                    for (int i = 0; i < built; ++i) {
+                        order[i] = i;
+                        island_ids[i] = rows.bullet_manifolds[i].island_id;
+                    }
+                    QuickSortSharedContactOrderIndices(order, island_ids, 0, built - 1);
+
+                    UninitArray<BulletManifoldEntry, kMaxBulletManifoldEntries> sorted;
+                    for (int i = 0; i < built; ++i) {
+                        sorted[i] = rows.bullet_manifolds[order[i]];
+                    }
+                    for (int i = 0; i < built; ++i) {
+                        rows.bullet_manifolds[i] = sorted[i];
+                    }
+                }
+                sorted_manifold_count = built;
+            }
+            solver_scratch->bullet_manifold_count = sorted_manifold_count;
+
+            ball_awake_after_contact_rows =
+                !ball_sleeping || split_row_count > 0 || normal_row_count > 0 || friction_row_count > 0;
+
+            // Settled-ball fast path (see BallSettleStateEqual). Only a still ball with no ball-car rows, empty retained
+            // mesh manifolds and 1..kBallSettledMaxWorldEntries world entries is a candidate; anything else clears it.
+            if (solver_scratch != nullptr) {
+                int16_t settle_world_ids[kBallSettledMaxWorldEntries] = {};
+                int settle_world_count = 0;
+                bool settle_candidate =
+                    !ball_sleeping && mutator.arena_collision != 0 &&
+                    mutator.game_mode == static_cast<uint8_t>(Mode::Soccar) && !mutator.physics_events.windows &&
+                    split_row_count == 0 && normal_row_count == 0 && friction_row_count == 0 &&
+                    ball.vel.y == 0.0f && ball.vel.z == 0.0f &&
+                    ball.ang_vel.x == 0.0f && ball.ang_vel.y == 0.0f && ball.ang_vel.z == 0.0f;
+                for (int e = 0; settle_candidate && e < sorted_manifold_count; ++e) {
+                    const BulletManifoldEntry& en = rows.bullet_manifolds[e];
+                    if (en.kind != 0) {
+                        continue;
+                    }
+                    if (settle_world_count >= kBallSettledMaxWorldEntries) {
+                        settle_candidate = false;
                         break;
                     }
+                    settle_world_ids[settle_world_count++] = en.static_id;
                 }
+                settle_candidate = settle_candidate && settle_world_count > 0 &&
+                    BallWorldMeshManifoldsEmpty(*solver_scratch);
+                if (!settle_candidate) {
+                    solver_scratch->ball_settled = 0;
+                } else {
+                    bool inputs_match =
+                        solver_scratch->ball_settled != 0 &&
+                        solver_scratch->ball_settled_mutator_epoch == mutator.ball_settle_epoch &&
+                        SettleBitsEqual(solver_scratch->ball_settled_sub_dt, sub_dt) &&
+                        SettleBitsEqual(solver_scratch->ball_settled_solver_vel_bt, ball_solver_linear_velocity_bt) &&
+                        solver_scratch->ball_settled_world_entry_count == settle_world_count;
+                    for (int k = 0; inputs_match && k < settle_world_count; ++k) {
+                        inputs_match = solver_scratch->ball_settled_world_entries[k] == settle_world_ids[k];
+                    }
+                    inputs_match = inputs_match && BallSettleStateEqual(ball, solver_scratch->ball_settled_state);
+                    if (inputs_match) {
+                        ball_settled_skip = true;
+                    } else {
+                        solver_scratch->ball_settled = 0;
+                        solver_scratch->ball_settled_mutator_epoch = mutator.ball_settle_epoch;
+                        solver_scratch->ball_settled_sub_dt = sub_dt;
+                        solver_scratch->ball_settled_solver_vel_bt = ball_solver_linear_velocity_bt;
+                        solver_scratch->ball_settled_world_entry_count = static_cast<uint8_t>(settle_world_count);
+                        for (int k = 0; k < kBallSettledMaxWorldEntries; ++k) {
+                            solver_scratch->ball_settled_world_entries[k] = settle_world_ids[k];
+                        }
+                        solver_scratch->ball_settled_state = ball;
+                        ball_settled_verify = true;
+                    }
+                }
+            }
+
+            if (!ball_sleeping && !ball_settled_skip && mutator.arena_collision) {
+                AppendBallWorldSpecialContactRows(
+                    ball,
+                    mutator,
+                    sleeping_start_ball_external_linear_delta,
+                    solver_scratch,
+                    rows.bullet_manifolds,
+                    split_rows,
+                    split_row_count,
+                    sub_dt,
+                    normal_rows,
+                    normal_row_count,
+                    friction_rows,
+                    friction_row_count,
+                    mesh_triangles,
+                    mesh_triangle_count,
+                    mesh_bvh_quantization,
+                    mesh_bvh_quantization_count,
+                    mesh_bvh_meshes,
+                    mesh_bvh_mesh_count,
+                    mesh_bvh_nodes,
+                    mesh_bvh_node_count,
+                    mesh_bvh_subtrees,
+                    mesh_bvh_subtree_count,
+                    &ball_solver_linear_velocity_bt, env_idx);
+                if (mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker) && solver_scratch) {
+                    for (int hs_idx = 0; hs_idx < solver_scratch->hs_world_normal_count; ++hs_idx) {
+                        if (HeatseekerOnWorldContact(ball, solver_scratch->hs_world_normals[hs_idx])) {
+                            break;
+                        }
+                    }
+                }
+            }
+            if (should_stop_after_stage(3)) {
+                return;
+            }
+            if (world_part == kWorldStepContacts) {
+                solver_scratch->world_step_carry = carry;
+                return;
             }
         }
         // A verified fixed point needs a ball world velocity row, so the velocity solver writes the ball back
         // whether or not cars add rows. Without ball split rows the split solver leaves the ball untouched
         // (zero push and turn), so its ball split rows may be absent.
         const bool ball_settled_rows_ok = normal_row_count > 0;
-        if (should_stop_after_stage(3)) {
-            return;
-        }
 
-        for (int i = 0; i < count; ++i) {
+        if (world_part == kWorldStepRows) {
+            PackCarWorldRows(count, solver_scratch->car_world_rows_out, rows, world_split_row_count,
+                             world_velocity_row_count, world_friction_row_count,
+                             solver_scratch->shared_contact_order_group_count);
+        }
+        for (int i = 0; world_part != kWorldStepRows && i < count; ++i) {
             const int car_idx = base + i;
             if (pre_contact_cars[i].is_demoed || cars[car_idx].just_respawned) {
                 if (i < kMaxCarWorldMeshPersistentCars) {
@@ -2227,30 +2284,17 @@ ROCKETGPU_HD void WorldStepSoccar(
             return;
         }
 
-        {
-            BallCarReorderRowSpan reorder_spans[8];
-            for (int s = 0; s < ball_car_row_span_count && s < 8; ++s) {
-                const auto& src = ball_car_row_spans[s];
-                reorder_spans[s].car_local_idx = src.car_local_idx;
-                reorder_spans[s].normal_start = src.normal_start;
-                reorder_spans[s].normal_count = src.normal_count;
-                reorder_spans[s].friction_start = src.friction_start;
-                reorder_spans[s].friction_count = src.friction_count;
-                reorder_spans[s].split_start = src.split_start;
-                reorder_spans[s].split_count = src.split_count;
-            }
-            ReorderBallCarRowsForBulletQuickSortIslandFlip(
-                normal_rows,
-                normal_row_count,
-                friction_rows,
-                friction_row_count,
-                split_rows,
-                split_row_count,
-                reorder_spans,
-                ball_car_row_span_count,
-                rows.shared_contact_order_groups,
-                solver_scratch->shared_contact_order_group_count);
-        }
+        ReorderBallCarRowsForBulletQuickSortIslandFlip(
+            normal_rows,
+            normal_row_count,
+            friction_rows,
+            friction_row_count,
+            split_rows,
+            split_row_count,
+            ball_car_row_spans,
+            ball_car_row_span_count,
+            rows.shared_contact_order_groups,
+            solver_scratch->shared_contact_order_group_count);
 
         ReorderCarWorldSharedRowsForBulletIslandSort<kUseExternalContactSortScratch>(
             world_velocity_rows,
@@ -2577,7 +2621,8 @@ ROCKETGPU_HD void RocketSim_Arena_WorldStepSoccar(
     int32_t mesh_bvh_node_count = 0,
     const ArenaMeshBvhSubtreeInfo* mesh_bvh_subtrees = nullptr,
     int32_t mesh_bvh_subtree_count = 0,
-    const ArenaBroadphaseGrid& broadphase_grid = ArenaBroadphaseGrid{}) {
+    const ArenaBroadphaseGrid& broadphase_grid = ArenaBroadphaseGrid{},
+    int world_part = kWorldStepWhole) {
     WorldStepSoccar(
         env_idx,
         base,
@@ -2604,7 +2649,8 @@ ROCKETGPU_HD void RocketSim_Arena_WorldStepSoccar(
         mesh_bvh_node_count,
         mesh_bvh_subtrees,
         mesh_bvh_subtree_count,
-        broadphase_grid);
+        broadphase_grid,
+        world_part);
 }
 
 ROCKETGPU_HD void StageWheelRaysForEnv(
@@ -2731,6 +2777,57 @@ ROCKETGPU_HD void StepEnvVehicleUpdateCar(
 // Whether the cars' vehicle updates can run in any order: every wheel ray is staged (no live raycast against the
 // other cars) and none rests on a car or the ball (the only bodies an update pushes), and no physics events are
 // recorded (they are emitted in visit order). Each update then reads and writes only its own car.
+// Car slot i's turn in the WorldStepSoccar car-world loop, between kWorldStepContacts and kWorldStepRows: its rows go
+// to the env's shared world rows at the car's slot and its order groups to its CarWorldRowsOut (see PackCarWorldRows).
+ROCKETGPU_HD void BuildCarWorldRowsForCar(
+    int env_idx,
+    int i,
+    const SimConfig& cfg,
+    CarState* cars,
+    const CarConfig* car_configs,
+    WorldSolverScratch& scratch,
+    const WorldSolverScratchRows& rows,
+    bullet_port::btGjkEpaScratch* gjk_scratch) {
+    const int car_idx = env_idx * cfg.max_cars_per_env + i;
+    CarWorldRowsOut& out = scratch.car_world_rows_out[i];
+    out.group_count = 0;
+    int split_end = i * kMaxCarWorldSplitContactRows;
+    int velocity_end = i * kMaxCarWorldVelocityContactRows;
+    int friction_end = i * kMaxCarWorldFrictionContactRows;
+    if (scratch.pre_contact_cars[i].is_demoed || cars[car_idx].just_respawned) {
+        if (i < kMaxCarWorldMeshPersistentCars) {
+            for (int plane_idx = 0; plane_idx < kCarWorldPlaneRetainedManifoldsPerCar; ++plane_idx) {
+                scratch.car_world_plane_manifolds[i * kCarWorldPlaneRetainedManifoldsPerCar + plane_idx].count = 0;
+            }
+        }
+    } else {
+        const ArenaBroadphaseGrid grid = MakeArenaBroadphaseGrid(cfg);
+        const ContactAccumulator acc = SolveCarWorldStaticContacts(
+            cars[car_idx], car_configs[car_idx], cfg.mutator,
+            scratch.deferred_linear_deltas[i], scratch.deferred_angular_deltas[i],
+            cfg.tick_dt / static_cast<float>(DebugWorldSubsteps()), env_idx, i,
+            cfg.arena_mesh_tris, cfg.arena_mesh_tri_count,
+            cfg.arena_mesh_bvh_quantization, cfg.arena_mesh_bvh_quantization_count,
+            cfg.arena_mesh_bvh_meshes, cfg.arena_mesh_bvh_mesh_count,
+            cfg.arena_mesh_bvh_nodes, cfg.arena_mesh_bvh_node_count,
+            cfg.arena_mesh_bvh_subtrees, cfg.arena_mesh_bvh_subtree_count,
+            rows.world_split_rows, &split_end,
+            rows.world_velocity_rows, &velocity_end,
+            rows.world_friction_rows, &friction_end,
+            gjk_scratch,
+            EnvStridedArray<SharedContactOrderGroup>(out.groups), &out.group_count,
+            &grid,
+            CarWorldMeshCandidateStageFor(env_idx, i),
+            (i < kMaxCarWorldMeshPersistentCars)
+                ? &scratch.car_world_plane_manifolds[i * kCarWorldPlaneRetainedManifoldsPerCar]
+                : nullptr);
+        RecordArenaWorldContact(cars[car_idx], acc);
+    }
+    out.split_row_count = split_end - i * kMaxCarWorldSplitContactRows;
+    out.velocity_row_count = velocity_end - i * kMaxCarWorldVelocityContactRows;
+    out.friction_row_count = friction_end - i * kMaxCarWorldFrictionContactRows;
+}
+
 ROCKETGPU_HD bool VehicleUpdatesIndependent(const SimConfig& cfg, const WheelRayStage* staged_rays_for_env, int count) {
     if (staged_rays_for_env == nullptr || cfg.mutator.physics_events.windows != nullptr || count > kWheelRayStageSlots / 4) {
         return false;
@@ -2879,7 +2976,8 @@ ROCKETGPU_HD void StepEnvGeneric(
     const int* kickoff_order_override = nullptr,
 
     int phase = kStepEnvPhaseFull,
-    int tick_offset = 0) {
+    int tick_offset = 0,
+    int world_part = kWorldStepWhole) {
     const int base = env_idx * cfg.max_cars_per_env;
     const WheelRayStage* const staged_rays_for_env =
         ((phase == kStepEnvPhasePost || phase == kStepEnvPhasePostVehiclesDone) && solver_scratch != nullptr)
@@ -2904,8 +3002,8 @@ ROCKETGPU_HD void StepEnvGeneric(
         const uint64_t current_tick = static_cast<uint64_t>(env.tick);
 
         uint32_t cal_pushed_cars_mask = 0u;
-        const bool vehicle_updates_done =
-            phase == kStepEnvPhasePostVehiclesDone && VehicleUpdatesIndependent(cfg, staged_rays_for_env, count);
+        const bool vehicle_updates_done = world_part == kWorldStepRows ||
+            (phase == kStepEnvPhasePostVehiclesDone && VehicleUpdatesIndependent(cfg, staged_rays_for_env, count));
         for (int k = 0; !vehicle_updates_done && k < count; ++k) {
             const int i = CarVisitSlot(env_states[env_idx], k, count);
             StepEnvVehicleUpdateCar(env_idx, i, count, cfg, cars, wheel_runtime_states, car_configs, balls,
@@ -2913,7 +3011,7 @@ ROCKETGPU_HD void StepEnvGeneric(
         }
 
         BallState& ball = balls[env_idx];
-        if (cfg.mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker)) {
+        if (world_part != kWorldStepRows && cfg.mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker)) {
             HeatseekerBallPreTick(ball, cfg.tick_dt, [](BallState& b, const Vec3& v_bt) { SetBallLinearVelocityBt(b, v_bt); });
         }
         RocketSim_Arena_WorldStepSoccar(
@@ -2942,7 +3040,11 @@ ROCKETGPU_HD void StepEnvGeneric(
             cfg.arena_mesh_bvh_node_count,
             cfg.arena_mesh_bvh_subtrees,
             cfg.arena_mesh_bvh_subtree_count,
-            MakeArenaBroadphaseGrid(cfg));
+            MakeArenaBroadphaseGrid(cfg),
+            world_part);
+        if (world_part == kWorldStepContacts) {
+            continue;
+        }
 
         if (solver_scratch) {
             const PreContactCar* const pre_contact_cars =
@@ -3017,12 +3119,13 @@ ROCKETGPU_HD void StepEnv(
     uint64_t seed,
     int ticks,
     int phase = kStepEnvPhaseFull,
-    int tick_offset = 0) {
+    int tick_offset = 0,
+    int world_part = kWorldStepWhole) {
     InternalControlsAccessor accessor;
     accessor.controls = controls;
     accessor.base = env_idx * cfg.max_cars_per_env;
     NoopEnvCommandAccessor no_env_commands;
-    StepEnvGeneric(env_idx, cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls, accessor, no_env_commands, car_configs, balls, env_states, pads, respawn_slot_overrides, seed, ticks, nullptr, phase, tick_offset);
+    StepEnvGeneric(env_idx, cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls, accessor, no_env_commands, car_configs, balls, env_states, pads, respawn_slot_overrides, seed, ticks, nullptr, phase, tick_offset, world_part);
 }
 
 ROCKETGPU_HD void StepEnvWithControlStream(

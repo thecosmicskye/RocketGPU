@@ -287,7 +287,8 @@ ROCKETGPU_GLOBAL void StepKernel(
     EnvState* env_states,
     BoostPadState* pads,
     uint64_t seed,
-    bool vehicles_done) {
+    bool vehicles_done,
+    int world_part) {
     int env_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (env_idx >= cfg.env_count) {
         return;
@@ -295,7 +296,31 @@ ROCKETGPU_GLOBAL void StepKernel(
     MapStepEnv(cfg, env_idx);
     StepEnv(env_idx, cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls,
             car_configs, balls, env_states, pads, nullptr, seed, 1,
-            vehicles_done ? kStepEnvPhasePostVehiclesDone : kStepEnvPhasePost, 0);
+            vehicles_done ? kStepEnvPhasePostVehiclesDone : kStepEnvPhasePost, 0, world_part);
+}
+
+// The car-world rows of the world step, a thread per car, between StepKernel's kWorldStepContacts and kWorldStepRows.
+ROCKETGPU_GLOBAL void CarWorldRowsKernel(
+    SimConfig cfg,
+    const int32_t* env_car_count,
+    CarState* cars,
+    const CarConfig* car_configs,
+    WorldSolverScratch* solver_scratch,
+    WorldSolverScratchRowPool row_pool) {
+    const int stride = cfg.max_cars_per_env;
+    const long long tid = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= static_cast<long long>(cfg.env_count) * stride) {
+        return;
+    }
+    const int env_idx = static_cast<int>(tid / stride);
+    const int slot = static_cast<int>(tid - static_cast<long long>(env_idx) * stride);
+    if (slot >= env_car_count[env_idx]) {
+        return;
+    }
+    // Raw storage, as in StageCarWorldMeshCandidatesKernel.
+    alignas(bullet_port::btGjkEpaScratch) unsigned char gjk_storage[sizeof(bullet_port::btGjkEpaScratch)];
+    BuildCarWorldRowsForCar(env_idx, slot, cfg, cars, car_configs, solver_scratch[env_idx], row_pool.view(env_idx),
+                            reinterpret_cast<bullet_port::btGjkEpaScratch*>(gjk_storage));
 }
 
 ROCKETGPU_GLOBAL void StageWheelRaysKernel(
@@ -466,6 +491,7 @@ inline void EnsureCudaStepStackLimit() {
         reinterpret_cast<const void*>(&StepKernel),
         reinterpret_cast<const void*>(&PreTickKernel),
         reinterpret_cast<const void*>(&VehicleUpdateKernel),
+        reinterpret_cast<const void*>(&CarWorldRowsKernel),
     };
     for (const void* kernel : step_kernels) {
         cudaFuncAttributes attr{};
@@ -669,6 +695,10 @@ inline void LaunchStepTicks(
     // A thread per car for the vehicle updates pays only while a thread per env leaves the GPU short of warps;
     // at full occupancy their divergent branches cost what the split saves.
     const bool vehicles_apart = static_cast<long long>(cfg.env_count) * cfg.max_cars_per_env <= CudaSmCount() * 32ll * 8;
+    // So do the car-world rows below a quarter of that (their split costs two launches and a saved world step),
+    // unless physics events are on: those must come out in env step order.
+    const bool world_rows_apart = static_cast<long long>(cfg.env_count) * cfg.max_cars_per_env <= CudaSmCount() * 32ll * 2 &&
+                                  !cfg.mutator.physics_events.windows;
     if (cfg.env_count <= 0 || pre_block_size <= 0) {
         return;
     }
@@ -686,8 +716,17 @@ inline void LaunchStepTicks(
         }
         StepKernel<<<blocks, block_size, 0, stream>>>(
             cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls, car_configs,
-            balls, env_states, pads, seed, vehicles_apart);
+            balls, env_states, pads, seed, vehicles_apart, world_rows_apart ? kWorldStepContacts : kWorldStepWhole);
         CheckCuda(cudaGetLastError(), "StepKernel launch");
+        if (world_rows_apart) {
+            CarWorldRowsKernel<<<car_blocks, kCudaRayKernelBlockSize, 0, stream>>>(
+                cfg, env_car_count, cars, car_configs, solver_scratch, row_pool);
+            CheckCuda(cudaGetLastError(), "CarWorldRowsKernel launch");
+            StepKernel<<<blocks, block_size, 0, stream>>>(
+                cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls, car_configs,
+                balls, env_states, pads, seed, vehicles_apart, kWorldStepRows);
+            CheckCuda(cudaGetLastError(), "StepKernel launch");
+        }
     }
 }
 

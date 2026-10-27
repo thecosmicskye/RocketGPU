@@ -954,6 +954,45 @@ ROCKETGPU_HD PreContactCar MakePreContactCar(const ::rocketgpu::CarState& car) {
     return out;
 }
 
+struct BallCarReorderRowSpan {
+    int car_local_idx = -1;
+    int normal_start = 0;
+    int normal_count = 0;
+    int friction_start = 0;
+    int friction_count = 0;
+    int split_start = 0;
+    int split_count = 0;
+};
+
+// WorldStepSoccar locals that cross from its contact stages (kWorldStepContacts) to the car-world rows and the
+// solve (kWorldStepRows).
+struct WorldStepCarry {
+    int pair_split_row_count = 0;
+    int pair_velocity_row_count = 0;
+    int pair_friction_row_count = 0;
+    int split_row_count = 0;
+    int normal_row_count = 0;
+    int friction_row_count = 0;
+    BallCarReorderRowSpan ball_car_row_spans[8] = {};
+    int ball_car_row_span_count = 0;
+    int sorted_manifold_count = 0;
+    ::rocketgpu::Vec3 ball_solver_linear_velocity_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    bool ball_sleeping = false;
+    bool ball_awake_after_contact_rows = false;
+    bool ball_settled_skip = false;
+    bool ball_settled_verify = false;
+};
+
+// One car's car-world rows built apart (BuildCarWorldRowsForCar): the rows sit in the env's shared world rows at the
+// car's slot, kMaxCarWorld*ContactRows apart, until PackCarWorldRows moves them up in car order.
+struct CarWorldRowsOut {
+    int split_row_count = 0;
+    int velocity_row_count = 0;
+    int friction_row_count = 0;
+    int group_count = 0;
+    SharedContactOrderGroup groups[kMaxCarWorldMeshesPerCar + 4] = {};
+};
+
 struct WorldSolverScratch {
     static constexpr int kMaxHeatseekerWorldNormals = 16;
     ::rocketgpu::Vec3 hs_world_normals[kMaxHeatseekerWorldNormals];
@@ -998,6 +1037,8 @@ struct WorldSolverScratch {
     int32_t shared_contact_order_group_count = 0;
 
     WheelRayStage wheel_ray_stage[kWheelRayStageSlots] = {};
+    WorldStepCarry world_step_carry = {};
+    CarWorldRowsOut car_world_rows_out[8] = {};
 };
 
 ROCKETGPU_HD float BallSplitTurnErp() {
@@ -3046,16 +3087,6 @@ ROCKETGPU_HD void ReorderCarWorldSharedRowsForBulletIslandSort(
         second_last_group,
         last_group);
 }
-
-struct BallCarReorderRowSpan {
-    int car_local_idx = -1;
-    int normal_start = 0;
-    int normal_count = 0;
-    int friction_start = 0;
-    int friction_count = 0;
-    int split_start = 0;
-    int split_count = 0;
-};
 
 ROCKETGPU_HD void ReorderBallCarRowsForBulletQuickSortIslandFlip(
     EnvStridedArray<BallVelocityContactRow> normal_rows,
