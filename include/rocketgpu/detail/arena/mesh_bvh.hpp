@@ -60,6 +60,29 @@ struct ArenaMeshBvhSubtreeInfo {
     int32_t subtree_size = 0;
 };
 
+// Per mesh, a uniform grid over the mesh's quantized space (BuildArenaMeshLeafGrid). A cell lists, in node index
+// order, the leaves whose quantized AABB spans it or the cell after it, so a query no wider than a cell meets every
+// leaf it overlaps in the cell of its min corner. A parent's quantized AABB contains its children's (checked at
+// build), so the overlapping leaves are exactly the ones the stackless walk visits, and node order is its order.
+struct ArenaMeshLeafGridInfo {
+    int32_t cell_offset = -1;  // -1: no grid, walk the BVH
+    int32_t cells[3] = {0, 0, 0};
+    int32_t cell_width[3] = {1, 1, 1};  // in quantized units
+};
+
+struct alignas(16) ArenaMeshLeafEntry {
+    uint16_t quantized_aabb_min[3] = {0, 0, 0};
+    uint16_t quantized_aabb_max[3] = {0, 0, 0};
+    int32_t triangle_index = 0;
+};
+static_assert(sizeof(ArenaMeshLeafEntry) == 16, "ArenaMeshLeafEntry must stay one 128-bit load");
+
+struct ArenaMeshLeafGrid {
+    const ArenaMeshLeafGridInfo* infos = nullptr;  // per mesh info
+    const int32_t* cell_start = nullptr;           // per cell, plus one
+    const ArenaMeshLeafEntry* entries = nullptr;
+};
+
 struct ArenaBroadphaseGrid {
     Vec3 min_bt = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 max_bt = Vec3(0.0f, 0.0f, 0.0f);
@@ -69,6 +92,7 @@ struct ArenaBroadphaseGrid {
     int32_t cells_z = 0;
     const uint16_t* cell_mesh_mask = nullptr;
     int32_t cell_count = 0;
+    ArenaMeshLeafGrid leaf_grid;
 
     ROCKETGPU_HD bool valid() const {
         return cell_mesh_mask != nullptr && cell_count > 0 && cell_size_bt > 0.0f &&
@@ -386,6 +410,49 @@ ROCKETGPU_HD void WalkArenaMeshBvhStacklessQuantizedTreeCacheFriendly(
         root_node_index,
         root_node_index + node_count,
         callback);
+}
+
+// Calls back the leaves a walk of mesh mesh_info_idx visits for the query, in walk order. False, calling nothing,
+// when the mesh has no grid or the query is wider than a cell.
+template <typename Callback>
+ROCKETGPU_HD bool WalkArenaMeshLeafGrid(
+    const ArenaMeshLeafGrid* grid,
+    int mesh_info_idx,
+    const uint16_t* quantized_query_aabb_min,
+    const uint16_t* quantized_query_aabb_max,
+    Callback&& callback) {
+    if (grid == nullptr || grid->infos == nullptr) {
+        return false;
+    }
+    const ArenaMeshLeafGridInfo& info = grid->infos[mesh_info_idx];
+    if (info.cell_offset < 0) {
+        return false;
+    }
+    int cell[3];
+    for (int a = 0; a < 3; ++a) {
+        if (quantized_query_aabb_max[a] - quantized_query_aabb_min[a] > info.cell_width[a]) {
+            return false;
+        }
+        cell[a] = quantized_query_aabb_min[a] / info.cell_width[a];
+        cell[a] = cell[a] < info.cells[a] ? cell[a] : info.cells[a] - 1;
+    }
+    const int cell_idx = info.cell_offset + (cell[2] * info.cells[1] + cell[1]) * info.cells[0] + cell[0];
+    const int end = grid->cell_start[cell_idx + 1];
+    for (int e = grid->cell_start[cell_idx]; e < end; ++e) {
+#if defined(__CUDA_ARCH__)
+        ArenaMeshLeafEntry entry;
+        const uint4 raw = __ldg(reinterpret_cast<const uint4*>(&grid->entries[e]));
+        memcpy(&entry, &raw, sizeof(entry));
+#else
+        const ArenaMeshLeafEntry& entry = grid->entries[e];
+#endif
+        if (TestQuantizedAabbAgainstQuantizedAabb(
+                quantized_query_aabb_min, quantized_query_aabb_max,
+                entry.quantized_aabb_min, entry.quantized_aabb_max)) {
+            callback(entry.triangle_index);
+        }
+    }
+    return true;
 }
 }
 }

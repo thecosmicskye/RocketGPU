@@ -626,6 +626,74 @@ ROCKETGPU_HD bool CarWorldTriangleAgainstAabbBullet(
     return true;
 }
 
+// A car-triangle GJK/EPA contact with the internal-edge adjust applied; raw_* are the values before it.
+struct CarWorldTriangleHit {
+    Vec3 normal;
+    Vec3 raw_normal;
+    Vec3 point_on_b_bt;
+    Vec3 raw_point_on_b_bt;
+    float distance_bt;
+    uint8_t hit;
+    uint8_t internal_edge_adjusted;
+};
+
+ROCKETGPU_HD CarWorldTriangleHit ComputeCarWorldTriangleHit(
+    const CarState& car,
+    const CarConfig& cfg,
+    const MutatorConfig& mutator,
+    const ArenaMeshTriangle* mesh_triangles,
+    int32_t tri_idx,
+    float contact_threshold_bt,
+    bullet_port::btGjkEpaScratch* gjk_epa_scratch) {
+    const ArenaMeshTriangle& tri = mesh_triangles[tri_idx];
+    CarWorldTriangleHit out;
+    out.hit = 0;
+    out.internal_edge_adjusted = 0;
+    Vec3 contact_normal(0.0f, 0.0f, 1.0f);
+    float distance_bt = 0.0f;
+    Vec3 point_on_a_bt(0.0f, 0.0f, 0.0f);
+    Vec3 point_on_b_bt(0.0f, 0.0f, 0.0f);
+    const bool cal_frame_gjk = mutator.cal_arena_local_tris != nullptr;
+    const ArenaMeshTriangle& gjk_tri = cal_frame_gjk ? mutator.cal_arena_local_tris[tri_idx] : tri;
+    const float gjk_tri_origin_y_bt =
+        cal_frame_gjk ? static_cast<float>(gjk_tri.cal_origin_sign) * kGoalMeshOriginYBt : 0.0f;
+    if (!ComputeCarArenaTriangleContact(car, cfg, gjk_tri, contact_threshold_bt, contact_normal, distance_bt,
+                                        &point_on_a_bt, &point_on_b_bt, gjk_epa_scratch, nullptr, nullptr, 0,
+                                        gjk_tri_origin_y_bt)) {
+        return out;
+    }
+    contact_normal = ArenaTriangleFaceNormal(gjk_tri);
+    out.raw_normal = contact_normal;
+    out.raw_point_on_b_bt = point_on_b_bt;
+    const Vec3 cp_point_on_a_bt = point_on_b_bt + contact_normal * distance_bt;
+    if (EnableArenaTriangleInternalEdgeAdjust()) {
+        out.internal_edge_adjusted = MaybeAdjustArenaTriangleInternalEdgeContact(
+            tri, cp_point_on_a_bt, distance_bt, point_on_b_bt, contact_normal, nullptr,
+            mutator.game_mode == static_cast<uint8_t>(Mode::Soccar),
+            mutator.native_sphere_rsqrt_table, mutator.native_sphere_rsqrt_shift,
+            cal_frame_gjk ? &mutator.cal_arena_local_tris[tri_idx] : nullptr) ? 1 : 0;
+    }
+    out.normal = contact_normal;
+    out.point_on_b_bt = point_on_b_bt;
+    out.distance_bt = distance_bt;
+    out.hit = 1;
+    return out;
+}
+
+// Car-triangle pairs staged for a thread each. The gather pass lists, in walk order, every triangle of a staged
+// (car, mesh) pair that passes the plane test; the contact pass computes each pair's hit; the merge pass folds the
+// hits into the pair's candidates in list order, as the inline walk does.
+struct CarWorldTrianglePairs {
+    int32_t* car_idx;
+    int32_t* tri_idx;
+    CarWorldTriangleHit* hits;
+    int32_t* count;
+    int32_t capacity;
+    int32_t car_stride;  // global car index = env_idx * car_stride + slot
+};
+enum : int { kTrianglePairsNone = 0, kTrianglePairsGather = 1, kTrianglePairsMerge = 2 };
+constexpr int kCarWorldMeshGatherTriangles = 128;
+
 struct MeshContactCandidate {
     int32_t tri_idx = -1;
     int32_t mesh_world_idx = -1;
@@ -650,6 +718,8 @@ struct CarWorldMeshCandidateStageMesh {
     MeshContactCandidate candidates[kCarWorldMeshStageCandidates];
     int32_t candidate_count = 0;
     int32_t broadphase_hits = 0;
+    int32_t pair_start = 0;  // CarWorldTrianglePairs entries from the gather pass; -1 count: none
+    int32_t pair_count = -1;
     uint8_t has_collected_normal = 0;
     Vec3 last_collected_normal = Vec3(0.0f, 0.0f, 1.0f);
 };
@@ -870,7 +940,10 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
     float broadphase_dt = 0.0f,
     CarWorldMeshCandidateStage* stage_out = nullptr,
     const CarWorldMeshCandidateStage* stage_in = nullptr,
-    int stage_mesh = -1) {
+    int stage_mesh = -1,
+    const ArenaMeshLeafGrid* leaf_grid = nullptr,
+    const CarWorldTrianglePairs* triangle_pairs = nullptr,
+    int triangle_pairs_pass = kTrianglePairsNone) {
     if (mesh_triangles == nullptr || mesh_triangle_count <= 0) {
         return;
     }
@@ -1052,83 +1125,51 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
         }
     };
 
-    auto consider_triangle = [&](int32_t tri_idx, MeshContactCandidate* candidates, int& candidate_count, int mesh_info_idx = -1) {
+    // Gather pass: the triangles of this (car, mesh) pair that pass the plane test, in walk order.
+    int32_t gathered_tris[kCarWorldMeshGatherTriangles];
+    int gathered_count = 0;
+    auto consider_triangle = [&](int32_t tri_idx, MeshContactCandidate* candidates, int& candidate_count,
+                                 const CarWorldTriangleHit* precomputed = nullptr) {
         const ArenaMeshTriangle& tri = mesh_triangles[tri_idx];
-        if (!CarWorldTriangleAgainstAabbBullet(tri, aabb_min_bt, aabb_max_bt)) {
+        if (precomputed == nullptr) {
+            if (!CarWorldTriangleAgainstAabbBullet(tri, aabb_min_bt, aabb_max_bt)) {
+                return;
+            }
+            ++current_mesh_broadphase_hits;
+            const Vec3 triangle_normal_world = Normalize(tri.normal, Vec3(0.0f, 0.0f, 1.0f));
+            const float center_proj = Dot(triangle_normal_world, box_center_bt);
+            const float support_extent =
+                Abs(Dot(triangle_normal_world, axis_x)) * box_half_extent_with_margin_bt.x +
+                Abs(Dot(triangle_normal_world, axis_y)) * box_half_extent_with_margin_bt.y +
+                Abs(Dot(triangle_normal_world, axis_z)) * box_half_extent_with_margin_bt.z;
+            const float tri_proj = Dot(triangle_normal_world, tri.a);
+            const float separation_along_normal = tri_proj - (center_proj + support_extent);
+            const float separation_against_normal = (center_proj - support_extent) - tri_proj;
+            if (separation_along_normal > contact_threshold_bt ||
+                separation_against_normal > contact_threshold_bt) {
+                return;
+            }
+            if (triangle_pairs_pass == kTrianglePairsGather) {
+                if (gathered_count < kCarWorldMeshGatherTriangles) {
+                    gathered_tris[gathered_count] = tri_idx;
+                }
+                ++gathered_count;
+                return;
+            }
+        }
+        const CarWorldTriangleHit hit =
+            precomputed != nullptr
+                ? *precomputed
+                : ComputeCarWorldTriangleHit(car, cfg, mutator, mesh_triangles, tri_idx, contact_threshold_bt, gjk_epa_scratch);
+        if (hit.hit == 0) {
             return;
         }
-        ++current_mesh_broadphase_hits;
-        const Vec3 triangle_normal_world = Normalize(tri.normal, Vec3(0.0f, 0.0f, 1.0f));
-        const float center_proj = Dot(triangle_normal_world, box_center_bt);
-        const float support_extent =
-            Abs(Dot(triangle_normal_world, axis_x)) * box_half_extent_with_margin_bt.x +
-            Abs(Dot(triangle_normal_world, axis_y)) * box_half_extent_with_margin_bt.y +
-            Abs(Dot(triangle_normal_world, axis_z)) * box_half_extent_with_margin_bt.z;
-        const float tri_proj = Dot(triangle_normal_world, tri.a);
-        const float separation_along_normal = tri_proj - (center_proj + support_extent);
-        const float separation_against_normal = (center_proj - support_extent) - tri_proj;
-        if (separation_along_normal > contact_threshold_bt ||
-            separation_against_normal > contact_threshold_bt) {
-            return;
-        }
-
-        Vec3 contact_normal(0.0f, 0.0f, 1.0f);
-        float distance_bt = 0.0f;
-        Vec3 point_on_a_bt(0.0f, 0.0f, 0.0f);
-        Vec3 point_on_b_bt(0.0f, 0.0f, 0.0f);
-        int debug_local_triangle_idx = tri_idx;
-        if (mesh_bvh_meshes != nullptr &&
-            mesh_info_idx >= 0 &&
-            mesh_info_idx < mesh_bvh_mesh_count) {
-            debug_local_triangle_idx = tri_idx - mesh_bvh_meshes[mesh_info_idx].triangle_start;
-        }
-
-        const bool cal_frame_gjk = mutator.cal_arena_local_tris != nullptr;
-        const ArenaMeshTriangle& gjk_tri = cal_frame_gjk ? mutator.cal_arena_local_tris[tri_idx] : tri;
-        const float gjk_tri_origin_y_bt =
-            cal_frame_gjk ? static_cast<float>(gjk_tri.cal_origin_sign) * kGoalMeshOriginYBt : 0.0f;
-        const bool triangle_hit = ComputeCarArenaTriangleContact(
-                car,
-                cfg,
-                gjk_tri,
-                contact_threshold_bt,
-                contact_normal,
-                distance_bt,
-                &point_on_a_bt,
-                &point_on_b_bt,
-                gjk_epa_scratch,
-                nullptr,
-                nullptr,
-                0,
-                gjk_tri_origin_y_bt);
-        if (!triangle_hit) {
-            return;
-        }
-
-        {
-            const ArenaMeshTriangle& face_tri =
-                mutator.cal_arena_local_tris != nullptr ? mutator.cal_arena_local_tris[tri_idx] : tri;
-            contact_normal = ArenaTriangleFaceNormal(face_tri);
-        }
-
-        const Vec3 contact_normal_pre_adjust = contact_normal;
-        const Vec3 point_on_b_bt_pre_adjust = point_on_b_bt;
-
-        bool internal_edge_adjusted = false;
-
-        const Vec3 cp_point_on_a_bt = point_on_b_bt + contact_normal * distance_bt;
-        if (EnableArenaTriangleInternalEdgeAdjust()) {
-            internal_edge_adjusted = MaybeAdjustArenaTriangleInternalEdgeContact(
-                tri,
-                cp_point_on_a_bt,
-                distance_bt,
-                point_on_b_bt,
-                contact_normal,
-                nullptr,
-                mutator.game_mode == static_cast<uint8_t>(Mode::Soccar),
-                mutator.native_sphere_rsqrt_table, mutator.native_sphere_rsqrt_shift,
-                mutator.cal_arena_local_tris != nullptr ? &mutator.cal_arena_local_tris[tri_idx] : nullptr);
-        }
+        const Vec3 contact_normal = hit.normal;
+        const float distance_bt = hit.distance_bt;
+        const Vec3 point_on_b_bt = hit.point_on_b_bt;
+        const Vec3 contact_normal_pre_adjust = hit.raw_normal;
+        const Vec3 point_on_b_bt_pre_adjust = hit.raw_point_on_b_bt;
+        const bool internal_edge_adjusted = hit.internal_edge_adjusted != 0;
 
         MeshContactCandidate candidate;
         candidate.tri_idx = tri_idx;
@@ -1257,9 +1298,19 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
             if (!CarWorldMeshInfoUsable(mesh_info, mesh_bvh_quantization_count, mesh_bvh_node_count)) {
                 continue;
             }
+            // Not staged: the query AABB misses this mesh, so it has no candidates; only a Bullet manifold with it
+            // still gives it an (empty) order group, as below.
+            if (stage_in != nullptr && broadphase_grid != nullptr && ((stage_in->mesh_mask >> mesh_info_idx) & 1u) == 0) {
+                if (BulletCarMeshManifoldExists(car_broadphase_proxy, *broadphase_grid, mesh_info)) {
+                    append_local_world_order_group(
+                        100 + Max(mesh_info.mesh_index, 0), normal_row_count, 0, friction_row_count, 0);
+                }
+                continue;
+            }
 
             int candidate_count = 0;
             current_mesh_broadphase_hits = 0;
+            gathered_count = 0;
             const ArenaMeshBvhQuantization& quantization = mesh_bvh_quantization[mesh_info.mesh_index];
             QuantizeArenaMeshBvhPoint(quantization, aabb_min_bt, 0, quantized_query_aabb_min);
             QuantizeArenaMeshBvhPoint(quantization, aabb_max_bt, 1, quantized_query_aabb_max);
@@ -1304,24 +1355,55 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
                     last_collected_normal = staged.last_collected_normal;
                 }
                 }
+            } else if (mesh_aabb_may_overlap && triangle_pairs_pass == kTrianglePairsMerge &&
+                       stage_out->meshes[mesh_info_idx].pair_count >= 0) {
+                const CarWorldMeshCandidateStageMesh& gathered = stage_out->meshes[mesh_info_idx];
+                for (int k = 0; k < gathered.pair_count; ++k) {
+                    consider_triangle(triangle_pairs->tri_idx[gathered.pair_start + k], candidates, candidate_count,
+                                      &triangle_pairs->hits[gathered.pair_start + k]);
+                }
+                current_mesh_broadphase_hits = gathered.broadphase_hits;
             } else if (mesh_aabb_may_overlap) {
-            SelectArenaMeshBvhDfsOrderSubtrees(
-                mesh_info, mesh_bvh_subtrees, mesh_bvh_subtree_count, mesh_subtrees, mesh_subtree_count);
+            const auto visit_leaf = [&](int32_t local_triangle_index) {
+                if (local_triangle_index < 0 || local_triangle_index >= mesh_info.triangle_count) {
+                    return;
+                }
+                consider_triangle(mesh_info.triangle_start + local_triangle_index, candidates, candidate_count);
+            };
+            if (!WalkArenaMeshLeafGrid(
+                    leaf_grid, mesh_info_idx, quantized_query_aabb_min, quantized_query_aabb_max, visit_leaf)) {
+                SelectArenaMeshBvhDfsOrderSubtrees(
+                    mesh_info, mesh_bvh_subtrees, mesh_bvh_subtree_count, mesh_subtrees, mesh_subtree_count);
 
-            WalkArenaMeshBvhStacklessQuantizedTreeCacheFriendly(
-                mesh_bvh_nodes,
-                mesh_subtrees,
-                mesh_subtree_count,
-                quantized_query_aabb_min,
-                quantized_query_aabb_max,
-                mesh_info.node_offset,
-                mesh_info.node_count,
-                [&](int32_t local_triangle_index) {
-                    if (local_triangle_index < 0 || local_triangle_index >= mesh_info.triangle_count) {
-                        return;
+                WalkArenaMeshBvhStacklessQuantizedTreeCacheFriendly(
+                    mesh_bvh_nodes,
+                    mesh_subtrees,
+                    mesh_subtree_count,
+                    quantized_query_aabb_min,
+                    quantized_query_aabb_max,
+                    mesh_info.node_offset,
+                    mesh_info.node_count,
+                    visit_leaf);
+            }
+            }
+            if (stage_out != nullptr && triangle_pairs_pass == kTrianglePairsGather) {
+                CarWorldMeshCandidateStageMesh& staged = stage_out->meshes[mesh_info_idx];
+                staged.broadphase_hits = current_mesh_broadphase_hits;
+                staged.pair_count = -1;  // the merge pass walks this pair itself
+#if defined(__CUDA_ARCH__)
+                if (gathered_count <= kCarWorldMeshGatherTriangles) {
+                    const int start = gathered_count > 0 ? atomicAdd(triangle_pairs->count, gathered_count) : 0;
+                    if (start + gathered_count <= triangle_pairs->capacity) {
+                        for (int k = 0; k < gathered_count; ++k) {
+                            triangle_pairs->car_idx[start + k] = env_idx * triangle_pairs->car_stride + car_idx;
+                            triangle_pairs->tri_idx[start + k] = gathered_tris[k];
+                        }
+                        staged.pair_start = start;
+                        staged.pair_count = gathered_count;
                     }
-                    consider_triangle(mesh_info.triangle_start + local_triangle_index, candidates, candidate_count, mesh_info_idx);
-                });
+                }
+#endif
+                continue;
             }
             if (stage_out != nullptr) {
                 CarWorldMeshCandidateStageMesh& staged = stage_out->meshes[mesh_info_idx];

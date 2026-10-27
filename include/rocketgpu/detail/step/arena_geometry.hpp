@@ -3725,6 +3725,9 @@ ROCKETGPU_HD ArenaBroadphaseGrid MakeArenaBroadphaseGrid(const ::rocketgpu::SimC
     grid.cells_z = cfg.arena_broadphase_cells_z;
     grid.cell_mesh_mask = cfg.arena_broadphase_cell_mask;
     grid.cell_count = cfg.arena_broadphase_cell_count;
+    grid.leaf_grid.infos = cfg.arena_mesh_leaf_grid_infos;
+    grid.leaf_grid.cell_start = cfg.arena_mesh_leaf_cell_start;
+    grid.leaf_grid.entries = cfg.arena_mesh_leaf_entries;
     return grid;
 }
 

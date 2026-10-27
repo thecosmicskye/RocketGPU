@@ -11,6 +11,8 @@ struct ArenaMeshTriangle;
 struct ArenaMeshBvhQuantization;
 struct ArenaMeshBvhNode;
 struct ArenaMeshBvhSubtreeInfo;
+struct ArenaMeshLeafGridInfo;
+struct ArenaMeshLeafEntry;
 struct ArenaMeshBvhMeshInfo;
 struct WheelRuntimeState;
 struct WorldSolverScratch;
@@ -495,6 +497,10 @@ struct SimConfig {
     int32_t arena_mesh_bvh_node_count = 0;
     const detail::ArenaMeshBvhSubtreeInfo* arena_mesh_bvh_subtrees = nullptr;
     int32_t arena_mesh_bvh_subtree_count = 0;
+    // Per-mesh leaf grids (ArenaMeshLeafGrid); null walks the BVH.
+    const detail::ArenaMeshLeafGridInfo* arena_mesh_leaf_grid_infos = nullptr;
+    const int32_t* arena_mesh_leaf_cell_start = nullptr;
+    const detail::ArenaMeshLeafEntry* arena_mesh_leaf_entries = nullptr;
 
     const uint16_t* arena_broadphase_cell_mask = nullptr;
     int32_t arena_broadphase_cell_count = 0;

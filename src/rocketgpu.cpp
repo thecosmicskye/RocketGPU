@@ -382,6 +382,24 @@ struct BatchSim::Impl {
                 cfg.arena_mesh_bvh_subtrees = arena_mesh_bvh_subtrees.data();
                 cfg.arena_mesh_bvh_subtree_count = static_cast<int32_t>(arena_mesh_bvh_subtrees.size());
 
+                std::vector<detail::ArenaMeshLeafGridInfo> host_leaf_grid_infos;
+                std::vector<int32_t> host_leaf_cell_start;
+                std::vector<detail::ArenaMeshLeafEntry> host_leaf_entries;
+                detail::BuildArenaMeshLeafGrid(host_mesh_quantization, host_mesh_infos, host_mesh_nodes,
+                                               host_mesh_subtrees, host_leaf_grid_infos, host_leaf_cell_start,
+                                               host_leaf_entries);
+                if (!host_leaf_entries.empty()) {
+                    arena_mesh_leaf_grid_infos.resize(host_leaf_grid_infos.size());
+                    arena_mesh_leaf_grid_infos.copy_from_host(host_leaf_grid_infos.data(), host_leaf_grid_infos.size());
+                    arena_mesh_leaf_cell_start.resize(host_leaf_cell_start.size());
+                    arena_mesh_leaf_cell_start.copy_from_host(host_leaf_cell_start.data(), host_leaf_cell_start.size());
+                    arena_mesh_leaf_entries.resize(host_leaf_entries.size());
+                    arena_mesh_leaf_entries.copy_from_host(host_leaf_entries.data(), host_leaf_entries.size());
+                    cfg.arena_mesh_leaf_grid_infos = arena_mesh_leaf_grid_infos.data();
+                    cfg.arena_mesh_leaf_cell_start = arena_mesh_leaf_cell_start.data();
+                    cfg.arena_mesh_leaf_entries = arena_mesh_leaf_entries.data();
+                }
+
                 detail::ArenaBroadphaseGrid host_grid{};
                 const std::vector<uint16_t> host_cell_mask =
                     detail::BuildArenaBroadphaseCellMask(host_mesh, host_mesh_infos, host_grid);
@@ -438,6 +456,9 @@ struct BatchSim::Impl {
     detail::Buffer<detail::ArenaMeshBvhMeshInfo> arena_mesh_bvh_meshes;
     detail::Buffer<detail::ArenaMeshBvhNode> arena_mesh_bvh_nodes;
     detail::Buffer<detail::ArenaMeshBvhSubtreeInfo> arena_mesh_bvh_subtrees;
+    detail::Buffer<detail::ArenaMeshLeafGridInfo> arena_mesh_leaf_grid_infos;
+    detail::Buffer<int32_t> arena_mesh_leaf_cell_start;
+    detail::Buffer<detail::ArenaMeshLeafEntry> arena_mesh_leaf_entries;
     detail::Buffer<uint16_t> arena_broadphase_cell_mask;
     detail::Buffer<uint32_t> native_sphere_rsqrt;
     detail::Buffer<CarState> car_states;

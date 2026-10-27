@@ -375,10 +375,12 @@ ROCKETGPU_GLOBAL void VehicleUpdateKernel(
                             controls[env_idx * stride + slot], staged, pushed_cars_mask);
 }
 
-// Car-world mesh staging, in two passes. The prefilter runs a thread per car slot: it writes the stage header,
-// marks the meshes the car's query AABB may touch, and lists each (car, overlapping mesh) pair under its
-// mesh. The staging pass runs a thread per listed pair, mesh-major so a warp walks one mesh's BVH. Every pair writes
-// only its own entry, so the list order does not affect the result.
+// Car-world mesh staging. The prefilter runs a thread per car slot: it writes the stage header, marks the meshes
+// the car's query AABB may touch, and lists each (car, overlapping mesh) pair under its mesh. The staging kernel
+// then runs a thread per listed pair, mesh-major so a warp walks one mesh's BVH, twice: the gather pass lists the
+// pair's triangles that pass the plane test, CarWorldTriangleHitsKernel runs their GJK/EPA a thread per
+// car-triangle, and the merge pass folds the hits into the pair's candidates in walk order. Every pair writes only
+// its own entry, so the list orders do not affect the result.
 ROCKETGPU_GLOBAL void PrefilterCarWorldMeshCandidatesKernel(
     SimConfig cfg,
     const CarState* cars,
@@ -445,15 +447,14 @@ ROCKETGPU_GLOBAL void StageCarWorldMeshCandidatesKernel(
     CarWorldMeshCandidateStage* stages,
     const int32_t* mesh_work,
     const int32_t* mesh_work_count,
-    int spread) {
+    CarWorldTrianglePairs pairs,
+    int pairs_pass) {
     const int stride = cfg.max_cars_per_env;
     const long long car_slots = static_cast<long long>(cfg.env_count) * stride;
     const long long tid = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const long long span = car_slots * spread;
-    const int mesh = static_cast<int>(tid / span);
-    const long long lane = tid - mesh * span;
-    const long long item = lane / spread;
-    if (lane - item * spread != 0 || mesh >= cfg.arena_mesh_bvh_mesh_count || item >= mesh_work_count[mesh]) {
+    const int mesh = static_cast<int>(tid / car_slots);
+    const long long item = tid - mesh * car_slots;
+    if (mesh >= cfg.arena_mesh_bvh_mesh_count || item >= mesh_work_count[mesh]) {
         return;
     }
     const int car_idx = mesh_work[static_cast<long long>(mesh) * car_slots + item];
@@ -462,6 +463,7 @@ ROCKETGPU_GLOBAL void StageCarWorldMeshCandidatesKernel(
     // Raw storage: GJK/EPA initialize it on use, and constructing 28 KB per thread every tick dominates otherwise.
     alignas(bullet_port::btGjkEpaScratch) unsigned char gjk_storage[sizeof(bullet_port::btGjkEpaScratch)];
     bullet_port::btGjkEpaScratch* const gjk_scratch = reinterpret_cast<bullet_port::btGjkEpaScratch*>(gjk_storage);
+    const ArenaMeshLeafGrid leaf_grid = MakeArenaBroadphaseGrid(cfg).leaf_grid;
     ContactAccumulator acc;
     int split_row_count = 0;
     int normal_row_count = 0;
@@ -475,7 +477,25 @@ ROCKETGPU_GLOBAL void StageCarWorldMeshCandidatesKernel(
         cfg.arena_mesh_bvh_nodes, cfg.arena_mesh_bvh_node_count,
         cfg.arena_mesh_bvh_subtrees, cfg.arena_mesh_bvh_subtree_count,
         env_idx, slot, gjk_scratch, nullptr, nullptr, nullptr, 0.0f,
-        &stages[car_idx], nullptr, mesh);
+        &stages[car_idx], nullptr, mesh, &leaf_grid, &pairs, pairs_pass);
+}
+
+// The contact pass between gather and merge: one car-triangle GJK/EPA per thread.
+ROCKETGPU_GLOBAL void CarWorldTriangleHitsKernel(
+    SimConfig cfg,
+    const CarState* cars,
+    const CarConfig* car_configs,
+    CarWorldTrianglePairs pairs) {
+    const int count = Min(*pairs.count, pairs.capacity);
+    alignas(bullet_port::btGjkEpaScratch) unsigned char gjk_storage[sizeof(bullet_port::btGjkEpaScratch)];
+    bullet_port::btGjkEpaScratch* const gjk_scratch = reinterpret_cast<bullet_port::btGjkEpaScratch*>(gjk_storage);
+    for (int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); i < count; i += static_cast<int>(gridDim.x * blockDim.x)) {
+        const int car_idx = pairs.car_idx[i];
+        const CarConfig& car_cfg = car_configs[car_idx];
+        pairs.hits[i] = ComputeCarWorldTriangleHit(
+            cars[car_idx], car_cfg, cfg.mutator, cfg.arena_mesh_tris, pairs.tri_idx[i],
+            CarContactBreakingThresholdUU(car_cfg) * (1.0f / 50.0f), gjk_scratch);
+    }
 }
 
 inline void EnsureCudaStepStackLimit() {
@@ -530,11 +550,13 @@ inline int GetCudaStepBlockSize(int env_count) {
 }
 
 constexpr int kCudaRayKernelBlockSize = 128;
+constexpr size_t kCarWorldTrianglePairsPerCar = 16;
 
 struct CarWorldStageBuffers {
     CarWorldMeshCandidateStage* stages = nullptr;
     int32_t* mesh_work = nullptr;        // per mesh, the car slots whose query AABB may touch it
     int32_t* mesh_work_count = nullptr;  // kCarWorldMeshStageMeshes counters
+    CarWorldTrianglePairs pairs{};       // count lives in mesh_work_count[kCarWorldMeshStageMeshes]
     size_t capacity = 0;
     CarWorldMeshCandidateStage* published = nullptr;
     int published_stride = 0;
@@ -575,12 +597,22 @@ inline bool EnsureCarWorldStageArmed(const SimConfig& cfg, cudaStream_t stream) 
         if (b.stages != nullptr) {
             cudaFree(b.stages);
             cudaFree(b.mesh_work);
+            cudaFree(b.pairs.car_idx);
+            cudaFree(b.pairs.tri_idx);
+            cudaFree(b.pairs.hits);
             b.stages = nullptr;
             b.mesh_work = nullptr;
+            b.pairs = CarWorldTrianglePairs{};
         }
         if (b.mesh_work_count == nullptr) {
-            CheckCuda(cudaMalloc(&b.mesh_work_count, kCarWorldMeshStageMeshes * sizeof(int32_t)), "cudaMalloc(car-world mesh work count)");
+            CheckCuda(cudaMalloc(&b.mesh_work_count, (kCarWorldMeshStageMeshes + 1) * sizeof(int32_t)), "cudaMalloc(car-world mesh work count)");
         }
+        const size_t pair_capacity = count * kCarWorldTrianglePairsPerCar;
+        CheckCuda(cudaMalloc(&b.pairs.car_idx, pair_capacity * sizeof(int32_t)), "cudaMalloc(car-world triangle pairs)");
+        CheckCuda(cudaMalloc(&b.pairs.tri_idx, pair_capacity * sizeof(int32_t)), "cudaMalloc(car-world triangle pairs)");
+        CheckCuda(cudaMalloc(&b.pairs.hits, pair_capacity * sizeof(CarWorldTriangleHit)), "cudaMalloc(car-world triangle hits)");
+        b.pairs.count = b.mesh_work_count + kCarWorldMeshStageMeshes;
+        b.pairs.capacity = static_cast<int32_t>(std::min<size_t>(pair_capacity, INT32_MAX));
         b.capacity = 0;
         b.published = nullptr;
         CheckCuda(cudaMalloc(&b.mesh_work, count * kCarWorldMeshStageMeshes * sizeof(int32_t)), "cudaMalloc(car-world mesh work)");
@@ -617,25 +649,32 @@ inline void LaunchStageCarWorldMeshCandidates(
     CarWorldStageBuffers& b = GetCarWorldStageBuffers();
     const size_t car_slots = static_cast<size_t>(cfg.env_count) * static_cast<size_t>(cfg.max_cars_per_env);
     const int block_size = kCudaRayKernelBlockSize;
-    CheckCuda(cudaMemsetAsync(b.mesh_work_count, 0, kCarWorldMeshStageMeshes * sizeof(int32_t), stream),
+    CheckCuda(cudaMemsetAsync(b.mesh_work_count, 0, (kCarWorldMeshStageMeshes + 1) * sizeof(int32_t), stream),
               "cudaMemsetAsync(car-world mesh work count)");
     PrefilterCarWorldMeshCandidatesKernel<<<static_cast<unsigned>((car_slots + block_size - 1) / block_size),
                                             static_cast<unsigned>(block_size), 0, stream>>>(
         cfg, cars, car_configs, env_car_count, b.stages, b.mesh_work, b.mesh_work_count);
     CheckCuda(cudaGetLastError(), "PrefilterCarWorldMeshCandidatesKernel launch");
     const int meshes = std::max(0, std::min(cfg.arena_mesh_bvh_mesh_count, kCarWorldMeshStageMeshes));
-    // Lanes per staged pair. Pairs packed densely serialize their divergent GJK work within a warp; that only
-    // pays once there are enough pairs (about three per car) to fill the GPU, so small batches spread them out.
-    const size_t lanes_to_fill = static_cast<size_t>(CudaSmCount()) * 32 * 32;
-    const int spread = static_cast<int>(std::max<size_t>(1, std::min<size_t>(8, lanes_to_fill / std::max<size_t>(1, car_slots * 3))));
-    const size_t count = car_slots * static_cast<size_t>(meshes) * static_cast<size_t>(spread);
-    if (count == 0) {
+    const size_t pair_count = car_slots * static_cast<size_t>(meshes);
+    if (pair_count == 0) {
         return;
     }
-    StageCarWorldMeshCandidatesKernel<<<static_cast<unsigned>((count + block_size - 1) / block_size),
+    // Gather each pair's plane-test survivors, run their GJK/EPA a thread per car-triangle, then merge in walk order.
+    CarWorldTrianglePairs pairs = b.pairs;
+    pairs.car_stride = cfg.max_cars_per_env;
+    StageCarWorldMeshCandidatesKernel<<<static_cast<unsigned>((pair_count + block_size - 1) / block_size),
                                         static_cast<unsigned>(block_size), 0, stream>>>(
-        cfg, cars, car_configs, b.stages, b.mesh_work, b.mesh_work_count, spread);
-    CheckCuda(cudaGetLastError(), "StageCarWorldMeshCandidatesKernel launch");
+        cfg, cars, car_configs, b.stages, b.mesh_work, b.mesh_work_count, pairs, kTrianglePairsGather);
+    CheckCuda(cudaGetLastError(), "StageCarWorldMeshCandidatesKernel gather launch");
+    const size_t hit_threads = std::min<size_t>(static_cast<size_t>(pairs.capacity), static_cast<size_t>(CudaSmCount()) * 32 * 32);
+    CarWorldTriangleHitsKernel<<<static_cast<unsigned>((hit_threads + block_size - 1) / block_size),
+                                 static_cast<unsigned>(block_size), 0, stream>>>(cfg, cars, car_configs, pairs);
+    CheckCuda(cudaGetLastError(), "CarWorldTriangleHitsKernel launch");
+    StageCarWorldMeshCandidatesKernel<<<static_cast<unsigned>((pair_count + block_size - 1) / block_size),
+                                        static_cast<unsigned>(block_size), 0, stream>>>(
+        cfg, cars, car_configs, b.stages, b.mesh_work, b.mesh_work_count, pairs, kTrianglePairsMerge);
+    CheckCuda(cudaGetLastError(), "StageCarWorldMeshCandidatesKernel merge launch");
 }
 inline void LaunchStageWheelRays(
     const SimConfig& cfg,

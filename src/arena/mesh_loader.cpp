@@ -762,5 +762,116 @@ std::vector<uint16_t> BuildArenaBroadphaseCellMask(
     }
     return mask;
 }
+
+void BuildArenaMeshLeafGrid(
+    const std::vector<ArenaMeshBvhQuantization>& quantization,
+    const std::vector<ArenaMeshBvhMeshInfo>& mesh_infos,
+    const std::vector<ArenaMeshBvhNode>& nodes,
+    const std::vector<ArenaMeshBvhSubtreeInfo>& subtrees,
+    std::vector<ArenaMeshLeafGridInfo>& out_infos,
+    std::vector<int32_t>& out_cell_start,
+    std::vector<ArenaMeshLeafEntry>& out_entries) {
+    // A car's mesh query AABB is at most ~3 bt wide; wider queries walk the BVH.
+    constexpr float kCellBt = 4.0f;
+    const auto contains = [](const uint16_t* outer_min, const uint16_t* outer_max,
+                             const uint16_t* inner_min, const uint16_t* inner_max) {
+        for (int a = 0; a < 3; ++a) {
+            if (inner_min[a] < outer_min[a] || inner_max[a] > outer_max[a]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    out_infos.assign(mesh_infos.size(), ArenaMeshLeafGridInfo{});
+    out_cell_start.assign(1, 0);
+    out_entries.clear();
+    for (size_t m = 0; m < mesh_infos.size(); ++m) {
+        const ArenaMeshBvhMeshInfo& mesh = mesh_infos[m];
+        const int begin = mesh.node_offset;
+        const int end = mesh.node_offset + mesh.node_count;
+        if (mesh.mesh_index < 0 || mesh.mesh_index >= static_cast<int>(quantization.size()) ||
+            mesh.node_count <= 0 || begin < 0 || end > static_cast<int>(nodes.size())) {
+            continue;
+        }
+        // The walk visits a leaf when it and every enclosing node (and subtree header) overlap the query.
+        bool nested = true;
+        for (int i = begin; nested && i < end; ++i) {
+            if (nodes[i].is_leaf_node()) {
+                continue;
+            }
+            const int stop = std::min(end, i + nodes[i].get_escape_index());
+            for (int j = i + 1; nested && j < stop; ++j) {
+                nested = contains(nodes[i].quantized_aabb_min, nodes[i].quantized_aabb_max,
+                                  nodes[j].quantized_aabb_min, nodes[j].quantized_aabb_max);
+            }
+        }
+        // The walk takes the node-index-sorted headers when it has them (SelectArenaMeshBvhDfsOrderSubtrees),
+        // else the whole tree; the headers must then cover every leaf.
+        const bool headers = mesh.subtree_count > 0 && mesh.subtree_offset >= 0 && mesh.dfs_subtree_offset >= 0 &&
+                             mesh.dfs_subtree_offset + mesh.subtree_count <= static_cast<int>(subtrees.size());
+        if (nested && headers) {
+            std::vector<uint8_t> covered(static_cast<size_t>(mesh.node_count), 0);
+            for (int h = 0; nested && h < mesh.subtree_count; ++h) {
+                const ArenaMeshBvhSubtreeInfo& header = subtrees[static_cast<size_t>(mesh.dfs_subtree_offset + h)];
+                const int stop = std::min(end, header.root_node_index + header.subtree_size);
+                for (int j = std::max(begin, header.root_node_index); nested && j < stop; ++j) {
+                    nested = contains(header.quantized_aabb_min, header.quantized_aabb_max,
+                                      nodes[j].quantized_aabb_min, nodes[j].quantized_aabb_max);
+                    covered[static_cast<size_t>(j - begin)] = 1;
+                }
+            }
+            for (int j = begin; nested && j < end; ++j) {
+                nested = !nodes[j].is_leaf_node() || covered[static_cast<size_t>(j - begin)] != 0;
+            }
+        }
+        if (!nested) {
+            continue;
+        }
+
+        const Vec3 q = quantization[static_cast<size_t>(mesh.mesh_index)].bvh_quantization;
+        ArenaMeshLeafGridInfo& info = out_infos[m];
+        const float scale[3] = {q.x, q.y, q.z};
+        int max_q[3] = {0, 0, 0};
+        for (int i = begin; i < end; ++i) {
+            for (int a = 0; a < 3 && nodes[i].is_leaf_node(); ++a) {
+                max_q[a] = std::max(max_q[a], static_cast<int>(nodes[i].quantized_aabb_max[a]));
+            }
+        }
+        for (int a = 0; a < 3; ++a) {
+            info.cell_width[a] = std::max(1, static_cast<int>(std::ceil(kCellBt * scale[a])));
+            info.cells[a] = max_q[a] / info.cell_width[a] + 1;
+        }
+        const size_t cell_count = static_cast<size_t>(info.cells[0]) * info.cells[1] * info.cells[2];
+        std::vector<std::vector<ArenaMeshLeafEntry>> cells(cell_count);
+        for (int i = begin; i < end; ++i) {
+            const ArenaMeshBvhNode& node = nodes[i];
+            if (!node.is_leaf_node()) {
+                continue;
+            }
+            ArenaMeshLeafEntry entry;
+            int lo[3];
+            int hi[3];
+            for (int a = 0; a < 3; ++a) {
+                entry.quantized_aabb_min[a] = node.quantized_aabb_min[a];
+                entry.quantized_aabb_max[a] = node.quantized_aabb_max[a];
+                lo[a] = std::max(0, node.quantized_aabb_min[a] / info.cell_width[a] - 1);
+                hi[a] = std::min(info.cells[a] - 1, node.quantized_aabb_max[a] / info.cell_width[a]);
+            }
+            entry.triangle_index = node.get_triangle_index();
+            for (int z = lo[2]; z <= hi[2]; ++z) {
+                for (int y = lo[1]; y <= hi[1]; ++y) {
+                    for (int x = lo[0]; x <= hi[0]; ++x) {
+                        cells[(static_cast<size_t>(z) * info.cells[1] + y) * info.cells[0] + x].push_back(entry);
+                    }
+                }
+            }
+        }
+        info.cell_offset = static_cast<int32_t>(out_cell_start.size()) - 1;
+        for (const std::vector<ArenaMeshLeafEntry>& cell : cells) {
+            out_entries.insert(out_entries.end(), cell.begin(), cell.end());
+            out_cell_start.push_back(static_cast<int32_t>(out_entries.size()));
+        }
+    }
+}
 }
 }

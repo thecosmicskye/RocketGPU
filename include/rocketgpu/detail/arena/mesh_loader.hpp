@@ -12,6 +12,17 @@ std::vector<uint16_t> BuildArenaBroadphaseCellMask(
     const std::vector<ArenaMeshBvhMeshInfo>& mesh_infos,
     ArenaBroadphaseGrid& out_grid);
 
+// Fills the per-mesh leaf grids WalkArenaMeshLeafGrid reads. A mesh whose BVH breaks the containment the grid relies
+// on gets none (cell_offset -1) and keeps the walk.
+void BuildArenaMeshLeafGrid(
+    const std::vector<ArenaMeshBvhQuantization>& quantization,
+    const std::vector<ArenaMeshBvhMeshInfo>& mesh_infos,
+    const std::vector<ArenaMeshBvhNode>& nodes,
+    const std::vector<ArenaMeshBvhSubtreeInfo>& subtrees,
+    std::vector<ArenaMeshLeafGridInfo>& out_infos,
+    std::vector<int32_t>& out_cell_start,
+    std::vector<ArenaMeshLeafEntry>& out_entries);
+
 std::vector<ArenaMeshTriangle> LoadArenaMeshTriangles(
     std::vector<ArenaMeshBvhQuantization>* out_quantization = nullptr,
     std::vector<ArenaMeshBvhMeshInfo>* out_mesh_infos = nullptr,
