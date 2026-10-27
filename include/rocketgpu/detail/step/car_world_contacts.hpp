@@ -1392,8 +1392,22 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
                 staged.pair_count = -1;  // the merge pass walks this pair itself
 #if defined(__CUDA_ARCH__)
                 if (gathered_count <= kCarWorldMeshGatherTriangles) {
-                    const int start = gathered_count > 0 ? atomicAdd(triangle_pairs->count, gathered_count) : 0;
-                    if (start + gathered_count <= triangle_pairs->capacity) {
+                    int start = 0;
+                    if (gathered_count > 0) {
+                        start = atomicAdd(triangle_pairs->count, 0);
+                        while (true) {
+                            if (start > triangle_pairs->capacity - gathered_count) {
+                                start = -1;
+                                break;
+                            }
+                            const int observed = atomicCAS(triangle_pairs->count, start, start + gathered_count);
+                            if (observed == start) {
+                                break;
+                            }
+                            start = observed;
+                        }
+                    }
+                    if (start >= 0) {
                         for (int k = 0; k < gathered_count; ++k) {
                             triangle_pairs->car_idx[start + k] = env_idx * triangle_pairs->car_stride + car_idx;
                             triangle_pairs->tri_idx[start + k] = gathered_tris[k];
