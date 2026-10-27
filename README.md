@@ -52,9 +52,9 @@ RTX 5090, random controls, 55% 1v1, 27% 2v2 and 18% 3v3 arenas:
 
 | Arenas | Arena-ticks/s |
 |---|---|
-| 1,024 | 460k |
-| 8,192 | 2.29M |
-| 16,384 | 3.22M |
+| 1,024 | 821k |
+| 8,192 | 3.63M |
+| 16,384 | 5.42M |
 
 ## Accuracy
 

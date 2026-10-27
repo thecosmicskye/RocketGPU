@@ -53,6 +53,14 @@ ROCKETGPU_HD constexpr float Clamp(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
+// Local array whose slots are not default-constructed: for scratch whose every read slot is assigned first.
+template <typename T, int N>
+struct UninitArray {
+    alignas(T) unsigned char bytes[N * sizeof(T)];
+    ROCKETGPU_HD T* data() { return reinterpret_cast<T*>(bytes); }
+    ROCKETGPU_HD operator T*() { return data(); }
+};
+
 ROCKETGPU_HD constexpr float Sign(float v) {
     return (v > 0.0f) - (v < 0.0f);
 }

@@ -149,8 +149,6 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     int* shared_velocity_row_count = nullptr,
     EnvStridedArray<CarSharedFrictionContactRow> shared_friction_rows = nullptr,
     int* shared_friction_row_count = nullptr,
-    CarWorldMeshPersistentManifold* persistent_world_manifolds = nullptr,
-    int persistent_world_manifold_count = 0,
     bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr,
     EnvStridedArray<SharedContactOrderGroup> shared_contact_order_groups = nullptr,
     int* shared_contact_order_group_count = nullptr,
@@ -178,22 +176,17 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     if (!mutator.arena_collision) {
         return acc;
     }
-    CarWorldSplitContactRow split_rows[kMaxCarWorldSplitContactRows];
+    UninitArray<CarWorldSplitContactRow, kMaxCarWorldSplitContactRows> split_rows;
     int split_row_count = 0;
-    CarWorldVelocityContactRow normal_rows[kMaxCarWorldVelocityContactRows];
+    UninitArray<CarWorldVelocityContactRow, kMaxCarWorldVelocityContactRows> normal_rows;
     int normal_row_count = 0;
-    CarWorldFrictionContactRow friction_rows[kMaxCarWorldFrictionContactRows];
+    UninitArray<CarWorldFrictionContactRow, kMaxCarWorldFrictionContactRows> friction_rows;
     int friction_row_count = 0;
-    SharedContactOrderGroup local_world_order_groups[kMaxCarWorldMeshPersistentManifoldsPerCar + 4];
+    UninitArray<SharedContactOrderGroup, kMaxCarWorldMeshesPerCar + 4> local_world_order_group_storage;
+    SharedContactOrderGroup* const local_world_order_groups = local_world_order_group_storage;
     int local_world_order_group_count = 0;
-    const CarState pre_contact_car = car;
-#if defined(ROCKETGPU_USE_CUDA)
-    const bool env219_probe =
-        Abs(car.pos.x - 78.06f) < 5.0f &&
-        Abs(car.pos.y + 5202.87f) < 5.0f &&
-        Abs(car.pos.z - 611.66f) < 5.0f &&
-        Abs(car.vel.z - 15433.4f) < 200.0f;
-#endif
+    const bool use_mesh_world_rows =
+        mesh_triangles != nullptr && mesh_triangle_count > 0;
 
     const Vec3 center = car.pos + RotateCarBasis(car, cfg.hitbox_offset);
 
@@ -202,9 +195,6 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     const bool in_goal_window_neg_y = InGoalWindow(center.x, center.z, support_radius) && center.y < 0.0f;
     const bool past_pos_y_wall2 = center.y > ArenaExtentY();
     const bool past_neg_y_wall2 = center.y < -ArenaExtentY();
-
-    const bool use_mesh_world_rows =
-        mesh_triangles != nullptr && mesh_triangle_count > 0;
 
     if (!use_mesh_world_rows && !in_goal_window_pos_y && !past_pos_y_wall2) {
         AppendCarWorldPlaneContactRows(
@@ -330,8 +320,6 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
             mesh_bvh_node_count,
             mesh_bvh_subtrees,
             mesh_bvh_subtree_count,
-            persistent_world_manifolds,
-            persistent_world_manifold_count,
             env_idx,
             car_idx,
             gjk_epa_scratch,
@@ -509,50 +497,6 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
             mutator.arena_friction,
             acc,
             external_linear_delta);
-    }
-
-    const Vec3 pre_contact_center = pre_contact_car.pos + RotateCarBasis(pre_contact_car, cfg.hitbox_offset);
-
-    if (!use_mesh_world_rows &&
-        acc.hit &&
-        mesh_triangles != nullptr &&
-        mesh_triangle_count > 0 &&
-        CarWorldApproximateContactNeedsMeshValidation(pre_contact_center, acc.primary_normal) &&
-        !HasAlignedCarArenaMeshWorldContact(
-            pre_contact_car,
-            cfg,
-            mesh_triangles,
-            mesh_triangle_count,
-            acc.primary_normal,
-            0.5f,
-            gjk_epa_scratch)) {
-        car = pre_contact_car;
-        acc = ContactAccumulator{};
-    }
-
-    if (!use_mesh_world_rows && !acc.hit && mesh_triangles != nullptr && mesh_triangle_count > 0) {
-        Vec3 mesh_normal(0.0f, 0.0f, 1.0f);
-        float mesh_distance_bt = 0.0f;
-        if (FindBestCarArenaMeshWorldContact(
-                car,
-                cfg,
-                mesh_triangles,
-                mesh_triangle_count,
-                mesh_normal,
-                mesh_distance_bt,
-                gjk_epa_scratch,
-                mesh_bvh_meshes,
-                mesh_bvh_mesh_count,
-                mesh_bvh_quantization,
-                mesh_bvh_quantization_count,
-                mesh_bvh_nodes,
-                mesh_bvh_node_count)) {
-            const float penetration_uu = Max(0.0f, -mesh_distance_bt) * 50.0f;
-            if (penetration_uu > 0.0f) {
-                const float penetration_solve = car.is_on_ground ? CarWorldPenetrationSolveGround() : CarWorldPenetrationSolveAir();
-                SetCarOriginBt(car, car.pos_bt + UuVecToBtDiv(mesh_normal * (penetration_uu * penetration_solve)));
-            }
-        }
     }
 
     return acc;
@@ -968,8 +912,10 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                 continue;
             }
 
-            BallMeshPersistentManifold transient_manifold = {};
-            BallMeshPersistentManifold* persistent_manifold = &transient_manifold;
+            // The transient manifold is never retained, so it is always reset below before use.
+            UninitArray<BallMeshPersistentManifold, 1> transient_storage;
+            BallMeshPersistentManifold* const transient_manifold = transient_storage.data();
+            BallMeshPersistentManifold* persistent_manifold = transient_manifold;
             if (solver_scratch != nullptr &&
                 mesh_info_idx >= 0 &&
                 mesh_info_idx < kMaxBallWorldMeshPersistentManifolds) {
@@ -983,7 +929,7 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
             // every tick's points would pile up as duplicates of the retained ones.
             const bool retain_ball_mesh_points =
                 mutator.cal_ball_world != 0 &&
-                persistent_manifold != &transient_manifold;
+                persistent_manifold != transient_manifold;
             if (!retain_ball_mesh_points) {
                 ResetBallMeshPersistentManifold(*persistent_manifold);
             }

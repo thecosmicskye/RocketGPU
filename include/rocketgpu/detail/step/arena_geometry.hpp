@@ -233,41 +233,6 @@ bool ComputeCarArenaTriangleContact(
     TriangleContactDebugSummary* debug_summary = nullptr,
     uint8_t debug_triangle_phase = 0,
     float tri_origin_y_bt = 0.0f);
-bool FindBestCarArenaMeshWorldContact(
-    const ::rocketgpu::CarState& car,
-    const ::rocketgpu::CarConfig& cfg,
-    const ArenaMeshTriangle* mesh_triangles,
-    int32_t mesh_triangle_count,
-    ::rocketgpu::Vec3& out_normal,
-    float& out_distance_bt,
-    bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr,
-    const ArenaMeshBvhMeshInfo* mesh_bvh_meshes = nullptr,
-    int32_t mesh_bvh_mesh_count = 0,
-    const ArenaMeshBvhQuantization* mesh_bvh_quantization = nullptr,
-    int32_t mesh_bvh_quantization_count = 0,
-    const ArenaMeshBvhNode* mesh_bvh_nodes = nullptr,
-    int32_t mesh_bvh_node_count = 0);
-bool HasAlignedCarArenaMeshWorldContact(
-    const ::rocketgpu::CarState& car,
-    const ::rocketgpu::CarConfig& cfg,
-    const ArenaMeshTriangle* mesh_triangles,
-    int32_t mesh_triangle_count,
-    const ::rocketgpu::Vec3& desired_normal,
-    float min_alignment = 0.5f,
-    bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr);
-bool CarWorldApproximateContactNeedsMeshValidation(
-    const ::rocketgpu::Vec3& center,
-    const ::rocketgpu::Vec3& normal);
-void AccumulateCarArenaMeshWorldContact(
-    const ::rocketgpu::CarState& car,
-    const ::rocketgpu::CarConfig& cfg,
-    ContactAccumulator& acc,
-    const ArenaMeshTriangle* mesh_triangles,
-    int32_t mesh_triangle_count,
-    bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr);
-#if defined(ROCKETGPU_CAN_COMPILE_OFFICIAL_HOST_HELPERS)
-void AccumulateCarArenaMeshWorldContactHost(const ::rocketgpu::CarState& car, const ::rocketgpu::CarConfig& cfg, ContactAccumulator& acc);
-#endif
 bool DebugCarWorldSolverTraceEnabledFor(int env_idx, int car_idx);
 bool DebugBallCarSolverTraceEnabledFor(int env_idx, int car_idx);
 bool ShouldSleepBallAtTickStart(const ::rocketgpu::BallState& ball);
@@ -682,20 +647,6 @@ struct BallMeshPersistentManifold {
     BallMeshManifoldPoint points[4] = {};
 };
 
-struct CarWorldMeshPersistentPoint {
-    ::rocketgpu::Vec3 normal = ::rocketgpu::Vec3(0.0f, 0.0f, 1.0f);
-    ::rocketgpu::Vec3 tri_normal = ::rocketgpu::Vec3(0.0f, 0.0f, 1.0f);
-    ::rocketgpu::Vec3 local_point_a_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-    ::rocketgpu::Vec3 point_on_b_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-    float distance_bt = 0.0f;
-    int32_t triangle_index = -1;
-};
-
-struct CarWorldMeshPersistentManifold {
-    uint8_t count = 0;
-    CarWorldMeshPersistentPoint points[4] = {};
-};
-
 // Retained car-world plane manifold (cal_retained_world_contacts), one per (car, static plane). Every point's
 // normal is that plane's inward normal, so a point stores only its anchors and its refreshed distance. Slots at or
 // past count are never read, so emptying a manifold only clears count.
@@ -764,19 +715,10 @@ ROCKETGPU_HD void ResetBallMeshPersistentManifold(BallMeshPersistentManifold& ma
     }
 }
 
-ROCKETGPU_HD void ResetCarWorldMeshPersistentManifold(CarWorldMeshPersistentManifold& manifold) {
-    manifold.count = 0;
-    for (int manifold_idx = 0; manifold_idx < 4; ++manifold_idx) {
-        manifold.points[manifold_idx] = CarWorldMeshPersistentPoint{};
-    }
-}
-
 constexpr int kMaxBallWorldMeshPersistentManifolds = 16;
 constexpr int kBallSettledMaxWorldEntries = 4;
-constexpr int kMaxCarWorldMeshPersistentManifoldsPerCar = kMaxBallWorldMeshPersistentManifolds;
+constexpr int kMaxCarWorldMeshesPerCar = kMaxBallWorldMeshPersistentManifolds;
 constexpr int kMaxCarWorldMeshPersistentCars = 8;
-constexpr int kMaxCarWorldMeshPersistentManifolds =
-    kMaxCarWorldMeshPersistentManifoldsPerCar * kMaxCarWorldMeshPersistentCars;
 // Retained car-world plane manifolds per car: floor, ceiling, +X wall, -X wall.
 constexpr int kCarWorldPlaneRetainedManifoldsPerCar = 4;
 constexpr int kMaxCarWorldPlaneRetainedManifolds =
@@ -993,6 +935,25 @@ struct WheelRayStage {
 };
 constexpr int kWheelRayStageSlots = 32;
 
+// The car fields the contact pass reads from its snapshot of the car before contacts.
+struct PreContactCar {
+    ::rocketgpu::Quat rot = ::rocketgpu::Quat(1.0f, 0.0f, 0.0f, 0.0f);
+    ::rocketgpu::Vec3 vel = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    ::rocketgpu::Vec3 vel_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    ::rocketgpu::Vec3 ang_vel = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    uint8_t is_demoed = 0;
+};
+
+ROCKETGPU_HD PreContactCar MakePreContactCar(const ::rocketgpu::CarState& car) {
+    PreContactCar out;
+    out.rot = car.rot;
+    out.vel = car.vel;
+    out.vel_bt = car.vel_bt;
+    out.ang_vel = car.ang_vel;
+    out.is_demoed = car.is_demoed;
+    return out;
+}
+
 struct WorldSolverScratch {
     static constexpr int kMaxHeatseekerWorldNormals = 16;
     ::rocketgpu::Vec3 hs_world_normals[kMaxHeatseekerWorldNormals];
@@ -1001,7 +962,7 @@ struct WorldSolverScratch {
     bullet_port::btGjkEpaScratch car_triangle_gjk_epa_scratch = {};
     bullet_port::btGjkEpaScratch ball_car_gjk_epa_scratch = {};
     CarCarPairCachedContact pair_contact_cache[kMaxCarCarPairSlots] = {};
-    ::rocketgpu::CarState pre_contact_cars[8] = {};
+    PreContactCar pre_contact_cars[8] = {};
     ::rocketgpu::Vec3 deferred_linear_deltas[8] = {};
     ::rocketgpu::Vec3 deferred_angular_deltas[8] = {};
 
@@ -1029,7 +990,6 @@ struct WorldSolverScratch {
     uint32_t bp_insert_seq[9] = {};
     uint32_t bp_seq_counter = 0;
     uint8_t bp_initialized = 0;
-    CarWorldMeshPersistentManifold car_world_mesh_manifolds[kMaxCarWorldMeshPersistentManifolds] = {};
     CarWorldPlaneRetainedManifold car_world_plane_manifolds[kMaxCarWorldPlaneRetainedManifolds] = {};
     CarCarRetainedManifold car_car_retained_manifolds[kMaxCarCarRetainedManifolds] = {};
     BallCarRetainedManifold ball_car_retained_manifolds[kMaxBallCarRetainedManifolds] = {};
@@ -3934,7 +3894,7 @@ ROCKETGPU_HD int BuildBulletManifoldList(
     const ::rocketgpu::BallState& ball,
     int car_count,
     const ::rocketgpu::CarState* cars,
-    const ::rocketgpu::CarState* pre_contact_cars,
+    const PreContactCar* pre_contact_cars,
     const ::rocketgpu::CarConfig* car_configs,
     float ball_radius,
     float dt,

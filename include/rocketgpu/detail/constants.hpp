@@ -23,11 +23,6 @@ ROCKETGPU_HD constexpr float CarBallCollisionRestitution() { return 0.0f; }
 ROCKETGPU_HD constexpr float CarCarCollisionFriction() { return 0.09f; }
 ROCKETGPU_HD constexpr float CarCarCollisionRestitution() { return 0.1f; }
 ROCKETGPU_HD constexpr float BoostPadCylinderHeight() { return 95.0f; }
-ROCKETGPU_HD constexpr float BoostPadCylinderRadBig() { return 208.0f; }
-ROCKETGPU_HD constexpr float BoostPadCylinderRadSmall() { return 144.0f; }
-ROCKETGPU_HD constexpr float BoostPadBoxHeight() { return 64.0f; }
-ROCKETGPU_HD constexpr float BoostPadBoxRadBig() { return 160.0f; }
-ROCKETGPU_HD constexpr float BoostPadBoxRadSmall() { return 120.0f; }
 
 struct SpawnPos {
     float x;

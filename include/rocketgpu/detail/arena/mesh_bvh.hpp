@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 
 #include "rocketgpu/detail/constants.hpp"
 
@@ -32,7 +33,8 @@ struct ArenaMeshBvhQuantization {
     Vec3 bvh_quantization = Vec3(1.0f, 1.0f, 1.0f);
 };
 
-struct ArenaMeshBvhNode {
+// 16-byte aligned so the device walk fetches a node with one 128-bit load.
+struct alignas(16) ArenaMeshBvhNode {
     uint16_t quantized_aabb_min[3] = {0, 0, 0};
     uint16_t quantized_aabb_max[3] = {0, 0, 0};
     int32_t escape_index_or_triangle_index = 0;
@@ -49,6 +51,7 @@ struct ArenaMeshBvhNode {
         return escape_index_or_triangle_index;
     }
 };
+static_assert(sizeof(ArenaMeshBvhNode) == 16, "ArenaMeshBvhNode must stay one 128-bit load");
 
 struct ArenaMeshBvhSubtreeInfo {
     uint16_t quantized_aabb_min[3] = {0, 0, 0};
@@ -269,6 +272,15 @@ ROCKETGPU_HD bool TestQuantizedAabbAgainstQuantizedAabb(
              aabb_min_1[2] > aabb_max_2[2] || aabb_max_1[2] < aabb_min_2[2]);
 }
 
+#if defined(__CUDA_ARCH__)
+__device__ inline ArenaMeshBvhNode LoadArenaMeshBvhNode(const ArenaMeshBvhNode* p) {
+    ArenaMeshBvhNode node;
+    const uint4 raw = __ldg(reinterpret_cast<const uint4*>(p));
+    memcpy(&node, &raw, sizeof(node));
+    return node;
+}
+#endif
+
 template <typename Callback>
 ROCKETGPU_HD void WalkArenaMeshBvhStacklessQuantizedTree(
     const ArenaMeshBvhNode* nodes,
@@ -279,24 +291,41 @@ ROCKETGPU_HD void WalkArenaMeshBvhStacklessQuantizedTree(
     Callback&& callback) {
     int cur_index = start_node_index;
     const ArenaMeshBvhNode* root_node = &nodes[start_node_index];
+#if defined(__CUDA_ARCH__)
+    // The next node in memory is fetched while the current one is tested, so the common descend step
+    // does not wait on a dependent load.
+    ArenaMeshBvhNode node = cur_index < end_node_index ? LoadArenaMeshBvhNode(root_node) : ArenaMeshBvhNode{};
     while (cur_index < end_node_index) {
+        const ArenaMeshBvhNode next = cur_index + 1 < end_node_index ? LoadArenaMeshBvhNode(root_node + 1) : node;
+#else
+    while (cur_index < end_node_index) {
+        const ArenaMeshBvhNode& node = *root_node;
+#endif
         const bool aabb_overlap = TestQuantizedAabbAgainstQuantizedAabb(
             quantized_query_aabb_min,
             quantized_query_aabb_max,
-            root_node->quantized_aabb_min,
-            root_node->quantized_aabb_max);
-        const bool is_leaf_node = root_node->is_leaf_node();
+            node.quantized_aabb_min,
+            node.quantized_aabb_max);
+        const bool is_leaf_node = node.is_leaf_node();
         if (is_leaf_node && aabb_overlap) {
-            callback(root_node->get_triangle_index());
+            callback(node.get_triangle_index());
         }
 
         if (aabb_overlap || is_leaf_node) {
             ++root_node;
             ++cur_index;
+#if defined(__CUDA_ARCH__)
+            node = next;
+#endif
         } else {
-            const int escape_index = root_node->get_escape_index();
+            const int escape_index = node.get_escape_index();
             root_node += escape_index;
             cur_index += escape_index;
+#if defined(__CUDA_ARCH__)
+            if (cur_index < end_node_index) {
+                node = LoadArenaMeshBvhNode(root_node);
+            }
+#endif
         }
     }
 }
