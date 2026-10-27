@@ -1,6 +1,6 @@
 # RocketGPU
 
-Rocket League physics for thousands of arenas at once on one GPU.
+Rocket League physics on a GPU.
 
 ## Build
 
@@ -58,7 +58,7 @@ RTX 5090, random controls, 55% 1v1, 27% 2v2 and 18% 3v3 arenas:
 
 ## Accuracy
 
-Compared against RocketSim v3 (latest), using real RLBot recordings as ground truth.
+Compared against RocketSim v3 (latest), using RLBot recordings as ground truth.
 
 **RLBot match suite** (lower is better)
 
