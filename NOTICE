@@ -1,0 +1,14 @@
+This repository is derived from and intended to stay compatible with
+RocketSim:
+
+  https://github.com/ZealanL/RocketSim
+
+Important status notes:
+
+- This repository is not an official RocketSim repository.
+- "Official fork" status requires explicit approval or adoption by the
+  RocketSim maintainer.
+- The upstream RocketSim project is MIT-licensed. This repository preserves
+  that license notice in LICENSE.
+- Local documentation should describe this project as an unofficial derivative
+  or fork candidate until upstream says otherwise.
