@@ -3109,7 +3109,7 @@ ROCKETGPU_HD void StepEnvGeneric(
     }
 }
 
-ROCKETGPU_HD void StepEnv(
+ROCKETGPU_HD ROCKETGPU_NOINLINE void StepEnv(
     int env_idx,
     const SimConfig& cfg,
     Team* teams,
