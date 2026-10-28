@@ -66,9 +66,9 @@ RTX 5090, random controls, 55% 1v1, 27% 2v2 and 18% 3v3 arenas:
 | Arenas | Arena-ticks/s |
 |---|---|
 | 1,024 | 1.10M |
-| 8,192 | 4.65M |
-| 16,384 | 7.17M |
-| 32,768 | 9.47M |
+| 8,192 | 4.43M |
+| 16,384 | 6.54M |
+| 32,768 | 8.66M |
 
 ## Accuracy
 
@@ -96,4 +96,5 @@ MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 ## Credits
 
-Built on [RocketSim](https://github.com/ZealanL/RocketSim) by ZealanL.
+Built on [RocketSim](https://github.com/ZealanL/RocketSim) by ZealanL. Thanks to [VirxEC](https://github.com/VirxEC) for
+guidance and accuracy suite.
