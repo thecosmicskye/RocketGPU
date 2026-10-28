@@ -766,10 +766,7 @@ struct EnvStridedArray {
     ROCKETGPU_HD bool operator!=(std::nullptr_t) const { return base != nullptr; }
 };
 
-struct ContactSortScratch;
-
 struct WorldSolverScratchRows {
-    ContactSortScratch* contact_sort_scratch = nullptr;
     EnvStridedArray<BallSplitContactRow> ball_split_rows;
     EnvStridedArray<BallVelocityContactRow> ball_velocity_rows;
     EnvStridedArray<BallFrictionContactRow> ball_friction_rows;
@@ -784,8 +781,6 @@ struct WorldSolverScratchRows {
 };
 
 struct WorldSolverScratchRowPool {
-    ContactSortScratch* contact_sort_scratch = nullptr;
-    size_t contact_sort_stride = 0;
     BallSplitContactRow* ball_split_rows = nullptr;
     BallVelocityContactRow* ball_velocity_rows = nullptr;
     BallFrictionContactRow* ball_friction_rows = nullptr;
@@ -813,8 +808,6 @@ struct WorldSolverScratchRowPool {
 
     ROCKETGPU_HD WorldSolverScratchRows view(int env_idx) const {
         WorldSolverScratchRows rows;
-        rows.contact_sort_scratch = contact_sort_scratch ? reinterpret_cast<ContactSortScratch*>(
-            reinterpret_cast<unsigned char*>(contact_sort_scratch) + env_idx * contact_sort_stride) : nullptr;
         rows.ball_split_rows = view_one(ball_split_rows, kMaxBallSplitContactRows, env_idx);
         rows.ball_velocity_rows = view_one(ball_velocity_rows, kMaxBallVelocityContactRows, env_idx);
         rows.ball_friction_rows = view_one(ball_friction_rows, kMaxBallFrictionContactRows, env_idx);
@@ -954,16 +947,6 @@ ROCKETGPU_HD PreContactCar MakePreContactCar(const ::rocketgpu::CarState& car) {
     return out;
 }
 
-struct BallCarReorderRowSpan {
-    int car_local_idx = -1;
-    int normal_start = 0;
-    int normal_count = 0;
-    int friction_start = 0;
-    int friction_count = 0;
-    int split_start = 0;
-    int split_count = 0;
-};
-
 // WorldStepSoccar locals that cross from its contact stages (kWorldStepContacts) to the car-world rows and the
 // solve (kWorldStepRows).
 struct WorldStepCarry {
@@ -973,8 +956,6 @@ struct WorldStepCarry {
     int split_row_count = 0;
     int normal_row_count = 0;
     int friction_row_count = 0;
-    BallCarReorderRowSpan ball_car_row_spans[8] = {};
-    int ball_car_row_span_count = 0;
     int sorted_manifold_count = 0;
     ::rocketgpu::Vec3 ball_solver_linear_velocity_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
     bool ball_sleeping = false;
@@ -1029,6 +1010,14 @@ struct WorldSolverScratch {
     uint32_t bp_insert_seq[9] = {};
     uint32_t bp_seq_counter = 0;
     uint8_t bp_initialized = 0;
+    // Bullet's bookkeeping carried across ticks (BuildBulletManifoldList): the overlapping pair cache, btRSBroadphase's
+    // activePairs and the dispatcher's manifold array, as pair keys (island_id unused).
+    uint8_t bp_pair_count = 0;
+    uint8_t bp_active_count = 0;
+    uint8_t bp_manifold_count = 0;
+    BulletManifoldEntry bp_pairs[kMaxBulletManifoldEntries] = {};
+    BulletManifoldEntry bp_active[kMaxBulletManifoldEntries] = {};
+    BulletManifoldEntry bp_manifolds[kMaxBulletManifoldEntries] = {};
     CarWorldPlaneRetainedManifold car_world_plane_manifolds[kMaxCarWorldPlaneRetainedManifolds] = {};
     CarCarRetainedManifold car_car_retained_manifolds[kMaxCarCarRetainedManifolds] = {};
     BallCarRetainedManifold ball_car_retained_manifolds[kMaxBallCarRetainedManifolds] = {};
@@ -2379,140 +2368,8 @@ ROCKETGPU_HD void AppendSharedContactOrderGroup(
     group.initial_order = initial_order;
 }
 
-struct CarWorldSharedRowGroup {
-    int start = 0;
-    int count = 0;
-    int island_id = 0;
-    int source_tag = 0;
-    int body_a_local_idx = -1;
-    int body_b_local_idx = -1;
-};
-
-struct ContactSortScratch {
-    CarWorldSharedRowGroup row_groups[kMaxSharedContactOrderGroups];
-    int order[kMaxSharedContactOrderGroups];
-    int island_ids[kMaxSharedContactOrderGroups];
-    int desired_source_tags[kMaxSharedContactOrderGroups];
-    int desired_body_a[kMaxSharedContactOrderGroups];
-    int desired_body_b[kMaxSharedContactOrderGroups];
-    uint8_t row_group_used[kMaxSharedContactOrderGroups];
-};
-template<bool External> struct ContactSortStorage {
-    ContactSortScratch local;
-    ROCKETGPU_HD ContactSortScratch& get(ContactSortScratch*) { return local; }
-};
-template<> struct ContactSortStorage<true> {
-    ROCKETGPU_HD ContactSortScratch& get(ContactSortScratch* scratch) { return *scratch; }
-};
-#if defined(__CUDA_ARCH__)
-constexpr bool kUseExternalContactSortScratch = true;
-#else
-constexpr bool kUseExternalContactSortScratch = false;
-#endif
-
-ROCKETGPU_HD void ReverseCarSharedVelocityRows(EnvStridedArray<CarSharedVelocityContactRow> rows, int begin, int end) {
-    --end;
-    while (begin < end) {
-        const CarSharedVelocityContactRow tmp = rows[begin];
-        rows[begin] = rows[end];
-        rows[end] = tmp;
-        ++begin;
-        --end;
-    }
-}
-
-ROCKETGPU_HD void ReverseCarSharedFrictionRows(EnvStridedArray<CarSharedFrictionContactRow> rows, int begin, int end) {
-    --end;
-    while (begin < end) {
-        const CarSharedFrictionContactRow tmp = rows[begin];
-        rows[begin] = rows[end];
-        rows[end] = tmp;
-        ++begin;
-        --end;
-    }
-}
-
-ROCKETGPU_HD void ReverseCarSharedSplitRows(EnvStridedArray<CarSharedSplitContactRow> rows, int begin, int end) {
-    --end;
-    while (begin < end) {
-        const CarSharedSplitContactRow tmp = rows[begin];
-        rows[begin] = rows[end];
-        rows[end] = tmp;
-        ++begin;
-        --end;
-    }
-}
-
-ROCKETGPU_HD int CarWorldIslandIdForRow(const CarSharedVelocityContactRow& row) {
-    const int body_idx = row.body_a_local_idx >= 0 ? row.body_a_local_idx : row.body_b_local_idx;
-    return body_idx >= 0 ? body_idx + 1 : -1;
-}
-
-ROCKETGPU_HD int CarWorldIslandIdForRow(const CarSharedSplitContactRow& row) {
-    const int body_idx = row.body_a_local_idx >= 0 ? row.body_a_local_idx : row.body_b_local_idx;
-    return body_idx >= 0 ? body_idx + 1 : -1;
-}
-
-ROCKETGPU_HD int FindSharedContactOrderParent(int* parent, int x);
-ROCKETGPU_HD void UnionSharedContactOrderParents(int* parent, int a, int b);
-ROCKETGPU_HD void ResolveSharedContactOrderCarIslandIds(int* parent, const int* component_max, int* car_island_id);
-ROCKETGPU_HD int SharedContactOrderIslandIdForBody(const int* car_island_id, int body_a_local_idx);
-ROCKETGPU_HD void QuickSortSharedContactOrderIndices(int* order, const int* island_ids, int lo, int hi);
-
-ROCKETGPU_HD int CountSharedContactOrderGroupsForIsland(
-    EnvStridedArray<const SharedContactOrderGroup> groups,
-    int group_count,
-    int car_count,
-    int target_island_id) {
-    if (!groups || group_count <= 0 || car_count <= 0 || target_island_id < 0) {
-        return -1;
-    }
-
-    int parent[8];
-    int component_max[8];
-    for (int i = 0; i < 8; ++i) {
-        parent[i] = i;
-        component_max[i] = i;
-    }
-    for (int group_idx = 0; group_idx < group_count && group_idx < kMaxSharedContactOrderGroups; ++group_idx) {
-        const SharedContactOrderGroup& group = groups[group_idx];
-        if (!group.valid || group.bucket != SharedContactOrderBucket::Pair || group.normal_row_count <= 0) {
-            continue;
-        }
-        UnionSharedContactOrderParents(parent, group.body_a_local_idx, group.body_b_local_idx);
-    }
-    for (int i = 0; i < car_count && i < 8; ++i) {
-        const int root = FindSharedContactOrderParent(parent, i);
-        if (root >= 0 && root < 8) {
-            component_max[root] = Max(component_max[root], i);
-        }
-    }
-
-    int island_group_count = 0;
-    for (int group_idx = 0; group_idx < group_count && group_idx < kMaxSharedContactOrderGroups; ++group_idx) {
-        const SharedContactOrderGroup& group = groups[group_idx];
-        if (!group.valid ||
-            group.normal_row_count <= 0 ||
-            group.body_a_local_idx < 0 ||
-            group.body_a_local_idx >= car_count ||
-            group.body_a_local_idx >= 8) {
-            continue;
-        }
-        const int root = FindSharedContactOrderParent(parent, group.body_a_local_idx);
-        const int island_id = (root >= 0 && root < 8 ? component_max[root] : group.body_a_local_idx) + 1;
-        if (island_id == target_island_id) {
-            ++island_group_count;
-        }
-    }
-    return island_group_count;
-}
-
 ROCKETGPU_HD bool IsBtStaticPlaneSourceTag(int source_tag) {
     return source_tag == 1 || source_tag == 2 || source_tag == 5 || source_tag == 6;
-}
-
-ROCKETGPU_HD bool IsBtXWallPlaneSourceTag(int source_tag) {
-    return source_tag == 1 || source_tag == 2;
 }
 
 ROCKETGPU_HD bool IsBtFloorCeilingPlaneSourceTag(int source_tag) {
@@ -2538,630 +2395,6 @@ ROCKETGPU_HD int BulletContactOrderInitialKey(const SharedContactOrderGroup& gro
     }
 
     return group.initial_order;
-}
-
-ROCKETGPU_HD bool SameCarWorldManifoldGroup(
-    const CarSharedVelocityContactRow& a,
-    const CarSharedVelocityContactRow& b) {
-    return a.body_a_local_idx == b.body_a_local_idx &&
-           a.body_b_local_idx == b.body_b_local_idx &&
-           a.source_tag == b.source_tag;
-}
-
-ROCKETGPU_HD bool SameCarWorldManifoldGroup(
-    const CarSharedSplitContactRow& a,
-    const CarSharedSplitContactRow& b) {
-    return a.body_a_local_idx == b.body_a_local_idx &&
-           a.body_b_local_idx == b.body_b_local_idx &&
-           a.source_tag == b.source_tag;
-}
-
-ROCKETGPU_HD bool SameCarWorldGroupOwner(
-    const CarWorldSharedRowGroup& a,
-    const CarWorldSharedRowGroup& b) {
-    return a.island_id == b.island_id &&
-           a.body_a_local_idx == b.body_a_local_idx &&
-           a.body_b_local_idx == b.body_b_local_idx;
-}
-
-ROCKETGPU_HD void SwapAdjacentCarWorldSharedGroups(
-    EnvStridedArray<CarSharedVelocityContactRow> normal_rows,
-    EnvStridedArray<CarSharedFrictionContactRow> friction_rows,
-    int friction_row_count,
-    const CarWorldSharedRowGroup& first_group,
-    const CarWorldSharedRowGroup& second_group) {
-    const int first_start = first_group.start;
-    const int first_end = first_group.start + first_group.count;
-    const int second_start = second_group.start;
-    const int second_end = second_group.start + second_group.count;
-    if (first_end != second_start) {
-        return;
-    }
-
-    ReverseCarSharedVelocityRows(normal_rows, first_start, first_end);
-    ReverseCarSharedVelocityRows(normal_rows, second_start, second_end);
-    ReverseCarSharedVelocityRows(normal_rows, first_start, second_end);
-
-    if (!friction_rows || friction_row_count <= 0) {
-        return;
-    }
-
-    int friction_first_start = -1;
-    int friction_second_start = -1;
-    int friction_end = -1;
-    for (int i = 0; i < friction_row_count; ++i) {
-        const int old_idx = friction_rows[i].normal_row_idx;
-        const bool in_first = old_idx >= first_start && old_idx < first_end;
-        const bool in_second = old_idx >= second_start && old_idx < second_end;
-        if (in_first || in_second) {
-            if (friction_first_start < 0) {
-                friction_first_start = i;
-            }
-            if (in_second && friction_second_start < 0) {
-                friction_second_start = i;
-            }
-            friction_end = i + 1;
-        }
-    }
-    if (friction_first_start >= 0 && friction_second_start > friction_first_start && friction_end > friction_second_start) {
-        ReverseCarSharedFrictionRows(friction_rows, friction_first_start, friction_second_start);
-        ReverseCarSharedFrictionRows(friction_rows, friction_second_start, friction_end);
-        ReverseCarSharedFrictionRows(friction_rows, friction_first_start, friction_end);
-    }
-
-    for (int i = 0; i < friction_row_count; ++i) {
-        const int old_idx = friction_rows[i].normal_row_idx;
-        if (old_idx >= first_start && old_idx < first_end) {
-            friction_rows[i].normal_row_idx = old_idx + second_group.count;
-        } else if (old_idx >= second_start && old_idx < second_end) {
-            friction_rows[i].normal_row_idx = old_idx - first_group.count;
-        }
-    }
-}
-
-ROCKETGPU_HD void SwapAdjacentCarWorldSharedSplitGroups(
-    EnvStridedArray<CarSharedSplitContactRow> rows,
-    const CarWorldSharedRowGroup& first_group,
-    const CarWorldSharedRowGroup& second_group) {
-    const int first_start = first_group.start;
-    const int first_end = first_group.start + first_group.count;
-    const int second_start = second_group.start;
-    const int second_end = second_group.start + second_group.count;
-    if (!rows || first_end != second_start) {
-        return;
-    }
-
-    ReverseCarSharedSplitRows(rows, first_start, first_end);
-    ReverseCarSharedSplitRows(rows, second_start, second_end);
-    ReverseCarSharedSplitRows(rows, first_start, second_end);
-}
-
-ROCKETGPU_HD void ReorderCarWorldSharedSplitRowsForBulletIslandSort(
-    EnvStridedArray<CarSharedSplitContactRow> split_rows,
-    int split_row_count,
-    EnvStridedArray<const SharedContactOrderGroup> contact_order_groups = nullptr,
-    int contact_order_group_count = 0,
-    int car_count = 0) {
-    if (!split_rows || split_row_count <= 1) {
-        return;
-    }
-
-    int group_count = 0;
-    int max_island_id = -1;
-    int max_island_group_count = 0;
-    CarWorldSharedRowGroup row_groups[kMaxSharedContactOrderGroups];
-    CarWorldSharedRowGroup second_last_group;
-    CarWorldSharedRowGroup last_group;
-    CarWorldSharedRowGroup triple_mesh_group;
-    CarWorldSharedRowGroup triple_plane_group;
-    bool has_triple_mesh_plane_swap = false;
-    for (int row_idx = 0; row_idx < split_row_count;) {
-        const int start = row_idx;
-        const CarSharedSplitContactRow& first = split_rows[start];
-        ++row_idx;
-        while (row_idx < split_row_count && SameCarWorldManifoldGroup(first, split_rows[row_idx])) {
-            ++row_idx;
-        }
-        CarWorldSharedRowGroup group;
-        group.start = start;
-        group.count = row_idx - start;
-        group.island_id = CarWorldIslandIdForRow(first);
-        group.source_tag = first.source_tag;
-        group.body_a_local_idx = first.body_a_local_idx;
-        group.body_b_local_idx = first.body_b_local_idx;
-        if (group_count < kMaxSharedContactOrderGroups) {
-            row_groups[group_count] = group;
-        }
-        if (group.island_id > max_island_id) {
-            max_island_id = group.island_id;
-            max_island_group_count = 1;
-        } else if (group.island_id == max_island_id) {
-            ++max_island_group_count;
-        }
-        if (!has_triple_mesh_plane_swap &&
-            group_count >= 2 &&
-            SameCarWorldGroupOwner(second_last_group, last_group) &&
-            SameCarWorldGroupOwner(last_group, group) &&
-            IsBtXWallPlaneSourceTag(second_last_group.source_tag) &&
-            last_group.source_tag >= 100 &&
-            IsBtFloorCeilingPlaneSourceTag(group.source_tag)) {
-            triple_mesh_group = last_group;
-            triple_plane_group = group;
-            has_triple_mesh_plane_swap = true;
-        }
-        second_last_group = last_group;
-        last_group = group;
-        ++group_count;
-    }
-
-    if (group_count <= 1) {
-        return;
-    }
-
-    bool has_pair_order_group = false;
-    bool applied_full_bullet_order = false;
-    if (contact_order_groups && contact_order_group_count > 0 && car_count > 0 &&
-        group_count <= kMaxSharedContactOrderGroups) {
-        int parent[8];
-        int component_max[8];
-        for (int i = 0; i < 8; ++i) {
-            parent[i] = i;
-            component_max[i] = i;
-        }
-        for (int group_idx = 0; group_idx < contact_order_group_count && group_idx < kMaxSharedContactOrderGroups; ++group_idx) {
-            const SharedContactOrderGroup& group = contact_order_groups[group_idx];
-            if (!group.valid || group.bucket != SharedContactOrderBucket::Pair || group.normal_row_count <= 0) {
-                continue;
-            }
-            has_pair_order_group = true;
-            UnionSharedContactOrderParents(parent, group.body_a_local_idx, group.body_b_local_idx);
-        }
-        for (int i = 0; i < car_count && i < 8; ++i) {
-            const int root = FindSharedContactOrderParent(parent, i);
-            if (root >= 0 && root < 8) {
-                component_max[root] = Max(component_max[root], i);
-            }
-        }
-
-        int car_island_id[8];
-        ResolveSharedContactOrderCarIslandIds(parent, component_max, car_island_id);
-
-        int order[kMaxSharedContactOrderGroups];
-        int island_ids[kMaxSharedContactOrderGroups];
-        int active_count = 0;
-        for (int group_idx = 0; group_idx < contact_order_group_count && group_idx < kMaxSharedContactOrderGroups; ++group_idx) {
-            const SharedContactOrderGroup& group = contact_order_groups[group_idx];
-            if (!group.valid ||
-                group.normal_row_count <= 0 ||
-                group.body_a_local_idx < 0 ||
-                group.body_a_local_idx >= car_count) {
-                continue;
-            }
-            int insert = active_count;
-            const int group_order_key = BulletContactOrderInitialKey(group);
-            while (insert > 0 &&
-                   BulletContactOrderInitialKey(contact_order_groups[order[insert - 1]]) > group_order_key) {
-                order[insert] = order[insert - 1];
-                --insert;
-            }
-            order[insert] = group_idx;
-            ++active_count;
-        }
-        for (int order_idx = 0; order_idx < active_count; ++order_idx) {
-            const SharedContactOrderGroup& group = contact_order_groups[order[order_idx]];
-            island_ids[order[order_idx]] = SharedContactOrderIslandIdForBody(car_island_id, group.body_a_local_idx);
-        }
-        if (active_count > 1) {
-            QuickSortSharedContactOrderIndices(order, island_ids, 0, active_count - 1);
-        }
-
-        int desired_source_tags[kMaxSharedContactOrderGroups];
-        int desired_body_a[kMaxSharedContactOrderGroups];
-        int desired_body_b[kMaxSharedContactOrderGroups];
-        uint8_t row_group_used[kMaxSharedContactOrderGroups] = {};
-        int desired_count = 0;
-        bool matched_all_world_groups = true;
-        for (int order_idx = 0; order_idx < active_count; ++order_idx) {
-            const SharedContactOrderGroup& group = contact_order_groups[order[order_idx]];
-            if (!group.valid || group.bucket != SharedContactOrderBucket::World || group.normal_row_count <= 0) {
-                continue;
-            }
-            int match_idx = -1;
-            for (int row_group_idx = 0; row_group_idx < group_count; ++row_group_idx) {
-                const CarWorldSharedRowGroup& row_group = row_groups[row_group_idx];
-                if (!row_group_used[row_group_idx] &&
-                    row_group.body_a_local_idx == group.body_a_local_idx &&
-                    row_group.body_b_local_idx == group.body_b_local_idx &&
-                    row_group.source_tag == group.source_tag) {
-                    match_idx = row_group_idx;
-                    break;
-                }
-            }
-            if (match_idx < 0) {
-                matched_all_world_groups = false;
-                break;
-            }
-            row_group_used[match_idx] = 1;
-            desired_source_tags[desired_count] = group.source_tag;
-            desired_body_a[desired_count] = group.body_a_local_idx;
-            desired_body_b[desired_count] = group.body_b_local_idx;
-            ++desired_count;
-        }
-
-        if (matched_all_world_groups && desired_count == group_count) {
-            for (int target_idx = 0; target_idx < desired_count; ++target_idx) {
-                int match_idx = -1;
-                for (int row_group_idx = target_idx; row_group_idx < group_count; ++row_group_idx) {
-                    const CarWorldSharedRowGroup& row_group = row_groups[row_group_idx];
-                    if (row_group.body_a_local_idx == desired_body_a[target_idx] &&
-                        row_group.body_b_local_idx == desired_body_b[target_idx] &&
-                        row_group.source_tag == desired_source_tags[target_idx]) {
-                        match_idx = row_group_idx;
-                        break;
-                    }
-                }
-                while (match_idx > target_idx) {
-                    CarWorldSharedRowGroup first = row_groups[match_idx - 1];
-                    CarWorldSharedRowGroup second = row_groups[match_idx];
-                    SwapAdjacentCarWorldSharedSplitGroups(split_rows, first, second);
-                    second.start = first.start;
-                    first.start = second.start + second.count;
-                    row_groups[match_idx - 1] = second;
-                    row_groups[match_idx] = first;
-                    --match_idx;
-                }
-            }
-            applied_full_bullet_order = true;
-        }
-    }
-    if (applied_full_bullet_order) {
-        return;
-    }
-
-    if (has_triple_mesh_plane_swap) {
-        SwapAdjacentCarWorldSharedSplitGroups(split_rows, triple_mesh_group, triple_plane_group);
-        return;
-    }
-
-    const bool has_two_group_max_suffix =
-        second_last_group.island_id == max_island_id &&
-        last_group.island_id == max_island_id;
-    const int full_island_group_count = CountSharedContactOrderGroupsForIsland(
-        contact_order_groups,
-        contact_order_group_count,
-        car_count,
-        max_island_id);
-    const int bullet_island_group_count =
-        full_island_group_count >= 0 ? full_island_group_count : max_island_group_count;
-    if (!has_two_group_max_suffix || bullet_island_group_count != 2) {
-        return;
-    }
-    const bool has_static_mesh_suffix =
-        (second_last_group.source_tag >= 100 && IsBtStaticPlaneSourceTag(last_group.source_tag)) ||
-        (IsBtStaticPlaneSourceTag(second_last_group.source_tag) && last_group.source_tag >= 100);
-    if (!has_static_mesh_suffix) {
-        return;
-    }
-    if (!has_pair_order_group &&
-        IsBtXWallPlaneSourceTag(second_last_group.source_tag) &&
-        last_group.source_tag >= 100) {
-        return;
-    }
-    SwapAdjacentCarWorldSharedSplitGroups(split_rows, second_last_group, last_group);
-}
-
-template<bool ExternalScratch = false>
-ROCKETGPU_HD void ReorderCarWorldSharedRowsForBulletIslandSort(
-    EnvStridedArray<CarSharedVelocityContactRow> normal_rows,
-    int normal_row_count,
-    EnvStridedArray<CarSharedFrictionContactRow> friction_rows,
-    int friction_row_count,
-    EnvStridedArray<const SharedContactOrderGroup> contact_order_groups = nullptr,
-    int contact_order_group_count = 0,
-    int car_count = 0, ContactSortScratch* external_scratch = nullptr) {
-    if (!normal_rows || normal_row_count <= 1) {
-        return;
-    }
-
-    int group_count = 0;
-    int max_island_id = -1;
-    int max_island_group_count = 0;
-    ContactSortStorage<ExternalScratch> storage;
-    auto& scratch = storage.get(external_scratch);
-    auto& row_groups = scratch.row_groups;
-    if constexpr (ExternalScratch) {
-        for (int i=0;i<kMaxSharedContactOrderGroups;++i) row_groups[i]=CarWorldSharedRowGroup{};
-    }
-    CarWorldSharedRowGroup second_last_group;
-    CarWorldSharedRowGroup last_group;
-    CarWorldSharedRowGroup triple_mesh_group;
-    CarWorldSharedRowGroup triple_plane_group;
-    bool has_triple_mesh_plane_swap = false;
-    for (int row_idx = 0; row_idx < normal_row_count;) {
-        const int start = row_idx;
-        const CarSharedVelocityContactRow& first = normal_rows[start];
-        ++row_idx;
-        while (row_idx < normal_row_count && SameCarWorldManifoldGroup(first, normal_rows[row_idx])) {
-            ++row_idx;
-        }
-        CarWorldSharedRowGroup group;
-        group.start = start;
-        group.count = row_idx - start;
-        group.island_id = CarWorldIslandIdForRow(first);
-        group.source_tag = first.source_tag;
-        group.body_a_local_idx = first.body_a_local_idx;
-        group.body_b_local_idx = first.body_b_local_idx;
-        if (group_count < kMaxSharedContactOrderGroups) {
-            row_groups[group_count] = group;
-        }
-        if (group.island_id > max_island_id) {
-            max_island_id = group.island_id;
-            max_island_group_count = 1;
-        } else if (group.island_id == max_island_id) {
-            ++max_island_group_count;
-        }
-        if (!has_triple_mesh_plane_swap &&
-            group_count >= 2 &&
-            SameCarWorldGroupOwner(second_last_group, last_group) &&
-            SameCarWorldGroupOwner(last_group, group) &&
-            IsBtXWallPlaneSourceTag(second_last_group.source_tag) &&
-            last_group.source_tag >= 100 &&
-            IsBtFloorCeilingPlaneSourceTag(group.source_tag)) {
-            triple_mesh_group = last_group;
-            triple_plane_group = group;
-            has_triple_mesh_plane_swap = true;
-        }
-        second_last_group = last_group;
-        last_group = group;
-        ++group_count;
-    }
-
-    if (group_count <= 1) {
-        return;
-    }
-
-    bool has_pair_order_group = false;
-    bool applied_full_bullet_order = false;
-    if (contact_order_groups && contact_order_group_count > 0 && car_count > 0 &&
-        group_count <= kMaxSharedContactOrderGroups) {
-        int parent[8];
-        int component_max[8];
-        for (int i = 0; i < 8; ++i) {
-            parent[i] = i;
-            component_max[i] = i;
-        }
-        for (int group_idx = 0; group_idx < contact_order_group_count && group_idx < kMaxSharedContactOrderGroups; ++group_idx) {
-            const SharedContactOrderGroup& group = contact_order_groups[group_idx];
-            if (!group.valid || group.bucket != SharedContactOrderBucket::Pair || group.normal_row_count <= 0) {
-                continue;
-            }
-            has_pair_order_group = true;
-            UnionSharedContactOrderParents(parent, group.body_a_local_idx, group.body_b_local_idx);
-        }
-        for (int i = 0; i < car_count && i < 8; ++i) {
-            const int root = FindSharedContactOrderParent(parent, i);
-            if (root >= 0 && root < 8) {
-                component_max[root] = Max(component_max[root], i);
-            }
-        }
-
-        int car_island_id[8];
-        ResolveSharedContactOrderCarIslandIds(parent, component_max, car_island_id);
-
-        auto& order = scratch.order;
-        auto& island_ids = scratch.island_ids;
-        int active_count = 0;
-        for (int group_idx = 0; group_idx < contact_order_group_count && group_idx < kMaxSharedContactOrderGroups; ++group_idx) {
-            const SharedContactOrderGroup& group = contact_order_groups[group_idx];
-            if (!group.valid ||
-                group.normal_row_count <= 0 ||
-                group.body_a_local_idx < 0 ||
-                group.body_a_local_idx >= car_count) {
-                continue;
-            }
-            int insert = active_count;
-            const int group_order_key = BulletContactOrderInitialKey(group);
-            while (insert > 0 &&
-                   BulletContactOrderInitialKey(contact_order_groups[order[insert - 1]]) > group_order_key) {
-                order[insert] = order[insert - 1];
-                --insert;
-            }
-            order[insert] = group_idx;
-            ++active_count;
-        }
-        for (int order_idx = 0; order_idx < active_count; ++order_idx) {
-            const SharedContactOrderGroup& group = contact_order_groups[order[order_idx]];
-            island_ids[order[order_idx]] = SharedContactOrderIslandIdForBody(car_island_id, group.body_a_local_idx);
-        }
-        if (active_count > 1) {
-            QuickSortSharedContactOrderIndices(order, island_ids, 0, active_count - 1);
-        }
-
-        auto& desired_source_tags = scratch.desired_source_tags;
-        auto& desired_body_a = scratch.desired_body_a;
-        auto& desired_body_b = scratch.desired_body_b;
-        auto& row_group_used = scratch.row_group_used;
-        for (int i=0;i<kMaxSharedContactOrderGroups;++i) row_group_used[i]=0;
-        int desired_count = 0;
-        bool matched_all_world_groups = true;
-        for (int order_idx = 0; order_idx < active_count; ++order_idx) {
-            const SharedContactOrderGroup& group = contact_order_groups[order[order_idx]];
-            if (!group.valid || group.bucket != SharedContactOrderBucket::World || group.normal_row_count <= 0) {
-                continue;
-            }
-            int match_idx = -1;
-            for (int row_group_idx = 0; row_group_idx < group_count; ++row_group_idx) {
-                const CarWorldSharedRowGroup& row_group = row_groups[row_group_idx];
-                if (!row_group_used[row_group_idx] &&
-                    row_group.body_a_local_idx == group.body_a_local_idx &&
-                    row_group.body_b_local_idx == group.body_b_local_idx &&
-                    row_group.source_tag == group.source_tag) {
-                    match_idx = row_group_idx;
-                    break;
-                }
-            }
-            if (match_idx < 0) {
-                matched_all_world_groups = false;
-                break;
-            }
-            row_group_used[match_idx] = 1;
-            desired_source_tags[desired_count] = group.source_tag;
-            desired_body_a[desired_count] = group.body_a_local_idx;
-            desired_body_b[desired_count] = group.body_b_local_idx;
-            ++desired_count;
-        }
-
-        if (matched_all_world_groups && desired_count == group_count) {
-            for (int target_idx = 0; target_idx < desired_count; ++target_idx) {
-                int match_idx = -1;
-                for (int row_group_idx = target_idx; row_group_idx < group_count; ++row_group_idx) {
-                    const CarWorldSharedRowGroup& row_group = row_groups[row_group_idx];
-                    if (row_group.body_a_local_idx == desired_body_a[target_idx] &&
-                        row_group.body_b_local_idx == desired_body_b[target_idx] &&
-                        row_group.source_tag == desired_source_tags[target_idx]) {
-                        match_idx = row_group_idx;
-                        break;
-                    }
-                }
-                while (match_idx > target_idx) {
-                    CarWorldSharedRowGroup first = row_groups[match_idx - 1];
-                    CarWorldSharedRowGroup second = row_groups[match_idx];
-                    SwapAdjacentCarWorldSharedGroups(
-                        normal_rows,
-                        friction_rows,
-                        friction_row_count,
-                        first,
-                        second);
-                    second.start = first.start;
-                    first.start = second.start + second.count;
-                    row_groups[match_idx - 1] = second;
-                    row_groups[match_idx] = first;
-                    --match_idx;
-                }
-            }
-            applied_full_bullet_order = true;
-        }
-    }
-    if (applied_full_bullet_order) {
-        return;
-    }
-
-    if (has_triple_mesh_plane_swap) {
-        SwapAdjacentCarWorldSharedGroups(
-            normal_rows,
-            friction_rows,
-            friction_row_count,
-            triple_mesh_group,
-            triple_plane_group);
-        return;
-    }
-
-    const bool has_two_group_max_suffix =
-        second_last_group.island_id == max_island_id &&
-        last_group.island_id == max_island_id;
-    const int full_island_group_count = CountSharedContactOrderGroupsForIsland(
-        contact_order_groups,
-        contact_order_group_count,
-        car_count,
-        max_island_id);
-    const int bullet_island_group_count =
-        full_island_group_count >= 0 ? full_island_group_count : max_island_group_count;
-    if (!has_two_group_max_suffix || bullet_island_group_count != 2) {
-        return;
-    }
-    const bool has_static_mesh_suffix =
-        (second_last_group.source_tag >= 100 && IsBtStaticPlaneSourceTag(last_group.source_tag)) ||
-        (IsBtStaticPlaneSourceTag(second_last_group.source_tag) && last_group.source_tag >= 100);
-    if (!has_static_mesh_suffix) {
-        return;
-    }
-    if (!has_pair_order_group &&
-        IsBtXWallPlaneSourceTag(second_last_group.source_tag) &&
-        last_group.source_tag >= 100) {
-        return;
-    }
-    SwapAdjacentCarWorldSharedGroups(
-        normal_rows,
-        friction_rows,
-        friction_row_count,
-        second_last_group,
-        last_group);
-}
-
-ROCKETGPU_HD void ReorderBallCarRowsForBulletQuickSortIslandFlip(
-    EnvStridedArray<BallVelocityContactRow> normal_rows,
-    int                     ,
-    EnvStridedArray<BallFrictionContactRow> friction_rows,
-    int friction_row_count,
-    EnvStridedArray<BallSplitContactRow> split_rows,
-    int                    ,
-    const BallCarReorderRowSpan* row_spans,
-    int row_span_count,
-    EnvStridedArray<const SharedContactOrderGroup> contact_order_groups,
-    int contact_order_group_count) {
-    if (!normal_rows || !row_spans || row_span_count != 2) {
-        return;
-    }
-
-    const BallCarReorderRowSpan& span_a = row_spans[0];
-    const BallCarReorderRowSpan& span_b = row_spans[1];
-    if (span_a.normal_count <= 0 || span_b.normal_count <= 0) {
-        return;
-    }
-
-    if (span_a.normal_count != 1 || span_b.normal_count != 1 ||
-        span_a.friction_count != 1 || span_b.friction_count != 1 ||
-        span_a.split_count != 1 || span_b.split_count != 1) {
-        return;
-    }
-
-    if (span_a.normal_start + span_a.normal_count != span_b.normal_start ||
-        span_a.friction_start + span_a.friction_count != span_b.friction_start ||
-        span_a.split_start + span_a.split_count != span_b.split_start) {
-        return;
-    }
-
-    if (span_a.car_local_idx < 0 || span_a.car_local_idx >= 8 ||
-        span_b.car_local_idx < 0 || span_b.car_local_idx >= 8) {
-        return;
-    }
-
-    if (contact_order_groups && contact_order_group_count > 0) {
-        for (int gi = 0; gi < contact_order_group_count && gi < kMaxSharedContactOrderGroups; ++gi) {
-            const SharedContactOrderGroup& g = contact_order_groups[gi];
-            if (!g.valid) {
-                continue;
-            }
-            const bool a_touches = (g.body_a_local_idx == span_a.car_local_idx ||
-                                    g.body_b_local_idx == span_a.car_local_idx);
-            const bool b_touches = (g.body_a_local_idx == span_b.car_local_idx ||
-                                    g.body_b_local_idx == span_b.car_local_idx);
-            if (a_touches || b_touches) {
-                return;
-            }
-        }
-    }
-
-    {
-        const BallVelocityContactRow tmp = normal_rows[span_a.normal_start];
-        normal_rows[span_a.normal_start] = normal_rows[span_b.normal_start];
-        normal_rows[span_b.normal_start] = tmp;
-    }
-    if (friction_rows && friction_row_count > 0 &&
-        span_a.friction_start < friction_row_count &&
-        span_b.friction_start < friction_row_count) {
-        BallFrictionContactRow tmp = friction_rows[span_a.friction_start];
-        friction_rows[span_a.friction_start] = friction_rows[span_b.friction_start];
-        friction_rows[span_b.friction_start] = tmp;
-
-        friction_rows[span_a.friction_start].normal_row_idx = span_a.normal_start;
-        friction_rows[span_b.friction_start].normal_row_idx = span_b.normal_start;
-    }
-    if (split_rows) {
-        const BallSplitContactRow tmp = split_rows[span_a.split_start];
-        split_rows[span_a.split_start] = split_rows[span_b.split_start];
-        split_rows[span_b.split_start] = tmp;
-    }
 }
 
 ROCKETGPU_HD void ApplySharedCarVelocityImpulse(
@@ -4074,63 +3307,34 @@ ROCKETGPU_HD int BuildBulletManifoldList(
     }
 
     const int body_count = Min(car_count + 1, kMaxBodies);
-    uint8_t pair_seen[kMaxBodies][kMaxBodies] = {};
-    uint8_t broadphase_pair_union[kMaxBodies][kMaxBodies] = {};
-    int entry_count = 0;
+    if (bp_history == nullptr) {
+        return 0;
+    }
+    WorldSolverScratch& h = *bp_history;
 
-    const auto push_entry = [&](int8_t kind, int8_t body_a, int8_t body_b, int16_t static_id) {
-        if (entry_count >= max_entries || entry_count >= kMaxBulletManifoldEntries) {
-            return;
-        }
-        BulletManifoldEntry& entry = out_entries[entry_count];
-        entry.kind = kind;
-        entry.body_a = body_a;
-        entry.body_b = body_b;
-        entry.static_id = static_id;
-        entry.island_id = 0;
-        ++entry_count;
-    };
-
-    uint32_t insert_seq[kMaxBodies] = {};
-    if (bp_history != nullptr) {
-        if (!bp_history->bp_initialized) {
-            bp_history->bp_seq_counter = 0;
-            for (int body = 0; body < body_count; ++body) {
-                bp_history->bp_cell_i[body] = proxies[body].cell_i;
-                bp_history->bp_cell_j[body] = proxies[body].cell_j;
-                bp_history->bp_cell_k[body] = proxies[body].cell_k;
-                bp_history->bp_insert_seq[body] = ++bp_history->bp_seq_counter;
-            }
-            bp_history->bp_initialized = 1;
-        } else {
-            for (int body = 0; body < body_count; ++body) {
-                const BulletBroadphaseProxy& proxy = proxies[body];
-                if (!proxy.valid) {
-                    continue;
-                }
-                if (proxy.cell_i != bp_history->bp_cell_i[body] ||
-                    proxy.cell_j != bp_history->bp_cell_j[body] ||
-                    proxy.cell_k != bp_history->bp_cell_k[body]) {
-                    bp_history->bp_cell_i[body] = proxy.cell_i;
-                    bp_history->bp_cell_j[body] = proxy.cell_j;
-                    bp_history->bp_cell_k[body] = proxy.cell_k;
-                    bp_history->bp_insert_seq[body] = ++bp_history->bp_seq_counter;
-                }
-            }
-        }
+    if (!h.bp_initialized) {
+        h.bp_seq_counter = 0;
         for (int body = 0; body < body_count; ++body) {
-            insert_seq[body] = bp_history->bp_insert_seq[body];
+            h.bp_cell_i[body] = proxies[body].cell_i;
+            h.bp_cell_j[body] = proxies[body].cell_j;
+            h.bp_cell_k[body] = proxies[body].cell_k;
+            h.bp_insert_seq[body] = ++h.bp_seq_counter;
         }
+        h.bp_initialized = 1;
     } else {
         for (int body = 0; body < body_count; ++body) {
-            insert_seq[body] = static_cast<uint32_t>(body + 1);
+            const BulletBroadphaseProxy& proxy = proxies[body];
+            if (proxy.valid &&
+                (proxy.cell_i != h.bp_cell_i[body] || proxy.cell_j != h.bp_cell_j[body] || proxy.cell_k != h.bp_cell_k[body])) {
+                h.bp_cell_i[body] = proxy.cell_i;
+                h.bp_cell_j[body] = proxy.cell_j;
+                h.bp_cell_k[body] = proxy.cell_k;
+                h.bp_insert_seq[body] = ++h.bp_seq_counter;
+            }
         }
     }
+    const uint32_t* insert_seq = h.bp_insert_seq;
 
-    constexpr int kMaxUnionPairs = 64;
-    int8_t union_pair_a[kMaxUnionPairs];
-    int8_t union_pair_b[kMaxUnionPairs];
-    int union_pair_count = 0;
     int partner_order[kMaxBodies];
     for (int i = 0; i < body_count; ++i) {
         partner_order[i] = i;
@@ -4147,149 +3351,171 @@ ROCKETGPU_HD int BuildBulletManifoldList(
         partner_order[j + 1] = v;
     }
 
+    // Pair keys use BulletManifoldEntry: kind 0 ball-static, 1 ball-car, 2 car-static, 3 car-car (body_a < body_b).
+    const auto mesh_info_for = [&](int mesh_index) -> const ArenaMeshBvhMeshInfo* {
+        for (int slot = 0; slot < mesh_info_count; ++slot) {
+            if (mesh_infos[slot].mesh_index == mesh_index && mesh_infos[slot].triangle_count > 0) {
+                return &mesh_infos[slot];
+            }
+        }
+        return nullptr;
+    };
+    const auto body_proxy = [&](int body) -> const BulletBroadphaseProxy* {
+        return body >= 0 && body < body_count && proxies[body].valid ? &proxies[body] : nullptr;
+    };
+    // Broadphase overlap (proxy AABBs), and whether the narrowphase holds a manifold: a ball-static algorithm makes
+    // its manifold on creation; a car's compound child algorithm exists while the child AABB overlaps the other shape.
+    const auto overlap = [&](const BulletManifoldEntry& key, bool manifold) {
+        const BulletBroadphaseProxy* pa = body_proxy(key.kind <= 1 ? 0 : key.body_a + 1);
+        if (pa == nullptr) {
+            return false;
+        }
+        if (key.kind == 1 || key.kind == 3) {
+            const BulletBroadphaseProxy* pb = body_proxy(key.kind == 1 ? key.body_a + 1 : key.body_b + 1);
+            return pb != nullptr && BulletAabbOverlap(pa->aabb_min, pa->aabb_max, pb->aabb_min, pb->aabb_max) &&
+                   (!manifold ||
+                    BulletAabbOverlap(pa->child_aabb_min, pa->child_aabb_max, pb->child_aabb_min, pb->child_aabb_max));
+        }
+        if (!arena_static) {
+            return false;
+        }
+        ::rocketgpu::Vec3 proxy_min(0.0f, 0.0f, 0.0f), proxy_max(0.0f, 0.0f, 0.0f);
+        ::rocketgpu::Vec3 shape_min(0.0f, 0.0f, 0.0f), shape_max(0.0f, 0.0f, 0.0f);
+        if (key.static_id >= 100) {
+            BulletStaticPlaneProxyAabb(key.static_id - 100, proxy_min, proxy_max);
+            BulletStaticPlaneShapeAabb(key.static_id - 100, shape_min, shape_max);
+        } else {
+            const ArenaMeshBvhMeshInfo* info = mesh_info_for(key.static_id);
+            if (info == nullptr) {
+                return false;
+            }
+            shape_min = info->aabb_min;
+            shape_max = info->aabb_max;
+            const ::rocketgpu::Vec3 threshold(kContactThresholdBt, kContactThresholdBt, kContactThresholdBt);
+            proxy_min = shape_min - threshold;
+            proxy_max = shape_max + threshold;
+        }
+        return BulletAabbOverlap(pa->aabb_min, pa->aabb_max, proxy_min, proxy_max) &&
+               (!manifold || key.kind == 0 ||
+                BulletAabbOverlap(pa->child_aabb_min, pa->child_aabb_max, shape_min, shape_max));
+    };
+    const auto find = [](const BulletManifoldEntry* list, int n, const BulletManifoldEntry& key) {
+        for (int i = 0; i < n; ++i) {
+            if (list[i].kind == key.kind && list[i].body_a == key.body_a && list[i].body_b == key.body_b &&
+                list[i].static_id == key.static_id) {
+                return i;
+            }
+        }
+        return -1;
+    };
+    const auto swap_remove = [](BulletManifoldEntry* list, uint8_t& n, int i) {
+        if (i >= 0) {
+            list[i] = list[--n];
+        }
+    };
+
+    // btRSBroadphase::calculateOverlappingPairs: every pair leaves the cache (btHashedOverlappingPairCache swaps the
+    // last pair into its slot; its algorithm releases its manifold the same way) except the retained ball-world,
+    // ball-car and car-car pairs whose AABBs still overlap, which stay first in activePairs.
+    int kept = 0;
+    for (int i = 0; i < h.bp_active_count; ++i) {
+        const BulletManifoldEntry key = h.bp_active[i];
+        if (key.kind != 2 && overlap(key, false)) {
+            h.bp_active[kept++] = key;
+            continue;
+        }
+        swap_remove(h.bp_pairs, h.bp_pair_count, find(h.bp_pairs, h.bp_pair_count, key));
+        swap_remove(h.bp_manifolds, h.bp_manifold_count, find(h.bp_manifolds, h.bp_manifold_count, key));
+    }
+    h.bp_active_count = static_cast<uint8_t>(kept);
+
+    // New pairs, per dynamic proxy in handle order: its cell's statics in registration order, then its cell's dynamics.
+    const auto add_pair = [&](int8_t kind, int8_t body_a, int8_t body_b, int16_t static_id) {
+        BulletManifoldEntry key;
+        key.kind = kind;
+        key.body_a = body_a;
+        key.body_b = body_b;
+        key.static_id = static_id;
+        if (!overlap(key, false) || find(h.bp_pairs, h.bp_pair_count, key) >= 0 ||
+            h.bp_pair_count >= kMaxBulletManifoldEntries) {
+            return;
+        }
+        h.bp_pairs[h.bp_pair_count++] = key;
+        h.bp_active[h.bp_active_count++] = key;
+    };
     for (int body = 0; body < body_count; ++body) {
         const BulletBroadphaseProxy& proxy = proxies[body];
         if (!proxy.valid) {
             continue;
         }
-        const int cell_index = proxy.cell_i * grid.cells_y * grid.cells_z +
-                               proxy.cell_j * grid.cells_z + proxy.cell_k;
-
+        const int8_t kind = proxy.is_ball ? 0 : 2;
+        const int8_t body_a = proxy.is_ball ? static_cast<int8_t>(-1) : static_cast<int8_t>(body - 1);
+        const int cell_index = proxy.cell_i * grid.cells_y * grid.cells_z + proxy.cell_j * grid.cells_z + proxy.cell_k;
         for (int mesh_slot = 0; arena_static && mesh_slot < mesh_info_count; ++mesh_slot) {
             const ArenaMeshBvhMeshInfo& info = mesh_infos[mesh_slot];
-            if (info.mesh_index < 0 || info.triangle_count <= 0) {
-                continue;
+            if (info.mesh_index >= 0 && info.triangle_count > 0 && grid.mesh_registered_in_cell(cell_index, info.mesh_index)) {
+                add_pair(kind, body_a, -1, static_cast<int16_t>(info.mesh_index));
             }
-            if (!grid.mesh_registered_in_cell(cell_index, info.mesh_index)) {
-                continue;
-            }
-            const ::rocketgpu::Vec3 mesh_proxy_min(
-                info.aabb_min.x - kContactThresholdBt,
-                info.aabb_min.y - kContactThresholdBt,
-                info.aabb_min.z - kContactThresholdBt);
-            const ::rocketgpu::Vec3 mesh_proxy_max(
-                info.aabb_max.x + kContactThresholdBt,
-                info.aabb_max.y + kContactThresholdBt,
-                info.aabb_max.z + kContactThresholdBt);
-            if (!BulletAabbOverlap(proxy.aabb_min, proxy.aabb_max, mesh_proxy_min, mesh_proxy_max)) {
-                continue;
-            }
-            if (!proxy.is_ball &&
-                !BulletAabbOverlap(proxy.child_aabb_min, proxy.child_aabb_max, info.aabb_min, info.aabb_max)) {
-                continue;
-            }
-            push_entry(
-                proxy.is_ball ? 0 : 2,
-                proxy.is_ball ? static_cast<int8_t>(-1) : static_cast<int8_t>(body - 1),
-                -1,
-                static_cast<int16_t>(info.mesh_index));
         }
         for (int plane_rank = 0; arena_static && plane_rank < 4; ++plane_rank) {
-            if (!BulletPlaneRegisteredInCell(grid, plane_rank, proxy.cell_i, proxy.cell_j, proxy.cell_k)) {
-                continue;
+            if (BulletPlaneRegisteredInCell(grid, plane_rank, proxy.cell_i, proxy.cell_j, proxy.cell_k)) {
+                add_pair(kind, body_a, -1, static_cast<int16_t>(100 + plane_rank));
             }
-            ::rocketgpu::Vec3 plane_proxy_min(0.0f, 0.0f, 0.0f);
-            ::rocketgpu::Vec3 plane_proxy_max(0.0f, 0.0f, 0.0f);
-            BulletStaticPlaneProxyAabb(plane_rank, plane_proxy_min, plane_proxy_max);
-            if (!BulletAabbOverlap(proxy.aabb_min, proxy.aabb_max, plane_proxy_min, plane_proxy_max)) {
-                continue;
-            }
-            if (!proxy.is_ball) {
-                ::rocketgpu::Vec3 plane_shape_min(0.0f, 0.0f, 0.0f);
-                ::rocketgpu::Vec3 plane_shape_max(0.0f, 0.0f, 0.0f);
-                BulletStaticPlaneShapeAabb(plane_rank, plane_shape_min, plane_shape_max);
-                if (!BulletAabbOverlap(proxy.child_aabb_min, proxy.child_aabb_max, plane_shape_min, plane_shape_max)) {
-                    continue;
-                }
-            }
-            push_entry(
-                proxy.is_ball ? 0 : 2,
-                proxy.is_ball ? static_cast<int8_t>(-1) : static_cast<int8_t>(body - 1),
-                -1,
-                static_cast<int16_t>(100 + plane_rank));
         }
-
         for (int order_i = 0; order_i < body_count; ++order_i) {
             const int other = partner_order[order_i];
-            if (other == body) {
-                continue;
-            }
             const BulletBroadphaseProxy& other_proxy = proxies[other];
-            if (!other_proxy.valid || pair_seen[body][other]) {
+            if (other == body || !other_proxy.valid || Abs(other_proxy.cell_i - proxy.cell_i) > 1 ||
+                Abs(other_proxy.cell_j - proxy.cell_j) > 1 || Abs(other_proxy.cell_k - proxy.cell_k) > 1) {
                 continue;
-            }
-            if (Abs(other_proxy.cell_i - proxy.cell_i) > 1 ||
-                Abs(other_proxy.cell_j - proxy.cell_j) > 1 ||
-                Abs(other_proxy.cell_k - proxy.cell_k) > 1) {
-                continue;
-            }
-            if (!BulletAabbOverlap(proxy.aabb_min, proxy.aabb_max, other_proxy.aabb_min, other_proxy.aabb_max)) {
-                continue;
-            }
-            if (!BulletAabbOverlap(
-                    proxy.child_aabb_min, proxy.child_aabb_max,
-                    other_proxy.child_aabb_min, other_proxy.child_aabb_max)) {
-                broadphase_pair_union[body][other] = 1;
-                broadphase_pair_union[other][body] = 1;
-                pair_seen[body][other] = 1;
-                pair_seen[other][body] = 1;
-                if (union_pair_count < kMaxUnionPairs) {
-                    union_pair_a[union_pair_count] = static_cast<int8_t>(body);
-                    union_pair_b[union_pair_count] = static_cast<int8_t>(other);
-                    ++union_pair_count;
-                }
-                continue;
-            }
-            if (union_pair_count < kMaxUnionPairs) {
-                union_pair_a[union_pair_count] = static_cast<int8_t>(body);
-                union_pair_b[union_pair_count] = static_cast<int8_t>(other);
-                ++union_pair_count;
             }
             if (proxy.is_ball || other_proxy.is_ball) {
-                const int car_body = proxy.is_ball ? other : body;
-                push_entry(1, static_cast<int8_t>(car_body - 1), -1, -1);
+                add_pair(1, static_cast<int8_t>((proxy.is_ball ? other : body) - 1), -1, -1);
             } else {
-                push_entry(
-                    3,
-                    static_cast<int8_t>(Min(body, other) - 1),
-                    static_cast<int8_t>(Max(body, other) - 1),
-                    -1);
+                add_pair(3, static_cast<int8_t>(Min(body, other) - 1), static_cast<int8_t>(Max(body, other) - 1), -1);
             }
-            pair_seen[body][other] = 1;
-            pair_seen[other][body] = 1;
         }
     }
 
+    // dispatchAllCollisionPairs in pair cache order: a manifold is appended when its algorithm first makes it and
+    // swap-removed when a compound child algorithm is dropped.
+    for (int i = 0; i < h.bp_pair_count; ++i) {
+        const BulletManifoldEntry& key = h.bp_pairs[i];
+        const int at = find(h.bp_manifolds, h.bp_manifold_count, key);
+        const bool want = overlap(key, true);
+        if (want && at < 0) {
+            h.bp_manifolds[h.bp_manifold_count++] = key;
+        } else if (!want) {
+            swap_remove(h.bp_manifolds, h.bp_manifold_count, at);
+        }
+    }
+
+    // Islands: btSimulationIslandManager::findUnions over the pair cache, proxy0 (lower unique id) uniting into proxy1.
     int parent[kMaxBodies];
     for (int i = 0; i < kMaxBodies; ++i) {
         parent[i] = i;
     }
     const auto find_root = [&](int idx) {
-        while (idx >= 0 && idx < kMaxBodies && parent[idx] != idx) {
+        while (parent[idx] != idx) {
             idx = parent[idx];
         }
         return idx;
     };
-    for (int p = 0; p < union_pair_count; ++p) {
-        const int a = union_pair_a[p];
-        const int b = union_pair_b[p];
-        if (a < 0 || a >= kMaxBodies || b < 0 || b >= kMaxBodies) {
-            continue;
+    for (int i = 0; i < h.bp_pair_count; ++i) {
+        const BulletManifoldEntry& key = h.bp_pairs[i];
+        if (key.kind == 1 || key.kind == 3) {
+            const int ra = find_root(key.kind == 1 ? 0 : key.body_a + 1);
+            const int rb = find_root(key.kind == 1 ? key.body_a + 1 : key.body_b + 1);
+            if (ra != rb) {
+                parent[ra] = rb;
+            }
         }
-        const int ra = find_root(a);
-        const int rb = find_root(b);
-        if (ra == rb) {
-            continue;
-        }
-        parent[ra] = rb;
     }
-    const auto island_for_body = [&](int body) {
-        return find_root(body);
-    };
+    const int entry_count = Min(static_cast<int>(h.bp_manifold_count), Min(max_entries, kMaxBulletManifoldEntries));
     for (int i = 0; i < entry_count; ++i) {
-        BulletManifoldEntry& entry = out_entries[i];
-        const int body = entry.kind == 0 ? 0 : (entry.kind == 1 ? 0 : entry.body_a + 1);
-        entry.island_id = island_for_body(body);
+        BulletManifoldEntry entry = h.bp_manifolds[i];
+        entry.island_id = find_root(entry.kind <= 1 ? 0 : entry.body_a + 1);
+        out_entries[i] = entry;
     }
     return entry_count;
 }

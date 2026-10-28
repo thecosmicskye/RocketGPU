@@ -388,15 +388,6 @@ void BuildArenaMeshBulletStyleBvh(
 }
 }
 
-bool HasGoalMeshes() {
-    const std::filesystem::path dir = OfficialCollisionMeshRoot() / "soccar_goals";
-    if (!std::filesystem::exists(dir)) return false;
-    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
-        if (entry.path().extension() == ".cmf") return true;
-    }
-    return false;
-}
-
 std::vector<ArenaMeshTriangle> LoadArenaMeshTriangles(
     std::vector<ArenaMeshBvhQuantization>* out_quantization,
     std::vector<ArenaMeshBvhMeshInfo>* out_mesh_infos,
@@ -410,32 +401,6 @@ std::vector<ArenaMeshTriangle> LoadArenaMeshTriangles(
         throw std::runtime_error("official RocketSim collision meshes not found");
     }
 
-    struct LocalMeshFile {
-        std::vector<TriangleIndex> tris;
-        std::vector<MeshVertex> vertices;
-    };
-    std::vector<LocalMeshFile> local_files;
-    if (out_local_triangles) {
-        out_local_triangles->clear();
-        const std::filesystem::path local_dir = OfficialCollisionMeshRoot() / "soccar_goals";
-        if (std::filesystem::exists(local_dir)) {
-            for (const auto& entry : std::filesystem::directory_iterator(local_dir)) {
-                if (entry.path().extension() != ".cmf") continue;
-                std::ifstream in(entry.path(), std::ios::binary);
-                int32_t nt = 0, nv = 0;
-                in.read(reinterpret_cast<char*>(&nt), sizeof(nt));
-                in.read(reinterpret_cast<char*>(&nv), sizeof(nv));
-                if (!in || nt <= 0 || nv <= 0) throw std::runtime_error("invalid local collision mesh: " + entry.path().string());
-                LocalMeshFile f;
-                f.tris.resize(static_cast<size_t>(nt));
-                f.vertices.resize(static_cast<size_t>(nv));
-                in.read(reinterpret_cast<char*>(f.tris.data()), static_cast<std::streamsize>(f.tris.size() * sizeof(TriangleIndex)));
-                in.read(reinterpret_cast<char*>(f.vertices.data()), static_cast<std::streamsize>(f.vertices.size() * sizeof(MeshVertex)));
-                if (!in) throw std::runtime_error("failed to read local collision mesh: " + entry.path().string());
-                local_files.push_back(std::move(f));
-            }
-        }
-    }
     int local_goal_meshes = 0;
 
     if (out_quantization) {
@@ -579,33 +544,12 @@ std::vector<ArenaMeshTriangle> LoadArenaMeshTriangles(
         }
 
         if (out_local_triangles) {
-            const std::vector<MeshVertex>* frame_vertices = &vertices;
-            int8_t origin_sign = 0;
-            for (const LocalMeshFile& f : local_files) {
-                if (f.tris.size() != tri_indices.size() || f.vertices.size() != vertices.size()) continue;
-                bool same_tris = true;
-                for (size_t t = 0; t < f.tris.size() && same_tris; ++t) {
-                    for (int c = 0; c < 3; ++c) {
-                        if (f.tris[t].vertex_index[c] != tri_indices[t].vertex_index[c]) same_tris = false;
-                    }
-                }
-                if (!same_tris) continue;
-                for (int8_t sign : {static_cast<int8_t>(1), static_cast<int8_t>(-1)}) {
-                    const float o = static_cast<float>(sign) * kGoalMeshOriginYBt;
-                    bool same = true;
-                    for (size_t i = 0; i < vertices.size() && same; ++i) {
-                        const MeshVertex& lv = f.vertices[i];
-                        const MeshVertex& wv = vertices[i];
-                        if (lv.x != wv.x || lv.z != wv.z || std::fabs((lv.y + o) - wv.y) > 1e-3f) same = false;
-                    }
-                    if (same) {
-                        frame_vertices = &f.vertices;
-                        origin_sign = sign;
-                        break;
-                    }
-                }
-                if (origin_sign != 0) break;
-            }
+            // The game's goal meshes are in their own frame, placed at the goal: a mesh centered past the goal line
+            // is moved into it
+            const float center_y = 0.5f * (mesh_min.y + mesh_max.y);
+            const int8_t origin_sign = center_y > kGoalMeshOriginYBt ? 1 : (center_y < -kGoalMeshOriginYBt ? -1 : 0);
+            std::vector<MeshVertex> frame_vertices = vertices;
+            for (MeshVertex& v : frame_vertices) v.y -= static_cast<float>(origin_sign) * kGoalMeshOriginYBt;
             local_goal_meshes += origin_sign != 0;
             if (out_mesh_infos && !out_mesh_infos->empty() && out_mesh_infos->back().mesh_index == mesh_idx) {
                 out_mesh_infos->back().cal_origin_y = static_cast<float>(origin_sign) * kGoalMeshOriginYBt;
@@ -614,9 +558,9 @@ std::vector<ArenaMeshTriangle> LoadArenaMeshTriangles(
             std::vector<ArenaMeshTriangle>& local = *out_local_triangles;
             for (int32_t tri_i = 0; tri_i < num_tris; ++tri_i) {
                 const TriangleIndex& tri_idx = tri_indices[static_cast<size_t>(tri_i)];
-                const MeshVertex& va = (*frame_vertices)[static_cast<size_t>(tri_idx.vertex_index[0])];
-                const MeshVertex& vb = (*frame_vertices)[static_cast<size_t>(tri_idx.vertex_index[1])];
-                const MeshVertex& vc = (*frame_vertices)[static_cast<size_t>(tri_idx.vertex_index[2])];
+                const MeshVertex& va = frame_vertices[static_cast<size_t>(tri_idx.vertex_index[0])];
+                const MeshVertex& vb = frame_vertices[static_cast<size_t>(tri_idx.vertex_index[1])];
+                const MeshVertex& vc = frame_vertices[static_cast<size_t>(tri_idx.vertex_index[2])];
                 ArenaMeshTriangle tri = triangles[mesh_base + static_cast<size_t>(tri_i)];
                 tri.a = Vec3(va.x, va.y, va.z);
                 tri.b = Vec3(vb.x, vb.y, vb.z);

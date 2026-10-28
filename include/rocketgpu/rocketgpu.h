@@ -144,23 +144,32 @@ struct BallHitInfo {
 struct CarState {
     Vec3 pos = Vec3(0.0f, 0.0f, 17.0f);
     Quat rot = Quat(1.0f, 0.0f, 0.0f, 0.0f);
+    // Fields RLBot exposes hold RLBot's value for the tick (see internal_* at the end for the step's own values):
+    // vel and ang_vel after the 2300 uu/s and 5.5 rad/s caps.
     Vec3 vel = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 ang_vel = Vec3(0.0f, 0.0f, 0.0f);
 
     Vec3 flip_rel_torque = Vec3(0.0f, 0.0f, 0.0f);
 
+    // Timers follow RocketSim v3 (car_state.rs) and the game. Seconds; a tick is tick_dt.
+    // Ticks since the jump started (while is_jumping) or ended (after), times tick_dt: v3 jump_ticks / 120.
+    // Advances every tick the car is not demoed, on the ground too. Exact multiple of tick_dt.
     float jump_time = 0.0f;
+    // Seconds since flip activity last changed: flip start, flip end, or landing mid-flip (v3 flip_time).
+    // Reads one tick on the tick it changes, then advances every tick the car is not demoed, on the ground too.
     float flip_time = 0.0f;
-    float air_time = 0.0f;
-    float air_time_since_jump = 0.0f;
+    float air_time = 0.0f;  // Total time in the air; 0 on the ground.
+    float air_time_since_jump = 0.0f;  // Time in the air since the jump ended; 0 on the ground or without a jump.
     float boost = 100.0f;
-    float time_since_boosted = 0.0f;
-    float boosting_time = 0.0f;
-    float supersonic_time = 0.0f;
-    float handbrake_val = 0.0f;
-    float auto_flip_timer = 0.0f;
-    float auto_flip_torque_scale = 0.0f;
+    float time_since_boosted = 0.0f;  // Seconds since boost was last applied.
+    float boosting_time = 0.0f;  // Seconds of the current boost streak; 0 when not boosting.
+    float supersonic_time = 0.0f;  // v3 supersonic_grace_timer: time below start speed while still supersonic.
+    float handbrake_val = 0.0f;  // Smoothed handbrake, 0..1.
+    float auto_flip_timer = 0.0f;  // Seconds left in auto-flip recovery.
+    float auto_flip_torque_scale = 0.0f;  // Roll direction sign of the auto-flip, +1 or -1.
     float demo_respawn_timer = 0.0f;
+    // Ticks since the last state set. Set it to 0 whenever you write a state: the next step then rebuilds
+    // RocketGPU's internal clocks (internal_* below) from jump_time, flip_time and the flags.
     uint64_t tick_count_since_update = 0;
 
     uint8_t ball_contact_last_tick = 0;
@@ -194,13 +203,16 @@ struct CarState {
 
     uint8_t is_on_ground = 1;
     uint8_t wheels_with_contact[4] = {1,1,1,1};
+    // RLBot: has_jumped clears on a tick air_state reads OnGround more than 0.05 s after the jump started (it stays
+    // clear if the car then leaves the ground); has_double_jumped and has_flipped clear on the tick air_state reads
+    // OnGround.
     uint8_t has_jumped = 0;
     uint8_t has_double_jumped = 0;
     uint8_t has_flipped = 0;
     uint8_t is_flipping = 0;
     uint8_t is_jumping = 0;
     uint8_t is_boosting = 0;
-    uint8_t is_supersonic = 0;
+    uint8_t is_supersonic = 0;  // RLBot: |vel| >= 2200 on this tick. The game's flag, held by supersonic_time, is internal.
     uint8_t is_auto_flipping = 0;
     uint8_t is_demoed = 0;
     uint8_t just_respawned = 0;
@@ -260,6 +272,106 @@ struct CarState {
     uint64_t last_directional_flip_start = ~0ULL;
     uint8_t last_ball_started_with_world = 0;
     uint8_t flip_or_jump_last_tick = 1;
+
+    // Internal, not part of the API. The step reads these clocks instead of jump_time / flip_time: time since the
+    // jump started while has_jumped, and time since the flip started while has_flipped (one tick behind, restart
+    // timer otherwise; 0 means unknown). Rebuilt from the fields above whenever tick_count_since_update == 0.
+    float internal_jump_time = 0.0f;
+    float internal_flip_time = 0.0f;
+
+    // RLBot v5 car fields, reported after every tick (not read by the step).
+    uint8_t air_state = 0;  // RLBot AirState: 0 OnGround, 1 Jumping, 2 DoubleJumping (13 ticks), 3 Dodging, 4 InAir.
+    // Seconds left to dodge after the jump: 1.25 minus the time since the jump ended (the release tick counts one tick).
+    // -1 on the ground, while jumping, after a double jump or dodge, without has_jumped, or once it runs out.
+    float dodge_timeout = -1.0f;
+    float dodge_elapsed = 0.0f;  // Seconds since the dodge started, while has_flipped (not OnGround); else 0.
+    float dodge_dir_x = 0.0f;  // Direction of the last dodge: (flip_rel_torque.y, -flip_rel_torque.x).
+    float dodge_dir_y = 0.0f;
+    // Latest ball touch: the tick a ball contact started, the car-side contact point, and the unit normal from the
+    // car toward the ball centre. latest_touch_tick is ~0 until the car first touches the ball.
+    uint64_t latest_touch_tick = ~0ULL;
+    Vec3 latest_touch_location = Vec3(0.0f, 0.0f, 0.0f);
+    Vec3 latest_touch_normal = Vec3(0.0f, 0.0f, 0.0f);
+
+    // Internal, not part of the API. vel, ang_vel, has_jumped, has_double_jumped, has_flipped and is_supersonic hold
+    // RLBot's values between steps; the step works on the internal_* values. A field written since the last step
+    // (it no longer equals its reported_* value) replaces the internal value.
+    Vec3 internal_vel = Vec3(0.0f, 0.0f, 0.0f);
+    Vec3 internal_ang_vel = Vec3(0.0f, 0.0f, 0.0f);
+    Vec3 reported_vel = Vec3(0.0f, 0.0f, 0.0f);
+    Vec3 reported_ang_vel = Vec3(0.0f, 0.0f, 0.0f);
+    uint8_t internal_has_jumped = 0;
+    uint8_t internal_has_double_jumped = 0;
+    uint8_t internal_has_flipped = 0;
+    uint8_t internal_is_supersonic = 0;  // the game's supersonic flag, which holds through supersonic_time
+    uint8_t reported_flags = 0;  // kReported* bits of the reported flags; kReportedValid once reported
+    uint8_t game_has_jumped = 0;  // the game's has_jumped, reported as has_jumped
+    uint8_t double_jump_ticks = 255;  // ticks since has_double_jumped was set; 255 when unknown or not set
+    // v3's jump_hold_broken (car/base.rs update_jump), kept for compat GetStateV3 only: the step's jump does not read it.
+    uint8_t jump_hold_broken = 0;
+    // Set by compat SetStateV3, whose supersonic flag already reflects the state's velocity (v3 updates it at the end of
+    // a tick, the step at the start of the next): the next step skips its tick-start update once.
+    uint8_t supersonic_set_v3 = 0;
+
+    static constexpr uint8_t kReportedVel = 1, kReportedAngVel = 2, kReportedHasJumped = 4,
+        kReportedHasDoubleJumped = 8, kReportedHasFlipped = 16, kReportedIsSupersonic = 32, kReportedValid = 128;
+
+    // Puts the internal values back into the reported fields that still hold what the last step reported, and returns
+    // the kReported* bits of those fields (kReportedValid if the state had been reported at all).
+    ROCKETGPU_HD uint8_t RestoreWorkingFields() {
+        if (!(reported_flags & kReportedValid)) {
+            return 0;
+        }
+        uint8_t kept = kReportedValid;
+        if (vel.x == reported_vel.x && vel.y == reported_vel.y && vel.z == reported_vel.z) {
+            vel = internal_vel;
+            kept |= kReportedVel;
+        }
+        if (ang_vel.x == reported_ang_vel.x && ang_vel.y == reported_ang_vel.y && ang_vel.z == reported_ang_vel.z) {
+            ang_vel = internal_ang_vel;
+            kept |= kReportedAngVel;
+        }
+        RestoreWorkingFlag(has_jumped, internal_has_jumped, kReportedHasJumped, kept);
+        RestoreWorkingFlag(has_double_jumped, internal_has_double_jumped, kReportedHasDoubleJumped, kept);
+        RestoreWorkingFlag(has_flipped, internal_has_flipped, kReportedHasFlipped, kept);
+        RestoreWorkingFlag(is_supersonic, internal_is_supersonic, kReportedIsSupersonic, kept);
+        return kept;
+    }
+    // After RestoreWorkingFields (kept = its result) and an edit of the working values: the working values become the
+    // internal ones and the fields that were kept show their reported values again.
+    ROCKETGPU_HD void ReReportFields(uint8_t kept) {
+        if (!(kept & kReportedValid)) {
+            return;
+        }
+        internal_vel = vel;
+        internal_ang_vel = ang_vel;
+        internal_has_jumped = has_jumped;
+        internal_has_double_jumped = has_double_jumped;
+        internal_has_flipped = has_flipped;
+        internal_is_supersonic = is_supersonic;
+        if (kept & kReportedVel) vel = reported_vel; else reported_vel = vel;
+        if (kept & kReportedAngVel) ang_vel = reported_ang_vel; else reported_ang_vel = ang_vel;
+        uint8_t flags = kReportedValid;
+        ReReportFlag(has_jumped, kReportedHasJumped, kept, flags);
+        ReReportFlag(has_double_jumped, kReportedHasDoubleJumped, kept, flags);
+        ReReportFlag(has_flipped, kReportedHasFlipped, kept, flags);
+        ReReportFlag(is_supersonic, kReportedIsSupersonic, kept, flags);
+        reported_flags = flags;
+    }
+    ROCKETGPU_HD void RestoreWorkingFlag(uint8_t& field, uint8_t internal, uint8_t bit, uint8_t& kept) const {
+        if ((field != 0) == ((reported_flags & bit) != 0)) {
+            field = internal;
+            kept |= bit;
+        }
+    }
+    ROCKETGPU_HD void ReReportFlag(uint8_t& field, uint8_t bit, uint8_t kept, uint8_t& flags) const {
+        if (kept & bit) {
+            field = (reported_flags & bit) ? 1 : 0;
+        }
+        if (field) {
+            flags |= bit;
+        }
+    }
 };
 
 struct BallState {

@@ -1574,7 +1574,12 @@ ROCKETGPU_HD void RecordBallCarCollisionInfoIfOverlapping(
     }
 
     const bool contact_started = !car_mut.ball_contact_last_tick && !car_mut.ball_contact_this_tick;
-    if (contact_started) car_mut.RecordBallContactStart();
+    if (contact_started) {
+        car_mut.RecordBallContactStart();
+        car_mut.latest_touch_tick = env_tick;
+        car_mut.latest_touch_location = car.pos + rel_car_contact;
+        car_mut.latest_touch_normal = normal;
+    }
     car_mut.ball_contact_this_tick = 1;
     if (contact_started && mutator.physics_events.windows) {
         PhysicsEvent event;

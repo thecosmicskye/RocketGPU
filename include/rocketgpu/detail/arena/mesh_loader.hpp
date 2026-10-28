@@ -32,6 +32,5 @@ std::vector<ArenaMeshTriangle> LoadArenaMeshTriangles(
     std::vector<ArenaMeshTriangle>* out_local_triangles = nullptr,
     int* out_local_goal_meshes = nullptr);
 
-bool HasGoalMeshes();
 }
 }

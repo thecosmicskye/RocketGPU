@@ -192,12 +192,14 @@ ROCKETGPU_GLOBAL void CanonicalizeImportedCarsKernel(CarState* cars, int32_t cou
         return;
     }
     constexpr float kCarBTToUU = 50.0f;
+    const uint8_t kept = cars[idx].tick_count_since_update != 0 ? cars[idx].RestoreWorkingFields() : 0;
     cars[idx].ResetTrainingHistory();
     cars[idx].pos_bt = ImportedCarLinearVec3Bt(cars[idx].pos);
     cars[idx].vel_bt = ImportedCarLinearVec3Bt(cars[idx].vel);
     cars[idx].pos = cars[idx].pos_bt * kCarBTToUU;
     cars[idx].vel = CanonicalizeImportedLinearVec3(cars[idx].vel);
     CanonicalizeImportedCarOrientation(cars[idx]);
+    cars[idx].ReReportFields(kept);
 }
 
 ROCKETGPU_GLOBAL void CanonicalizeImportedBallsKernel(BallState* balls, int32_t count) {

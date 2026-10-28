@@ -1354,9 +1354,9 @@ ROCKETGPU_HD float DodgeCancelPitchRaw(const CarState& car, const CarControls& c
         constexpr float kGameMinDodgeTorqueTime = 0.041f;
         // v3 base.rs:484-491 quantizes the negated raw pitch, not the step's quantized pitch.
         const float pitch = raw_pitch <= 1.0f ? raw_pitch : controls.pitch;
-        return car.flip_time >= kGameMinDodgeTorqueTime ? pitch : 0.0f;
+        return car.internal_flip_time >= kGameMinDodgeTorqueTime ? pitch : 0.0f;
     }
-    return (car.flip_time > (0.0f)) ? car.last_controls.pitch : controls.pitch;
+    return (car.internal_flip_time > (0.0f)) ? car.last_controls.pitch : controls.pitch;
 }
 
 ROCKETGPU_HD float DodgeCancelPitch(const CarState& car, const CarControls& controls, const MutatorConfig& mutator, float dt,
@@ -1394,7 +1394,7 @@ ROCKETGPU_HD void ApplyAirControl(
         float pitch_torque_scale = 1.0f;
         if (car.is_flipping) {
             pitch_torque_scale = 0.0f;
-        } else if (car.has_flipped && car.flip_time < (mutator.flip_torque_time + mutator.flip_pitchlock_extra_time)) {
+        } else if (car.has_flipped && car.internal_flip_time < (mutator.flip_torque_time + mutator.flip_pitchlock_extra_time)) {
             pitch_torque_scale = 0.0f;        } else if (cal_pitchlock_restart_time >= 0.0f && cal_pitchlock_restart_time < mutator.flip_pitchlock_extra_time) {
             pitch_torque_scale = 0.0f;
         }
@@ -1553,7 +1553,7 @@ ROCKETGPU_HD void CalLimitCarVels(CarState& car, const MutatorConfig& mutator) {
 
 ROCKETGPU_HD void StartJump(CarState& car, const MutatorConfig& mutator) {
     car.is_jumping = 1;
-    car.jump_time = 0.0f;
+    car.internal_jump_time = 0.0f;
 
     Vec3 jump_fwd(1.0f, 0.0f, 0.0f);
     Vec3 jump_rgt(0.0f, 1.0f, 0.0f);
@@ -1571,7 +1571,7 @@ ROCKETGPU_HD void ContinueJump(
     float dt,
     WheelRuntimeState* wheel_runtime_state) {
     if (car.is_jumping) {
-        if (!(car.jump_time < mutator.jump_min_time || (controls.jump && car.jump_time < mutator.jump_max_time))) {
+        if (!(car.internal_jump_time < mutator.jump_min_time || (controls.jump && car.internal_jump_time < mutator.jump_max_time))) {
             car.is_jumping = 0;
         }
     }
@@ -1602,7 +1602,7 @@ ROCKETGPU_HD void ContinueJump(
         }
     }
     if (car.is_jumping || car.has_jumped) {
-        car.jump_time += dt;
+        car.internal_jump_time += dt;
     }
 }
 
@@ -1615,7 +1615,7 @@ ROCKETGPU_HD void ApplyFlipTorque(
     WheelRuntimeState* wheel_runtime_state = nullptr,
     float raw_pitch = 2.0f) {
     if (car.is_flipping) {
-        car.is_flipping = (car.has_flipped && car.flip_time < mutator.flip_torque_time) ? 1 : 0;
+        car.is_flipping = (car.has_flipped && car.internal_flip_time < mutator.flip_torque_time) ? 1 : 0;
     }
     if (!car.is_flipping) {
         return;
@@ -1703,7 +1703,8 @@ ROCKETGPU_HD void ApplyAutoFlip(
     }
 }
 
-ROCKETGPU_HD void TryDoubleJumpOrFlip(
+// Returns true when a directional flip starts.
+ROCKETGPU_HD bool TryDoubleJumpOrFlip(
     CarState& car,
     const CarControls& controls_in,
     const CarConfig& cfg,
@@ -1730,11 +1731,11 @@ ROCKETGPU_HD void TryDoubleJumpOrFlip(
         can_use = ((!car.has_double_jumped && !car.has_flipped) || mutator.unlimited_double_jumps) && !car.is_auto_flipping;
     }
     if (!can_use) {
-        return;
+        return false;
     }
 
     if (is_flip_input) {
-        car.flip_time = 0.0f;
+        car.internal_flip_time = 0.0f;
         car.last_directional_flip_start = car.tick_count_since_update;
         car.has_flipped = 1;
         car.is_flipping = 1;
@@ -1780,6 +1781,7 @@ ROCKETGPU_HD void TryDoubleJumpOrFlip(
 
         car.has_double_jumped = 1;
     }
+    return is_flip_input;
 }
 
 ROCKETGPU_HD void UpdateJumpState(
@@ -1791,14 +1793,14 @@ ROCKETGPU_HD void UpdateJumpState(
     WheelRuntimeState* wheel_runtime_state = nullptr,
     bool cal_jump_blocked = false) {
     if (car.is_on_ground && !car.is_jumping) {
-        if (!(car.has_jumped && car.jump_time < mutator.jump_min_time + mutator.jump_reset_time_pad)) {
+        if (!(car.has_jumped && car.internal_jump_time < mutator.jump_min_time + mutator.jump_reset_time_pad)) {
             car.has_jumped = 0;
-            car.jump_time = 0.0f;
+            car.internal_jump_time = 0.0f;
         }
     }
 
     if (car.is_jumping) {
-        if (!(car.jump_time < mutator.jump_min_time || (controls.jump && car.jump_time < mutator.jump_max_time))) {
+        if (!(car.internal_jump_time < mutator.jump_min_time || (controls.jump && car.internal_jump_time < mutator.jump_max_time))) {
             car.is_jumping = 0;
         }
     }
@@ -1814,15 +1816,15 @@ ROCKETGPU_HD void UpdateJumpState(
 // write flip_time = 0 there, and the simulated timer is never exactly 0 at tick start.
 ROCKETGPU_HD float CalFlipRestartTimeOnGround(const CarState& car, const MutatorConfig& mutator, float dt) {
     if (!car.has_flipped) {
-        return car.flip_time;
+        return car.internal_flip_time;
     }
     if (car.is_flipping) {
         return 0.0f;
     }
-    if (car.flip_time < mutator.flip_torque_time) {
+    if (car.internal_flip_time < mutator.flip_torque_time) {
         return 0.0f;  // no flip clock to convert (set state with has_flipped and a zero timer): leave the timer unknown
     }
-    int k = static_cast<int>(rintf(car.flip_time / dt)) - static_cast<int>(rintf(mutator.flip_torque_time / dt));
+    int k = static_cast<int>(rintf(car.internal_flip_time / dt)) - static_cast<int>(rintf(mutator.flip_torque_time / dt));
     if (k < 1) {
         k = 1;
     }
@@ -1836,6 +1838,39 @@ ROCKETGPU_HD float CalFlipRestartTimeOnGround(const CarState& car, const Mutator
     return t;
 }
 
+// n additions of dt from 0: RocketGPU's float flip clock after n ticks.
+ROCKETGPU_HD float CalAccumulatedTicks(int n, float dt) {
+    if (n > 1024) {
+        return static_cast<float>(n) * dt;
+    }
+    float t = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        t += dt;
+    }
+    return t;
+}
+
+// A state set (tick_count_since_update == 0) carries jump_time and flip_time in v3's convention (car_state.rs). Rebuild
+// the internal clocks the step runs on from them:
+// - jump: the jump clock while is_jumping; after the jump, v3's time since it ended (it seeds the game's inactive-jump
+//   timer in PreTickCar); 0 without a jump.
+// - flip: during a flip the internal clock trails v3's by one tick (m v3 ticks -> m - 1 additions of dt). After the
+//   torque ends it keeps counting from the flip start (m ticks since the end -> m + flip_torque_time / dt additions),
+//   also on the landing tick, where the next update converts it back to the restart timer. With no flip it is v3's
+//   restart timer.
+ROCKETGPU_HD void CalInternalTimersFromSetState(CarState& car, const MutatorConfig& mutator, float dt) {
+    car.internal_jump_time = (car.is_jumping || car.has_jumped) ? car.jump_time : 0.0f;
+    const float flip_ticks = rintf(car.flip_time / dt);
+    const int m = flip_ticks >= 0.0f ? static_cast<int>(Min(flip_ticks, 1.0e6f)) : 0;
+    if (car.is_flipping) {
+        car.internal_flip_time = CalAccumulatedTicks(m > 1 ? m - 1 : 0, dt);
+    } else if (car.has_flipped) {
+        car.internal_flip_time = CalAccumulatedTicks(m + static_cast<int>(rintf(mutator.flip_torque_time / dt)), dt);
+    } else {
+        car.internal_flip_time = car.flip_time;
+    }
+}
+
 ROCKETGPU_HD void UpdateDoubleJumpOrFlipState(
     CarState& car,
     const CarControls& controls,
@@ -1845,17 +1880,18 @@ ROCKETGPU_HD void UpdateDoubleJumpOrFlipState(
     float forward_speed_uu,
     float dt,
     bool cal_press_as_air = false,
-    float raw_pitch = 2.0f) {
+    float raw_pitch = 2.0f,
+    bool* flip_started = nullptr) {
     if (car.is_on_ground && !cal_press_as_air) {
         car.has_double_jumped = 0;
-        car.flip_time = CalFlipRestartTimeOnGround(car, mutator, dt);
+        car.internal_flip_time = CalFlipRestartTimeOnGround(car, mutator, dt);
         car.has_flipped = 0;
         car.air_time = 0.0f;
         car.air_time_since_jump = 0.0f;
     } else {
         if (car.is_on_ground) {
             car.has_double_jumped = 0;
-            car.flip_time = CalFlipRestartTimeOnGround(car, mutator, dt);
+            car.internal_flip_time = CalFlipRestartTimeOnGround(car, mutator, dt);
             car.has_flipped = 0;
             car.air_time = 0.0f;
             car.air_time_since_jump = 0.0f;
@@ -1868,18 +1904,20 @@ ROCKETGPU_HD void UpdateDoubleJumpOrFlipState(
         }
 
         if (jump_pressed && car.air_time_since_jump < mutator.doublejump_max_delay) {
-            TryDoubleJumpOrFlip(car, controls, cfg, mutator, forward_speed_uu, raw_pitch);
+            if (TryDoubleJumpOrFlip(car, controls, cfg, mutator, forward_speed_uu, raw_pitch) && flip_started) {
+                *flip_started = true;
+            }
 
-            if (car.is_flipping && car.flip_time == 0.0f) {
-                car.flip_time = -dt;
+            if (car.is_flipping && car.internal_flip_time == 0.0f) {
+                car.internal_flip_time = -dt;
             }
         }
     }
 
     if (car.is_flipping) {
-        car.flip_time += dt;
-    } else if (car.has_flipped || (car.flip_time != 0.0f)) {
-        car.flip_time += dt;
+        car.internal_flip_time += dt;
+    } else if (car.has_flipped || (car.internal_flip_time != 0.0f)) {
+        car.internal_flip_time += dt;
     }
 }
 
@@ -2128,7 +2166,7 @@ ROCKETGPU_HD void CalFlipZDampPrepass(CarState& car, const MutatorConfig& mutato
     if (car.is_demoed || car.is_on_ground || !car.is_flipping) {
         return;
     }
-    const float flip_time = car.flip_time + dt;
+    const float flip_time = car.internal_flip_time + dt;
     if (!(flip_time >= 0.15f && flip_time <= mutator.flip_torque_time)) {
         return;
     }

@@ -1252,6 +1252,8 @@ ROCKETGPU_HD void ResetCarCommonState(CarState& car, const MutatorConfig& mutato
     car.boost = spawn_boost;
     car.jump_time = 0.0f;
     car.flip_time = 0.0f;
+    car.internal_jump_time = 0.0f;
+    car.internal_flip_time = 0.0f;
     car.air_time = 0.0f;
     car.air_time_since_jump = 0.0f;
     car.boosting_time = 0.0f;

@@ -175,6 +175,14 @@ PYBIND11_MODULE(rocketgpu_py, m) {
         .def_readwrite("vel_impulse_cache", &rocketgpu::CarState::vel_impulse_cache)
         .def_readwrite("ball_hit_info", &rocketgpu::CarState::ball_hit_info)
         .def_readwrite("last_controls", &rocketgpu::CarState::last_controls)
+        .def_readwrite("air_state", &rocketgpu::CarState::air_state)
+        .def_readwrite("dodge_timeout", &rocketgpu::CarState::dodge_timeout)
+        .def_readwrite("dodge_elapsed", &rocketgpu::CarState::dodge_elapsed)
+        .def_readwrite("dodge_dir_x", &rocketgpu::CarState::dodge_dir_x)
+        .def_readwrite("dodge_dir_y", &rocketgpu::CarState::dodge_dir_y)
+        .def_readwrite("latest_touch_tick", &rocketgpu::CarState::latest_touch_tick)
+        .def_readwrite("latest_touch_location", &rocketgpu::CarState::latest_touch_location)
+        .def_readwrite("latest_touch_normal", &rocketgpu::CarState::latest_touch_normal)
         .def_property(
             "wheels_with_contact",
             [](const rocketgpu::CarState& state) {
@@ -477,6 +485,14 @@ PYBIND11_MODULE(rocketgpu_py, m) {
             scalar("bump_event_other_id", "<u4", offsetof(S, bump_event_other_id), f);
             scalar("bump_event_is_demo", "|u1", offsetof(S, bump_event_is_demo), f);
             scalar("bump_event_was_bumper", "|u1", offsetof(S, bump_event_was_bumper), f);
+            scalar("air_state", "|u1", offsetof(S, air_state), f);
+            scalar("dodge_timeout", "<f4", offsetof(S, dodge_timeout), f);
+            scalar("dodge_elapsed", "<f4", offsetof(S, dodge_elapsed), f);
+            scalar("dodge_dir_x", "<f4", offsetof(S, dodge_dir_x), f);
+            scalar("dodge_dir_y", "<f4", offsetof(S, dodge_dir_y), f);
+            scalar("latest_touch_tick", "<u8", offsetof(S, latest_touch_tick), f);
+            vec3("latest_touch_location", offsetof(S, latest_touch_location), f);
+            vec3("latest_touch_normal", offsetof(S, latest_touch_normal), f);
             finish("car_states", sizeof(S), f);
         }
         {
@@ -836,12 +852,83 @@ PYBIND11_MODULE(rocketgpu_py, m) {
                 [](rc::CarStateCompat& st, float v) { st.carContact.cooldownTimer = v; })
             .def_readwrite("is_demoed", &rc::CarStateCompat::isDemoed)
             .def_readwrite("demo_respawn_timer", &rc::CarStateCompat::demoRespawnTimer)
-            .def_readwrite("last_controls", &rc::CarStateCompat::lastControls);
+            .def_readwrite("last_controls", &rc::CarStateCompat::lastControls)
+            .def_readwrite("air_state", &rc::CarStateCompat::airState)
+            .def_readwrite("dodge_timeout", &rc::CarStateCompat::dodgeTimeout)
+            .def_readwrite("dodge_elapsed", &rc::CarStateCompat::dodgeElapsed)
+            .def_readwrite("dodge_dir_x", &rc::CarStateCompat::dodgeDirX)
+            .def_readwrite("dodge_dir_y", &rc::CarStateCompat::dodgeDirY)
+            .def_property("latest_touch_tick",
+                [](const rc::CarStateCompat& st) { return st.latestTouch.tick; },
+                [](rc::CarStateCompat& st, uint64_t v) { st.latestTouch.tick = v; })
+            .def_property("latest_touch_location",
+                [](const rc::CarStateCompat& st) { return st.latestTouch.location; },
+                [](rc::CarStateCompat& st, const rocketgpu::Vec3& v) { st.latestTouch.location = v; })
+            .def_property("latest_touch_normal",
+                [](const rc::CarStateCompat& st) { return st.latestTouch.normal; },
+                [](rc::CarStateCompat& st, const rocketgpu::Vec3& v) { st.latestTouch.normal = v; });
+        // RocketSim v3's CarState (rocketsim crate), field for field; None where v3 has an empty Option.
+        py::class_<rc::CarStateV3>(c, "CarStateV3")
+            .def(py::init<>())
+            .def_readwrite("pos", &rc::CarStateV3::pos)
+            .def_readwrite("rot_mat", &rc::CarStateV3::rotMat)
+            .def_readwrite("vel", &rc::CarStateV3::vel)
+            .def_readwrite("ang_vel", &rc::CarStateV3::angVel)
+            .def_readwrite("controls", &rc::CarStateV3::controls)
+            .def_readwrite("has_jumped", &rc::CarStateV3::hasJumped)
+            .def_readwrite("has_double_jumped", &rc::CarStateV3::hasDoubleJumped)
+            .def_readwrite("has_flipped", &rc::CarStateV3::hasFlipped)
+            .def_readwrite("flip_rel_torque", &rc::CarStateV3::flipRelTorque)
+            .def_readwrite("jump_ticks", &rc::CarStateV3::jumpTicks)
+            .def_readwrite("flip_time", &rc::CarStateV3::flipTime)
+            .def_readwrite("is_flipping", &rc::CarStateV3::isFlipping)
+            .def_readwrite("is_jumping", &rc::CarStateV3::isJumping)
+            .def_readwrite("jump_hold_broken", &rc::CarStateV3::jumpHoldBroken)
+            .def_readwrite("air_time", &rc::CarStateV3::airTime)
+            .def_readwrite("air_time_since_jump", &rc::CarStateV3::airTimeSinceJump)
+            .def_readwrite("boost", &rc::CarStateV3::boost)
+            .def_readwrite("handbrake_val", &rc::CarStateV3::handbrakeVal)
+            .def_readwrite("is_supersonic", &rc::CarStateV3::isSupersonic)
+            .def_readwrite("supersonic_grace_timer", &rc::CarStateV3::supersonicGraceTimer)
+            .def_readwrite("time_since_boosted", &rc::CarStateV3::timeSinceBoosted)
+            .def_readwrite("boosting_time", &rc::CarStateV3::boostingTime)
+            .def_readwrite("is_boosting", &rc::CarStateV3::isBoosting)
+            .def_readwrite("is_auto_flipping", &rc::CarStateV3::isAutoFlipping)
+            .def_readwrite("auto_flip_timer", &rc::CarStateV3::autoFlipTimer)
+            .def_readwrite("auto_flip_torque_scale", &rc::CarStateV3::autoFlipTorqueScale)
+            .def_readwrite("bump_cooldown_timer", &rc::CarStateV3::bumpCooldownTimer)
+            .def_property("bump_cooldown_victim",
+                [](const rc::CarStateV3& st) -> py::object {
+                    return st.bumpCooldownVictim ? py::object(py::int_(st.bumpCooldownVictim)) : py::object(py::none());
+                },
+                [](rc::CarStateV3& st, py::object v) { st.bumpCooldownVictim = v.is_none() ? 0u : v.cast<uint32_t>(); })
+            .def_property("last_extra_hit_tick",
+                [](const rc::CarStateV3& st) -> py::object {
+                    return st.lastExtraHitTick != ~0ULL ? py::object(py::int_(st.lastExtraHitTick)) : py::object(py::none());
+                },
+                [](rc::CarStateV3& st, py::object v) { st.lastExtraHitTick = v.is_none() ? ~0ULL : v.cast<uint64_t>(); })
+            .def_readwrite("is_demoed", &rc::CarStateV3::isDemoed)
+            .def_readwrite("demo_respawn_timer", &rc::CarStateV3::demoRespawnTimer)
+            .def_readwrite("is_on_ground", &rc::CarStateV3::isOnGround)
+            .def_property("wheels_with_contact",
+                [](const rc::CarStateV3& st) { return std::vector<bool>(st.wheelsWithContact, st.wheelsWithContact + 4); },
+                [](rc::CarStateV3& st, const std::vector<bool>& v) { for (size_t i = 0; i < 4 && i < v.size(); ++i) st.wheelsWithContact[i] = v[i]; })
+            .def_property("world_contact_normal",
+                [](const rc::CarStateV3& st) -> py::object {
+                    return st.hasWorldContact ? py::cast(st.worldContactNormal) : py::object(py::none());
+                },
+                [](rc::CarStateV3& st, py::object v) {
+                    st.hasWorldContact = !v.is_none();
+                    st.worldContactNormal = v.is_none() ? rocketgpu::Vec3(0.0f, 0.0f, 0.0f) : v.cast<rocketgpu::Vec3>();
+                })
+            .def_readwrite("prev_controls", &rc::CarStateV3::prevControls);
         py::class_<rc::Car, std::unique_ptr<rc::Car, py::nodelete>>(c, "Car")
             .def_readonly("id", &rc::Car::id)
             .def_readonly("team", &rc::Car::team)
             .def("get_state", &rc::Car::GetState)
             .def("set_state", &rc::Car::SetState)
+            .def("get_state_v3", &rc::Car::GetStateV3)
+            .def("set_state_v3", &rc::Car::SetStateV3)
             .def("set_controls", &rc::Car::SetControls);
         py::class_<rc::Ball, std::unique_ptr<rc::Ball, py::nodelete>>(c, "Ball")
             .def("get_state", &rc::Ball::GetState)

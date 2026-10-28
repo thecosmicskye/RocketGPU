@@ -69,6 +69,9 @@ struct CarStateCompat : PhysState {
     bool hasDoubleJumped = false;
     bool hasFlipped = false;
     Vec3 flipRelTorque{};
+    // RocketSim v3 timer conventions, in both GetState and SetState (see CarState in rocketgpu.h):
+    // jumpTime is v3 jump_ticks / 120 (ticks since the jump started, or ended), flipTime is seconds since flip
+    // activity last changed. SetState rebuilds the step's internal clocks from them.
     float jumpTime = 0.0f;
     float flipTime = 0.0f;
     bool isFlipping = false;
@@ -80,7 +83,7 @@ struct CarStateCompat : PhysState {
     bool isBoosting = false;
     float boostingTime = 0.0f;
     bool isSupersonic = false;
-    float supersonicTime = 0.0f;
+    float supersonicTime = 0.0f;  // v3 supersonic_grace_timer
     float handbrakeVal = 0.0f;
     bool isAutoFlipping = false;
     float autoFlipTimer = 0.0f;
@@ -97,6 +100,61 @@ struct CarStateCompat : PhysState {
     float demoRespawnTimer = 0.0f;
     BallHitInfoCompat ballHitInfo{};
     CarControls lastControls{};
+    // RLBot v5 fields (CarState in rocketgpu.h). GetState reports them; SetState ignores the derived ones (airState,
+    // dodge*), which the next step recomputes. vel, angVel and isSupersonic left as GetState returned them keep the
+    // step's own values (uncapped velocities, the game's supersonic flag).
+    uint8_t airState = 0;
+    float dodgeTimeout = -1.0f;
+    float dodgeElapsed = 0.0f;
+    float dodgeDirX = 0.0f;
+    float dodgeDirY = 0.0f;
+    struct {
+        uint64_t tick = ~0ULL;
+        Vec3 location{};
+        Vec3 normal{};
+    } latestTouch;
+};
+
+// A car's state in RocketSim v3's conventions, field for field (rocketsim crate, CarState in sim/car/car_state.rs):
+// velocities before the speed caps, the step's own jump/flip flags, the grace-timer supersonic flag as of the end of
+// the tick, wheels in v3's order. Car::GetStateV3 / SetStateV3 convert, so a v3 state goes in and comes out unchanged.
+struct CarStateV3 {
+    Vec3 pos{};
+    RotMat rotMat = RotMat::GetIdentity();
+    Vec3 vel{};
+    Vec3 angVel{};
+    CarControls controls{};  // controls for the next step (Car::SetControls)
+    bool hasJumped = false;
+    bool hasDoubleJumped = false;
+    bool hasFlipped = false;
+    Vec3 flipRelTorque{};
+    uint32_t jumpTicks = 0;
+    float flipTime = 0.0f;
+    bool isFlipping = false;
+    bool isJumping = false;
+    bool jumpHoldBroken = false;  // tracked and stored, but RocketGPU's jump does not read it (a re-press resumes it)
+    float airTime = 0.0f;
+    float airTimeSinceJump = 0.0f;
+    float boost = 33.3f;
+    float handbrakeVal = 0.0f;
+    bool isSupersonic = false;
+    float supersonicGraceTimer = 0.0f;
+    float timeSinceBoosted = 0.0f;
+    float boostingTime = 0.0f;
+    bool isBoosting = false;
+    bool isAutoFlipping = false;
+    float autoFlipTimer = 0.0f;
+    float autoFlipTorqueScale = 0.0f;
+    float bumpCooldownTimer = 0.0f;
+    uint32_t bumpCooldownVictim = 0;  // victim's car id; 0 is None
+    uint64_t lastExtraHitTick = ~0ULL;  // ~0 is None
+    bool isDemoed = false;
+    float demoRespawnTimer = 0.0f;
+    bool isOnGround = true;
+    bool wheelsWithContact[4] = {true, true, true, true};
+    bool hasWorldContact = false;  // world_contact_normal is Some
+    Vec3 worldContactNormal{};
+    CarControls prevControls{};
 };
 
 struct BallStateCompat : PhysState {
@@ -118,6 +176,8 @@ public:
 
     CarStateCompat GetState() const;
     void SetState(const CarStateCompat& state);
+    CarStateV3 GetStateV3() const;
+    void SetStateV3(const CarStateV3& state);
     void SetControls(const CarControls& controls);
 
 private:

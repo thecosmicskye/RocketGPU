@@ -545,6 +545,14 @@ CarStateCompat Car::GetState() const {
     out.tickCountSinceUpdate = s.tick_count_since_update;
     out.ballHitInfo = BallHitInfoFromState(s.ball_hit_info);
     out.lastControls = s.last_controls;
+    out.airState = s.air_state;
+    out.dodgeTimeout = s.dodge_timeout;
+    out.dodgeElapsed = s.dodge_elapsed;
+    out.dodgeDirX = s.dodge_dir_x;
+    out.dodgeDirY = s.dodge_dir_y;
+    out.latestTouch.tick = s.latest_touch_tick;
+    out.latestTouch.location = s.latest_touch_location;
+    out.latestTouch.normal = s.latest_touch_normal;
     return out;
 }
 
@@ -553,8 +561,11 @@ void Car::SetState(const CarStateCompat& state) {
     CarState& s = arena_->car_states_[slot_];
     s.pos = state.pos;
     SeedCarBasisFromRotMat(s, state.rotMat);
-    s.vel = state.vel;
-    s.ang_vel = state.angVel;
+    // Velocities and the supersonic flag left as reported keep the step's values.
+    const bool reported = (s.reported_flags & CarState::kReportedValid) != 0;
+    const auto same = [](const Vec3& a, const Vec3& b) { return a.x == b.x && a.y == b.y && a.z == b.z; };
+    s.vel = (reported && same(state.vel, s.reported_vel)) ? s.internal_vel : state.vel;
+    s.ang_vel = (reported && same(state.angVel, s.reported_ang_vel)) ? s.internal_ang_vel : state.angVel;
     s.is_on_ground = state.isOnGround ? 1 : 0;
     for (int w = 0; w < 4; ++w) s.wheels_with_contact[w] = state.wheelsWithContact[w] ? 1 : 0;
     s.has_jumped = state.hasJumped ? 1 : 0;
@@ -571,7 +582,8 @@ void Car::SetState(const CarStateCompat& state) {
     s.time_since_boosted = state.timeSinceBoosted;
     s.is_boosting = state.isBoosting ? 1 : 0;
     s.boosting_time = state.boostingTime;
-    s.is_supersonic = state.isSupersonic ? 1 : 0;
+    s.is_supersonic = (reported && state.isSupersonic == ((s.reported_flags & CarState::kReportedIsSupersonic) != 0))
+        ? s.internal_is_supersonic : (state.isSupersonic ? 1 : 0);
     s.supersonic_time = state.supersonicTime;
     s.handbrake_val = state.handbrakeVal;
     s.is_auto_flipping = state.isAutoFlipping ? 1 : 0;
@@ -590,8 +602,140 @@ void Car::SetState(const CarStateCompat& state) {
     s.ball_hit_info.extra_hit_vel = state.ballHitInfo.extraHitVel;
     s.ball_hit_info.tick_count_when_hit = state.ballHitInfo.tickCountWhenHit;
     s.ball_hit_info.tick_count_when_extra_impulse_applied = state.ballHitInfo.tickCountWhenExtraImpulseApplied;
+    s.latest_touch_tick = state.latestTouch.tick;
+    s.latest_touch_location = state.latestTouch.location;
+    s.latest_touch_normal = state.latestTouch.normal;
     s.tick_count_since_update = 0;
     s.last_controls = state.lastControls;
+    arena_->PushStates();
+}
+
+CarStateV3 Car::GetStateV3() const {
+    arena_->PullStates();
+    CarState s = arena_->car_states_[slot_];
+    if (s.tick_count_since_update != 0) {
+        s.RestoreWorkingFields();  // the step's own velocities and flags, unless written since the step
+    } else if (s.supersonic_time > 0.0f) {
+        s.is_supersonic = 1;  // as the next step reads a set state
+    }
+    if (!s.supersonic_set_v3 && !s.is_demoed) {
+        // v3 updates the supersonic flag from the velocity at the end of a tick (car/base.rs post_tick_update); the
+        // step does it at the start of the next. Apply v3's update to this velocity.
+        const MutatorConfig& m = arena_->GetMutatorConfig();
+        const float speed_sq = s.vel.x * s.vel.x + s.vel.y * s.vel.y + s.vel.z * s.vel.z;
+        const float start_sq = m.supersonic_start_speed * m.supersonic_start_speed;
+        if (!s.is_supersonic) {
+            s.is_supersonic = speed_sq >= start_sq ? 1 : 0;
+            s.supersonic_time = 0.0f;
+        } else if (speed_sq >= start_sq) {
+            s.supersonic_time = 0.0f;
+        } else if (speed_sq < m.supersonic_maintain_min_speed * m.supersonic_maintain_min_speed) {
+            s.is_supersonic = 0;
+            s.supersonic_time = 0.0f;
+        } else {
+            s.supersonic_time += arena_->GetTickTime();
+            if (s.supersonic_time >= m.supersonic_maintain_max_time) {
+                s.is_supersonic = 0;
+                s.supersonic_time = 0.0f;
+            }
+        }
+    }
+    CarStateV3 out;
+    out.pos = s.pos;
+    out.rotMat = PublicRotMatFromCarState(s);
+    out.vel = s.vel;
+    out.angVel = s.ang_vel;
+    out.controls = arena_->controls_[slot_];
+    out.hasJumped = s.has_jumped != 0;
+    out.hasDoubleJumped = s.has_double_jumped != 0;
+    out.hasFlipped = s.has_flipped != 0;
+    out.flipRelTorque = s.flip_rel_torque;
+    out.jumpTicks = static_cast<uint32_t>(rintf(s.jump_time / arena_->GetTickTime()));
+    out.flipTime = s.flip_time;
+    out.isFlipping = s.is_flipping != 0;
+    out.isJumping = s.is_jumping != 0;
+    out.jumpHoldBroken = s.jump_hold_broken != 0;
+    out.airTime = s.air_time;
+    out.airTimeSinceJump = s.air_time_since_jump;
+    out.boost = s.boost;
+    out.handbrakeVal = s.handbrake_val;
+    out.isSupersonic = s.is_supersonic != 0;
+    out.supersonicGraceTimer = s.supersonic_time;
+    out.timeSinceBoosted = s.time_since_boosted;
+    out.boostingTime = s.boosting_time;
+    out.isBoosting = s.is_boosting != 0;
+    out.isAutoFlipping = s.is_auto_flipping != 0;
+    out.autoFlipTimer = s.auto_flip_timer;
+    out.autoFlipTorqueScale = s.auto_flip_torque_scale;
+    out.bumpCooldownTimer = s.car_contact.cooldown_timer;
+    out.bumpCooldownVictim = s.car_contact.other_car_id ? arena_->CompatIdFromDeviceId(s.car_contact.other_car_id) : 0;
+    out.lastExtraHitTick = s.ball_hit_info.is_valid ? s.ball_hit_info.tick_count_when_extra_impulse_applied : ~0ULL;
+    out.isDemoed = s.is_demoed != 0;
+    out.demoRespawnTimer = s.demo_respawn_timer;
+    out.isOnGround = s.is_on_ground != 0;
+    // v3 numbers each wheel pair the other way round (v3 wheel w is RocketGPU wheel w ^ 1).
+    for (int w = 0; w < 4; ++w) out.wheelsWithContact[w] = s.wheels_with_contact[w ^ 1] != 0;
+    out.hasWorldContact = s.world_contact.has_contact != 0;
+    out.worldContactNormal = s.world_contact.contact_normal;
+    out.prevControls = s.last_controls;
+    return out;
+}
+
+void Car::SetStateV3(const CarStateV3& state) {
+    arena_->PullStates();
+    CarState& s = arena_->car_states_[slot_];
+    const float dt = arena_->GetTickTime();
+    s.pos = state.pos;
+    SeedCarBasisFromRotMat(s, state.rotMat);
+    s.vel = state.vel;
+    s.ang_vel = state.angVel;
+    s.has_jumped = state.hasJumped ? 1 : 0;
+    s.has_double_jumped = state.hasDoubleJumped ? 1 : 0;
+    s.has_flipped = state.hasFlipped ? 1 : 0;
+    s.flip_rel_torque = state.flipRelTorque;
+    // jump_time sums dt per tick for its first 1024 ticks, like the step's jump clock (see CarState::jump_time).
+    float jump_time = 0.0f;
+    if (state.jumpTicks > 1024) {
+        jump_time = static_cast<float>(state.jumpTicks) * dt;
+    } else {
+        for (uint32_t i = 0; i < state.jumpTicks; ++i) jump_time += dt;
+    }
+    s.jump_time = jump_time;
+    s.flip_time = state.flipTime;
+    s.is_flipping = state.isFlipping ? 1 : 0;
+    s.is_jumping = state.isJumping ? 1 : 0;
+    s.jump_hold_broken = state.jumpHoldBroken ? 1 : 0;
+    s.air_time = state.airTime;
+    s.air_time_since_jump = state.airTimeSinceJump;
+    s.boost = state.boost;
+    s.handbrake_val = state.handbrakeVal;
+    s.is_supersonic = state.isSupersonic ? 1 : 0;
+    s.supersonic_time = state.supersonicGraceTimer;
+    s.supersonic_set_v3 = state.isDemoed ? 0 : 1;
+    s.time_since_boosted = state.timeSinceBoosted;
+    s.boosting_time = state.boostingTime;
+    s.is_boosting = state.isBoosting ? 1 : 0;
+    s.is_auto_flipping = state.isAutoFlipping ? 1 : 0;
+    s.auto_flip_timer = state.autoFlipTimer;
+    s.auto_flip_torque_scale = state.autoFlipTorqueScale;
+    s.car_contact.cooldown_timer = state.bumpCooldownTimer;
+    s.car_contact.other_car_id = state.bumpCooldownVictim;
+    if (state.lastExtraHitTick == ~0ULL) {
+        s.ball_hit_info.tick_count_when_extra_impulse_applied = ~0ULL;
+    } else {
+        s.ball_hit_info.is_valid = 1;
+        s.ball_hit_info.tick_count_when_extra_impulse_applied = state.lastExtraHitTick;
+    }
+    s.is_demoed = state.isDemoed ? 1 : 0;
+    s.demo_respawn_timer = state.demoRespawnTimer;
+    s.is_on_ground = state.isOnGround ? 1 : 0;
+    for (int w = 0; w < 4; ++w) s.wheels_with_contact[w ^ 1] = state.wheelsWithContact[w] ? 1 : 0;
+    s.world_contact.has_contact = state.hasWorldContact ? 1 : 0;
+    s.world_contact.contact_normal = state.hasWorldContact ? state.worldContactNormal : Vec3(0.0f, 0.0f, 0.0f);
+    s.last_controls = state.prevControls;
+    s.reported_flags = 0;  // every field above is the step's own value
+    s.tick_count_since_update = 0;
+    arena_->controls_[slot_] = state.controls;
     arena_->PushStates();
 }
 

@@ -25,7 +25,7 @@ Meshes are not included. Dump them from your own copy of Rocket League, then set
 export ROCKETGPU_COLLISION_MESH_DIR=/path/to/collision_meshes
 ```
 
-The folder needs `soccar/` (the RocketSim arena meshes) and `soccar_goals/` (the goal meshes `goal_obj8.cmf` to `goal_obj11.cmf`).
+The folder needs `soccar/` (the RocketSim arena meshes).
 
 ## Use
 
@@ -46,6 +46,19 @@ sim.step(1)
 cars = sim.download_car_states(sim.car_capacity())
 ```
 
+## Car state
+
+Car fields that RLBot v5 exposes hold RLBot's value for the tick: `vel` and `ang_vel` after the speed caps,
+`is_supersonic` (speed >= 2200), `has_jumped`, `has_double_jumped`, `has_flipped`, and the RLBot-only `air_state`,
+`dodge_timeout`, `dodge_elapsed`, `dodge_dir_x`/`dodge_dir_y` and latest ball touch. The other timers follow RocketSim
+v3 (`jump_time` is v3's `jump_ticks / 120`). Written states use the same meanings; set `tick_count_since_update = 0` on
+every car you change. `include/rocketgpu/rocketgpu.h` documents each field.
+
+For RocketSim v3's own conventions, the compat `Car::GetStateV3` / `SetStateV3` (Python `get_state_v3` /
+`set_state_v3`) read and write `CarStateV3`, which mirrors v3's `CarState` field for field: velocities before the caps,
+the step's own flags, `jump_ticks`, the grace-timer `is_supersonic`, `bump_cooldown_victim` (a car id) and
+`last_extra_hit_tick` (`None` when unset). RocketGPU stores `jump_hold_broken` but its jump does not read it.
+
 ## Speed
 
 RTX 5090, random controls, 55% 1v1, 27% 2v2 and 18% 3v3 arenas:
@@ -59,23 +72,23 @@ RTX 5090, random controls, 55% 1v1, 27% 2v2 and 18% 3v3 arenas:
 
 ## Accuracy
 
-Compared against RocketSim v3 (latest), using RLBot recordings as ground truth.
+Compared against RocketSim v3 (latest).
 
-**RLBot match suite** (lower is better)
+**RLBot match suite**: real-game states captured through RLBot (lower is better)
 
 | | RocketGPU | v3 (latest) |
 |---|---|---|
-| Mean position error after 1 s, all 2342 match windows (uu) | 1.152 | 2.409 |
+| Mean position error after 1 s, all 2342 match windows (uu) | 0.857 | 2.409 |
 | Mean position error, 393 plan trials (uu) | 0.133 | 0.271 |
 
-**v3's suite** (pass %: higher is better; error norm: lower is better)
+**v3's suite**: v3's real-game recordings, scored with its `rlpr_metric` (pass %: higher is better; error norm: lower is better)
 
 | | RocketGPU | v3 (latest) |
 |---|---|---|
-| Games, pass % (688,806 car-ticks) | 91.75 | 91.01 |
-| Games, mean error norm | 8.38 | 9.09 |
-| Special cases, pass % (14,356 car-ticks) | 91.13 | 90.34 |
-| Special cases, mean error norm | 1.11 | 2.01 |
+| Games, pass % (709,990 car-ticks) | 93.17 | 92.29 |
+| Games, mean error norm | 1.86 | 2.88 |
+| Special cases, pass % (15,586 car-ticks) | 91.23 | 90.12 |
+| Special cases, mean error norm | 0.97 | 1.82 |
 
 ## License
 

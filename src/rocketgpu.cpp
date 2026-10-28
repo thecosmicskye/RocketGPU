@@ -148,6 +148,8 @@ Vec3 BtVec3ToUuMirror(const Vec3& value_bt) {
 
 void CanonicalizeImportedCarStatesInPlace(CarState* states, size_t count) {
     for (size_t idx = 0; idx < count; ++idx) {
+        // A stepped car (tick_count_since_update != 0) imports the step's values behind its reported RLBot fields.
+        const uint8_t kept = states[idx].tick_count_since_update != 0 ? states[idx].RestoreWorkingFields() : 0;
         states[idx].ResetTrainingHistory();
         states[idx].pos_bt = ImportedCarLinearVec3Bt(states[idx].pos);
 
@@ -156,6 +158,7 @@ void CanonicalizeImportedCarStatesInPlace(CarState* states, size_t count) {
         states[idx].vel = CanonicalizeImportedLinearVec3(states[idx].vel);
 
         detail::CanonicalizeImportedCarOrientation(states[idx]);
+        states[idx].ReReportFields(kept);
     }
 }
 
@@ -340,9 +343,6 @@ struct BatchSim::Impl {
             std::vector<detail::ArenaMeshBvhSubtreeInfo> host_mesh_subtrees;
 
             const bool soccar_arena = cfg.mode == Mode::Soccar || cfg.mode == Mode::Snowday || cfg.mode == Mode::Heatseeker;
-            if (soccar_arena && !detail::HasGoalMeshes()) {
-                throw std::runtime_error("soccar arenas need the game's local goal meshes in <collision mesh dir>/soccar_goals/");
-            }
             std::vector<detail::ArenaMeshTriangle> host_local_mesh;
             int local_goal_meshes = 0;
             std::vector<detail::ArenaMeshTriangle> host_mesh = LoadArenaMeshTriangles(
@@ -354,7 +354,7 @@ struct BatchSim::Impl {
                 &local_goal_meshes);
             if (soccar_arena) {
                 if (local_goal_meshes == 0 || host_local_mesh.size() != host_mesh.size()) {
-                    throw std::runtime_error("no local goal mesh in soccar_goals/ matches the arena meshes");
+                    throw std::runtime_error("no goal mesh found in the soccar arena meshes");
                 }
                 arena_mesh_local_triangles.resize(host_local_mesh.size());
                 arena_mesh_local_triangles.copy_from_host(host_local_mesh.data(), host_local_mesh.size());
@@ -476,7 +476,6 @@ struct BatchSim::Impl {
     detail::Buffer<detail::CarSharedFrictionContactRow> rows_world_friction;
     detail::Buffer<detail::SharedContactOrderGroup> rows_shared_contact_order_groups;
     detail::Buffer<detail::BulletManifoldEntry> rows_bullet_manifolds;
-    detail::Buffer<detail::ContactSortScratch> contact_sort_scratch;
     detail::WorldSolverScratchRowPool solver_row_pool;
     detail::Buffer<uint8_t> respawn_slot_overrides;
     detail::Buffer<CarControls> controls;
@@ -655,11 +654,6 @@ struct BatchSim::Impl {
         rows_shared_contact_order_groups.resize(n * detail::kMaxSharedContactOrderGroups);
         rows_bullet_manifolds.resize(n * detail::kMaxBulletManifoldEntries);
         solver_row_pool = detail::WorldSolverScratchRowPool{};
-#if defined(ROCKETGPU_USE_CUDA)
-        contact_sort_scratch.resize(n);
-        solver_row_pool.contact_sort_scratch = contact_sort_scratch.data();
-        solver_row_pool.contact_sort_stride = sizeof(detail::ContactSortScratch);
-#endif
         solver_row_pool.ball_split_rows = rows_ball_split.data();
         solver_row_pool.ball_velocity_rows = rows_ball_velocity.data();
         solver_row_pool.ball_friction_rows = rows_ball_friction.data();
