@@ -1282,9 +1282,17 @@ ROCKETGPU_HD void CheckBoostPadCollisionForCar(
     const int visit_max_x = Min(car_cell_x + 1, BoostPadGridCellsX() - 1);
     const int visit_min_y = Max(car_cell_y - 1, 0);
     const int visit_max_y = Min(car_cell_y + 1, BoostPadGridCellsY() - 1);
+    constexpr float kUUToBT = 1.0f / 50.0f;
     for (int p = 0; p < BoostPadCount(cfg); ++p) {
-        BoostPadState& pad = pads[pad_base + p];
         const Vec3 pad_pos = BoostPadLoc(cfg, p);
+        // Loose bounds on BoostPadCheckCollideBt for either pad size, so most pads skip loading their state.
+        const float near_dx = car.pos_bt.x - pad_pos.x * kUUToBT;
+        const float near_dy = car.pos_bt.y - pad_pos.y * kUUToBT;
+        if (near_dx * near_dx + near_dy * near_dy > (216.0f * kUUToBT) * (216.0f * kUUToBT) ||
+            Abs(car.pos_bt.z - pad_pos.z * kUUToBT) > (110.0f * kUUToBT)) {
+            continue;
+        }
+        BoostPadState& pad = pads[pad_base + p];
         const int pad_cell_x = BoostPadGridIndexX(pad_pos.x);
         const int pad_cell_y = BoostPadGridIndexY(pad_pos.y);
 
