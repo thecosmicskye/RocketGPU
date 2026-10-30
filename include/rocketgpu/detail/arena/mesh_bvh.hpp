@@ -144,6 +144,9 @@ struct ArenaMeshBvhMeshInfo {
     int32_t dfs_subtree_offset = -1;
 
     float cal_origin_y = 0.0f;
+    // Arena-wide, the same on every mesh (SetArenaMeshFreeBox): no mesh AABB meets |x| < free_half_x, |y| < free_half_y.
+    float free_half_x = 0.0f;
+    float free_half_y = 0.0f;
 };
 
 enum ArenaTriangleEdgeFlags : uint8_t {

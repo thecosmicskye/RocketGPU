@@ -126,6 +126,10 @@ struct CarConfig {
     float back_suspension_rest = 37.055f;
     float dodge_deadzone = 0.5f;
     uint8_t three_wheels = 0;
+    // Steer angle (rad) at |forward speed| 0, 500, 1000, 1500, 1750, 3000 uu/s, and the powerslide one at 0, 2500.
+    // Per body: RLPR wheel steer gives the Plank its own values (see PlankConfig).
+    float steer_angle_curve[6] = {0.53356f, 0.31930f, 0.18203f, 0.10570f, 0.08507f, 0.03454f};
+    float powerslide_steer_angle_curve[2] = {0.39235f, 0.12610f};
 };
 
 struct BallHitInfo {
@@ -307,11 +311,20 @@ struct CarState {
     uint8_t reported_flags = 0;  // kReported* bits of the reported flags; kReportedValid once reported
     uint8_t game_has_jumped = 0;  // the game's has_jumped, reported as has_jumped
     uint8_t double_jump_ticks = 255;  // ticks since has_double_jumped was set; 255 when unknown or not set
-    // v3's jump_hold_broken (car/base.rs update_jump), kept for compat GetStateV3 only: the step's jump does not read it.
+    // v3's jump_hold_broken (car/base.rs update_jump): the jump's hold was released; set only while jumping.
     uint8_t jump_hold_broken = 0;
     // Set by compat SetStateV3, whose supersonic flag already reflects the state's velocity (v3 updates it at the end of
     // a tick, the step at the start of the next): the next step skips its tick-start update once.
     uint8_t supersonic_set_v3 = 0;
+    // Set by compat SetStateV3 when the state carries the game's per-wheel contact normals (RocketGPU wheel order):
+    // the previous tick's wheel contacts, which the first step's sticky force and auto-roll read instead of a raycast
+    // at the set pose. Bit w of set_wheel_normals_mask marks wheel w in contact, bit 4 that the normals were supplied;
+    // cleared by that step.
+    Vec3 set_wheel_normals[4] = {};
+    uint8_t set_wheel_normals_mask = 0;
+    // The car's tick-start ang_vel, saved when another car's wheel first pushes it this tick (that step's
+    // pushed-cars mask): v3 update_air_torque damps the tick-start state.phys.ang_vel, not the pushed body's.
+    Vec3 cal_tick_start_ang_vel = Vec3(0.0f, 0.0f, 0.0f);
 
     static constexpr uint8_t kReportedVel = 1, kReportedAngVel = 2, kReportedHasJumped = 4,
         kReportedHasDoubleJumped = 8, kReportedHasFlipped = 16, kReportedIsSupersonic = 32, kReportedValid = 128;
@@ -409,6 +422,12 @@ struct BallState {
     uint32_t basis_authoritative = 0;
 
     Vec3 vel_impulse_cache_bt = Vec3(0.0f, 0.0f, 0.0f);
+
+    // Bullet activation: 0 awake, 1 asleep (ISLAND_SLEEPING: no gravity, frozen until a car touches it), 2 just
+    // uploaded (the next step infers it, see ResolveBallActivationAtTickStart). deactivation_time is Bullet's
+    // m_deactivationTime: seconds spent below the sleeping thresholds.
+    uint32_t sleeping = 0;
+    float deactivation_time = 0.0f;
 };
 
 struct BoostPadState {

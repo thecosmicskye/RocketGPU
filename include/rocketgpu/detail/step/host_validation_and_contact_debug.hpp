@@ -1175,6 +1175,16 @@ ROCKETGPU_HD void RayCastTriangleLikeBullet(
     hit = true;
 }
 
+// The arena planes are axis-aligned, so CastStaticPlaneLikeBullet's two triangles lie exactly in the plane and their
+// normal is exactly along it: each triangle cast returns at dist_a * dist_b >= 0 unless the ray endpoints are strictly
+// on opposite sides. False only when the cast cannot hit (NaN endpoints return true and take the full cast).
+ROCKETGPU_HD bool StaticPlaneRayMayCross(
+    const Vec3& source_bt, const Vec3& to_bt, const Vec3& plane_origin_bt, const Vec3& plane_normal) {
+    const float side_from = Dot(plane_normal, source_bt - plane_origin_bt);
+    const float side_to = Dot(plane_normal, to_bt - plane_origin_bt);
+    return !((side_from >= 0.0f && side_to >= 0.0f) || (side_from <= 0.0f && side_to <= 0.0f));
+}
+
 ROCKETGPU_HD void CastStaticPlaneLikeBullet(
     const Vec3& source_bt,
     const Vec3& to_bt,
@@ -1248,13 +1258,21 @@ ROCKETGPU_HD void CastArenaRayPlanesImpl(const Vec3& source_bt, const Vec3& ray_
     const Vec3 to_bt = source_bt + ray_delta_bt;
 
     if (Abs(ray_delta_bt.z) > kEps) {
-        CastStaticPlaneLikeBullet(source_bt, to_bt, Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 1.0f), max_len, best, native_table, native_shift);
-        CastStaticPlaneLikeBullet(source_bt, to_bt, Vec3(0.0f, 0.0f, ArenaHeight() * kUUToBT), Vec3(0.0f, 0.0f, -1.0f), max_len, best, native_table, native_shift);
+        if (StaticPlaneRayMayCross(source_bt, to_bt, Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 1.0f))) {
+            CastStaticPlaneLikeBullet(source_bt, to_bt, Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 1.0f), max_len, best, native_table, native_shift);
+        }
+        if (StaticPlaneRayMayCross(source_bt, to_bt, Vec3(0.0f, 0.0f, ArenaHeight() * kUUToBT), Vec3(0.0f, 0.0f, -1.0f))) {
+            CastStaticPlaneLikeBullet(source_bt, to_bt, Vec3(0.0f, 0.0f, ArenaHeight() * kUUToBT), Vec3(0.0f, 0.0f, -1.0f), max_len, best, native_table, native_shift);
+        }
     }
 
     if (Abs(ray_delta_bt.x) > kEps) {
-        CastStaticPlaneLikeBullet(source_bt, to_bt, Vec3(ArenaExtentX() * kUUToBT, 0.0f, ArenaHeight() * 0.5f * kUUToBT), Vec3(-1.0f, 0.0f, 0.0f), max_len, best, native_table, native_shift);
-        CastStaticPlaneLikeBullet(source_bt, to_bt, Vec3(-ArenaExtentX() * kUUToBT, 0.0f, ArenaHeight() * 0.5f * kUUToBT), Vec3(1.0f, 0.0f, 0.0f), max_len, best, native_table, native_shift);
+        if (StaticPlaneRayMayCross(source_bt, to_bt, Vec3(ArenaExtentX() * kUUToBT, 0.0f, ArenaHeight() * 0.5f * kUUToBT), Vec3(-1.0f, 0.0f, 0.0f))) {
+            CastStaticPlaneLikeBullet(source_bt, to_bt, Vec3(ArenaExtentX() * kUUToBT, 0.0f, ArenaHeight() * 0.5f * kUUToBT), Vec3(-1.0f, 0.0f, 0.0f), max_len, best, native_table, native_shift);
+        }
+        if (StaticPlaneRayMayCross(source_bt, to_bt, Vec3(-ArenaExtentX() * kUUToBT, 0.0f, ArenaHeight() * 0.5f * kUUToBT), Vec3(1.0f, 0.0f, 0.0f))) {
+            CastStaticPlaneLikeBullet(source_bt, to_bt, Vec3(-ArenaExtentX() * kUUToBT, 0.0f, ArenaHeight() * 0.5f * kUUToBT), Vec3(1.0f, 0.0f, 0.0f), max_len, best, native_table, native_shift);
+        }
     }
 
     if (Abs(ray_delta_bt.y) > kEps) {
@@ -1514,6 +1532,12 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
         Max(ray_source_bt.x, to_bt.x),
         Max(ray_source_bt.y, to_bt.y),
         Max(ray_source_bt.z, to_bt.z));
+    // Inside the free box every mesh AABB misses the ray AABB (each lies beyond it in x or y), so each mesh is skipped
+    // by the test below.
+    if (ray_max_bt.x < mesh_bvh_meshes[0].free_half_x && ray_min_bt.x > -mesh_bvh_meshes[0].free_half_x &&
+        ray_max_bt.y < mesh_bvh_meshes[0].free_half_y && ray_min_bt.y > -mesh_bvh_meshes[0].free_half_y) {
+        return best.hit != 0;
+    }
     float best_fraction = best.hit ? best.ray_fraction : 1.0f;
 
     uint16_t quantized_query_aabb_min[3] = {0, 0, 0};
@@ -1521,6 +1545,13 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
 
     for (int mesh_info_idx = 0; mesh_info_idx < mesh_bvh_mesh_count; ++mesh_info_idx) {
         const ArenaMeshBvhMeshInfo& mesh_info = mesh_bvh_meshes[mesh_info_idx];
+        // aabb_min/max is the union of this mesh's triangle AABBs, so when it misses the ray AABB every
+        // triangle fails the per-triangle AABB test below: skipping the walk can't change the hit.
+        if (mesh_info.aabb_max.x < ray_min_bt.x || mesh_info.aabb_min.x > ray_max_bt.x ||
+            mesh_info.aabb_max.y < ray_min_bt.y || mesh_info.aabb_min.y > ray_max_bt.y ||
+            mesh_info.aabb_max.z < ray_min_bt.z || mesh_info.aabb_min.z > ray_max_bt.z) {
+            continue;
+        }
         if (mesh_info.mesh_index < 0 ||
             mesh_info.mesh_index >= mesh_bvh_quantization_count ||
             mesh_info.node_offset < 0 ||
@@ -1529,13 +1560,6 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
             mesh_info.triangle_start < 0 ||
             mesh_info.triangle_count <= 0 ||
             mesh_info.triangle_start + mesh_info.triangle_count > mesh_triangle_count) {
-            continue;
-        }
-        // aabb_min/max is the union of this mesh's triangle AABBs, so when it misses the ray AABB every
-        // triangle fails the per-triangle AABB test below: skipping the walk can't change the hit.
-        if (mesh_info.aabb_max.x < ray_min_bt.x || mesh_info.aabb_min.x > ray_max_bt.x ||
-            mesh_info.aabb_max.y < ray_min_bt.y || mesh_info.aabb_min.y > ray_max_bt.y ||
-            mesh_info.aabb_max.z < ray_min_bt.z || mesh_info.aabb_min.z > ray_max_bt.z) {
             continue;
         }
 
@@ -1552,6 +1576,10 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
             mesh_subtrees = mesh_bvh_subtrees + mesh_info.subtree_offset;
             mesh_subtree_count = mesh_info.subtree_count;
         }
+        // Bullet's reportRayOverlappingNodex walks the whole quantized tree stacklessly (node order), and the closest
+        // hit keeps the first triangle on an exact fraction tie: walk the node-ordered headers, not the build-order ones.
+        SelectArenaMeshBvhDfsOrderSubtrees(
+            mesh_info, mesh_bvh_subtrees, mesh_bvh_subtree_count, mesh_subtrees, mesh_subtree_count);
 
         WalkArenaMeshBvhStacklessQuantizedTreeCacheFriendly(
             mesh_bvh_nodes,

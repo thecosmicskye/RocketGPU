@@ -104,41 +104,36 @@ bool SolverRowsInterleavedDefault() {
 #endif
 }
 
-float CanonicalizeImportedLinearScalar(float value) {
+// The game reports a body's state in uu as its Bullet value times 50, and quantizes that product at tick start. An
+// imported uu value is restored to the Bullet value whose product with 50 gives it back exactly (the nearest float to
+// value / 50 that does), so the readback and the tick-start quantize see the recorded value bit for bit.
+float ImportedLinearScalarBt(float value) {
     constexpr float kUUToBT = 1.0f / 50.0f;
     constexpr float kBTToUU = 50.0f;
-    return (value * kUUToBT) * kBTToUU;
-}
-
-Vec3 CanonicalizeImportedLinearVec3(const Vec3& value) {
-    return Vec3(
-        CanonicalizeImportedLinearScalar(value.x),
-        CanonicalizeImportedLinearScalar(value.y),
-        CanonicalizeImportedLinearScalar(value.z));
-}
-
-float ImportedBallLinearScalarBt(float value) {
-    constexpr float kUUToBT = 1.0f / 50.0f;
-    return CanonicalizeImportedLinearScalar(value) * kUUToBT;
-}
-
-Vec3 ImportedBallLinearVec3Bt(const Vec3& value) {
-    return Vec3(
-        ImportedBallLinearScalarBt(value.x),
-        ImportedBallLinearScalarBt(value.y),
-        ImportedBallLinearScalarBt(value.z));
-}
-
-float ImportedCarLinearScalarBt(float value) {
-    constexpr float kUUToBT = 1.0f / 50.0f;
-    return CanonicalizeImportedLinearScalar(value) * kUUToBT;
+    const float bt = value * kUUToBT;
+    if (bt * kBTToUU == value) {
+        return bt;
+    }
+    const float up = nextafterf(bt, INFINITY);
+    const float down = nextafterf(bt, -INFINITY);
+    if (up * kBTToUU == value) {
+        return up;
+    }
+    if (down * kBTToUU == value) {
+        return down;
+    }
+    return bt;
 }
 
 Vec3 ImportedCarLinearVec3Bt(const Vec3& value) {
     return Vec3(
-        ImportedCarLinearScalarBt(value.x),
-        ImportedCarLinearScalarBt(value.y),
-        ImportedCarLinearScalarBt(value.z));
+        ImportedLinearScalarBt(value.x),
+        ImportedLinearScalarBt(value.y),
+        ImportedLinearScalarBt(value.z));
+}
+
+Vec3 ImportedBallLinearVec3Bt(const Vec3& value) {
+    return ImportedCarLinearVec3Bt(value);
 }
 
 Vec3 BtVec3ToUuMirror(const Vec3& value_bt) {
@@ -155,7 +150,7 @@ void CanonicalizeImportedCarStatesInPlace(CarState* states, size_t count) {
 
         states[idx].vel_bt = ImportedCarLinearVec3Bt(states[idx].vel);
         states[idx].pos = BtVec3ToUuMirror(states[idx].pos_bt);
-        states[idx].vel = CanonicalizeImportedLinearVec3(states[idx].vel);
+        states[idx].vel = BtVec3ToUuMirror(states[idx].vel_bt);
 
         detail::CanonicalizeImportedCarOrientation(states[idx]);
         states[idx].ReReportFields(kept);
@@ -168,6 +163,8 @@ void CanonicalizeImportedBallStatesInPlace(BallState* states, size_t count) {
         states[idx].vel_bt = ImportedBallLinearVec3Bt(states[idx].vel);
         states[idx].pos = BtVec3ToUuMirror(states[idx].pos_bt);
         states[idx].vel = BtVec3ToUuMirror(states[idx].vel_bt);
+        states[idx].sleeping = 2;
+        states[idx].deactivation_time = 0.0f;
     }
 }
 }
@@ -210,9 +207,17 @@ CarConfig DominusConfig() {
                             13.50f, 33.85f, Vec3(-34.75f, 33.00f, 15.75f), false);
 }
 CarConfig PlankConfig() {
-    return MakePresetConfig(Vec3(131.32f, 87.1704f, 31.8944f), Vec3(9.00857f, 0.0f, 12.0942f),
-                            12.50f, 31.9242f, Vec3(49.97f, 27.80f, 12.0942f),
-                            17.00f, 27.9242f, Vec3(-35.43f, 20.28f, 12.0942f), false);
+    CarConfig c = MakePresetConfig(Vec3(131.32f, 87.1704f, 31.8944f), Vec3(9.00857f, 0.0f, 12.0942f),
+                                   12.50f, 31.9242f, Vec3(49.97f, 27.80f, 12.0942f),
+                                   17.00f, 27.9242f, Vec3(-35.43f, 20.28f, 12.0942f), false);
+    // Least-squares knots of RLPR wheel steer vs the previous tick's |forward speed| over all four Plank cars of
+    // daizen_2v2_300s (28.5k steer-at-full-input ticks, rms 1.4e-6; 195 powerslide ticks, rms 3.4e-7). The same fit
+    // on the Octane and Merc recordings returns the default curves to 5e-6.
+    const float steer[6] = {0.529582f, 0.317619f, 0.181425f, 0.105480f, 0.084926f, 0.034519f};
+    for (int i = 0; i < 6; ++i) c.steer_angle_curve[i] = steer[i];
+    c.powerslide_steer_angle_curve[0] = 0.389930f;
+    c.powerslide_steer_angle_curve[1] = 0.125785f;
+    return c;
 }
 CarConfig BreakoutConfig() {
     return MakePresetConfig(Vec3(133.992f, 83.021f, 32.8f), Vec3(12.5f, 0.0f, 11.75f),
@@ -361,6 +366,7 @@ struct BatchSim::Impl {
                 cfg.mutator.cal_arena_local_tris = arena_mesh_local_triangles.data();
             }
             if (!host_mesh.empty()) {
+                detail::SetArenaMeshFreeBox(host_mesh_infos);
                 arena_mesh_triangles.resize(host_mesh.size());
                 arena_mesh_triangles.copy_from_host(host_mesh.data(), host_mesh.size());
                 cfg.arena_mesh_tris = arena_mesh_triangles.data();
@@ -476,6 +482,12 @@ struct BatchSim::Impl {
     detail::Buffer<detail::CarSharedFrictionContactRow> rows_world_friction;
     detail::Buffer<detail::SharedContactOrderGroup> rows_shared_contact_order_groups;
     detail::Buffer<detail::BulletManifoldEntry> rows_bullet_manifolds;
+    detail::Buffer<detail::CarCarPairCachedContact> rows_pair_contact_cache;
+    detail::Buffer<detail::CarWorldPlaneRetainedManifold> rows_car_world_plane;
+    detail::Buffer<detail::CarWorldMeshRetainedManifold> rows_car_world_mesh;
+    detail::Buffer<detail::CarCarRetainedManifold> rows_car_car_retained;
+    detail::Buffer<detail::BallCarRetainedManifold> rows_ball_car_retained;
+    detail::Buffer<detail::CarWorldLocalRows> rows_car_world_local;  // per-call scratch: never zeroed, copied or read back
     detail::WorldSolverScratchRowPool solver_row_pool;
     detail::Buffer<uint8_t> respawn_slot_overrides;
     detail::Buffer<CarControls> controls;
@@ -642,17 +654,24 @@ struct BatchSim::Impl {
 
     void allocate_solver_rows() {
         const size_t n = static_cast<size_t>(cfg.env_count);
-        rows_ball_split.resize(n * detail::kMaxBallSplitContactRows);
-        rows_ball_velocity.resize(n * detail::kMaxBallVelocityContactRows);
-        rows_ball_friction.resize(n * detail::kMaxBallFrictionContactRows);
-        rows_pair_split.resize(n * detail::kMaxCarPairSplitContactRows);
-        rows_world_split.resize(n * detail::kMaxCarSharedSplitContactRows);
-        rows_pair_velocity.resize(n * detail::kMaxCarPairSharedVelocityContactRows);
-        rows_pair_friction.resize(n * detail::kMaxCarPairSharedFrictionContactRows);
-        rows_world_velocity.resize(n * detail::kMaxCarWorldSharedVelocityContactRows);
-        rows_world_friction.resize(n * detail::kMaxCarWorldSharedFrictionContactRows);
-        rows_shared_contact_order_groups.resize(n * detail::kMaxSharedContactOrderGroups);
-        rows_bullet_manifolds.resize(n * detail::kMaxBulletManifoldEntries);
+        const detail::WorldSolverScratchRowCaps caps = detail::MakeWorldSolverScratchRowCaps(cfg.max_cars_per_env);
+        rows_ball_split.resize(n * caps.ball_split);
+        rows_ball_velocity.resize(n * caps.ball_velocity);
+        rows_ball_friction.resize(n * caps.ball_friction);
+        rows_pair_split.resize(n * caps.pair_split);
+        rows_world_split.resize(n * caps.world_split);
+        rows_pair_velocity.resize(n * caps.pair_velocity);
+        rows_pair_friction.resize(n * caps.pair_friction);
+        rows_world_velocity.resize(n * caps.world_velocity);
+        rows_world_friction.resize(n * caps.world_friction);
+        rows_shared_contact_order_groups.resize(n * caps.order_groups);
+        rows_bullet_manifolds.resize(n * caps.manifolds);
+        rows_pair_contact_cache.resize(n * caps.pair_cache_cars * caps.pair_cache_cars);
+        rows_car_world_plane.resize(n * caps.car_world_plane);
+        rows_car_world_mesh.resize(n * caps.car_world_mesh);
+        rows_car_car_retained.resize(n * caps.car_car_retained);
+        rows_ball_car_retained.resize(n * caps.ball_car_retained);
+        rows_car_world_local.resize(n * caps.car_world_local);
         solver_row_pool = detail::WorldSolverScratchRowPool{};
         solver_row_pool.ball_split_rows = rows_ball_split.data();
         solver_row_pool.ball_velocity_rows = rows_ball_velocity.data();
@@ -665,8 +684,15 @@ struct BatchSim::Impl {
         solver_row_pool.world_friction_rows = rows_world_friction.data();
         solver_row_pool.shared_contact_order_groups = rows_shared_contact_order_groups.data();
         solver_row_pool.bullet_manifolds = rows_bullet_manifolds.data();
+        solver_row_pool.pair_contact_cache = rows_pair_contact_cache.data();
+        solver_row_pool.car_world_plane_manifolds = rows_car_world_plane.data();
+        solver_row_pool.car_world_mesh_manifolds = rows_car_world_mesh.data();
+        solver_row_pool.car_car_retained_manifolds = rows_car_car_retained.data();
+        solver_row_pool.ball_car_retained_manifolds = rows_ball_car_retained.data();
+        solver_row_pool.car_world_local_rows = rows_car_world_local.data();
         solver_row_pool.env_count = cfg.env_count;
         solver_row_pool.interleaved = SolverRowsInterleavedDefault() ? 1 : 0;
+        solver_row_pool.caps = caps;
     }
 
     void memset_zero_solver_rows(cudaStream_t stream) {
@@ -681,11 +707,17 @@ struct BatchSim::Impl {
         rows_world_friction.memset_zero(stream);
         rows_shared_contact_order_groups.memset_zero(stream);
         rows_bullet_manifolds.memset_zero(stream);
+        rows_pair_contact_cache.memset_zero(stream);
+        rows_car_world_plane.memset_zero(stream);
+        rows_car_world_mesh.memset_zero(stream);
+        rows_car_car_retained.memset_zero(stream);
+        rows_ball_car_retained.memset_zero(stream);
     }
 
     void copy_solver_rows_from(const Impl& source, cudaStream_t stream) {
         if (source.solver_row_pool.interleaved != solver_row_pool.interleaved ||
-            source.solver_row_pool.env_count != solver_row_pool.env_count) {
+            source.solver_row_pool.env_count != solver_row_pool.env_count ||
+            source.cfg.max_cars_per_env != cfg.max_cars_per_env) {
             throw std::invalid_argument("copy_solver_rows_from: row pool layout mismatch");
         }
         rows_ball_split.copy_from_buffer(source.rows_ball_split, rows_ball_split.size(), stream);
@@ -699,6 +731,11 @@ struct BatchSim::Impl {
         rows_world_friction.copy_from_buffer(source.rows_world_friction, rows_world_friction.size(), stream);
         rows_shared_contact_order_groups.copy_from_buffer(source.rows_shared_contact_order_groups, rows_shared_contact_order_groups.size(), stream);
         rows_bullet_manifolds.copy_from_buffer(source.rows_bullet_manifolds, rows_bullet_manifolds.size(), stream);
+        rows_pair_contact_cache.copy_from_buffer(source.rows_pair_contact_cache, rows_pair_contact_cache.size(), stream);
+        rows_car_world_plane.copy_from_buffer(source.rows_car_world_plane, rows_car_world_plane.size(), stream);
+        rows_car_world_mesh.copy_from_buffer(source.rows_car_world_mesh, rows_car_world_mesh.size(), stream);
+        rows_car_car_retained.copy_from_buffer(source.rows_car_car_retained, rows_car_car_retained.size(), stream);
+        rows_ball_car_retained.copy_from_buffer(source.rows_ball_car_retained, rows_ball_car_retained.size(), stream);
     }
 
     template <typename T>
@@ -723,21 +760,33 @@ struct BatchSim::Impl {
     }
 
     void download_solver_rows(detail::WorldSolverScratchRowPoolHost& out, size_t first, size_t count, cudaStream_t stream) const {
-        out.reset(static_cast<int>(count), solver_row_pool.interleaved != 0);
+        out.reset(static_cast<int>(count), solver_row_pool.interleaved != 0, solver_row_pool.caps);
         if (count == 0) {
             return;
         }
-        download_rows_one(rows_ball_split, out.ball_split_rows.data(), detail::kMaxBallSplitContactRows, first, count, stream);
-        download_rows_one(rows_ball_velocity, out.ball_velocity_rows.data(), detail::kMaxBallVelocityContactRows, first, count, stream);
-        download_rows_one(rows_ball_friction, out.ball_friction_rows.data(), detail::kMaxBallFrictionContactRows, first, count, stream);
-        download_rows_one(rows_pair_split, out.pair_split_rows.data(), detail::kMaxCarPairSplitContactRows, first, count, stream);
-        download_rows_one(rows_world_split, out.world_split_rows.data(), detail::kMaxCarSharedSplitContactRows, first, count, stream);
-        download_rows_one(rows_pair_velocity, out.pair_velocity_rows.data(), detail::kMaxCarPairSharedVelocityContactRows, first, count, stream);
-        download_rows_one(rows_pair_friction, out.pair_friction_rows.data(), detail::kMaxCarPairSharedFrictionContactRows, first, count, stream);
-        download_rows_one(rows_world_velocity, out.world_velocity_rows.data(), detail::kMaxCarWorldSharedVelocityContactRows, first, count, stream);
-        download_rows_one(rows_world_friction, out.world_friction_rows.data(), detail::kMaxCarWorldSharedFrictionContactRows, first, count, stream);
-        download_rows_one(rows_shared_contact_order_groups, out.shared_contact_order_groups.data(), detail::kMaxSharedContactOrderGroups, first, count, stream);
-        download_rows_one(rows_bullet_manifolds, out.bullet_manifolds.data(), detail::kMaxBulletManifoldEntries, first, count, stream);
+        download_rows_one(rows_ball_split, out.ball_split_rows.data(), solver_row_pool.caps.ball_split, first, count, stream);
+        download_rows_one(rows_ball_velocity, out.ball_velocity_rows.data(), solver_row_pool.caps.ball_velocity, first, count, stream);
+        download_rows_one(rows_ball_friction, out.ball_friction_rows.data(), solver_row_pool.caps.ball_friction, first, count, stream);
+        download_rows_one(rows_pair_split, out.pair_split_rows.data(), solver_row_pool.caps.pair_split, first, count, stream);
+        download_rows_one(rows_world_split, out.world_split_rows.data(), solver_row_pool.caps.world_split, first, count, stream);
+        download_rows_one(rows_pair_velocity, out.pair_velocity_rows.data(), solver_row_pool.caps.pair_velocity, first, count, stream);
+        download_rows_one(rows_pair_friction, out.pair_friction_rows.data(), solver_row_pool.caps.pair_friction, first, count, stream);
+        download_rows_one(rows_world_velocity, out.world_velocity_rows.data(), solver_row_pool.caps.world_velocity, first, count, stream);
+        download_rows_one(rows_world_friction, out.world_friction_rows.data(), solver_row_pool.caps.world_friction, first, count, stream);
+        download_rows_one(rows_shared_contact_order_groups, out.shared_contact_order_groups.data(), solver_row_pool.caps.order_groups, first, count, stream);
+        download_rows_one(rows_bullet_manifolds, out.bullet_manifolds.data(), solver_row_pool.caps.manifolds, first, count, stream);
+        download_rows_one(rows_pair_contact_cache, out.pair_contact_cache.data(),
+                          solver_row_pool.caps.pair_cache_cars * solver_row_pool.caps.pair_cache_cars, first, count, stream);
+        // The retained manifolds are contiguous per env either way.
+        const detail::WorldSolverScratchRowCaps& caps = solver_row_pool.caps;
+        rows_car_world_plane.copy_range_to_host(out.car_world_plane_manifolds.data(), first * caps.car_world_plane,
+                                                count * caps.car_world_plane, stream);
+        rows_car_world_mesh.copy_range_to_host(out.car_world_mesh_manifolds.data(), first * caps.car_world_mesh,
+                                               count * caps.car_world_mesh, stream);
+        rows_car_car_retained.copy_range_to_host(out.car_car_retained_manifolds.data(), first * caps.car_car_retained,
+                                                 count * caps.car_car_retained, stream);
+        rows_ball_car_retained.copy_range_to_host(out.ball_car_retained_manifolds.data(), first * caps.ball_car_retained,
+                                                  count * caps.ball_car_retained, stream);
     }
 
     void reset_to_kickoff(uint64_t new_seed, cudaStream_t stream) {
@@ -829,7 +878,7 @@ struct BatchSim::Impl {
                     have_order ? kickoff_order : nullptr);
                 if (host_commands[env_idx].reset_to_kickoff) {
                     solver_scratch.data()[env_idx] = detail::WorldSolverScratch{};
-                    detail::ZeroWorldSolverScratchRows(solver_row_pool.view(env_idx));
+                    detail::ZeroWorldSolverScratchRows(solver_row_pool.view(env_idx), solver_row_pool.caps);
                 }
             }
         }
@@ -1243,6 +1292,11 @@ size_t BatchSim::boost_pad_capacity() const noexcept {
 void BatchSim::set_env_car_count(const int32_t* host_counts, size_t count, cudaStream_t stream) {
     if (count > env_count()) {
         throw std::out_of_range("set_env_car_count count exceeds env_count");
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (host_counts[i] < 0 || host_counts[i] > impl_->cfg.max_cars_per_env) {
+            throw std::out_of_range("set_env_car_count: car count outside [0, max_cars_per_env]");
+        }
     }
     impl_->env_car_count.copy_from_host(host_counts, count, stream);
     impl_->rebuild_env_step_order(stream);

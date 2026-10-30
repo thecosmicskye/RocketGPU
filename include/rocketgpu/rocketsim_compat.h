@@ -155,6 +155,10 @@ struct CarStateV3 {
     bool hasWorldContact = false;  // world_contact_normal is Some
     Vec3 worldContactNormal{};
     CarControls prevControls{};
+    // Optional (SetStateV3 only, not v3 state): the game's contact normal per wheel for the wheels in wheelsWithContact,
+    // i.e. the previous tick's wheel contacts, which the next step's sticky force and auto-roll read.
+    bool hasWheelContactNormals = false;
+    Vec3 wheelContactNormals[4]{};
 };
 
 struct BallStateCompat : PhysState {

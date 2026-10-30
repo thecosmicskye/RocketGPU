@@ -623,7 +623,8 @@ namespace gjkepa2_impl
 #define GJK_SIMPLEX3_EPS ((btScalar)0.0)
 #define GJK_SIMPLEX4_EPS ((btScalar)0.0)
 
-#define EPA_MAX_VERTICES 128
+// The game links Bullet 2.82's 64-vertex EPA store (EPA::Evaluate stops at 64 vertices; 128 faces).
+#define EPA_MAX_VERTICES 64
 #define EPA_MAX_ITERATIONS 255
 #define EPA_ACCURACY ((btScalar)0.0001)
 #define EPA_PLANE_EPS ((btScalar)0.00001)
@@ -1806,9 +1807,50 @@ ROCKETGPU_HD void Initialize(const btConvexShape* shape0, const btTransform& wtr
 
 using namespace gjkepa2_impl;
 
+// GJK runs on every query; EPA (~26 KB) only when GJK finds the shapes inside each other. So the scratch holds the
+// GJK alone and EPA is leased for the one call that needs it: on the GPU from a pool of slots with busy flags
+// (filled by the host, see EnsureEpaScratchPool), on the CPU from a thread-local instance. EPA::Initialize resets
+// all the state Evaluate reads, so a slot carries nothing from one lease to the next.
 struct btGjkEpaScratch {
     GJK gjk;
-    EPA epa;
+};
+
+#if defined(__CUDACC__)
+extern __device__ EPA* g_rocketgpu_epa_pool;
+extern __device__ unsigned int* g_rocketgpu_epa_busy;
+extern __device__ unsigned int g_rocketgpu_epa_slots;
+#endif
+
+struct btEpaLease {
+    EPA* epa;
+#if defined(__CUDA_ARCH__)
+    unsigned int slot;
+    __device__ btEpaLease() {
+        const unsigned int slots = g_rocketgpu_epa_slots;
+        if (g_rocketgpu_epa_pool == nullptr || slots == 0) {
+            __trap();
+        }
+        const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+        unsigned int i = (tid * 2654435761u) % slots;
+        while (atomicCAS(&g_rocketgpu_epa_busy[i], 0u, 1u) != 0u) {
+            i = i + 1 == slots ? 0 : i + 1;
+        }
+        __threadfence();
+        slot = i;
+        epa = g_rocketgpu_epa_pool + i;
+    }
+    __device__ ~btEpaLease() {
+        __threadfence();
+        atomicExch(&g_rocketgpu_epa_busy[slot], 0u);
+    }
+#else
+    btEpaLease() {
+        thread_local EPA instance;
+        epa = &instance;
+    }
+#endif
+    btEpaLease(const btEpaLease&) = delete;
+    btEpaLease& operator=(const btEpaLease&) = delete;
 };
 
 ROCKETGPU_HD int btGjkEpaSolver2::StackSizeRequirement()
@@ -2007,8 +2049,10 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::PenetrationWit
     {
         case GJK::eStatus::Inside:
         {
-            scratch.epa.Initialize();
-            EPA::eStatus::_ epa_status = scratch.epa.Evaluate(scratch.gjk, -guess);
+            btEpaLease lease;
+            EPA& epa = *lease.epa;
+            epa.Initialize();
+            EPA::eStatus::_ epa_status = epa.Evaluate(scratch.gjk, -guess);
             if (epa_status != EPA::eStatus::Failed)
             {
                 btVector3 debug_dirs[4] = {
@@ -2023,10 +2067,10 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::PenetrationWit
                     btVector3(0, 0, 0),
                     btVector3(0, 0, 0),
                 };
-                for (U i = 0; i < scratch.epa.m_result.rank; ++i)
+                for (U i = 0; i < epa.m_result.rank; ++i)
                 {
-                    debug_dirs[i] = scratch.epa.m_result.c[i] ? scratch.epa.m_result.c[i]->d : btVector3(0, 0, 0);
-                    debug_ws[i] = scratch.epa.m_result.c[i] ? scratch.epa.m_result.c[i]->w : btVector3(0, 0, 0);
+                    debug_dirs[i] = epa.m_result.c[i] ? epa.m_result.c[i]->d : btVector3(0, 0, 0);
+                    debug_ws[i] = epa.m_result.c[i] ? epa.m_result.c[i]->w : btVector3(0, 0, 0);
                 }
                 btVector3 w0 = btVector3(0, 0, 0);
                 btVector3 support0_dir_norm[4] = {
@@ -2047,9 +2091,9 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::PenetrationWit
                     btVector3(0, 0, 0),
                     btVector3(0, 0, 0),
                 };
-                for (U i = 0; i < scratch.epa.m_result.rank; ++i)
+                for (U i = 0; i < epa.m_result.rank; ++i)
                 {
-                    support0_dir_norm[i] = scratch.epa.m_result.c[i]->d;
+                    support0_dir_norm[i] = epa.m_result.c[i]->d;
                     if (support0_dir_norm[i].length2() < (SIMD_EPSILON * SIMD_EPSILON)) {
                         support0_dir_norm[i].setValue(-1.0f, -1.0f, -1.0f);
                     }
@@ -2060,7 +2104,7 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::PenetrationWit
                     support0[i] =
                         support0_without_margin[i] +
                         shape.m_shapes[0]->getMarginNonVirtual() * support0_dir_norm[i];
-                    w0 += support0[i] * scratch.epa.m_result.p[i];
+                    w0 += support0[i] * epa.m_result.p[i];
                 }
 #if !defined(__CUDA_ARCH__)
                 TraceDebugEpaWitnessReconstruct(
@@ -2069,14 +2113,14 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::PenetrationWit
                     support0,
                     w0,
                     wtrs0,
-                    scratch.epa.m_normal,
-                    scratch.epa.m_depth);
+                    epa.m_normal,
+                    epa.m_depth);
 #endif
                 results.status = sResults::Penetrating;
                 results.witnesses[0] = wtrs0 * w0;
-                results.witnesses[1] = wtrs0 * (w0 - scratch.epa.m_normal * scratch.epa.m_depth);
-                results.normal = -scratch.epa.m_normal;
-                results.distance = -scratch.epa.m_depth;
+                results.witnesses[1] = wtrs0 * (w0 - epa.m_normal * epa.m_depth);
+                results.normal = -epa.m_normal;
+                results.distance = -epa.m_depth;
                 return true;
             }
             else

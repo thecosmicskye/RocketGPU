@@ -707,6 +707,37 @@ std::vector<uint16_t> BuildArenaBroadphaseCellMask(
     return mask;
 }
 
+void SetArenaMeshFreeBox(std::vector<ArenaMeshBvhMeshInfo>& mesh_infos) {
+    // A mesh's gap on an axis: how far its AABB stays from 0 on that axis (0 when it straddles 0).
+    const auto gap = [](float lo, float hi) { return lo > 0.0f ? lo : (hi < 0.0f ? -hi : 0.0f); };
+    constexpr float kUnbounded = 1.0e4f;
+    float best_x = 0.0f, best_y = 0.0f;
+    std::vector<float> candidates(1, kUnbounded);
+    for (const ArenaMeshBvhMeshInfo& m : mesh_infos) {
+        candidates.push_back(gap(m.aabb_min.x, m.aabb_max.x));
+    }
+    for (const float x : candidates) {
+        if (x <= 0.0f) {
+            continue;
+        }
+        // Meshes whose x gap reaches x lie beyond the box in x; every other one must lie beyond it in y.
+        float y = kUnbounded;
+        for (const ArenaMeshBvhMeshInfo& m : mesh_infos) {
+            if (gap(m.aabb_min.x, m.aabb_max.x) < x) {
+                y = std::min(y, gap(m.aabb_min.y, m.aabb_max.y));
+            }
+        }
+        if (y > 0.0f && x * y > best_x * best_y) {
+            best_x = x;
+            best_y = y;
+        }
+    }
+    for (ArenaMeshBvhMeshInfo& m : mesh_infos) {
+        m.free_half_x = best_x;
+        m.free_half_y = best_y;
+    }
+}
+
 void BuildArenaMeshLeafGrid(
     const std::vector<ArenaMeshBvhQuantization>& quantization,
     const std::vector<ArenaMeshBvhMeshInfo>& mesh_infos,

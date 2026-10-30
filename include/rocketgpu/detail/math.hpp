@@ -582,6 +582,158 @@ ROCKETGPU_HD void BulletSetRotationColumns(const Quat& q, Vec3& fwd, Vec3& right
     up = Vec3(xz + wy, yz - wx, 1.0f - (xx + yy));
 }
 
+// Bullet's scalar quaternion forms, which the game uses. Bullet's SSE forms above group sums
+// differently and round differently, so they are not bit-exact against the game.
+// btMatrix3x3::getRotation, scalar build: w = sqrt(trace + 1) * 0.5, the rest times 0.5 / s.
+ROCKETGPU_HD Quat GameGetRotationScalar(const Vec3& fwd, const Vec3& right, const Vec3& up) {
+    // m[r][c]: fwd, right, up are the columns. Bullet's i/j/k index form is spelled out per i (no dynamic
+    // indexing, which puts the matrix in local memory on the GPU); the arithmetic is the same.
+    const float m00 = fwd.x, m01 = right.x, m02 = up.x;
+    const float m10 = fwd.y, m11 = right.y, m12 = up.y;
+    const float m20 = fwd.z, m21 = right.z, m22 = up.z;
+    const float trace = (m00 + m11) + m22;
+    if (trace > 0.0f) {
+        float s = sqrtf(trace + 1.0f);
+        const float w = s * 0.5f;
+        s = 0.5f / s;
+        return Quat(w, (m21 - m12) * s, (m02 - m20) * s, (m10 - m01) * s);
+    }
+    if (m00 < m11 ? m11 < m22 : m00 < m22) {
+        // i = 2, j = 0, k = 1
+        float s = sqrtf(((m22 - m00) - m11) + 1.0f);
+        const float z = s * 0.5f;
+        s = 0.5f / s;
+        return Quat((m10 - m01) * s, (m02 + m20) * s, (m12 + m21) * s, z);
+    }
+    if (m00 < m11) {
+        // i = 1, j = 2, k = 0
+        float s = sqrtf(((m11 - m22) - m00) + 1.0f);
+        const float y = s * 0.5f;
+        s = 0.5f / s;
+        return Quat((m02 - m20) * s, (m01 + m10) * s, y, (m21 + m12) * s);
+    }
+    // i = 0, j = 1, k = 2
+    float s = sqrtf(((m00 - m11) - m22) + 1.0f);
+    const float x = s * 0.5f;
+    s = 0.5f / s;
+    return Quat((m21 - m12) * s, x, (m10 + m01) * s, (m20 + m02) * s);
+}
+
+// btMatrix3x3::setRotation, scalar build: s = 2 / (((x*x + y*y) + z*z) + w*w).
+ROCKETGPU_HD void GameSetRotationScalarColumns(const Quat& q, Vec3& fwd, Vec3& right, Vec3& up) {
+    const float d = ((q.x * q.x + q.y * q.y) + q.z * q.z) + q.w * q.w;
+    const float s = 2.0f / d;
+    const float xs = q.x * s, ys = q.y * s, zs = q.z * s;
+    const float wx = q.w * xs, wy = q.w * ys, wz = q.w * zs;
+    const float xx = q.x * xs, xy = q.x * ys, xz = q.x * zs;
+    const float yy = q.y * ys, yz = q.y * zs, zz = q.z * zs;
+    fwd = Vec3(1.0f - (yy + zz), xy + wz, xz - wy);
+    right = Vec3(xy - wz, 1.0f - (xx + zz), yz + wx);
+    up = Vec3(xz + wy, yz - wx, 1.0f - (xx + yy));
+}
+
+// q * 1 / sqrt(((x*x + y*y) + z*z) + w*w), as FQuat::Normalize and integrateTransform do; identity at or below
+// min_len_sq (FQuat uses 1e-8; integrateTransform has no guard, pass a negative value).
+ROCKETGPU_HD Quat GameQuatNormalizeScalar(const Quat& q, float min_len_sq) {
+    const float len_sq = ((q.x * q.x + q.y * q.y) + q.z * q.z) + q.w * q.w;
+    if (!(len_sq > min_len_sq)) {
+        return Quat(1.0f, 0.0f, 0.0f, 0.0f);
+    }
+    const float s = 1.0f / sqrtf(len_sq);
+    return Quat(q.w * s, q.x * s, q.y * s, q.z * s);
+}
+
+// The game's replicated-rigid-body quaternion quantization (FRigidBodyState quantize, which writes then
+// reads the state through the net serializer with 18 bits). Encode:
+// normalize; drop the component of largest magnitude (ties to the lower index of x, y, z, w); if it is negative,
+// negate the other three; each other component c in order goes to clamp(RoundToInt(((c * sqrt2) * 0.5 + 0.5) *
+// (2^18 - 1)), 0, 2^18 - 1), where RoundToInt(v) = cvtss2si(v + v + 0.5) >> 1. Decode: ((k / (2^18 - 1)) - 0.5) * 2
+// * (1 / sqrt2); the dropped component is sqrt(((1 - a*a) - b*b) - c*c), taken in double; normalize again.
+ROCKETGPU_HD float GameQuatQuantizeComponent(float c) {
+    constexpr int kMax = (1 << 18) - 1;
+    const float max_f = static_cast<float>(kMax);
+    float v = ((c * 1.41421354f) * 0.5f + 0.5f) * max_f;
+    v = (v + v) + 0.5f;
+    int k = static_cast<int>(rintf(v));
+    k = k < 0 ? (k - 1) / 2 : k / 2;  // arithmetic shift right by one
+    k = k < 0 ? 0 : (k < kMax ? k : kMax);
+    const float r = static_cast<float>(k) / max_f - 0.5f;
+    return (r + r) * 0.707106769f;
+}
+
+ROCKETGPU_HD Quat GameRbStateQuantizeQuat(const Quat& q_in) {
+    const Quat q = GameQuatNormalizeScalar(q_in, 1e-8f);
+    const float c[4] = {q.x, q.y, q.z, q.w};
+    const float a[4] = {fabsf(c[0]), fabsf(c[1]), fabsf(c[2]), fabsf(c[3])};
+    const int i01 = a[0] < a[1] ? 1 : 0;
+    const int i23 = a[2] < a[3] ? 3 : 2;
+    const int big = a[i01] >= a[i23] ? i01 : i23;
+    const float sign = c[big] < 0.0f ? -1.0f : 1.0f;
+    float d[3];
+    for (int i = 0, n = 0; i < 4; ++i) {
+        if (i != big) d[n++] = GameQuatQuantizeComponent(c[i] * sign);
+    }
+    const float rest = ((1.0f - d[0] * d[0]) - d[1] * d[1]) - d[2] * d[2];
+    // The game takes this root in double and rounds to float; for rest >= 0 that equals the correctly rounded sqrtf
+    // (53 >= 2 * 24 + 2 bits, so double rounding is innocuous), which keeps FP64 off the GPU.
+#if defined(__CUDA_ARCH__)
+    const float dropped = __fsqrt_rn(rest);
+#else
+    const float dropped = sqrtf(rest);
+#endif
+    float o[4];
+    for (int i = 0, n = 0; i < 4; ++i) o[i] = i == big ? dropped : d[n++];
+    return GameQuatNormalizeScalar(Quat(o[3], o[0], o[1], o[2]), 1e-8f);
+}
+
+// Quantize an orientation given as basis columns, as the game's tick-start state quantize does; returns the quat.
+ROCKETGPU_HD Quat GameQuantizeBasisColumns(Vec3& fwd, Vec3& right, Vec3& up) {
+    const Quat q = GameRbStateQuantizeQuat(GameGetRotationScalar(fwd, right, up));
+    GameSetRotationScalarColumns(q, fwd, right, up);
+    return q;
+}
+
+// btTransformUtil::integrateTransform orientation part, scalar build: dorn * getRotation(basis),
+// normalized without a guard, then setRotation.
+ROCKETGPU_HD void GameIntegrateOrientationBasisColumns(
+    Vec3& fwd, Vec3& right, Vec3& up, Quat& q_mirror, const Vec3& ang_vel_world, float dt,
+    bool soccar_platform_math = false) {
+    constexpr float kAngularMotionThreshold = 0.5f * Pi() * 0.5f;
+    float angle = sqrtf((ang_vel_world.x * ang_vel_world.x + ang_vel_world.y * ang_vel_world.y) +
+                        ang_vel_world.z * ang_vel_world.z);
+    if (angle * dt > kAngularMotionThreshold) {
+        angle = kAngularMotionThreshold / dt;
+    }
+    float f;
+    if (angle < 0.001f) {
+        f = dt * 0.5f - ((((dt * dt) * dt) * 0.020833333333f) * angle) * angle;
+    } else {
+        const float half_angle = (angle * 0.5f) * dt;
+#if defined(__CUDA_ARCH__) && defined(_WIN32)
+        const float sine = soccar_platform_math ? WindowsUcrtFmaSmallSin(half_angle) : RocketGpuSinf(half_angle);
+#else
+        const float sine = RocketGpuSinf(half_angle);
+#endif
+        f = sine / angle;
+    }
+    const float ax = ang_vel_world.x * f, ay = ang_vel_world.y * f, az = ang_vel_world.z * f;
+    const float cosine_angle = (angle * dt) * 0.5f;
+#if defined(__CUDA_ARCH__) && defined(_WIN32)
+    const float c = soccar_platform_math ? WindowsUcrtFmaSmallCos(cosine_angle) : RocketGpuCosf(cosine_angle);
+#else
+    (void)soccar_platform_math;
+    const float c = RocketGpuCosf(cosine_angle);
+#endif
+    const Quat o = GameGetRotationScalar(fwd, right, up);
+    const Quat p(
+        ((c * o.w - ax * o.x) - ay * o.y) - az * o.z,
+        ((ax * o.w + c * o.x) + ay * o.z) - az * o.y,
+        ((c * o.y + ay * o.w) + az * o.x) - ax * o.z,
+        ((c * o.z + az * o.w) + ax * o.y) - ay * o.x);
+    q_mirror = GameQuatNormalizeScalar(p, -1.0f);
+    GameSetRotationScalarColumns(q_mirror, fwd, right, up);
+}
+
 ROCKETGPU_HD bool IntegrateOrientationBasisColumns(
     Vec3& fwd, Vec3& right, Vec3& up, Quat& q_mirror, const Vec3& ang_vel_world, float dt, bool soccar_platform_math = false,
     bool native_sse_math = false) {
@@ -632,6 +784,11 @@ ROCKETGPU_HD bool IntegrateOrientationBasisColumns(
 ROCKETGPU_HD void IntegrateCarOrientation(CarState& car, const Vec3& ang_vel_world, float dt, const char* site = "final", bool soccar_platform_math = false, bool native_sse_math = false) {
     if (!car.basis_authoritative) {
         IntegrateOrientation(car.rot, ang_vel_world, dt);
+        return;
+    }
+    if (!native_sse_math) {
+        GameIntegrateOrientationBasisColumns(
+            car.basis_forward, car.basis_right, car.basis_up, car.rot, ang_vel_world, dt, soccar_platform_math);
         return;
     }
     IntegrateOrientationBasisColumns(

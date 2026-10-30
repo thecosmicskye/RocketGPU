@@ -92,37 +92,54 @@ ROCKETGPU_HD bool DebugCarWorldSolverTraceEnabledFor(int env_idx, int car_idx) {
     return false;
 }
 
-ROCKETGPU_HD int CarWorldStaticPlaneDispatchRank(int source_tag) {
-    if (source_tag == 6) return 0;
-    if (source_tag == 5) return 1;
-    if (source_tag == 2) return 2;
-    if (source_tag == 1) return 3;
-    return -1;
-}
-
-ROCKETGPU_HD void ApplyCarWorldCallbackOrderForBullet(
+// The game's car world-contact normal (read by auto-roll) is built
+// after the step: per colliding world object, the unit sum of its contact point normals,
+// then the unit sum over those objects. v3 keeps the last contact-added normal instead. RLPR records
+// the averaged normal (cw_turtle_autoroll_slope frame 17568: slope points (-0.955,0,0.297) and (-0.637,0,0.771),
+// recorded (-0.830,0,0.557)).
+ROCKETGPU_HD void ApplyGameCarWorldContactNormal(
     ContactAccumulator& acc,
     const CarWorldVelocityContactRow* normal_rows,
     int normal_row_count) {
     if (!acc.hit || !normal_rows || normal_row_count <= 0) {
         return;
     }
-    int best_rank = -1;
-    Vec3 plane_normal(0.0f, 0.0f, 1.0f);
+    constexpr int kMaxObjects = 8;
+    int tags[kMaxObjects];
+    Vec3 sums[kMaxObjects];
+    int object_count = 0;
     for (int row_idx = 0; row_idx < normal_row_count; ++row_idx) {
         if (!normal_rows[row_idx].valid) {
             continue;
         }
-        const int rank = CarWorldStaticPlaneDispatchRank(normal_rows[row_idx].source_tag);
-        if (rank > best_rank) {
-            best_rank = rank;
-            plane_normal = normal_rows[row_idx].normal;
+        const int tag = normal_rows[row_idx].source_tag;
+        int slot = 0;
+        while (slot < object_count && tags[slot] != tag) {
+            ++slot;
+        }
+        if (slot == object_count) {
+            if (object_count == kMaxObjects) {
+                continue;
+            }
+            tags[slot] = tag;
+            sums[slot] = Vec3(0.0f, 0.0f, 0.0f);
+            ++object_count;
+        }
+        sums[slot] += normal_rows[row_idx].normal;
+    }
+    Vec3 total(0.0f, 0.0f, 0.0f);
+    for (int i = 0; i < object_count; ++i) {
+        const float len_sq = Dot(sums[i], sums[i]);
+        if (len_sq >= 1e-8f) {
+            total += sums[i] * (1.0f / SqrtScalar(len_sq));
         }
     }
-    if (best_rank >= 0) {
-        acc.latest_normal = plane_normal;
+    const float total_len_sq = Dot(total, total);
+    if (total_len_sq >= 1e-8f) {
+        acc.latest_normal = total * (1.0f / SqrtScalar(total_len_sq));
     }
 }
+
 
 ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     CarState& car,
@@ -154,9 +171,53 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     int* shared_contact_order_group_count = nullptr,
     const ArenaBroadphaseGrid* broadphase_grid = nullptr,
     const CarWorldMeshCandidateStage* candidate_stage = nullptr,
-    CarWorldPlaneRetainedManifold* retained_plane_manifolds = nullptr) {
+    CarWorldPlaneRetainedManifold* retained_plane_manifolds = nullptr,
+    CarWorldMeshRetainedManifold* retained_mesh_manifolds = nullptr,
+    CarWorldLocalRows* local_rows = nullptr) {
     ContactAccumulator acc;
     acc.history_car = &car;
+
+    // car_world_early_out: a car out of reach of every arena mesh and clear of the four planes gets no rows, so skip
+    // the query and leave only what it would: an empty World group for each plane inside its broadphase window, and
+    // the retained plane manifolds emptied (their refresh culls every point). Retained mesh points and physics events
+    // take the full query. Host only: on the GPU the per-car test costs more than the queries it skips (a warp
+    // saves nothing unless all its cars skip), and the full query gives the same result.
+#if !defined(__CUDA_ARCH__)
+    if (mutator.arena_collision && !mutator.physics_events.windows && mesh_triangles != nullptr &&
+        mesh_triangle_count > 0) {
+        bool has_retained_mesh_points = false;
+        for (int k = 0; retained_mesh_manifolds != nullptr && k < kCarWorldMeshRetainedManifoldsPerCar; ++k) {
+            has_retained_mesh_points |= retained_mesh_manifolds[k].count > 0;
+        }
+        const int plane_groups = has_retained_mesh_points ? -1 : CarWorldPlanesOutOfReach(car, cfg);
+        if (plane_groups >= 0 && CarWorldMeshesOutOfReach(car, cfg, mesh_bvh_meshes, mesh_bvh_mesh_count, dt)) {
+            if (retained_plane_manifolds != nullptr) {
+                for (int plane_idx = 0; plane_idx < kCarWorldPlaneRetainedManifoldsPerCar; ++plane_idx) {
+                    retained_plane_manifolds[plane_idx].count = 0;
+                }
+            }
+            if (shared_velocity_rows && shared_velocity_row_count && shared_friction_rows && shared_friction_row_count &&
+                shared_contact_order_groups && shared_contact_order_group_count) {
+                int group_idx = 0;
+                const auto append_plane_group = [&](int bit, int source_tag) {
+                    if ((plane_groups & bit) == 0) {
+                        return;
+                    }
+                    AppendSharedContactOrderGroup(
+                        shared_contact_order_groups, *shared_contact_order_group_count, SharedContactOrderBucket::World,
+                        car_idx, -1, source_tag, -1, 0, -1, 0, car_idx * 100000 + 1000 + group_idx);
+                    ++group_idx;
+                };
+                // +X wall, -X wall, floor, ceiling (CarWorldPlaneSourceTag).
+                append_plane_group(1, 2);
+                append_plane_group(2, 1);
+                append_plane_group(4, 6);
+                append_plane_group(8, 5);
+            }
+            return acc;
+        }
+    }
+#endif
 
     const CarWorldMeshCandidateStage* mesh_candidate_stage_in = nullptr;
     if (candidate_stage != nullptr && candidate_stage->valid != 0) {
@@ -176,14 +237,22 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     if (!mutator.arena_collision) {
         return acc;
     }
-    UninitArray<CarWorldSplitContactRow, kMaxCarWorldSplitContactRows> split_rows;
+#if defined(__CUDA_ARCH__)
+    if (local_rows == nullptr) {
+        __trap();
+    }
+    CarWorldLocalRows& local = *local_rows;
+#else
+    UninitArray<CarWorldLocalRows, 1> host_local_rows;
+    CarWorldLocalRows& local = local_rows != nullptr ? *local_rows : host_local_rows.data()[0];
+#endif
+    CarWorldSplitContactRow* const split_rows = local.split_rows;
     int split_row_count = 0;
-    UninitArray<CarWorldVelocityContactRow, kMaxCarWorldVelocityContactRows> normal_rows;
+    CarWorldVelocityContactRow* const normal_rows = local.normal_rows;
     int normal_row_count = 0;
-    UninitArray<CarWorldFrictionContactRow, kMaxCarWorldFrictionContactRows> friction_rows;
+    CarWorldFrictionContactRow* const friction_rows = local.friction_rows;
     int friction_row_count = 0;
-    UninitArray<SharedContactOrderGroup, kMaxCarWorldMeshesPerCar + 4> local_world_order_group_storage;
-    SharedContactOrderGroup* const local_world_order_groups = local_world_order_group_storage;
+    SharedContactOrderGroup* const local_world_order_groups = local.order_groups;
     int local_world_order_group_count = 0;
     const bool use_mesh_world_rows =
         mesh_triangles != nullptr && mesh_triangle_count > 0;
@@ -328,7 +397,12 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
             broadphase_grid,
             dt,
             nullptr,
-            mesh_candidate_stage_in);
+            mesh_candidate_stage_in,
+            -1,
+            nullptr,
+            nullptr,
+            kTrianglePairsNone,
+            retained_mesh_manifolds);
     }
 
     AppendCarWorldPlaneContactRows(
@@ -443,7 +517,7 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
         }
     }
 
-    ApplyCarWorldCallbackOrderForBullet(acc, normal_rows, normal_row_count);
+    ApplyGameCarWorldContactNormal(acc, normal_rows, normal_row_count);
 
     if (shared_split_rows && shared_split_row_count && split_row_count > 0) {
         AppendCarWorldToSharedSplitRows(shared_split_rows, *shared_split_row_count, car_idx, split_rows, split_row_count);
@@ -1407,10 +1481,19 @@ ROCKETGPU_HD void ResetBall(BallState& ball) {
     ball.tick_count_since_update = 0;
     ball.hs_info = BallState::HeatseekerInfo{};
     ball.ds_info = BallState::DropshotInfo{};
+    ball.sleeping = 0;
+    ball.deactivation_time = 0.0f;
 }
 
 ROCKETGPU_HD void ResetBall(BallState& ball, uint8_t game_mode) {
     ResetBall(ball);
+    if (game_mode == static_cast<uint8_t>(Mode::Soccar)) {
+        // The game spawns the kickoff ball asleep at z 92.75 (every recorded kickoff: exactly still, 0.4 uu inside the
+        // ball's 93.15 rest height, which a simulated ball can't hold), so it takes no gravity until a car touches it.
+        constexpr float kUuToBt = 1.0f / 50.0f;
+        SetBallOriginBt(ball, Vec3(0.0f, 0.0f, 92.75f) * kUuToBt);
+        ball.sleeping = 1;
+    }
     if (game_mode == static_cast<uint8_t>(Mode::Snowday)) {
         constexpr float kUuToBt = 1.0f / 50.0f;
         SetBallLinearVelocityBt(ball, Vec3(0.0f, 0.0f, 1.1920928955078125e-7f) * kUuToBt);

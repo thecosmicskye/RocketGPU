@@ -98,20 +98,20 @@ ROCKETGPU_HD constexpr uint8_t BoostPadIsBigSoccar(int index) {
     return index >= 28 ? 1 : 0;
 }
 
-ROCKETGPU_HD float EvalSteerAngleFromSpeed(float speed_abs) {
+ROCKETGPU_HD float EvalSteerAngleFromSpeed(const float (&c)[6], float speed_abs) {
     const float s = Abs(speed_abs);
-    if (s <= 500.0f) return Lerp(0.53356f, 0.31930f, s / 500.0f);
-    if (s <= 1000.0f) return Lerp(0.31930f, 0.18203f, (s - 500.0f) / 500.0f);
-    if (s <= 1500.0f) return Lerp(0.18203f, 0.10570f, (s - 1000.0f) / 500.0f);
-    if (s <= 1750.0f) return Lerp(0.10570f, 0.08507f, (s - 1500.0f) / 250.0f);
-    if (s <= 3000.0f) return Lerp(0.08507f, 0.03454f, (s - 1750.0f) / 1250.0f);
-    return 0.03454f;
+    if (s <= 500.0f) return Lerp(c[0], c[1], s / 500.0f);
+    if (s <= 1000.0f) return Lerp(c[1], c[2], (s - 500.0f) / 500.0f);
+    if (s <= 1500.0f) return Lerp(c[2], c[3], (s - 1000.0f) / 500.0f);
+    if (s <= 1750.0f) return Lerp(c[3], c[4], (s - 1500.0f) / 250.0f);
+    if (s <= 3000.0f) return Lerp(c[4], c[5], (s - 1750.0f) / 1250.0f);
+    return c[5];
 }
 
-ROCKETGPU_HD float EvalPowerslideSteerAngleFromSpeed(float speed_abs) {
+ROCKETGPU_HD float EvalPowerslideSteerAngleFromSpeed(const float (&c)[2], float speed_abs) {
     const float s = Abs(speed_abs);
-    if (s <= 2500.0f) return Lerp(0.39235f, 0.12610f, s / 2500.0f);
-    return 0.12610f;
+    if (s <= 2500.0f) return Lerp(c[0], c[1], s / 2500.0f);
+    return c[1];
 }
 
 ROCKETGPU_HD float EvalSteerAngleFromSpeedThreeWheel(float speed_abs) {
@@ -127,10 +127,12 @@ ROCKETGPU_HD float EvalDriveTorqueFactor(float speed_abs) {
     return 0.0f;
 }
 
+// Knee at 0.707, not 0.7075: RLPR wheel long friction while coasting (the bare factor) lies on (0, 0.1)-(0.707, 0.5)
+// -(1, 1) to 1e-6 across ~5800 sloped wheel-ticks of Nexto, PartyCannon and Wisp.
 ROCKETGPU_HD float EvalNonStickyFrictionFactor(float contact_normal_z) {
     const float s = Clamp(contact_normal_z, 0.0f, 1.0f);
-    if (s <= 0.7075f) return Lerp(0.1f, 0.5f, s / 0.7075f);
-    return Lerp(0.5f, 1.0f, (s - 0.7075f) / (1.0f - 0.7075f));
+    if (s <= 0.707f) return Lerp(0.1f, 0.5f, s / 0.707f);
+    return Lerp(0.5f, 1.0f, (s - 0.707f) / (1.0f - 0.707f));
 }
 
 ROCKETGPU_HD float EvalLatFriction(float input) {

@@ -235,7 +235,6 @@ bool ComputeCarArenaTriangleContact(
     float tri_origin_y_bt = 0.0f);
 bool DebugCarWorldSolverTraceEnabledFor(int env_idx, int car_idx);
 bool DebugBallCarSolverTraceEnabledFor(int env_idx, int car_idx);
-bool ShouldSleepBallAtTickStart(const ::rocketgpu::BallState& ball);
 struct SplitImpulseAccumulator;
 void IntegrateSplitImpulseTransform(::rocketgpu::CarState& car, const SplitImpulseAccumulator& split, float dt, bool native_sse_math = false);
 void IntegrateSplitImpulseTransformBt(::rocketgpu::CarState& car, const SplitImpulseAccumulator& split_bt, float dt, bool native_sse_math = false);
@@ -295,9 +294,11 @@ ROCKETGPU_HD ::rocketgpu::Vec3 BallCarHitboxInsetBt(const ::rocketgpu::CarConfig
 }
 
 constexpr int kMaxBallSplitCars = 32;
-constexpr int kMaxBallSplitContactRows = 64;
-constexpr int kMaxBallVelocityContactRows = 64;
-constexpr int kMaxBallFrictionContactRows = 64;
+// Ball contact rows per env tick (rows past these are dropped). The Octane recordings (1v1 and 3v3, ~430k env-ticks)
+// never use more than 9; 32 holds four full 4-point manifolds of world contact plus four touching cars.
+constexpr int kMaxBallSplitContactRows = 32;
+constexpr int kMaxBallVelocityContactRows = 32;
+constexpr int kMaxBallFrictionContactRows = 32;
 constexpr int kMaxCarCarPairSlots = 8 * 8;
 constexpr int kMaxCarCarCachedPoints = 4;
 constexpr int kMaxCarWorldSplitContactRows = 16;
@@ -662,6 +663,22 @@ struct CarWorldPlaneRetainedManifold {
     CarWorldPlaneRetainedPoint points[4] = {};
 };
 
+// Retained car-world mesh manifold (cal_retained_world_contacts), one per (car, arena mesh) pair holding points.
+// Each point keeps the normal it was created with (v3 normal_world_on_b, internal-edge adjusted), and local_point_b_bt
+// is in the mesh body frame (world minus the mesh's cal_origin_y). A slot with count 0 is free.
+struct CarWorldMeshRetainedPoint {
+    ::rocketgpu::Vec3 local_point_a_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    ::rocketgpu::Vec3 local_point_b_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    ::rocketgpu::Vec3 normal = ::rocketgpu::Vec3(0.0f, 0.0f, 1.0f);
+    float distance_bt = 0.0f;
+};
+
+struct CarWorldMeshRetainedManifold {
+    uint8_t count = 0;
+    uint8_t mesh = 0;  // ArenaMeshBvhMeshInfo index
+    CarWorldMeshRetainedPoint points[4] = {};
+};
+
 // cal_car_car_manifold: v3 keeps each car pair's OBB-OBB persistent manifold across ticks
 // (collision_dispatcher.rs near_callback_with_bounds, persistent_manifold.rs). RocketGPU's pair
 // orientation is car A = higher local index = v3 body1, car B = lower = v3 body0, so v3's
@@ -723,6 +740,20 @@ constexpr int kMaxCarWorldMeshPersistentCars = 8;
 constexpr int kCarWorldPlaneRetainedManifoldsPerCar = 4;
 constexpr int kMaxCarWorldPlaneRetainedManifolds =
     kCarWorldPlaneRetainedManifoldsPerCar * kMaxCarWorldMeshPersistentCars;
+// Arena meshes a car can hold retained points with at once (at most 2 on all four recording sets); a further mesh
+// keeps only its fresh points.
+constexpr int kCarWorldMeshRetainedManifoldsPerCar = 2;
+constexpr int kMaxCarWorldMeshRetainedManifolds =
+    kCarWorldMeshRetainedManifoldsPerCar * kMaxCarWorldMeshPersistentCars;
+
+// SolveCarWorldStaticContacts' per-call rows and order groups, before they go to the shared rows (or are solved
+// in place). On the GPU they live in the row pool, one per car slot, instead of on every thread's stack.
+struct CarWorldLocalRows {
+    UninitArray<CarWorldSplitContactRow, kMaxCarWorldSplitContactRows> split_rows;
+    UninitArray<CarWorldVelocityContactRow, kMaxCarWorldVelocityContactRows> normal_rows;
+    UninitArray<CarWorldFrictionContactRow, kMaxCarWorldFrictionContactRows> friction_rows;
+    UninitArray<SharedContactOrderGroup, kMaxCarWorldMeshesPerCar + 4> order_groups;
+};
 
 struct BulletManifoldEntry {
     int8_t kind = 0;
@@ -737,6 +768,11 @@ struct BulletBroadphaseProxy {
     ::rocketgpu::Vec3 aabb_max = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
     ::rocketgpu::Vec3 child_aabb_min = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
     ::rocketgpu::Vec3 child_aabb_max = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    // The child shape in world space (bt): centre, axes and half extents with margin (a ball's are its getAabb extent).
+    ::rocketgpu::Vec3 child_center = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    ::rocketgpu::Vec3 child_axis[3] = {::rocketgpu::Vec3(1.0f, 0.0f, 0.0f), ::rocketgpu::Vec3(0.0f, 1.0f, 0.0f),
+                                       ::rocketgpu::Vec3(0.0f, 0.0f, 1.0f)};
+    ::rocketgpu::Vec3 child_half = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
     int32_t cell_i = 0;
     int32_t cell_j = 0;
     int32_t cell_k = 0;
@@ -745,6 +781,10 @@ struct BulletBroadphaseProxy {
 };
 
 constexpr int kMaxBulletManifoldEntries = 96;
+// btAxisSweep3 handles: arena meshes, the 4 planes, the ball and up to 8 cars (plus slack); edges per axis include
+// the two sentinels.
+constexpr int kAxisSweepMaxHandles = 40;
+constexpr int kAxisSweepMaxEdges = 2 * kAxisSweepMaxHandles + 2;
 
 template <typename T>
 struct EnvStridedArray {
@@ -766,6 +806,15 @@ struct EnvStridedArray {
     ROCKETGPU_HD bool operator!=(std::nullptr_t) const { return base != nullptr; }
 };
 
+// Per-tick car-car contact cache of one env: pair (a, b) of local car slots at [a * cars + b].
+struct CarCarPairCacheView {
+    EnvStridedArray<CarCarPairCachedContact> slots;
+    int cars = 0;
+    ROCKETGPU_HD explicit operator bool() const { return static_cast<bool>(slots); }
+    ROCKETGPU_HD int size() const { return cars * cars; }
+    ROCKETGPU_HD int index(int a, int b) const { return a < cars && b < cars ? a * cars + b : -1; }
+};
+
 struct WorldSolverScratchRows {
     EnvStridedArray<BallSplitContactRow> ball_split_rows;
     EnvStridedArray<BallVelocityContactRow> ball_velocity_rows;
@@ -778,7 +827,73 @@ struct WorldSolverScratchRows {
     EnvStridedArray<CarSharedFrictionContactRow> world_friction_rows;
     EnvStridedArray<SharedContactOrderGroup> shared_contact_order_groups;
     EnvStridedArray<BulletManifoldEntry> bullet_manifolds;
+    CarCarPairCacheView pair_contact_cache;
+    // Contact manifolds kept across ticks, contiguous per env: car slot i's planes at [i * 4], car pair (lo, hi) at
+    // [CarCarRetainedSlot(lo, hi)], car slot i's ball manifold at [i]. Cleared on kickoff reset through
+    // WorldSolverScratch::retained_reset_pending.
+    CarWorldPlaneRetainedManifold* car_world_plane_manifolds = nullptr;
+    CarWorldMeshRetainedManifold* car_world_mesh_manifolds = nullptr;  // car slot i's at [i * 2]
+    CarCarRetainedManifold* car_car_retained_manifolds = nullptr;
+    BallCarRetainedManifold* ball_car_retained_manifolds = nullptr;
+    // SolveCarWorldStaticContacts scratch, contiguous per env: car slot i's at [i].
+    CarWorldLocalRows* car_world_local_rows = nullptr;
+    int car_world_plane_count = 0;
+    int car_world_mesh_count = 0;
+    int car_car_retained_count = 0;
+    int ball_car_retained_count = 0;
 };
+
+// Rows each per-env pool holds. World pools fill at most kMaxCarWorld*ContactRows (16) rows per car (each car's rows
+// come from local arrays of 16, appended car after car or placed at slot*16), and pair pools at most
+// kMaxApproxCarCarContactPoints (4) rows per resolved car pair (one ResolveCarCarCollision per pair per tick). An env
+// holds at most max_cars_per_env cars, so these caps are never reached; past kMax the existing kMax guards apply.
+struct WorldSolverScratchRowCaps {
+    int ball_split = kMaxBallSplitContactRows;
+    int ball_velocity = kMaxBallVelocityContactRows;
+    int ball_friction = kMaxBallFrictionContactRows;
+    int pair_split = kMaxCarPairSplitContactRows;
+    int world_split = kMaxCarSharedSplitContactRows;
+    int pair_velocity = kMaxCarPairSharedVelocityContactRows;
+    int pair_friction = kMaxCarPairSharedFrictionContactRows;
+    int world_velocity = kMaxCarWorldSharedVelocityContactRows;
+    int world_friction = kMaxCarWorldSharedFrictionContactRows;
+    int order_groups = kMaxSharedContactOrderGroups;
+    int manifolds = kMaxBulletManifoldEntries;
+    int pair_cache_cars = 8;  // pair cache slots: pair_cache_cars^2
+    int car_world_plane = kMaxCarWorldPlaneRetainedManifolds;
+    int car_world_mesh = kMaxCarWorldMeshRetainedManifolds;
+    int car_car_retained = kMaxCarCarRetainedManifolds;
+    int ball_car_retained = kMaxBallCarRetainedManifolds;
+    int car_world_local = kMaxCarWorldMeshPersistentCars;
+};
+
+constexpr int kMaxCarPairRowsPerPair = 4;  // kMaxApproxCarCarContactPoints; checked in env_step.hpp
+
+ROCKETGPU_HD int CapRows(int max_rows, long long needed) {
+    return needed < max_rows ? static_cast<int>(needed) : max_rows;
+}
+
+ROCKETGPU_HD WorldSolverScratchRowCaps MakeWorldSolverScratchRowCaps(int max_cars_per_env) {
+    WorldSolverScratchRowCaps caps;
+    const long long cars = max_cars_per_env < 0 ? 0 : max_cars_per_env;
+    const long long pairs = cars * (cars - 1) / 2;
+    caps.world_split = CapRows(kMaxCarSharedSplitContactRows, cars * kMaxCarWorldSplitContactRows);
+    caps.world_velocity = CapRows(kMaxCarWorldSharedVelocityContactRows, cars * kMaxCarWorldVelocityContactRows);
+    caps.world_friction = CapRows(kMaxCarWorldSharedFrictionContactRows, cars * kMaxCarWorldFrictionContactRows);
+    caps.pair_split = CapRows(kMaxCarPairSplitContactRows, pairs * kMaxCarPairRowsPerPair);
+    caps.pair_velocity = CapRows(kMaxCarPairSharedVelocityContactRows, pairs * kMaxCarPairRowsPerPair);
+    caps.pair_friction = CapRows(kMaxCarPairSharedFrictionContactRows, pairs * kMaxCarPairRowsPerPair);
+    caps.pair_cache_cars = static_cast<int>(cars < 8 ? cars : 8);
+    caps.car_world_plane = CapRows(kMaxCarWorldPlaneRetainedManifolds, cars * kCarWorldPlaneRetainedManifoldsPerCar);
+    caps.car_world_mesh = CapRows(kMaxCarWorldMeshRetainedManifolds, cars * kCarWorldMeshRetainedManifoldsPerCar);
+    caps.car_car_retained = CapRows(kMaxCarCarRetainedManifolds, pairs);
+    caps.ball_car_retained = CapRows(kMaxBallCarRetainedManifolds, cars);
+    caps.car_world_local = CapRows(kMaxCarWorldMeshPersistentCars, cars);
+    // Order groups: each car's world groups come from a local array of kMaxCarWorldMeshesPerCar + 4, and car pairs
+    // add one group per resolved pair; cars^2 covers the pairs with room to spare.
+    caps.order_groups = CapRows(kMaxSharedContactOrderGroups, cars * (kMaxCarWorldMeshesPerCar + 4) + cars * cars);
+    return caps;
+}
 
 struct WorldSolverScratchRowPool {
     BallSplitContactRow* ball_split_rows = nullptr;
@@ -792,8 +907,15 @@ struct WorldSolverScratchRowPool {
     CarSharedFrictionContactRow* world_friction_rows = nullptr;
     SharedContactOrderGroup* shared_contact_order_groups = nullptr;
     BulletManifoldEntry* bullet_manifolds = nullptr;
+    CarCarPairCachedContact* pair_contact_cache = nullptr;
+    CarWorldPlaneRetainedManifold* car_world_plane_manifolds = nullptr;
+    CarWorldMeshRetainedManifold* car_world_mesh_manifolds = nullptr;
+    CarCarRetainedManifold* car_car_retained_manifolds = nullptr;
+    BallCarRetainedManifold* ball_car_retained_manifolds = nullptr;
+    CarWorldLocalRows* car_world_local_rows = nullptr;
     int env_count = 0;
     uint8_t interleaved = 0;
+    WorldSolverScratchRowCaps caps;
 
     template <typename T>
     ROCKETGPU_HD EnvStridedArray<T> view_one(T* base, int max_rows, int env_idx) const {
@@ -808,50 +930,86 @@ struct WorldSolverScratchRowPool {
 
     ROCKETGPU_HD WorldSolverScratchRows view(int env_idx) const {
         WorldSolverScratchRows rows;
-        rows.ball_split_rows = view_one(ball_split_rows, kMaxBallSplitContactRows, env_idx);
-        rows.ball_velocity_rows = view_one(ball_velocity_rows, kMaxBallVelocityContactRows, env_idx);
-        rows.ball_friction_rows = view_one(ball_friction_rows, kMaxBallFrictionContactRows, env_idx);
-        rows.pair_split_rows = view_one(pair_split_rows, kMaxCarPairSplitContactRows, env_idx);
-        rows.world_split_rows = view_one(world_split_rows, kMaxCarSharedSplitContactRows, env_idx);
-        rows.pair_velocity_rows = view_one(pair_velocity_rows, kMaxCarPairSharedVelocityContactRows, env_idx);
-        rows.pair_friction_rows = view_one(pair_friction_rows, kMaxCarPairSharedFrictionContactRows, env_idx);
-        rows.world_velocity_rows = view_one(world_velocity_rows, kMaxCarWorldSharedVelocityContactRows, env_idx);
-        rows.world_friction_rows = view_one(world_friction_rows, kMaxCarWorldSharedFrictionContactRows, env_idx);
-        rows.shared_contact_order_groups = view_one(shared_contact_order_groups, kMaxSharedContactOrderGroups, env_idx);
-        rows.bullet_manifolds = view_one(bullet_manifolds, kMaxBulletManifoldEntries, env_idx);
+        rows.ball_split_rows = view_one(ball_split_rows, caps.ball_split, env_idx);
+        rows.ball_velocity_rows = view_one(ball_velocity_rows, caps.ball_velocity, env_idx);
+        rows.ball_friction_rows = view_one(ball_friction_rows, caps.ball_friction, env_idx);
+        rows.pair_split_rows = view_one(pair_split_rows, caps.pair_split, env_idx);
+        rows.world_split_rows = view_one(world_split_rows, caps.world_split, env_idx);
+        rows.pair_velocity_rows = view_one(pair_velocity_rows, caps.pair_velocity, env_idx);
+        rows.pair_friction_rows = view_one(pair_friction_rows, caps.pair_friction, env_idx);
+        rows.world_velocity_rows = view_one(world_velocity_rows, caps.world_velocity, env_idx);
+        rows.world_friction_rows = view_one(world_friction_rows, caps.world_friction, env_idx);
+        rows.shared_contact_order_groups = view_one(shared_contact_order_groups, caps.order_groups, env_idx);
+        rows.bullet_manifolds = view_one(bullet_manifolds, caps.manifolds, env_idx);
+        rows.pair_contact_cache.slots =
+            view_one(pair_contact_cache, caps.pair_cache_cars * caps.pair_cache_cars, env_idx);
+        rows.pair_contact_cache.cars = caps.pair_cache_cars;
+        const auto contiguous = [env_idx](auto* base, int per_env) {
+            return base == nullptr ? base : base + static_cast<std::ptrdiff_t>(env_idx) * per_env;
+        };
+        rows.car_world_plane_manifolds = contiguous(car_world_plane_manifolds, caps.car_world_plane);
+        rows.car_world_mesh_manifolds = contiguous(car_world_mesh_manifolds, caps.car_world_mesh);
+        rows.car_car_retained_manifolds = contiguous(car_car_retained_manifolds, caps.car_car_retained);
+        rows.ball_car_retained_manifolds = contiguous(ball_car_retained_manifolds, caps.ball_car_retained);
+        rows.car_world_local_rows = contiguous(car_world_local_rows, caps.car_world_local);
+        rows.car_world_plane_count = caps.car_world_plane;
+        rows.car_world_mesh_count = caps.car_world_mesh;
+        rows.car_car_retained_count = caps.car_car_retained;
+        rows.ball_car_retained_count = caps.ball_car_retained;
         return rows;
     }
 };
 
-ROCKETGPU_HD size_t WorldSolverScratchRowBytesPerEnv() {
-    return sizeof(BallSplitContactRow) * kMaxBallSplitContactRows +
-           sizeof(BallVelocityContactRow) * kMaxBallVelocityContactRows +
-           sizeof(BallFrictionContactRow) * kMaxBallFrictionContactRows +
-           sizeof(CarSharedSplitContactRow) * kMaxCarPairSplitContactRows +
-           sizeof(CarSharedSplitContactRow) * kMaxCarSharedSplitContactRows +
-           sizeof(CarSharedVelocityContactRow) * kMaxCarPairSharedVelocityContactRows +
-           sizeof(CarSharedFrictionContactRow) * kMaxCarPairSharedFrictionContactRows +
-           sizeof(CarSharedVelocityContactRow) * kMaxCarWorldSharedVelocityContactRows +
-           sizeof(CarSharedFrictionContactRow) * kMaxCarWorldSharedFrictionContactRows +
-           sizeof(SharedContactOrderGroup) * kMaxSharedContactOrderGroups +
-           sizeof(BulletManifoldEntry) * kMaxBulletManifoldEntries;
+ROCKETGPU_HD size_t WorldSolverScratchRowBytesPerEnv(const WorldSolverScratchRowCaps& caps = WorldSolverScratchRowCaps{}) {
+    return sizeof(BallSplitContactRow) * caps.ball_split +
+           sizeof(BallVelocityContactRow) * caps.ball_velocity +
+           sizeof(BallFrictionContactRow) * caps.ball_friction +
+           sizeof(CarSharedSplitContactRow) * caps.pair_split +
+           sizeof(CarSharedSplitContactRow) * caps.world_split +
+           sizeof(CarSharedVelocityContactRow) * caps.pair_velocity +
+           sizeof(CarSharedFrictionContactRow) * caps.pair_friction +
+           sizeof(CarSharedVelocityContactRow) * caps.world_velocity +
+           sizeof(CarSharedFrictionContactRow) * caps.world_friction +
+           sizeof(SharedContactOrderGroup) * caps.order_groups +
+           sizeof(BulletManifoldEntry) * caps.manifolds +
+           sizeof(CarCarPairCachedContact) * caps.pair_cache_cars * caps.pair_cache_cars +
+           sizeof(CarWorldPlaneRetainedManifold) * caps.car_world_plane +
+           sizeof(CarWorldMeshRetainedManifold) * caps.car_world_mesh +
+           sizeof(CarCarRetainedManifold) * caps.car_car_retained +
+           sizeof(BallCarRetainedManifold) * caps.ball_car_retained +
+           sizeof(CarWorldLocalRows) * caps.car_world_local;
 }
 
-ROCKETGPU_HD void ZeroWorldSolverScratchRows(const WorldSolverScratchRows& rows) {
+// Kickoff reset of the retained manifolds (what WorldSolverScratch::retained_reset_pending asks for).
+ROCKETGPU_HD void ClearRetainedContactManifolds(const WorldSolverScratchRows& rows) {
+    for (int i = 0; rows.car_world_plane_manifolds && i < rows.car_world_plane_count; ++i) rows.car_world_plane_manifolds[i].count = 0;
+    for (int i = 0; rows.car_world_mesh_manifolds && i < rows.car_world_mesh_count; ++i) rows.car_world_mesh_manifolds[i].count = 0;
+    for (int i = 0; rows.car_car_retained_manifolds && i < rows.car_car_retained_count; ++i) rows.car_car_retained_manifolds[i].count = 0;
+    for (int i = 0; rows.ball_car_retained_manifolds && i < rows.ball_car_retained_count; ++i) rows.ball_car_retained_manifolds[i].count = 0;
+}
+
+ROCKETGPU_HD void ZeroWorldSolverScratchRows(const WorldSolverScratchRows& rows, const WorldSolverScratchRowCaps& caps) {
     if (!rows.ball_split_rows) {
         return;
     }
-    for (int i = 0; i < kMaxBallSplitContactRows; ++i) rows.ball_split_rows[i] = BallSplitContactRow{};
-    for (int i = 0; i < kMaxBallVelocityContactRows; ++i) rows.ball_velocity_rows[i] = BallVelocityContactRow{};
-    for (int i = 0; i < kMaxBallFrictionContactRows; ++i) rows.ball_friction_rows[i] = BallFrictionContactRow{};
-    for (int i = 0; i < kMaxCarPairSplitContactRows; ++i) rows.pair_split_rows[i] = CarSharedSplitContactRow{};
-    for (int i = 0; i < kMaxCarSharedSplitContactRows; ++i) rows.world_split_rows[i] = CarSharedSplitContactRow{};
-    for (int i = 0; i < kMaxCarPairSharedVelocityContactRows; ++i) rows.pair_velocity_rows[i] = CarSharedVelocityContactRow{};
-    for (int i = 0; i < kMaxCarPairSharedFrictionContactRows; ++i) rows.pair_friction_rows[i] = CarSharedFrictionContactRow{};
-    for (int i = 0; i < kMaxCarWorldSharedVelocityContactRows; ++i) rows.world_velocity_rows[i] = CarSharedVelocityContactRow{};
-    for (int i = 0; i < kMaxCarWorldSharedFrictionContactRows; ++i) rows.world_friction_rows[i] = CarSharedFrictionContactRow{};
-    for (int i = 0; i < kMaxSharedContactOrderGroups; ++i) rows.shared_contact_order_groups[i] = SharedContactOrderGroup{};
-    for (int i = 0; i < kMaxBulletManifoldEntries; ++i) rows.bullet_manifolds[i] = BulletManifoldEntry{};
+    for (int i = 0; i < caps.ball_split; ++i) rows.ball_split_rows[i] = BallSplitContactRow{};
+    for (int i = 0; i < caps.ball_velocity; ++i) rows.ball_velocity_rows[i] = BallVelocityContactRow{};
+    for (int i = 0; i < caps.ball_friction; ++i) rows.ball_friction_rows[i] = BallFrictionContactRow{};
+    for (int i = 0; i < caps.pair_split; ++i) rows.pair_split_rows[i] = CarSharedSplitContactRow{};
+    for (int i = 0; i < caps.world_split; ++i) rows.world_split_rows[i] = CarSharedSplitContactRow{};
+    for (int i = 0; i < caps.pair_velocity; ++i) rows.pair_velocity_rows[i] = CarSharedVelocityContactRow{};
+    for (int i = 0; i < caps.pair_friction; ++i) rows.pair_friction_rows[i] = CarSharedFrictionContactRow{};
+    for (int i = 0; i < caps.world_velocity; ++i) rows.world_velocity_rows[i] = CarSharedVelocityContactRow{};
+    for (int i = 0; i < caps.world_friction; ++i) rows.world_friction_rows[i] = CarSharedFrictionContactRow{};
+    for (int i = 0; i < caps.order_groups; ++i) rows.shared_contact_order_groups[i] = SharedContactOrderGroup{};
+    for (int i = 0; i < caps.manifolds; ++i) rows.bullet_manifolds[i] = BulletManifoldEntry{};
+    if (rows.pair_contact_cache) {
+        for (int i = 0; i < rows.pair_contact_cache.size(); ++i) rows.pair_contact_cache.slots[i] = CarCarPairCachedContact{};
+    }
+    for (int i = 0; rows.car_world_plane_manifolds && i < caps.car_world_plane; ++i) rows.car_world_plane_manifolds[i] = CarWorldPlaneRetainedManifold{};
+    for (int i = 0; rows.car_world_mesh_manifolds && i < caps.car_world_mesh; ++i) rows.car_world_mesh_manifolds[i] = CarWorldMeshRetainedManifold{};
+    for (int i = 0; rows.car_car_retained_manifolds && i < caps.car_car_retained; ++i) rows.car_car_retained_manifolds[i] = CarCarRetainedManifold{};
+    for (int i = 0; rows.ball_car_retained_manifolds && i < caps.ball_car_retained; ++i) rows.ball_car_retained_manifolds[i] = BallCarRetainedManifold{};
 }
 
 #if !defined(__CUDA_ARCH__)
@@ -868,21 +1026,33 @@ struct WorldSolverScratchRowPoolHost {
     std::vector<CarSharedFrictionContactRow> world_friction_rows;
     std::vector<SharedContactOrderGroup> shared_contact_order_groups;
     std::vector<BulletManifoldEntry> bullet_manifolds;
+    std::vector<CarCarPairCachedContact> pair_contact_cache;
+    std::vector<CarWorldPlaneRetainedManifold> car_world_plane_manifolds;
+    std::vector<CarWorldMeshRetainedManifold> car_world_mesh_manifolds;
+    std::vector<CarCarRetainedManifold> car_car_retained_manifolds;
+    std::vector<BallCarRetainedManifold> ball_car_retained_manifolds;
+    std::vector<CarWorldLocalRows> car_world_local_rows;
     WorldSolverScratchRowPool pool;
 
-    void reset(int env_count, bool interleaved) {
+    void reset(int env_count, bool interleaved, const WorldSolverScratchRowCaps& caps = WorldSolverScratchRowCaps{}) {
         const size_t n = static_cast<size_t>(env_count < 0 ? 0 : env_count);
-        ball_split_rows.assign(n * kMaxBallSplitContactRows, BallSplitContactRow{});
-        ball_velocity_rows.assign(n * kMaxBallVelocityContactRows, BallVelocityContactRow{});
-        ball_friction_rows.assign(n * kMaxBallFrictionContactRows, BallFrictionContactRow{});
-        pair_split_rows.assign(n * kMaxCarPairSplitContactRows, CarSharedSplitContactRow{});
-        world_split_rows.assign(n * kMaxCarSharedSplitContactRows, CarSharedSplitContactRow{});
-        pair_velocity_rows.assign(n * kMaxCarPairSharedVelocityContactRows, CarSharedVelocityContactRow{});
-        pair_friction_rows.assign(n * kMaxCarPairSharedFrictionContactRows, CarSharedFrictionContactRow{});
-        world_velocity_rows.assign(n * kMaxCarWorldSharedVelocityContactRows, CarSharedVelocityContactRow{});
-        world_friction_rows.assign(n * kMaxCarWorldSharedFrictionContactRows, CarSharedFrictionContactRow{});
-        shared_contact_order_groups.assign(n * kMaxSharedContactOrderGroups, SharedContactOrderGroup{});
-        bullet_manifolds.assign(n * kMaxBulletManifoldEntries, BulletManifoldEntry{});
+        ball_split_rows.assign(n * caps.ball_split, BallSplitContactRow{});
+        ball_velocity_rows.assign(n * caps.ball_velocity, BallVelocityContactRow{});
+        ball_friction_rows.assign(n * caps.ball_friction, BallFrictionContactRow{});
+        pair_split_rows.assign(n * caps.pair_split, CarSharedSplitContactRow{});
+        world_split_rows.assign(n * caps.world_split, CarSharedSplitContactRow{});
+        pair_velocity_rows.assign(n * caps.pair_velocity, CarSharedVelocityContactRow{});
+        pair_friction_rows.assign(n * caps.pair_friction, CarSharedFrictionContactRow{});
+        world_velocity_rows.assign(n * caps.world_velocity, CarSharedVelocityContactRow{});
+        world_friction_rows.assign(n * caps.world_friction, CarSharedFrictionContactRow{});
+        shared_contact_order_groups.assign(n * caps.order_groups, SharedContactOrderGroup{});
+        bullet_manifolds.assign(n * caps.manifolds, BulletManifoldEntry{});
+        pair_contact_cache.assign(n * caps.pair_cache_cars * caps.pair_cache_cars, CarCarPairCachedContact{});
+        car_world_plane_manifolds.assign(n * caps.car_world_plane, CarWorldPlaneRetainedManifold{});
+        car_world_mesh_manifolds.assign(n * caps.car_world_mesh, CarWorldMeshRetainedManifold{});
+        car_car_retained_manifolds.assign(n * caps.car_car_retained, CarCarRetainedManifold{});
+        ball_car_retained_manifolds.assign(n * caps.ball_car_retained, BallCarRetainedManifold{});
+        car_world_local_rows.assign(n * caps.car_world_local, CarWorldLocalRows{});
         pool = WorldSolverScratchRowPool{};
         pool.ball_split_rows = ball_split_rows.data();
         pool.ball_velocity_rows = ball_velocity_rows.data();
@@ -895,8 +1065,15 @@ struct WorldSolverScratchRowPoolHost {
         pool.world_friction_rows = world_friction_rows.data();
         pool.shared_contact_order_groups = shared_contact_order_groups.data();
         pool.bullet_manifolds = bullet_manifolds.data();
+        pool.pair_contact_cache = pair_contact_cache.data();
+        pool.car_world_plane_manifolds = car_world_plane_manifolds.data();
+        pool.car_world_mesh_manifolds = car_world_mesh_manifolds.data();
+        pool.car_car_retained_manifolds = car_car_retained_manifolds.data();
+        pool.ball_car_retained_manifolds = ball_car_retained_manifolds.data();
+        pool.car_world_local_rows = car_world_local_rows.data();
         pool.env_count = env_count;
         pool.interleaved = interleaved ? 1 : 0;
+        pool.caps = caps;
     }
 
     WorldSolverScratchRows view(int env_idx) const { return pool.view(env_idx); }
@@ -981,7 +1158,6 @@ struct WorldSolverScratch {
 
     bullet_port::btGjkEpaScratch car_triangle_gjk_epa_scratch = {};
     bullet_port::btGjkEpaScratch ball_car_gjk_epa_scratch = {};
-    CarCarPairCachedContact pair_contact_cache[kMaxCarCarPairSlots] = {};
     PreContactCar pre_contact_cars[8] = {};
     ::rocketgpu::Vec3 deferred_linear_deltas[8] = {};
     ::rocketgpu::Vec3 deferred_angular_deltas[8] = {};
@@ -1004,23 +1180,23 @@ struct WorldSolverScratch {
     ::rocketgpu::Vec3 ball_settled_solver_vel_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
     ::rocketgpu::BallState ball_settled_state = {};
 
-    int32_t bp_cell_i[9] = {};
-    int32_t bp_cell_j[9] = {};
-    int32_t bp_cell_k[9] = {};
-    uint32_t bp_insert_seq[9] = {};
-    uint32_t bp_seq_counter = 0;
-    uint8_t bp_initialized = 0;
-    // Bullet's bookkeeping carried across ticks (BuildBulletManifoldList): the overlapping pair cache, btRSBroadphase's
-    // activePairs and the dispatcher's manifold array, as pair keys (island_id unused).
+    // Bullet's bookkeeping carried across ticks (BuildBulletManifoldList): the overlapping pair cache and the
+    // dispatcher's manifold array, as pair keys (island_id unused).
     uint8_t bp_pair_count = 0;
-    uint8_t bp_active_count = 0;
     uint8_t bp_manifold_count = 0;
     BulletManifoldEntry bp_pairs[kMaxBulletManifoldEntries] = {};
-    BulletManifoldEntry bp_active[kMaxBulletManifoldEntries] = {};
     BulletManifoldEntry bp_manifolds[kMaxBulletManifoldEntries] = {};
-    CarWorldPlaneRetainedManifold car_world_plane_manifolds[kMaxCarWorldPlaneRetainedManifolds] = {};
-    CarCarRetainedManifold car_car_retained_manifolds[kMaxCarCarRetainedManifolds] = {};
-    BallCarRetainedManifold ball_car_retained_manifolds[kMaxBallCarRetainedManifolds] = {};
+    // RL's btAxisSweep3 (BuildBulletManifoldList): live handle count (0 = not built), static handle count, the sorted
+    // edges per axis (quantized position, owning handle; handle 0 is the sentinel) and each handle's edge indices.
+    uint8_t sap_handle_count = 0;
+    uint8_t sap_static_count = 0;
+    uint16_t sap_edge_pos[3][kAxisSweepMaxEdges] = {};
+    uint8_t sap_edge_handle[3][kAxisSweepMaxEdges] = {};
+    uint8_t sap_min_edge[kAxisSweepMaxHandles + 1][3] = {};
+    uint8_t sap_max_edge[kAxisSweepMaxHandles + 1][3] = {};
+    int16_t sap_static_id[kAxisSweepMaxHandles + 1] = {};
+    // Set by a kickoff reset: the next world step clears the retained manifolds in the row pool first.
+    uint8_t retained_reset_pending = 0;
 
     int32_t bullet_manifold_count = 0;
     int32_t shared_contact_order_group_count = 0;
@@ -1028,6 +1204,10 @@ struct WorldSolverScratch {
     WheelRayStage wheel_ray_stage[kWheelRayStageSlots] = {};
     WorldStepCarry world_step_carry = {};
     CarWorldRowsOut car_world_rows_out[8] = {};
+    // Cars of the tick that last wrote pair_contact_cache (its valid slots are among theirs).
+    uint8_t pair_cache_cars = 8;
+    // Staged CUDA step: whether this tick's vehicle updates ran a thread per car (VehicleUpdatesIndependent).
+    uint8_t vehicle_updates_independent = 0;
 };
 
 ROCKETGPU_HD float BallSplitTurnErp() {
@@ -2967,7 +3147,10 @@ ROCKETGPU_HD ArenaBroadphaseGrid MakeArenaBroadphaseGrid(const ::rocketgpu::SimC
 ROCKETGPU_HD bool BulletStaticPlaneProxyAabb(int plane_rank, ::rocketgpu::Vec3& out_min, ::rocketgpu::Vec3& out_max) {
     constexpr float kUUToBT = 1.0f / 50.0f;
     constexpr float kLarge = 1.0e18f;
-    constexpr float kSlabBt = 0.2f;
+    // RL's broadphase AABB for its plane shape (used by addCollisionObject; arena statics are never
+    // re-AABB'd: they are created with DISABLE_SIMULATION and RLPhysScene clears forceUpdateAllAabbs) is the plane's
+    // rectangle swept 1e18 behind it, so nothing in front of the surface. The in-plane extents are treated as infinite.
+    constexpr float kSlabBt = 0.0f;
     constexpr float kContactThresholdBt = 0.02f;
     const float arena_extent_x_bt = ArenaExtentX() * kUUToBT;
     const float arena_height_bt = ArenaHeight() * kUUToBT;
@@ -3062,7 +3245,9 @@ ROCKETGPU_HD BulletBroadphaseProxy ComputeBulletCarProxyAabb(
     ::rocketgpu::Vec3 pred_basis_fwd = car.basis_forward;
     ::rocketgpu::Vec3 pred_basis_right = car.basis_right;
     ::rocketgpu::Vec3 pred_basis_up = car.basis_up;
-    if (car.basis_authoritative) {
+    if (car.basis_authoritative && !native_sse_math) {
+        GameIntegrateOrientationBasisColumns(pred_basis_fwd, pred_basis_right, pred_basis_up, predicted_rot, car.ang_vel, dt);
+    } else if (car.basis_authoritative) {
         IntegrateOrientationBasisColumns(
             pred_basis_fwd, pred_basis_right, pred_basis_up, predicted_rot, car.ang_vel, dt, false, native_sse_math);
     } else {
@@ -3182,8 +3367,8 @@ ROCKETGPU_HD int BuildBulletManifoldList(
     constexpr float kSphereAabbExtraBt = 0.08f;
     constexpr float kCompoundMarginBt = 0.0f;
 
-    // true (cal_ball_wake_on_set): the step simulates an exactly-still ball, so its world manifolds
-    // must stay in the list that drives solver ordering (same predicate as ShouldSleepBallAtTickStart).
+    // A sleeping ball keeps its world manifolds in the list that drives solver ordering: Bullet keeps a sleeping
+    // body's pairs and manifolds (see ResolveBallActivationAtTickStart).
     constexpr int kMaxBodies = 9;
 
     BulletBroadphaseProxy proxies[kMaxBodies];
@@ -3207,6 +3392,8 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             Max(pos_bt.z, predicted_bt.z) + extent + kContactThresholdBt);
         proxy.child_aabb_min = ::rocketgpu::Vec3(pos_bt.x - extent, pos_bt.y - extent, pos_bt.z - extent);
         proxy.child_aabb_max = ::rocketgpu::Vec3(pos_bt.x + extent, pos_bt.y + extent, pos_bt.z + extent);
+        proxy.child_center = pos_bt;
+        proxy.child_half = ::rocketgpu::Vec3(extent, extent, extent);
         grid.cell_indices(proxy.aabb_min, proxy.cell_i, proxy.cell_j, proxy.cell_k);
         proxy.valid = 1;
         proxy.is_ball = 1;
@@ -3234,7 +3421,9 @@ ROCKETGPU_HD int BuildBulletManifoldList(
         ::rocketgpu::Vec3 pred_basis_fwd = car.basis_forward;
         ::rocketgpu::Vec3 pred_basis_right = car.basis_right;
         ::rocketgpu::Vec3 pred_basis_up = car.basis_up;
-        if (car.basis_authoritative) {
+        if (car.basis_authoritative && !native_sse_math) {
+            GameIntegrateOrientationBasisColumns(pred_basis_fwd, pred_basis_right, pred_basis_up, predicted_rot, car.ang_vel, dt);
+        } else if (car.basis_authoritative) {
             IntegrateOrientationBasisColumns(
                 pred_basis_fwd, pred_basis_right, pred_basis_up, predicted_rot, car.ang_vel, dt, false, native_sse_math);
         } else {
@@ -3301,6 +3490,11 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             center_now.x + child_extent_now.x,
             center_now.y + child_extent_now.y,
             center_now.z + child_extent_now.z);
+        proxy.child_center = center_now;
+        proxy.child_axis[0] = axis_x;
+        proxy.child_axis[1] = axis_y;
+        proxy.child_axis[2] = axis_z;
+        proxy.child_half = half_extent_bt;
         grid.cell_indices(proxy.aabb_min, proxy.cell_i, proxy.cell_j, proxy.cell_k);
         proxy.valid = 1;
         proxy.is_ball = 0;
@@ -3311,45 +3505,6 @@ ROCKETGPU_HD int BuildBulletManifoldList(
         return 0;
     }
     WorldSolverScratch& h = *bp_history;
-
-    if (!h.bp_initialized) {
-        h.bp_seq_counter = 0;
-        for (int body = 0; body < body_count; ++body) {
-            h.bp_cell_i[body] = proxies[body].cell_i;
-            h.bp_cell_j[body] = proxies[body].cell_j;
-            h.bp_cell_k[body] = proxies[body].cell_k;
-            h.bp_insert_seq[body] = ++h.bp_seq_counter;
-        }
-        h.bp_initialized = 1;
-    } else {
-        for (int body = 0; body < body_count; ++body) {
-            const BulletBroadphaseProxy& proxy = proxies[body];
-            if (proxy.valid &&
-                (proxy.cell_i != h.bp_cell_i[body] || proxy.cell_j != h.bp_cell_j[body] || proxy.cell_k != h.bp_cell_k[body])) {
-                h.bp_cell_i[body] = proxy.cell_i;
-                h.bp_cell_j[body] = proxy.cell_j;
-                h.bp_cell_k[body] = proxy.cell_k;
-                h.bp_insert_seq[body] = ++h.bp_seq_counter;
-            }
-        }
-    }
-    const uint32_t* insert_seq = h.bp_insert_seq;
-
-    int partner_order[kMaxBodies];
-    for (int i = 0; i < body_count; ++i) {
-        partner_order[i] = i;
-    }
-    for (int i = 1; i < body_count; ++i) {
-        const int v = partner_order[i];
-        int j = i - 1;
-        while (j >= 0 &&
-               (insert_seq[partner_order[j]] > insert_seq[v] ||
-                (insert_seq[partner_order[j]] == insert_seq[v] && partner_order[j] > v))) {
-            partner_order[j + 1] = partner_order[j];
-            --j;
-        }
-        partner_order[j + 1] = v;
-    }
 
     // Pair keys use BulletManifoldEntry: kind 0 ball-static, 1 ball-car, 2 car-static, 3 car-car (body_a < body_b).
     const auto mesh_info_for = [&](int mesh_index) -> const ArenaMeshBvhMeshInfo* {
@@ -3363,41 +3518,56 @@ ROCKETGPU_HD int BuildBulletManifoldList(
     const auto body_proxy = [&](int body) -> const BulletBroadphaseProxy* {
         return body >= 0 && body < body_count && proxies[body].valid ? &proxies[body] : nullptr;
     };
-    // Broadphase overlap (proxy AABBs), and whether the narrowphase holds a manifold: a ball-static algorithm makes
-    // its manifold on creation; a car's compound child algorithm exists while the child AABB overlaps the other shape.
-    const auto overlap = [&](const BulletManifoldEntry& key, bool manifold) {
+    // Whether the narrowphase holds a manifold for a cached pair. The near callback does no AABB test of its own; a car's
+    // compound child algorithm exists while the child AABB overlaps the other
+    // shape's getAabb. A plane's getAabb is +-1e18, so a car-plane manifold lives as long as the pair.
+    const auto overlap = [&](const BulletManifoldEntry& key) {
         const BulletBroadphaseProxy* pa = body_proxy(key.kind <= 1 ? 0 : key.body_a + 1);
         if (pa == nullptr) {
             return false;
         }
         if (key.kind == 1 || key.kind == 3) {
             const BulletBroadphaseProxy* pb = body_proxy(key.kind == 1 ? key.body_a + 1 : key.body_b + 1);
-            return pb != nullptr && BulletAabbOverlap(pa->aabb_min, pa->aabb_max, pb->aabb_min, pb->aabb_max) &&
-                   (!manifold ||
-                    BulletAabbOverlap(pa->child_aabb_min, pa->child_aabb_max, pb->child_aabb_min, pb->child_aabb_max));
+            return pb != nullptr &&
+                   BulletAabbOverlap(pa->child_aabb_min, pa->child_aabb_max, pb->child_aabb_min, pb->child_aabb_max);
         }
         if (!arena_static) {
             return false;
         }
-        ::rocketgpu::Vec3 proxy_min(0.0f, 0.0f, 0.0f), proxy_max(0.0f, 0.0f, 0.0f);
-        ::rocketgpu::Vec3 shape_min(0.0f, 0.0f, 0.0f), shape_max(0.0f, 0.0f, 0.0f);
         if (key.static_id >= 100) {
-            BulletStaticPlaneProxyAabb(key.static_id - 100, proxy_min, proxy_max);
-            BulletStaticPlaneShapeAabb(key.static_id - 100, shape_min, shape_max);
-        } else {
-            const ArenaMeshBvhMeshInfo* info = mesh_info_for(key.static_id);
-            if (info == nullptr) {
+            return true;
+        }
+        const ArenaMeshBvhMeshInfo* info = mesh_info_for(key.static_id);
+        return info != nullptr &&
+               BulletAabbOverlap(pa->child_aabb_min, pa->child_aabb_max, info->aabb_min, info->aabb_max);
+    };
+    // A car's compound child algorithm is made only for a child the compound's dbvt query returns, in the car's local
+    // frame: the other shape's getAabb there (a ball: btCompoundCollisionAlgorithm's collideTV), or the other car's
+    // child volume transformed into this car's frame as an AABB (car-car: MycollideTT, body0 = the lower handle).
+    // The child world AABB test (overlap) then gates it; once
+    // made it is dropped only when the child world AABBs separate (Wisp 11439 k42: the car-car manifold is made after
+    // both ball-car ones, which sets the solver order of the three).
+    const auto local_overlap = [&](const BulletManifoldEntry& key) {
+        const BulletBroadphaseProxy* pa = body_proxy(key.body_a + 1);
+        const BulletBroadphaseProxy* pb = body_proxy(key.kind == 1 ? 0 : key.body_b + 1);
+        if (pa == nullptr || pb == nullptr) {
+            return false;
+        }
+        const ::rocketgpu::Vec3 d = pb->child_center - pa->child_center;
+        const float ha[3] = {pa->child_half.x, pa->child_half.y, pa->child_half.z};
+        const float hb[3] = {pb->child_half.x, pb->child_half.y, pb->child_half.z};
+        for (int k = 0; k < 3; ++k) {
+            const ::rocketgpu::Vec3& ak = pa->child_axis[k];
+            float e = hb[k];
+            if (!pb->is_ball) {
+                e = Abs(Dot(ak, pb->child_axis[0])) * hb[0] + Abs(Dot(ak, pb->child_axis[1])) * hb[1] +
+                    Abs(Dot(ak, pb->child_axis[2])) * hb[2];
+            }
+            if (Abs(Dot(d, ak)) > ha[k] + e) {
                 return false;
             }
-            shape_min = info->aabb_min;
-            shape_max = info->aabb_max;
-            const ::rocketgpu::Vec3 threshold(kContactThresholdBt, kContactThresholdBt, kContactThresholdBt);
-            proxy_min = shape_min - threshold;
-            proxy_max = shape_max + threshold;
         }
-        return BulletAabbOverlap(pa->aabb_min, pa->aabb_max, proxy_min, proxy_max) &&
-               (!manifold || key.kind == 0 ||
-                BulletAabbOverlap(pa->child_aabb_min, pa->child_aabb_max, shape_min, shape_max));
+        return true;
     };
     const auto find = [](const BulletManifoldEntry* list, int n, const BulletManifoldEntry& key) {
         for (int i = 0; i < n; ++i) {
@@ -3414,65 +3584,212 @@ ROCKETGPU_HD int BuildBulletManifoldList(
         }
     };
 
-    // btRSBroadphase::calculateOverlappingPairs: every pair leaves the cache (btHashedOverlappingPairCache swaps the
-    // last pair into its slot; its algorithm releases its manifold the same way) except the retained ball-world,
-    // ball-car and car-car pairs whose AABBs still overlap, which stay first in activePairs.
-    int kept = 0;
-    for (int i = 0; i < h.bp_active_count; ++i) {
-        const BulletManifoldEntry key = h.bp_active[i];
-        if (key.kind != 2 && overlap(key, false)) {
-            h.bp_active[kept++] = key;
-            continue;
+    // RL's broadphase is btAxisSweep3<unsigned short>: RLPhysScene::RLPhysScene calls its ctor
+    // with world AABB +-10485.74 bt, 0x4000 handles and a hashed pair
+    // cache (v3 axis_sweep.rs). Handles are the arena meshes and 4 planes (raw shape AABBs), then the ball and
+    // the cars, in creation order. Each body's setAabb moves its quantized edges; a min edge passing down over a
+    // max edge (or a max edge passing up over a min edge) appends a pair when the other two axes overlap, and the
+    // reverse moves remove it (swap-with-last, releasing its manifold the same way).
+    constexpr float kSapHalfExtentBt = 10485.740234375f;
+    const float sap_quantize = 65535.0f / (kSapHalfExtentBt + kSapHalfExtentBt);
+    const auto quantize_point = [&](const ::rocketgpu::Vec3& p, uint16_t* out, int is_max) {
+        const float v[3] = {p.x, p.y, p.z};
+        for (int axis = 0; axis < 3; ++axis) {
+            float scaled = (v[axis] + kSapHalfExtentBt) * sap_quantize;
+            scaled = scaled >= 0.0f ? (scaled < 65535.0f ? scaled : 65535.0f) : 0.0f;
+            out[axis] = static_cast<uint16_t>((static_cast<int>(scaled) & 0xfffe) | is_max);
         }
-        swap_remove(h.bp_pairs, h.bp_pair_count, find(h.bp_pairs, h.bp_pair_count, key));
-        swap_remove(h.bp_manifolds, h.bp_manifold_count, find(h.bp_manifolds, h.bp_manifold_count, key));
-    }
-    h.bp_active_count = static_cast<uint8_t>(kept);
-
-    // New pairs, per dynamic proxy in handle order: its cell's statics in registration order, then its cell's dynamics.
-    const auto add_pair = [&](int8_t kind, int8_t body_a, int8_t body_b, int16_t static_id) {
+    };
+    // Pair handles to a pair key: handles 1..sap_static_count are statics, then body 0 (ball), body 1.. (cars).
+    const auto sap_key = [&](int ha, int hb, BulletManifoldEntry& key) {
+        if (ha > hb) {
+            const int t = ha;
+            ha = hb;
+            hb = t;
+        }
+        // Statics are added first, so a static hb means a static-static pair: needsBroadphaseCollision drops it
+        // (static objects' filter mask excludes StaticFilter). sap_static_count is still 0 while they are added.
+        if (h.sap_static_id[hb] >= 0) {
+            return false;
+        }
+        const int statics = h.sap_static_count;
+        const int body_b = hb - statics - 1;
+        if (body_b < 0 || body_b >= body_count) {
+            return false;
+        }
+        key = BulletManifoldEntry();
+        if (ha <= statics) {
+            key.kind = body_b == 0 ? 0 : 2;
+            key.body_a = static_cast<int8_t>(body_b - 1);
+            key.static_id = h.sap_static_id[ha];
+        } else {
+            const int body_a = ha - statics - 1;
+            key.kind = body_a == 0 ? 1 : 3;
+            key.body_a = static_cast<int8_t>(body_a == 0 ? body_b - 1 : body_a - 1);
+            key.body_b = static_cast<int8_t>(body_a == 0 ? -1 : body_b - 1);
+        }
+        return true;
+    };
+    const auto sap_add_pair = [&](int ha, int hb) {
         BulletManifoldEntry key;
-        key.kind = kind;
-        key.body_a = body_a;
-        key.body_b = body_b;
-        key.static_id = static_id;
-        if (!overlap(key, false) || find(h.bp_pairs, h.bp_pair_count, key) >= 0 ||
-            h.bp_pair_count >= kMaxBulletManifoldEntries) {
+        if (sap_key(ha, hb, key) && find(h.bp_pairs, h.bp_pair_count, key) < 0 &&
+            h.bp_pair_count < kMaxBulletManifoldEntries) {
+            h.bp_pairs[h.bp_pair_count++] = key;
+        }
+    };
+    const auto sap_remove_pair = [&](int ha, int hb) {
+        BulletManifoldEntry key;
+        if (!sap_key(ha, hb, key)) {
             return;
         }
-        h.bp_pairs[h.bp_pair_count++] = key;
-        h.bp_active[h.bp_active_count++] = key;
-    };
-    for (int body = 0; body < body_count; ++body) {
-        const BulletBroadphaseProxy& proxy = proxies[body];
-        if (!proxy.valid) {
-            continue;
+        const int at = find(h.bp_pairs, h.bp_pair_count, key);
+        if (at >= 0) {
+            swap_remove(h.bp_pairs, h.bp_pair_count, at);
+            swap_remove(h.bp_manifolds, h.bp_manifold_count, find(h.bp_manifolds, h.bp_manifold_count, key));
         }
-        const int8_t kind = proxy.is_ball ? 0 : 2;
-        const int8_t body_a = proxy.is_ball ? static_cast<int8_t>(-1) : static_cast<int8_t>(body - 1);
-        const int cell_index = proxy.cell_i * grid.cells_y * grid.cells_z + proxy.cell_j * grid.cells_z + proxy.cell_k;
-        for (int mesh_slot = 0; arena_static && mesh_slot < mesh_info_count; ++mesh_slot) {
-            const ArenaMeshBvhMeshInfo& info = mesh_infos[mesh_slot];
-            if (info.mesh_index >= 0 && info.triangle_count > 0 && grid.mesh_registered_in_cell(cell_index, info.mesh_index)) {
-                add_pair(kind, body_a, -1, static_cast<int16_t>(info.mesh_index));
+    };
+    // testOverlap2D: compares sorted edge indices on the two other axes; touching counts as overlap.
+    const auto overlap_2d = [&](int a, int b, int axis) {
+        const int axis1 = (1 << axis) & 3;
+        const int axis2 = (1 << axis1) & 3;
+        return !(h.sap_max_edge[a][axis1] < h.sap_min_edge[b][axis1] ||
+                 h.sap_max_edge[b][axis1] < h.sap_min_edge[a][axis1] ||
+                 h.sap_max_edge[a][axis2] < h.sap_min_edge[b][axis2] ||
+                 h.sap_max_edge[b][axis2] < h.sap_min_edge[a][axis2]);
+    };
+    const auto swap_edges = [&](int axis, int i, int j) {
+        const uint16_t pos = h.sap_edge_pos[axis][i];
+        const uint8_t owner = h.sap_edge_handle[axis][i];
+        h.sap_edge_pos[axis][i] = h.sap_edge_pos[axis][j];
+        h.sap_edge_handle[axis][i] = h.sap_edge_handle[axis][j];
+        h.sap_edge_pos[axis][j] = pos;
+        h.sap_edge_handle[axis][j] = owner;
+    };
+    // sortMinDown / sortMaxDown walk down, sortMinUp / sortMaxUp walk up to the max sentinel (handle 0).
+    const auto sort_down = [&](int axis, int index, bool is_max_edge, bool update) {
+        const int moving = h.sap_edge_handle[axis][index];
+        while (index > 0 && h.sap_edge_pos[axis][index] < h.sap_edge_pos[axis][index - 1]) {
+            const int prev = h.sap_edge_handle[axis][index - 1];
+            const bool prev_is_max = (h.sap_edge_pos[axis][index - 1] & 1) != 0;
+            if (update && prev_is_max != is_max_edge && overlap_2d(moving, prev, axis)) {
+                if (is_max_edge) {
+                    sap_remove_pair(moving, prev);
+                } else {
+                    sap_add_pair(moving, prev);
+                }
+            }
+            ++(prev_is_max ? h.sap_max_edge[prev][axis] : h.sap_min_edge[prev][axis]);
+            --(is_max_edge ? h.sap_max_edge[moving][axis] : h.sap_min_edge[moving][axis]);
+            swap_edges(axis, index, index - 1);
+            --index;
+        }
+    };
+    const auto sort_up = [&](int axis, int index, bool is_max_edge, bool update) {
+        const int moving = h.sap_edge_handle[axis][index];
+        const int len = 2 * h.sap_handle_count + 2;
+        while (index + 1 < len && h.sap_edge_handle[axis][index + 1] != 0 &&
+               h.sap_edge_pos[axis][index] >= h.sap_edge_pos[axis][index + 1]) {
+            const int next = h.sap_edge_handle[axis][index + 1];
+            const bool next_is_max = (h.sap_edge_pos[axis][index + 1] & 1) != 0;
+            if (update && next_is_max != is_max_edge && overlap_2d(moving, next, axis)) {
+                if (is_max_edge) {
+                    sap_add_pair(moving, next);
+                } else {
+                    sap_remove_pair(moving, next);
+                }
+            }
+            --(next_is_max ? h.sap_max_edge[next][axis] : h.sap_min_edge[next][axis]);
+            ++(is_max_edge ? h.sap_max_edge[moving][axis] : h.sap_min_edge[moving][axis]);
+            swap_edges(axis, index, index + 1);
+            ++index;
+        }
+    };
+    // addHandle: append the edges below the max sentinel, sort axes 0 and 1 down silently, axis 2 with pairs.
+    const auto add_handle = [&](const ::rocketgpu::Vec3& aabb_min, const ::rocketgpu::Vec3& aabb_max, int16_t id) {
+        uint16_t qmin[3], qmax[3];
+        quantize_point(aabb_min, qmin, 0);
+        quantize_point(aabb_max, qmax, 1);
+        const int handle = ++h.sap_handle_count;
+        const int limit = 2 * handle;
+        h.sap_static_id[handle] = id;
+        for (int axis = 0; axis < 3; ++axis) {
+            h.sap_max_edge[0][axis] = static_cast<uint8_t>(h.sap_max_edge[0][axis] + 2);
+            h.sap_edge_pos[axis][limit + 1] = h.sap_edge_pos[axis][limit - 1];
+            h.sap_edge_handle[axis][limit + 1] = h.sap_edge_handle[axis][limit - 1];
+            h.sap_edge_pos[axis][limit - 1] = qmin[axis];
+            h.sap_edge_handle[axis][limit - 1] = static_cast<uint8_t>(handle);
+            h.sap_edge_pos[axis][limit] = qmax[axis];
+            h.sap_edge_handle[axis][limit] = static_cast<uint8_t>(handle);
+            h.sap_min_edge[handle][axis] = static_cast<uint8_t>(limit - 1);
+            h.sap_max_edge[handle][axis] = static_cast<uint8_t>(limit);
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            sort_down(axis, h.sap_min_edge[handle][axis], false, axis == 2);
+            sort_down(axis, h.sap_max_edge[handle][axis], true, axis == 2);
+        }
+    };
+    if (h.sap_handle_count == 0) {
+        for (int axis = 0; axis < 3; ++axis) {
+            h.sap_edge_pos[axis][0] = 0;
+            h.sap_edge_handle[axis][0] = 0;
+            h.sap_edge_pos[axis][1] = 0xffff;
+            h.sap_edge_handle[axis][1] = 0;
+            h.sap_min_edge[0][axis] = 0;
+            h.sap_max_edge[0][axis] = 1;
+        }
+        for (int slot = 0; arena_static && slot < mesh_info_count; ++slot) {
+            const ArenaMeshBvhMeshInfo& info = mesh_infos[slot];
+            if (info.mesh_index >= 0 && info.triangle_count > 0 &&
+                h.sap_handle_count + 4 + kMaxBodies < kAxisSweepMaxHandles) {
+                add_handle(info.aabb_min, info.aabb_max, static_cast<int16_t>(info.mesh_index));
             }
         }
         for (int plane_rank = 0; arena_static && plane_rank < 4; ++plane_rank) {
-            if (BulletPlaneRegisteredInCell(grid, plane_rank, proxy.cell_i, proxy.cell_j, proxy.cell_k)) {
-                add_pair(kind, body_a, -1, static_cast<int16_t>(100 + plane_rank));
-            }
+            ::rocketgpu::Vec3 shape_min(0.0f, 0.0f, 0.0f), shape_max(0.0f, 0.0f, 0.0f);
+            BulletStaticPlaneShapeAabb(plane_rank, shape_min, shape_max);
+            add_handle(shape_min, shape_max, static_cast<int16_t>(100 + plane_rank));
         }
-        for (int order_i = 0; order_i < body_count; ++order_i) {
-            const int other = partner_order[order_i];
-            const BulletBroadphaseProxy& other_proxy = proxies[other];
-            if (other == body || !other_proxy.valid || Abs(other_proxy.cell_i - proxy.cell_i) > 1 ||
-                Abs(other_proxy.cell_j - proxy.cell_j) > 1 || Abs(other_proxy.cell_k - proxy.cell_k) > 1) {
+        h.sap_static_count = h.sap_handle_count;
+    }
+    // updateAabbs: the ball, then the cars (a demoed car keeps its edges); a body seen first is added.
+    for (int body = 0; body < body_count; ++body) {
+        const BulletBroadphaseProxy& proxy = proxies[body];
+        const int handle = h.sap_static_count + 1 + body;
+        if (handle > h.sap_handle_count) {
+            if (handle > kAxisSweepMaxHandles) {
+                break;
+            }
+            const ::rocketgpu::Vec3 at = body > 0 ? cars[body - 1].pos_bt : ball.pos_bt;
+            add_handle(proxy.valid ? proxy.aabb_min : at, proxy.valid ? proxy.aabb_max : at, -1);
+            continue;
+        }
+        if (!proxy.valid) {
+            continue;
+        }
+        uint16_t qmin[3], qmax[3];
+        quantize_point(proxy.aabb_min, qmin, 0);
+        quantize_point(proxy.aabb_max, qmax, 1);
+        for (int axis = 0; axis < 3; ++axis) {
+            const int emin = h.sap_min_edge[handle][axis];
+            const int emax = h.sap_max_edge[handle][axis];
+            const int dmin = static_cast<int>(qmin[axis]) - static_cast<int>(h.sap_edge_pos[axis][emin]);
+            const int dmax = static_cast<int>(qmax[axis]) - static_cast<int>(h.sap_edge_pos[axis][emax]);
+            if (dmin == 0 && dmax == 0) {
                 continue;
             }
-            if (proxy.is_ball || other_proxy.is_ball) {
-                add_pair(1, static_cast<int8_t>((proxy.is_ball ? other : body) - 1), -1, -1);
-            } else {
-                add_pair(3, static_cast<int8_t>(Min(body, other) - 1), static_cast<int8_t>(Max(body, other) - 1), -1);
+            h.sap_edge_pos[axis][emin] = qmin[axis];
+            h.sap_edge_pos[axis][emax] = qmax[axis];
+            if (dmin < 0) {
+                sort_down(axis, emin, false, true);
+            }
+            if (dmax > 0) {
+                sort_up(axis, emax, true, true);
+            }
+            if (dmin > 0) {
+                sort_up(axis, emin, false, true);
+            }
+            if (dmax < 0) {
+                sort_down(axis, emax, true, true);
             }
         }
     }
@@ -3482,7 +3799,11 @@ ROCKETGPU_HD int BuildBulletManifoldList(
     for (int i = 0; i < h.bp_pair_count; ++i) {
         const BulletManifoldEntry& key = h.bp_pairs[i];
         const int at = find(h.bp_manifolds, h.bp_manifold_count, key);
-        const bool want = overlap(key, true);
+        // A ball-static algorithm makes its manifold when the pair is first dispatched (v3 collision_dispatcher.rs).
+        const bool want = key.kind == 0 ? body_proxy(0) != nullptr : overlap(key);
+        if (want && at < 0 && (key.kind == 1 || key.kind == 3) && !local_overlap(key)) {
+            continue;
+        }
         if (want && at < 0) {
             h.bp_manifolds[h.bp_manifold_count++] = key;
         } else if (!want) {
@@ -3715,8 +4036,13 @@ ROCKETGPU_HD void SolveUnifiedSplitContactRows(
         if (!ball.basis_authoritative) {
             GetOfficialUploadBasisVectors(ball.rot, ball.basis_forward, ball.basis_right, ball.basis_up);
         }
-        IntegrateOrientationBasisColumns(ball.basis_forward, ball.basis_right, ball.basis_up,
-            ball.rot, ball_split.turn_velocity * BallSplitTurnErp(), dt, false, native_sse_math);
+        if (native_sse_math) {
+            IntegrateOrientationBasisColumns(ball.basis_forward, ball.basis_right, ball.basis_up,
+                ball.rot, ball_split.turn_velocity * BallSplitTurnErp(), dt, false, true);
+        } else {
+            GameIntegrateOrientationBasisColumns(ball.basis_forward, ball.basis_right, ball.basis_up,
+                ball.rot, ball_split.turn_velocity * BallSplitTurnErp(), dt);
+        }
         ball.basis_authoritative = 1;
     }
     for (int i = 0; i < count; ++i) {
@@ -3765,13 +4091,17 @@ ROCKETGPU_HD void UnionSharedContactOrderParents(int* parent, int a, int b) {
     }
 }
 
+// Partitions of disjoint ranges are independent, so taking the smaller side first gives the same order while
+// bounding the pending ranges by log2(n) + 1.
+template <typename Index, typename Key>
 ROCKETGPU_HD void QuickSortSharedContactOrderIndices(
-    int* order,
-    const int* island_ids,
+    Index* order,
+    const Key* island_ids,
     int lo,
     int hi) {
-    int range_lo[kMaxSharedContactOrderGroups];
-    int range_hi[kMaxSharedContactOrderGroups];
+    constexpr int kMaxPendingRanges = 32;
+    int range_lo[kMaxPendingRanges];
+    int range_hi[kMaxPendingRanges];
     int depth = 0;
     range_lo[depth] = lo;
     range_hi[depth] = hi;
@@ -3791,7 +4121,7 @@ ROCKETGPU_HD void QuickSortSharedContactOrderIndices(
                 --j;
             }
             if (i <= j) {
-                const int tmp = order[i];
+                const Index tmp = order[i];
                 order[i] = order[j];
                 order[j] = tmp;
                 ++i;
@@ -3799,15 +4129,16 @@ ROCKETGPU_HD void QuickSortSharedContactOrderIndices(
             }
         } while (i <= j);
 
-        if (i < cur_hi && depth < kMaxSharedContactOrderGroups) {
-            range_lo[depth] = i;
-            range_hi[depth] = cur_hi;
-            ++depth;
-        }
-        if (cur_lo < j && depth < kMaxSharedContactOrderGroups) {
-            range_lo[depth] = cur_lo;
-            range_hi[depth] = j;
-            ++depth;
+        const bool right_first = cur_hi - i < j - cur_lo;  // push the larger side first, pop the smaller next
+        for (int side = 0; side < 2; ++side) {
+            const bool right = (side == 0) != right_first;
+            const int range_start = right ? i : cur_lo;
+            const int range_end = right ? cur_hi : j;
+            if (range_start < range_end && depth < kMaxPendingRanges) {
+                range_lo[depth] = range_start;
+                range_hi[depth] = range_end;
+                ++depth;
+            }
         }
     }
 }
@@ -3843,8 +4174,8 @@ ROCKETGPU_HD int FirstSharedContactOrderBucket(
     int car_island_id[8];
     ResolveSharedContactOrderCarIslandIds(parent, component_max, car_island_id);
 
-    int order[kMaxSharedContactOrderGroups];
-    int island_ids[kMaxSharedContactOrderGroups];
+    int16_t order[kMaxSharedContactOrderGroups];
+    int16_t island_ids[kMaxSharedContactOrderGroups];  // car island ids (1..8) or body index + 1
     int active_count = 0;
     for (int group_idx = 0; group_idx < group_count && group_idx < kMaxSharedContactOrderGroups; ++group_idx) {
         const SharedContactOrderGroup& group = groups[group_idx];
@@ -3859,7 +4190,7 @@ ROCKETGPU_HD int FirstSharedContactOrderBucket(
             order[insert] = order[insert - 1];
             --insert;
         }
-        order[insert] = group_idx;
+        order[insert] = static_cast<int16_t>(group_idx);
         ++active_count;
     }
     if (active_count <= 0) {
@@ -3867,7 +4198,8 @@ ROCKETGPU_HD int FirstSharedContactOrderBucket(
     }
     for (int order_idx = 0; order_idx < active_count; ++order_idx) {
         const SharedContactOrderGroup& group = groups[order[order_idx]];
-        island_ids[order[order_idx]] = SharedContactOrderIslandIdForBody(car_island_id, group.body_a_local_idx);
+        island_ids[order[order_idx]] =
+            static_cast<int16_t>(SharedContactOrderIslandIdForBody(car_island_id, group.body_a_local_idx));
     }
     if (active_count > 1) {
         QuickSortSharedContactOrderIndices(order, island_ids, 0, active_count - 1);

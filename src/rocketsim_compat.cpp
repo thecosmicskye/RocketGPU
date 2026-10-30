@@ -561,6 +561,7 @@ void Car::SetState(const CarStateCompat& state) {
     CarState& s = arena_->car_states_[slot_];
     s.pos = state.pos;
     SeedCarBasisFromRotMat(s, state.rotMat);
+    s.set_wheel_normals_mask = 0;
     // Velocities and the supersonic flag left as reported keep the step's values.
     const bool reported = (s.reported_flags & CarState::kReportedValid) != 0;
     const auto same = [](const Vec3& a, const Vec3& b) { return a.x == b.x && a.y == b.y && a.z == b.z; };
@@ -678,6 +679,9 @@ CarStateV3 Car::GetStateV3() const {
     out.hasWorldContact = s.world_contact.has_contact != 0;
     out.worldContactNormal = s.world_contact.contact_normal;
     out.prevControls = s.last_controls;
+    // Wheel contact normals a set state supplied stay pending until the next step reads them.
+    out.hasWheelContactNormals = s.set_wheel_normals_mask != 0;
+    for (int w = 0; w < 4; ++w) out.wheelContactNormals[w] = s.set_wheel_normals[w ^ 1];
     return out;
 }
 
@@ -733,6 +737,14 @@ void Car::SetStateV3(const CarStateV3& state) {
     s.world_contact.has_contact = state.hasWorldContact ? 1 : 0;
     s.world_contact.contact_normal = state.hasWorldContact ? state.worldContactNormal : Vec3(0.0f, 0.0f, 0.0f);
     s.last_controls = state.prevControls;
+    s.set_wheel_normals_mask = 0;
+    if (state.hasWheelContactNormals) {
+        s.set_wheel_normals_mask = 0x10;
+        for (int w = 0; w < 4; ++w) {
+            s.set_wheel_normals[w ^ 1] = state.wheelContactNormals[w];
+            if (state.wheelsWithContact[w]) s.set_wheel_normals_mask |= static_cast<uint8_t>(1u << (w ^ 1));
+        }
+    }
     s.reported_flags = 0;  // every field above is the step's own value
     s.tick_count_since_update = 0;
     arena_->controls_[slot_] = state.controls;

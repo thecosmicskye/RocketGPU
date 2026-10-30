@@ -42,26 +42,11 @@ struct BallCarContactGeometryDebug {
     uint8_t valid = 0;
     uint8_t used_gjk = 0;
     uint16_t reserved = 0;
-    int32_t gjk_update_region = -1;
-    int32_t gjk_pre_reduce_num_vertices = 0;
-    int32_t gjk_triangle_region = -1;
     Vec3 gjk_cached_axis_bt = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 gjk_normal_bt = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 gjk_fixed_normal_bt = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 gjk_point_on_car_bt = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 gjk_point_on_ball_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_cached_p1_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_cached_p2_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_triangle_closest_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_simplex_w0_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_simplex_w1_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_simplex_w2_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_simplex_p0_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_simplex_p1_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_simplex_p2_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_simplex_q0_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_simplex_q1_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_simplex_q2_bt = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 gjk_local_trans_a_origin_bt = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 gjk_local_trans_a_basis0 = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 gjk_local_trans_a_basis1 = Vec3(0.0f, 0.0f, 0.0f);
@@ -75,11 +60,6 @@ struct BallCarContactGeometryDebug {
     float gjk_len_sqr = 0.0f;
     float gjk_inv_len = 0.0f;
     float gjk_distance_bt = 0.0f;
-    float gjk_triangle_param = 0.0f;
-    float gjk_barycentric0 = 0.0f;
-    float gjk_barycentric1 = 0.0f;
-    float gjk_barycentric2 = 0.0f;
-    float gjk_barycentric3 = 0.0f;
 };
 
 ROCKETGPU_HD bool GetCarBasisForBulletTransform(const CarState& car, Vec3& fwd, Vec3& rgt, Vec3& upv) {
@@ -176,16 +156,10 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool BulletPortCalcPenDepth(
     bullet_port::btGjkEpaScratch* scratch) {
     const bullet_port::btVector3 delta_origin =
         transform_b.getOrigin() - transform_a.getOrigin();
+    // The game's btGjkEpaPenetrationDepthSolver::calcPenDepth tries one guess, B.origin - A.origin
+    // (RocketSim adds eight fallback guesses).
     bullet_port::btVector3 guess_vectors[] = {
         delta_origin.safeNormalize(),
-        (-delta_origin).safeNormalize(),
-        bullet_port::btVector3(0.0f, 0.0f, 1.0f),
-        bullet_port::btVector3(0.0f, 1.0f, 0.0f),
-        bullet_port::btVector3(1.0f, 0.0f, 0.0f),
-        bullet_port::btVector3(1.0f, 1.0f, 0.0f),
-        bullet_port::btVector3(1.0f, 1.0f, 1.0f),
-        bullet_port::btVector3(0.0f, 1.0f, 1.0f),
-        bullet_port::btVector3(1.0f, 0.0f, 1.0f),
     };
 
     const int num_vectors = static_cast<int>(sizeof(guess_vectors) / sizeof(guess_vectors[0]));
@@ -920,26 +894,11 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
     if (debug) {
         debug->valid = 1;
         debug->used_gjk = 1;
-        debug->gjk_update_region = simplex.debug_update_region;
-        debug->gjk_pre_reduce_num_vertices = simplex.debug_pre_reduce_num_vertices;
-        debug->gjk_triangle_region = simplex.debug_triangle_region;
         debug->gjk_cached_axis_bt = cached_axis;
         debug->gjk_normal_bt = normal_bt;
         debug->gjk_fixed_normal_bt = bullet_normal_bt;
         debug->gjk_point_on_car_bt = point_on_car_bt;
         debug->gjk_point_on_ball_bt = point_on_ball_bt;
-        debug->gjk_cached_p1_bt = simplex.debug_cached_p1;
-        debug->gjk_cached_p2_bt = simplex.debug_cached_p2;
-        debug->gjk_triangle_closest_bt = simplex.debug_triangle_closest_point;
-        debug->gjk_simplex_w0_bt = simplex.debug_simplex_w[0];
-        debug->gjk_simplex_w1_bt = simplex.debug_simplex_w[1];
-        debug->gjk_simplex_w2_bt = simplex.debug_simplex_w[2];
-        debug->gjk_simplex_p0_bt = simplex.debug_simplex_p[0];
-        debug->gjk_simplex_p1_bt = simplex.debug_simplex_p[1];
-        debug->gjk_simplex_p2_bt = simplex.debug_simplex_p[2];
-        debug->gjk_simplex_q0_bt = simplex.debug_simplex_q[0];
-        debug->gjk_simplex_q1_bt = simplex.debug_simplex_q[1];
-        debug->gjk_simplex_q2_bt = simplex.debug_simplex_q[2];
         debug->gjk_local_trans_a_origin_bt = FromBulletPortVec3(local_trans_a.getOrigin());
         debug->gjk_local_trans_a_basis0 = FromBulletPortVec3(local_trans_a.getBasis()[0]);
         debug->gjk_local_trans_a_basis1 = FromBulletPortVec3(local_trans_a.getBasis()[1]);
@@ -953,11 +912,6 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
         debug->gjk_len_sqr = len_sqr;
         debug->gjk_inv_len = inv_len;
         debug->gjk_distance_bt = distance_bt;
-        debug->gjk_triangle_param = simplex.debug_triangle_param;
-        debug->gjk_barycentric0 = simplex.debug_barycentric_coords[0];
-        debug->gjk_barycentric1 = simplex.debug_barycentric_coords[1];
-        debug->gjk_barycentric2 = simplex.debug_barycentric_coords[2];
-        debug->gjk_barycentric3 = simplex.debug_barycentric_coords[3];
     }
 
     out_normal = -bullet_normal_bt;
@@ -1342,6 +1296,14 @@ ROCKETGPU_HD bool BulletRsBroadphaseAllowsBallCarPair(
     if (dt <= 0.0f || env_idx < 0) {
         return true;
     }
+    // Both AABBs lie in cubes around the tick-start and predicted origins (car: bounding sphere radius; ball: radius
+    // plus margins), so an axis gap beyond both reaches, the motion over dt and 2 bt of slack rules out an overlap.
+    const float reach_bt = (BoundingSphereRadius(cfg) + mutator.ball_radius) * (1.0f / 50.0f) +
+                           (Length(car.vel_bt) + Length(ball.vel_bt)) * dt + 2.0f;
+    const Vec3 gap_bt = ball.pos_bt - car.pos_bt;
+    if (Abs(gap_bt.x) > reach_bt || Abs(gap_bt.y) > reach_bt || Abs(gap_bt.z) > reach_bt) {
+        return false;
+    }
 
     const BallCarRsBroadphaseProbe probe =
         ComputeBulletRsBroadphaseBallCarProbe(ball, car, cfg, mutator, dt);
@@ -1621,13 +1583,24 @@ ROCKETGPU_HD void RecordBallCarCollisionInfoIfOverlapping(
             Vec3 ei_up(0.0f, 0.0f, 1.0f);
             CarBasisColumns(car, ei_fwd, ei_rgt, ei_up);
             (void)ei_rgt; (void)ei_up;
-            const Vec3 car_forward = ei_fwd;
+            // Car_TA.ApplyBallImpactForces takes
+            // ForwardDir = GetRotatorAxis(QuatToRotator(OldRBState.Quaternion), 0): QuatToRotator is FMatrix::Rotator
+            // (pitch/yaw = appRound(atan2f(..) * 32768 / PI), appRound = cvtss2si(2v + 0.5) >> 1), and
+            // GetRotatorAxis builds FRotationMatrix from UE3's 16384-entry sine table (index angle >> 2).
+            const auto ue3_round = [](float v) { return static_cast<int>(rintf(v + v + 0.5f)) >> 1; };
+            const int fwd_yaw = ue3_round(GlibcAtan2f(ei_fwd.y, ei_fwd.x) * 32768.0f / 3.14159274f);
+            const float fwd_xy = static_cast<float>(sqrt(static_cast<double>(ei_fwd.y * ei_fwd.y + ei_fwd.x * ei_fwd.x)));
+            const int fwd_pitch = ue3_round(GlibcAtan2f(ei_fwd.z, fwd_xy) * 32768.0f / 3.14159274f);
+            constexpr double kSinTabStep = 6.283185307179586476925 / 16384.0;
+            const auto sin_tab = [&](int a) { return static_cast<float>(sin(static_cast<double>((a >> 2) & 16383) * kSinTabStep)); };
+            const float cos_pitch = sin_tab(fwd_pitch + 16384);
+            const Vec3 car_forward(
+                cos_pitch * sin_tab(fwd_yaw + 16384), cos_pitch * sin_tab(fwd_yaw), sin_tab(fwd_pitch));
 
-            Vec3 hit_dir = RocketSimVecNormalized(
-                Vec3(
-                    rel_pos_for_extra.x,
-                    rel_pos_for_extra.y,
-                    rel_pos_for_extra.z * mutator.ball_car_extra_impulse_z_scale));
+            // HitDir = Normal(RelPosition); HitDir.Z *= PushZScale; HitDir = Normal(HitDir).
+            Vec3 hit_dir = RocketSimVecNormalized(rel_pos_for_extra);
+            hit_dir.z *= mutator.ball_car_extra_impulse_z_scale;
+            hit_dir = RocketSimVecNormalized(hit_dir);
             const Vec3 forward_dir_adjustment =
                 (car_forward * Dot(hit_dir, car_forward)) *
                 (1.0f - mutator.ball_car_extra_impulse_forward_scale);
@@ -1949,15 +1922,16 @@ ROCKETGPU_HD float BallCarRetainedRes(const Vec3& local, const Vec3& p1, const V
     return Dot(c, c);
 }
 
-// v3 PersistentManifold::add_contact_without_callback (get_cache_entry on local_point_a, replace,
-// add_manifold_point, sort_cached_points keeping the deepest point).
+// btPersistentManifold::getCacheEntry / addManifoldPoint / sortCachedPoints (keeping the deepest point). Both
+// match and replace on m_localPointA, which is in body0's frame. In the game's ball-car manifold body0 is the car
+// (the lower broadphase uid; the GJK already takes the car box as shape A), so these use the car-local points.
 ROCKETGPU_HD void AddBallCarRetainedPoint(
     BallCarRetainedManifold& manifold, const BallCarRetainedPoint& point, float threshold_bt) {
     const int count = manifold.count;
     float shortest = threshold_bt * threshold_bt;
     int nearest = -1;
     for (int i = 0; i < count; ++i) {
-        const Vec3 d = manifold.points[i].local_a_bt - point.local_a_bt;
+        const Vec3 d = manifold.points[i].local_b_bt - point.local_b_bt;
         const float dist_sq = Dot(d, d);
         if (dist_sq < shortest) {
             shortest = dist_sq;
@@ -1981,11 +1955,11 @@ ROCKETGPU_HD void AddBallCarRetainedPoint(
             max_pen = manifold.points[i].distance_bt;
         }
     }
-    const Vec3& l = point.local_a_bt;
-    const Vec3& p0 = manifold.points[0].local_a_bt;
-    const Vec3& p1 = manifold.points[1].local_a_bt;
-    const Vec3& p2 = manifold.points[2].local_a_bt;
-    const Vec3& p3 = manifold.points[3].local_a_bt;
+    const Vec3& l = point.local_b_bt;
+    const Vec3& p0 = manifold.points[0].local_b_bt;
+    const Vec3& p1 = manifold.points[1].local_b_bt;
+    const Vec3& p2 = manifold.points[2].local_b_bt;
+    const Vec3& p3 = manifold.points[3].local_b_bt;
     const float res0 = max_pen_idx == 0 ? 0.0f : BallCarRetainedRes(l, p1, p3, p2);
     const float res1 = max_pen_idx == 1 ? 0.0f : BallCarRetainedRes(l, p0, p3, p2);
     const float res2 = max_pen_idx == 2 ? 0.0f : BallCarRetainedRes(l, p0, p3, p1);

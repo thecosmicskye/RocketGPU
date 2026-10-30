@@ -67,7 +67,7 @@ ROCKETGPU_HD ArenaRayHit CastArenaRayWithBtSource(
 
 ROCKETGPU_HD Vec3 WheelRayCarHitboxHalfExtentWithBulletSafeMarginBT(const CarConfig& other_cfg);
 
-ROCKETGPU_HD bool CastWheelRayAgainstCarHitboxV3Exact(
+ROCKETGPU_HD bool CastWheelRayAgainstCarHitboxGjkCast(
     const Vec3& ray_source_bt,
     const Vec3& ray_dir,
     float max_len,
@@ -77,7 +77,7 @@ ROCKETGPU_HD bool CastWheelRayAgainstCarHitboxV3Exact(
     float max_len_bt_override);
 
 // v3 SphereShape::perform_quad_raycast: the wheel ray is moved into ball-local space and intersected with the sphere
-// analytically (nearest root in [0, dist], else the far root); the hit normal is the local hit point / radius rotated
+// analytically (nearest root in [0, dist]); the hit normal is the local hit point / radius rotated
 // back to world, and the hit point is the ray interpolated at the hit fraction (ClosestQuadRayResultCallback).
 ROCKETGPU_HD bool CastAnalyticRayVsSphereV3(
     const Vec3& ray_from_bt,
@@ -116,12 +116,13 @@ ROCKETGPU_HD bool CastAnalyticRayVsSphereV3(
     if (t0 > t1) {
         const float tmp = t0; t0 = t1; t1 = tmp;
     }
-    const bool t0_ok = t0 >= 0.0f && t0 <= dist;
-    const bool t1_ok = t1 >= 0.0f && t1 <= dist && !t0_ok;
-    if (!t0_ok && !t1_ok) {
+    // A ray that starts inside the ball (t0 < 0 <= t1) does not hit it: Bullet's convex ray test (RocketSim v2, and
+    // the game) reports no hit from inside a convex shape, while v3's far-root exit hit put a wheel on the ball
+    // whenever the ball overlapped a wheel (deep kickoff hits, e.g. PartyCannon 15726 k18).
+    if (!(t0 >= 0.0f && t0 <= dist)) {
         return false;
     }
-    const float t = t0_ok ? t0 : t1;
+    const float t = t0;
     const Vec3 hit_local = src + dir * t;
     const Vec3 n_local(hit_local.x / r, hit_local.y / r, hit_local.z / r);
     out_normal = ball_basis_forward * n_local.x + ball_basis_right * n_local.y + ball_basis_up * n_local.z;
@@ -231,10 +232,23 @@ ROCKETGPU_HD ArenaRayHit CastWheelRayAgainstCars(
             continue;
         }
         const CarState& other = cars_in_env[i];
+        // Reject before the call, without the basis: the hitbox center is within |offset| of the car origin
+        // (|R off| <= |off|) and the L1 norms bound the L2 ones, so this (0.01 bt looser) never rejects a ray the
+        // box-center sphere test in CastWheelRayAgainstCarHitboxV3Exact keeps.
+        {
+            const CarConfig& other_cfg = car_cfgs_in_env[i];
+            const float max_len_bt = max_len_bt_override > 0.0f ? max_len_bt_override : max_len * (1.0f / 50.0f);
+            const float reach_uu = 0.5f * (Abs(other_cfg.hitbox_size.x) + Abs(other_cfg.hitbox_size.y) + Abs(other_cfg.hitbox_size.z)) +
+                Abs(other_cfg.hitbox_offset.x) + Abs(other_cfg.hitbox_offset.y) + Abs(other_cfg.hitbox_offset.z);
+            const float rr = reach_uu * (1.0f / 50.0f) + max_len_bt + 1.0e-2f;
+            if (LengthSq(other.pos_bt - ray_source_bt) > rr * rr) {
+                continue;
+            }
+        }
 
         ArenaRayHit hit;
-        const bool hit_car = CastWheelRayAgainstCarHitboxV3Exact(
-                  ray_source_bt, ray_dir, max_len, other, car_cfgs_in_env[i], hit, max_len_bt_override);
+        const bool hit_car = CastWheelRayAgainstCarHitboxGjkCast(
+            ray_source_bt, ray_dir, max_len, other, car_cfgs_in_env[i], hit, max_len_bt_override);
         if (!hit_car) {
             continue;
         }
@@ -315,6 +329,10 @@ ROCKETGPU_HD void SetWheelRayMiss(WheelStepState& wheel) {
 ROCKETGPU_HD void ComputeWheelRayVelocityTerms(const CarState& car, const Vec3& car_up, const Vec3& hit_point_bt,
                                            WheelStepState& wheel);
 
+// The game (RLVehicle::rayCast, wheel setup 140f097b0) rejects wheel hits closer than (F - 1 uu) * 0.02 to the
+// hardpoint, F = half the physics-asset box height. v3's live-measured constant 0.116684 bt^2 puts F at 18.08 uu for
+// the Octane, whose hitbox_size.z (38.6591) is 2.5 uu taller than that box: hence hz/2 - 2.25. PartyCannon 28636 k14
+// car 3 (Octane): the game keeps a wheel hit on car 5 at 0.3652 bt, which hz/2 - 1 (0.3666 bt) rejected.
 ROCKETGPU_HD float CalMinWheelHitDistSqBt(const CarConfig& cfg) {
     const float d = (cfg.hitbox_size.z * 0.5f - 2.25f) * UnitsUUToBT();
     return d * d;
@@ -479,13 +497,9 @@ ROCKETGPU_HD void ComputeWheelRayVelocityTerms(const CarState& car, const Vec3& 
                                            WheelStepState& wheel) {
         const float denominator = Dot(wheel.contact_normal_ws, car_up);
 
-        const Vec3 car_pos_bt = car.pos_bt;
-        const Vec3 relpos_bt = hit_point_bt - car_pos_bt;
-        CarState car_bt = car;
-        car_bt.pos = car_pos_bt;
-
-        car_bt.vel = car.vel_bt;
-        const Vec3 vel_at_contact_bt = VelocityAtPoint(car_bt, relpos_bt);
+        const Vec3 relpos_bt = hit_point_bt - car.pos_bt;
+        // VelocityAtPoint with vel = vel_bt, without copying the CarState.
+        const Vec3 vel_at_contact_bt = car.vel_bt + Cross(car.ang_vel, relpos_bt);
         wheel.vel_at_contact = FromBtLinearVec(vel_at_contact_bt);
         const float proj_vel_bt = Dot(wheel.contact_normal_ws, vel_at_contact_bt);
         if (denominator > 0.1f) {
@@ -630,79 +644,85 @@ ROCKETGPU_HD void ApplyAutoRollReference(
     }
 }
 
-ROCKETGPU_HD void ApplyWheelSuspensionOnly(
-    CarState& car,
+// One wheel's chassis velocity change in the vehicle phase. A wheel's suspension and friction impulses depend on the
+// chassis rotation, position and that wheel only, so each wheel (or GPU lane) computes its own, and
+// CombineWheelImpulses applies them in wheel order 0..3, bit-identical to applying them wheel by wheel.
+struct WheelImpulseOut {
+    Vec3 dv_bt = Vec3(0.0f, 0.0f, 0.0f);
+    Vec3 dw = Vec3(0.0f, 0.0f, 0.0f);
+    int32_t applied = 0;
+};
+
+// ApplyImpulseAtPointBtRoundtripBtInputs split into its per-wheel part (this) and the chassis update (the combiner).
+ROCKETGPU_HD WheelImpulseOut WheelImpulseAtPointBt(
+    const CarState& car,
     const CarConfig& cfg,
-    const MutatorConfig& mutator,
-    float dt,
-    WheelStepState* wheels) {
+    float mass,
+    const Vec3& impulse_world_bt,
+    const Vec3& rel_point_world_bt) {
+    WheelImpulseOut out;
+    const float official_inv_mass = 1.0f / mass;
+    out.dv_bt = impulse_world_bt * official_inv_mass;
+    out.dw = ApplyInverseBodyInertiaWorldBtRowDot(car, cfg, mass, Cross(rel_point_world_bt, impulse_world_bt));
+    out.applied = 1;
+    return out;
+}
+
+ROCKETGPU_HD void CombineWheelImpulses(CarState& car, const WheelImpulseOut out[4]) {
     for (int i = 0; i < 4; ++i) {
-        WheelStepState& wheel = wheels[i];
-        if (!wheel.is_in_contact) {
-            wheel.wheels_suspension_force = 0.0f;
-            wheel.impulse = Vec3(0.0f, 0.0f, 0.0f);
+        if (!out[i].applied) {
             continue;
         }
-
-        const float force_bt =
-            (wheel.suspension_rest_length * UnitsUUToBT() - wheel.suspension_len_bt) *
-            wheel.suspension_stiffness *
-            wheel.clipped_inv_contact_dot_suspension;
-        const float damping = wheel.suspension_relative_velocity < 0.0f ? wheel.wheels_damping_compression : wheel.wheels_damping_relaxation;
-        float suspension_force_bt =
-            (force_bt - damping * wheel.suspension_relative_velocity_bt) *
-            wheel.suspension_force_scale;
-        if (suspension_force_bt < 0.0f) {
-            suspension_force_bt = 0.0f;
-        }
-        wheel.wheels_suspension_force = suspension_force_bt * UnitsBTToUU();
-
-        if (wheel.wheels_suspension_force > 0.0f) {
-            const Vec3 rel_bt = wheel.contact_point_bt - car.pos_bt;
-
-            const float base_force_scale_bt = (suspension_force_bt * dt) + wheel.extra_pushback;
-            const Vec3 impulse_bt = wheel.contact_normal_ws * base_force_scale_bt;
-
-            ApplyImpulseAtPointBtRoundtripBtInputs(car, cfg, mutator.car_mass, impulse_bt, rel_bt);
-        }
+        SetCarLinearVelocityBt(car, car.vel_bt + out[i].dv_bt);
+        car.vel_touched_solve_stage = 1;
+        car.ang_vel += out[i].dw;
     }
 }
 
-ROCKETGPU_HD void ApplyWheelFrictionOnly(
-    CarState& car,
-    const CarConfig& cfg,
-    const MutatorConfig& mutator,
-    const CarControls& controls,
-    float dt,
-    WheelStepState* wheels) {
-    Vec3 car_up(0.0f, 0.0f, 1.0f);
-    Vec3 unused_forward(1.0f, 0.0f, 0.0f);
-    Vec3 unused_right(0.0f, 1.0f, 0.0f);
-    CarBasisColumns(car, unused_forward, unused_right, car_up);
-
-    for (int i = 0; i < 4; ++i) {
-        WheelStepState& wheel = wheels[i];
-        if (!wheel.is_in_contact || LengthSq(wheel.impulse) == 0.0f) {
-            continue;
-        }
-
-        const Vec3 friction_rel_bt = wheel.contact_point_bt - car.pos_bt;
-        const Vec3 friction_wheel_rel_pos_bt =
-            friction_rel_bt - car_up * Dot(car_up, friction_rel_bt);
-        const Vec3 friction_impulse_bt = wheel.impulse * dt;
-
-        ApplyImpulseAtPointBtRoundtripBtInputs(
-            car, cfg, mutator.car_mass, friction_impulse_bt, friction_wheel_rel_pos_bt);
-    }
-
-    (void)controls;
-}
-
-ROCKETGPU_HD void CalWheelContactFriction(
+ROCKETGPU_HD WheelImpulseOut WheelSuspensionPhase(
     const CarState& car,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
-    WheelStepState* wheels);
+    WheelStepState& wheel,
+    float dt) {
+    WheelImpulseOut out;
+    if (!wheel.is_in_contact) {
+        wheel.wheels_suspension_force = 0.0f;
+        wheel.impulse = Vec3(0.0f, 0.0f, 0.0f);
+        return out;
+    }
+
+    const float force_bt =
+        (wheel.suspension_rest_length * UnitsUUToBT() - wheel.suspension_len_bt) *
+        wheel.suspension_stiffness *
+        wheel.clipped_inv_contact_dot_suspension;
+    const float damping = wheel.suspension_relative_velocity < 0.0f ? wheel.wheels_damping_compression : wheel.wheels_damping_relaxation;
+    float suspension_force_bt =
+        (force_bt - damping * wheel.suspension_relative_velocity_bt) *
+        wheel.suspension_force_scale;
+    if (suspension_force_bt < 0.0f) {
+        suspension_force_bt = 0.0f;
+    }
+    wheel.wheels_suspension_force = suspension_force_bt * UnitsBTToUU();
+
+    if (wheel.wheels_suspension_force > 0.0f) {
+        const Vec3 rel_bt = wheel.contact_point_bt - car.pos_bt;
+
+        const float base_force_scale_bt = (suspension_force_bt * dt) + wheel.extra_pushback;
+        const Vec3 impulse_bt = wheel.contact_normal_ws * base_force_scale_bt;
+
+        out = WheelImpulseAtPointBt(car, cfg, mutator.car_mass, impulse_bt, rel_bt);
+    }
+    return out;
+}
+
+// The wheel's contact friction impulse (from the chassis velocity after all suspension impulses) and its velocity change.
+ROCKETGPU_HD WheelImpulseOut WheelFrictionPhase(
+    const CarState& car,
+    const CarConfig& cfg,
+    const MutatorConfig& mutator,
+    WheelStepState& wheel,
+    float dt);
 
 ROCKETGPU_HD void ApplyWheelSuspensionAndFriction(
     CarState& car,
@@ -711,10 +731,16 @@ ROCKETGPU_HD void ApplyWheelSuspensionAndFriction(
     const CarControls& controls,
     float dt,
     WheelStepState* wheels) {
-    ApplyWheelSuspensionOnly(car, cfg, mutator, dt, wheels);
-    CalWheelContactFriction(car, cfg, mutator, wheels);
-
-    ApplyWheelFrictionOnly(car, cfg, mutator, controls, dt, wheels);
+    WheelImpulseOut out[4];
+    for (int i = 0; i < 4; ++i) {
+        out[i] = WheelSuspensionPhase(car, cfg, mutator, wheels[i], dt);
+    }
+    CombineWheelImpulses(car, out);
+    for (int i = 0; i < 4; ++i) {
+        out[i] = WheelFrictionPhase(car, cfg, mutator, wheels[i], dt);
+    }
+    CombineWheelImpulses(car, out);
+    (void)controls;
 }
 
 ROCKETGPU_HD void ComputeWheelTransformBasisFromSteer(
@@ -871,24 +897,559 @@ ROCKETGPU_HD float ResolveSingleBilateralBt(
     return -0.2f * out_rel_vel_bt * jac_diag_ab_inv;
 }
 
-ROCKETGPU_HD void CalWheelContactFriction(
+ROCKETGPU_HD WheelImpulseOut WheelFrictionPhase(
     const CarState& car,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
-    WheelStepState* wheels) {
+    WheelStepState& wheel,
+    float dt) {
+    WheelImpulseOut out;
+    if (!wheel.is_in_contact) {
+        return out;
+    }
     const BilateralBodyBt body1 = MakeBilateralCarBodyBt(car, cfg, mutator.car_mass);
     const BilateralBodyBt fixed_body;
-    for (int i = 0; i < 4; ++i) {
-        WheelStepState& wheel = wheels[i];
-        if (!wheel.is_in_contact) {
+    float lateral_speed_bt = 0.0f;
+    const float side_impulse = ResolveSingleBilateralBt(
+        body1, fixed_body, wheel.contact_point_bt, wheel.cal_axle_dir, lateral_speed_bt);
+    wheel.impulse = ((wheel.cal_forward_dir * wheel.cal_rolling_friction) * wheel.cal_long_friction +
+                     (wheel.cal_axle_dir * side_impulse) * wheel.cal_lat_friction) * wheel.cal_friction_scale;
+    if (LengthSq(wheel.impulse) == 0.0f) {
+        return out;
+    }
+
+    Vec3 car_up(0.0f, 0.0f, 1.0f);
+    Vec3 unused_forward(1.0f, 0.0f, 0.0f);
+    Vec3 unused_right(0.0f, 1.0f, 0.0f);
+    CarBasisColumns(car, unused_forward, unused_right, car_up);
+    const Vec3 friction_rel_bt = wheel.contact_point_bt - car.pos_bt;
+    const Vec3 friction_wheel_rel_pos_bt = friction_rel_bt - car_up * Dot(car_up, friction_rel_bt);
+    const Vec3 friction_impulse_bt = wheel.impulse * dt;
+    return WheelImpulseAtPointBt(car, cfg, mutator.car_mass, friction_impulse_bt, friction_wheel_rel_pos_bt);
+}
+
+// True when the wheel ray from hard_point along the car's down axis meets another car's hitbox on a face whose
+// outward normal is the recorded wheel contact normal: a game wheel contact on that car, not on the world. The
+// recorded normal is the previous tick's, so the box is grown by one tick of the two cars' relative motion; a ray that
+// only grazes the grown box (the game's ray hit near an edge, where Bullet's convex ray cast returns a normal between
+// the faces: PartyCannon 11445 k67 car 5 on car 4) counts when the normal points out of the box towards the ray.
+ROCKETGPU_HD bool SetWheelNormalIsOnOtherCar(const CarState& car, const CarConfig& cfg, const Vec3& hard_point,
+                                            const Vec3& normal, const CarState* cars, const CarConfig* cfgs,
+                                            int32_t count, int32_t self_idx) {
+    if (cfgs == nullptr) {
+        return false;
+    }
+    Vec3 f(1.0f, 0.0f, 0.0f), r(0.0f, 1.0f, 0.0f), u(0.0f, 0.0f, 1.0f);
+    CarBasisColumns(car, f, r, u);
+    const Vec3 dir = -u;
+    const float max_len = 2.0f * (Max(cfg.front_suspension_rest, cfg.back_suspension_rest) +
+                                  Max(cfg.front_wheel_radius, cfg.back_wheel_radius));
+    for (int32_t j = 0; j < count; ++j) {
+        if (j == self_idx || cars[j].is_demoed) {
             continue;
         }
-        float lateral_speed_bt = 0.0f;
-        const float side_impulse = ResolveSingleBilateralBt(
-            body1, fixed_body, wheel.contact_point_bt, wheel.cal_axle_dir, lateral_speed_bt);
-        wheel.impulse = ((wheel.cal_forward_dir * wheel.cal_rolling_friction) * wheel.cal_long_friction +
-                         (wheel.cal_axle_dir * side_impulse) * wheel.cal_lat_friction) * wheel.cal_friction_scale;
+        Vec3 ax[3];
+        CarBasisColumns(cars[j], ax[0], ax[1], ax[2]);
+        const Vec3 half = BulletBoxHalfExtentWithMargin(cfgs[j]);
+        const float grow = Length(car.vel - cars[j].vel) * (1.0f / 120.0f);
+        const float h[3] = {half.x, half.y, half.z};
+        const Vec3 center = cars[j].pos + RotateCarBasis(cars[j], cfgs[j].hitbox_offset);
+        const Vec3 d = hard_point - center;
+        float t_min = 0.0f, t_max = max_len;
+        int face = -1;
+        float face_sign = 0.0f;
+        bool miss = false;
+        for (int k = 0; k < 3 && !miss; ++k) {
+            const float o = Dot(d, ax[k]);
+            const float v = Dot(dir, ax[k]);
+            const float hk = h[k] + grow;
+            if (Abs(v) < 1.0e-8f) {
+                miss = Abs(o) > hk;
+                continue;
+            }
+            float t0 = (-hk - o) / v, t1 = (hk - o) / v;
+            float s0 = -1.0f;
+            if (t0 > t1) {
+                const float tmp = t0; t0 = t1; t1 = tmp;
+                s0 = 1.0f;
+            }
+            if (t0 > t_min) {
+                t_min = t0;
+                face = k;
+                face_sign = s0;
+            }
+            t_max = Min(t_max, t1);
+            miss = t_min > t_max;
+        }
+        if (miss || face < 0) {
+            continue;
+        }
+        if (Dot(ax[face] * face_sign, normal) > 0.99f) {
+            return true;
+        }
+        // Outward direction from the unexpanded box to the ray's entry point into the grown box.
+        const Vec3 p = d + dir * t_min;
+        Vec3 out(0.0f, 0.0f, 0.0f);
+        for (int k = 0; k < 3; ++k) {
+            const float o = Dot(p, ax[k]);
+            out += ax[k] * (o - Clamp(o, -h[k], h[k]));
+        }
+        const float out_len = Length(out);
+        if (out_len > 1.0e-4f && Dot(out, normal) > 0.9f * out_len) {
+            return true;
+        }
     }
+    return false;
+}
+
+// The previous tick's world wheel contacts a set state supplied (CarState::set_wheel_normals_mask): sums their
+// normals into normal_sum and returns their count. The recorded contacts include wheels on the ball, whose normal
+// points from the ball centre to the wheel, and wheels resting on another car; the game's sticky force and auto-roll
+// count neither (as v3's world-contact gate and the step's own raycast do).
+// A wheel contact on the world has its surface within a wheel ray of the hard point, so a ray from the hard point
+// against the normal meets the arena on a face with that normal. With the ball or another car in reach and no such
+// face, the contact was on that body; this catches the ones the ball and car tests miss because the bodies have moved
+// apart by the set pose (RLPR PartyCannon 3187 k50 wheel on the ball, 8575 k30 wheel on a car: the game applies no
+// sticky force). A teleported car keeps its contacts (no body in reach), as the game does (cb_aerial, cw_ceiling).
+ROCKETGPU_HD bool SetWheelNormalHasWorldFace(const WheelStepState& wheel, const Vec3& normal,
+                                             const ArenaMeshTriangle* mesh_triangles, int32_t mesh_triangle_count,
+                                             const ArenaMeshBvhQuantization* mesh_bvh_quantization,
+                                             int32_t mesh_bvh_quantization_count,
+                                             const ArenaMeshBvhMeshInfo* mesh_bvh_meshes, int32_t mesh_bvh_mesh_count,
+                                             const ArenaMeshBvhNode* mesh_bvh_nodes, int32_t mesh_bvh_node_count,
+                                             const ArenaMeshBvhSubtreeInfo* mesh_bvh_subtrees,
+                                             int32_t mesh_bvh_subtree_count) {
+    const float len = wheel.suspension_rest_length + wheel.max_suspension_travel + wheel.wheel_radius + 20.0f;
+    const ArenaRayHit hit = CastArenaRayWithBtSource(
+        wheel.hard_point_ws, -normal, len, wheel.ray_source_bt, mesh_triangles, mesh_triangle_count,
+        mesh_bvh_quantization, mesh_bvh_quantization_count, mesh_bvh_meshes, mesh_bvh_mesh_count, mesh_bvh_nodes,
+        mesh_bvh_node_count, mesh_bvh_subtrees, mesh_bvh_subtree_count);
+    return hit.hit && Dot(hit.normal, normal) > 0.9f * Length(hit.normal);
+}
+
+ROCKETGPU_HD int SetStateWorldWheelNormals(const CarState& car, const CarConfig& cfg, const WheelStepState* wheels,
+                                           const BallState* ball, float ball_radius, const CarState* cars,
+                                           const CarConfig* cfgs, int32_t count, int32_t self_idx, Vec3& normal_sum,
+                                           const ArenaMeshTriangle* mesh_triangles = nullptr,
+                                           int32_t mesh_triangle_count = 0,
+                                           const ArenaMeshBvhQuantization* mesh_bvh_quantization = nullptr,
+                                           int32_t mesh_bvh_quantization_count = 0,
+                                           const ArenaMeshBvhMeshInfo* mesh_bvh_meshes = nullptr,
+                                           int32_t mesh_bvh_mesh_count = 0,
+                                           const ArenaMeshBvhNode* mesh_bvh_nodes = nullptr,
+                                           int32_t mesh_bvh_node_count = 0,
+                                           const ArenaMeshBvhSubtreeInfo* mesh_bvh_subtrees = nullptr,
+                                           int32_t mesh_bvh_subtree_count = 0) {
+    normal_sum = Vec3(0.0f, 0.0f, 0.0f);
+    int n = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (!((car.set_wheel_normals_mask >> i) & 1)) {
+            continue;
+        }
+        const Vec3& hp = wheels[i].hard_point_ws;
+        const float reach = wheels[i].suspension_rest_length + wheels[i].max_suspension_travel +
+                            wheels[i].wheel_radius + 30.0f;
+        bool body_in_reach = ball != nullptr && Length(hp - ball->pos) < ball_radius + reach;
+        for (int32_t j = 0; cars != nullptr && cfgs != nullptr && j < count && !body_in_reach; ++j) {
+            if (j != self_idx && !cars[j].is_demoed) {
+                const Vec3 center = cars[j].pos + RotateCarBasis(cars[j], cfgs[j].hitbox_offset);
+                body_in_reach = Length(hp - center) < Length(BulletBoxHalfExtentWithMargin(cfgs[j])) + reach;
+            }
+        }
+        if (body_in_reach &&
+            !SetWheelNormalHasWorldFace(wheels[i], car.set_wheel_normals[i], mesh_triangles, mesh_triangle_count,
+                                        mesh_bvh_quantization, mesh_bvh_quantization_count, mesh_bvh_meshes,
+                                        mesh_bvh_mesh_count, mesh_bvh_nodes, mesh_bvh_node_count, mesh_bvh_subtrees,
+                                        mesh_bvh_subtree_count)) {
+            continue;
+        }
+        if (ball != nullptr) {
+            const Vec3 to_wheel = wheels[i].hard_point_ws - ball->pos;
+            const float dist = Length(to_wheel);
+            if (dist < ball_radius + 80.0f && dist > 0.0f && Dot(car.set_wheel_normals[i], to_wheel) > 0.95f * dist) {
+                continue;
+            }
+        }
+        // The wheel's ray at the set pose lands on another car (v3's set-state refresh raycast, which its own gate
+        // reads, counts no world contact there).
+        if (wheels[i].is_in_contact && wheels[i].ground_kind == ROCKETGPU_ARENA_RAY_HIT_CAR) {
+            continue;
+        }
+        if (cars != nullptr && SetWheelNormalIsOnOtherCar(car, cfg, wheels[i].hard_point_ws, car.set_wheel_normals[i],
+                                                          cars, cfgs, count, self_idx)) {
+            continue;
+        }
+        normal_sum += car.set_wheel_normals[i];
+        ++n;
+    }
+    return n;
+}
+
+// The drive, brake, steer and friction-curve setup for one wheel (wheel index i), from the chassis state and the
+// per-car values in WheelDriveShared. It writes only this wheel and its runtime slots.
+struct WheelDriveShared {
+    Vec3 car_forward = Vec3(1.0f, 0.0f, 0.0f);
+    float next_steer_angle = 0.0f;
+    float drive_engine_force = 0.0f;
+    float drive_brake_force = 0.0f;
+    float real_throttle = 0.0f;
+    float friction_scale = 0.0f;
+};
+
+ROCKETGPU_HD void WheelDriveSetupPhase(
+    const CarState& car,
+    const CarConfig& cfg,
+    const MutatorConfig& mutator,
+    const WheelDriveShared& shared,
+    WheelStepState& wheel,
+    int i,
+    WheelRuntimeState* wheel_runtime_state,
+    float dt) {
+    wheel.impulse = Vec3(0.0f, 0.0f, 0.0f);
+
+    const float prev_steer_angle = wheel_runtime_state ? wheel_runtime_state->steer_angle[i] : 0.0f;
+    const float prev_engine_force = wheel_runtime_state ? wheel_runtime_state->engine_force[i] : 0.0f;
+    const float prev_brake = wheel_runtime_state ? wheel_runtime_state->brake[i] : 0.0f;
+    const float prev_lat_friction = wheel_runtime_state ? wheel_runtime_state->lat_friction[i] : 0.0f;
+    const float prev_long_friction = wheel_runtime_state ? wheel_runtime_state->long_friction[i] : 0.0f;
+    wheel.prev_steer_angle = prev_steer_angle;
+    wheel.prev_engine_force = prev_engine_force;
+    wheel.prev_brake = prev_brake;
+    wheel.prev_lat_friction = prev_lat_friction;
+    wheel.prev_long_friction = prev_long_friction;
+
+    const float current_steer_angle = wheel.is_front_wheel ? shared.next_steer_angle : 0.0f;
+
+    const float applied_steer_angle = current_steer_angle;
+    const float applied_engine_force = shared.drive_engine_force;
+    const float applied_brake = shared.drive_brake_force;
+    wheel.engine_force = shared.drive_engine_force;
+    wheel.brake = shared.drive_brake_force;
+    wheel.steer_angle = current_steer_angle;
+
+    if (wheel_runtime_state) {
+        wheel_runtime_state->engine_force[i] = shared.drive_engine_force;
+        wheel_runtime_state->brake[i] = shared.drive_brake_force;
+        wheel_runtime_state->steer_angle[i] = current_steer_angle;
+    }
+
+    float current_lat_friction = prev_lat_friction;
+    float current_long_friction = prev_long_friction;
+    float base_friction = 0.0f;
+    float longitudinal_friction = 0.0f;
+    float friction_curve_input = 0.0f;
+    Vec3 friction_curve_lat_dir(0.0f, -1.0f, 0.0f);
+    Vec3 friction_curve_long_dir(1.0f, 0.0f, 0.0f);
+    Vec3 friction_curve_cross_vec(0.0f, 0.0f, 0.0f);
+    if (wheel.is_in_contact) {
+        Vec3 basis_right_col(0.0f, 0.0f, 0.0f);
+        Vec3 basis_forward_col(0.0f, 0.0f, 0.0f);
+        Vec3 basis_up_col(0.0f, 0.0f, 1.0f);
+        ComputeWheelTransformBasisFromSteer(wheel, applied_steer_angle, basis_right_col, basis_forward_col, basis_up_col, nullptr, mutator.game_mode == static_cast<uint8_t>(Mode::Soccar), NativeSseMath(mutator));
+
+        const Vec3 wheel_delta_bt = wheel.ray_source_bt - car.pos_bt;
+        const Vec3 cross_vec = (Cross(car.ang_vel, wheel_delta_bt) + car.vel_bt) * 50.0f;
+        friction_curve_cross_vec = cross_vec;
+        const Vec3 lat_dir = basis_right_col;
+        const Vec3 long_dir = Cross(lat_dir, wheel.contact_normal_ws);
+        friction_curve_lat_dir = lat_dir;
+        friction_curve_long_dir = long_dir;
+        base_friction = Abs(Dot(cross_vec, lat_dir));
+        longitudinal_friction = Abs(Dot(cross_vec, long_dir));
+        if (base_friction > 5.0f) {
+            friction_curve_input = base_friction / (longitudinal_friction + base_friction);
+        }
+
+        current_lat_friction = cfg.three_wheels ? EvalLatFrictionThreeWheel(friction_curve_input)
+                                                : EvalLatFriction(friction_curve_input);
+        current_long_friction = EvalLongFriction(friction_curve_input);
+
+        if (car.handbrake_val > 0.0f) {
+            current_lat_friction *= (EvalHandbrakeLatFrictionFactor(friction_curve_input) - 1.0f) * car.handbrake_val + 1.0f;
+            current_long_friction *= (EvalHandbrakeLongFrictionFactor(friction_curve_input) - 1.0f) * car.handbrake_val + 1.0f;
+        } else {
+            current_long_friction = 1.0f;
+        }
+
+        const bool is_contact_sticky = shared.real_throttle != 0.0f &&
+            !(!wheel.is_in_contact_with_world);
+        if (!is_contact_sticky) {
+            const float non_sticky = EvalNonStickyFrictionFactor(wheel.contact_normal_ws.z);
+            current_lat_friction *= non_sticky;
+            current_long_friction *= non_sticky;
+        }
+    }
+
+    wheel.lat_friction = current_lat_friction;
+    wheel.long_friction = current_long_friction;
+    if (wheel_runtime_state) {
+        wheel_runtime_state->lat_friction[i] = current_lat_friction;
+        wheel_runtime_state->long_friction[i] = current_long_friction;
+    }
+    const float applied_lat_friction = current_lat_friction;
+    const float applied_long_friction = current_long_friction;
+
+    if (!wheel.is_in_contact) {
+        return;
+    }
+
+    Vec3 axle_dir(0.0f, -1.0f, 0.0f);
+    Vec3 forward_dir = shared.car_forward;
+    Vec3 debug_steering[5];
+    Vec3 raw_axle_dir = axle_dir;
+    ComputeWheelBasisFromSteer(wheel, applied_steer_angle, shared.car_forward, axle_dir, forward_dir, debug_steering, mutator.game_mode == static_cast<uint8_t>(Mode::Soccar), NativeSseMath(mutator),
+        (&raw_axle_dir));
+
+    const Vec3 contact_point_bt = wheel.contact_point_bt;
+
+    const BilateralBodyBt body1 = MakeBilateralCarBodyBt(car, cfg, mutator.car_mass);
+    BilateralBodyBt body2;
+
+    const float side_impulse = 0.0f;
+
+    const Vec3 car_rel_contact_bt = contact_point_bt - body1.com_bt;
+    const Vec3 contact_vel_bt =
+        BilateralVelocityInLocalPoint(body1, car_rel_contact_bt) -
+        BilateralVelocityInLocalPoint(body2, car_rel_contact_bt);
+    const float forward_speed_bt = Dot(contact_vel_bt, forward_dir);
+
+    float rolling_friction = 0.0f;
+    if (applied_engine_force == 0.0f) {
+        if (applied_brake != 0.0f) {
+            float rel_vel = forward_speed_bt;
+            if (dt > (1.0f / 80.0f)) {
+                const float threshold = -(1.0f / (dt * 150.0f)) + 0.8f;
+                if (Abs(rel_vel) < threshold) {
+                    rel_vel = 0.0f;
+                }
+            }
+            rolling_friction = Clamp(-rel_vel * 113.73963f, -applied_brake, applied_brake);
+        }
+    } else {
+        rolling_friction = -applied_engine_force / shared.friction_scale;
+    }
+
+    wheel.impulse = ((forward_dir * rolling_friction) * applied_long_friction +
+                     (axle_dir * side_impulse) * applied_lat_friction) * shared.friction_scale;
+    wheel.cal_axle_dir = raw_axle_dir;
+    wheel.cal_forward_dir = forward_dir;
+    wheel.cal_rolling_friction = rolling_friction;
+    wheel.cal_lat_friction = applied_lat_friction;
+    wheel.cal_long_friction = applied_long_friction;
+    wheel.cal_friction_scale = shared.friction_scale;
+}
+
+// One wheel's ray (or staged ray) and pushback for the vehicle phase. The summary fields the later all-wheel reads
+// need are returned in WheelContactOut and reduced by CombineWheelContacts. A wheel resting on another car or the ball
+// pushes that body (dyn_hit_*), which later wheels read, so such a car must run its wheels serially.
+struct WheelContactOut {
+    Vec3 normal = Vec3(0.0f, 0.0f, 0.0f);
+    uint32_t flags = 0;  // kWheelContact* bits
+};
+constexpr uint32_t kWheelContactInContact = 1u;
+constexpr uint32_t kWheelContactWithWorld = 2u;
+constexpr uint32_t kWheelContactOnBall = 4u;
+
+// The per-car reductions of the wheel contacts, the same on every lane of a car.
+struct WheelContactSummary {
+    int num_wheels_in_contact = 0;
+    bool wheels_have_world_contact = false;
+    Vec3 wheel_normal_sum = Vec3(0.0f, 0.0f, 0.0f);        // in-contact normals, game wheel order (sim i ^ 1)
+    Vec3 contact_normal_sum_sim = Vec3(0.0f, 0.0f, 0.0f);  // in-contact normals, sim order 0..3 (GetUpwardsDirFromWheelContacts)
+    Vec3 world_normal_sum = Vec3(0.0f, 0.0f, 0.0f);        // world-contact normals, sim order 0..3
+    uint8_t world_contacts = 0;
+};
+
+ROCKETGPU_HD WheelContactOut WheelRayPhase(
+    const CarState& car,
+    const CarConfig& cfg,
+    const MutatorConfig& mutator,
+    WheelStepState& wheel,
+    int i,
+    float cal_front_scale,
+    float cal_back_scale,
+    float cal_min_hit_dist_sq_bt,
+    WheelRuntimeState* wheel_runtime_state,
+    const ArenaMeshTriangle* mesh_triangles,
+    int32_t mesh_triangle_count,
+    const CarState* cars_in_env,
+    const CarConfig* car_cfgs_in_env,
+    int32_t cars_in_env_count,
+    int32_t self_car_idx,
+    int32_t env_idx,
+    const BallState* ball,
+    float ball_radius,
+    const ArenaMeshBvhQuantization* mesh_bvh_quantization,
+    int32_t mesh_bvh_quantization_count,
+    const ArenaMeshBvhMeshInfo* mesh_bvh_meshes,
+    int32_t mesh_bvh_mesh_count,
+    const ArenaMeshBvhNode* mesh_bvh_nodes,
+    int32_t mesh_bvh_node_count,
+    const ArenaMeshBvhSubtreeInfo* mesh_bvh_subtrees,
+    int32_t mesh_bvh_subtree_count,
+    const WheelRayStage* staged_rays,
+    bool staged_rays_velocity_stale,
+    CarState* dyn_hit_cars,
+    BallState* dyn_hit_ball,
+    uint32_t* dyn_hit_pushed_mask) {
+    wheel = MakeWheelStepState(car, cfg, i);
+    wheel.suspension_force_scale = wheel.is_front_wheel ? cal_front_scale : cal_back_scale;
+
+    wheel.extra_pushback = wheel_runtime_state ? wheel_runtime_state->extra_pushback[i] : 0.0f;
+    if (staged_rays != nullptr && staged_rays[i].valid == 2) {
+        SetWheelRayMiss(wheel);
+    } else if (staged_rays != nullptr && staged_rays[i].valid) {
+        LoadWheelRayStage(wheel, staged_rays[i]);
+        if (staged_rays_velocity_stale && wheel.is_in_contact) {
+            ComputeWheelRayVelocityTerms(car, -wheel.wheel_dir_ws, wheel.contact_point_bt, wheel);
+        }
+    } else
+    RayCastWheelAgainstArena(
+        car,
+        cfg,
+        wheel,
+        mesh_triangles,
+        mesh_triangle_count,
+        cars_in_env,
+        car_cfgs_in_env,
+        cars_in_env_count,
+        self_car_idx,
+        env_idx,
+        i,
+        ball,
+        ball_radius,
+        mesh_bvh_quantization,
+        mesh_bvh_quantization_count,
+        mesh_bvh_meshes,
+        mesh_bvh_mesh_count,
+        mesh_bvh_nodes,
+        mesh_bvh_node_count,
+        mesh_bvh_subtrees,
+        mesh_bvh_subtree_count,
+        mutator.arena_collision != 0, mutator.native_sphere_rsqrt_table, mutator.native_sphere_rsqrt_shift,
+        nullptr, cal_min_hit_dist_sq_bt);
+    if (wheel.is_in_contact) {
+        wheel.extra_pushback = 0.0f;
+    }
+    if (wheel.is_in_contact) {
+        const float radius_bt = wheel.wheel_radius * UnitsUUToBT();
+        wheel.suspension_len_bt = wheel.wheel_trace_len_bt - radius_bt;
+        wheel.suspension_length = wheel.suspension_len_bt * UnitsBTToUU();
+        wheel.wheel_trace_length = (wheel.suspension_len_bt + radius_bt) * UnitsBTToUU();
+    }
+    if (wheel.is_in_contact_with_world) {
+        const float solver_dt = (1.0f / 60.0f);
+
+        const float pb_rest_bt = wheel.suspension_rest_length * UnitsUUToBT();
+        const float pb_radius_bt = wheel.wheel_radius * UnitsUUToBT();
+        const float ray_pushback_thresh_bt = (pb_rest_bt + pb_radius_bt) - 0.05f;
+        const float wheel_trace_len_bt = wheel.wheel_trace_len_bt;
+        wheel.debug_pushback_dist_bt = wheel_trace_len_bt - ray_pushback_thresh_bt;
+        if (wheel_trace_len_bt < ray_pushback_thresh_bt) {
+            const float wheel_trace_dist_delta_bt = wheel.debug_pushback_dist_bt;
+            StaticCollisionImpulseDebug pushback_debug;
+            const float unscaled_pushback_bt = ResolveStaticCollisionImpulseMagnitudeBtInputs(
+                car,
+                cfg,
+                mutator.car_mass,
+                wheel.contact_point_bt,
+                wheel.contact_normal_ws,
+                wheel_trace_dist_delta_bt,
+                solver_dt,
+                &pushback_debug);
+            wheel.debug_pushback_dist_bt = wheel_trace_dist_delta_bt;
+            wheel.extra_pushback = unscaled_pushback_bt / 4.0f;
+        }
+    }
+    if (wheel.is_in_contact && !wheel.is_in_contact_with_world) {
+        // v3 wheel_info.rs apply_ray_cast + vehicle_rl.rs apply_single_wheel_dynamic_effects: a wheel on another
+        // car gets resolve_single_collision pushback against that car; the hit body then takes ground_stick
+        // (-normal, massed) and, for a car, -normal * full pushback, before the next wheel reads its velocity.
+        const Vec3 n_bt = wheel.contact_normal_ws;
+        const Vec3 cp_bt = wheel.contact_point_bt;
+        if (wheel.ground_kind == ROCKETGPU_ARENA_RAY_HIT_CAR && dyn_hit_cars != nullptr && car_cfgs_in_env != nullptr &&
+            wheel.ground_car_idx >= 0 && wheel.ground_car_idx < cars_in_env_count &&
+            wheel.ground_car_idx != self_car_idx) {
+            CarState& other = dyn_hit_cars[wheel.ground_car_idx];
+            const CarConfig& other_cfg = car_cfgs_in_env[wheel.ground_car_idx];
+            const float solver_dt = (1.0f / 60.0f);
+            const float ray_pushback_thresh_bt =
+                (wheel.suspension_rest_length * UnitsUUToBT() + wheel.wheel_radius * UnitsUUToBT()) - 0.05f;
+            if (dyn_hit_pushed_mask != nullptr && wheel.ground_car_idx < 32 &&
+                !((*dyn_hit_pushed_mask >> wheel.ground_car_idx) & 1u)) {
+                other.cal_tick_start_ang_vel = other.ang_vel;
+            }
+            wheel.extra_pushback = 0.0f;
+            if (wheel.wheel_trace_len_bt < ray_pushback_thresh_bt) {
+                wheel.extra_pushback = ResolveCarCarWheelPushbackMagnitudeBtInputs(
+                    car, cfg, other, other_cfg, mutator.car_mass, cp_bt, n_bt,
+                    wheel.wheel_trace_len_bt - ray_pushback_thresh_bt, solver_dt) / 4.0f;
+            }
+            ApplyImpulseAtPointBtRoundtripBtInputs(other, other_cfg, mutator.car_mass, -n_bt, cp_bt - other.pos_bt);
+            if (wheel.extra_pushback > 0.0f) {
+                const float full_pushback = wheel.extra_pushback * 4.0f;
+                ApplyImpulseAtPointBtRoundtripBtInputs(
+                    other, other_cfg, mutator.car_mass, -n_bt * full_pushback, cp_bt - other.pos_bt);
+            }
+            if (dyn_hit_pushed_mask != nullptr && wheel.ground_car_idx < 32) {
+                *dyn_hit_pushed_mask |= (1u << wheel.ground_car_idx);
+            }
+        } else if (wheel.ground_kind == ROCKETGPU_ARENA_RAY_HIT_BALL && dyn_hit_ball != nullptr) {
+            BallState& b = *dyn_hit_ball;
+            const Vec3 push_bt = -n_bt;
+            SetBallLinearVelocityBt(b, b.vel_bt + push_bt * (1.0f / mutator.ball_mass));
+            b.ang_vel += ApplyInverseBallInertiaWorldBt(b.rot, mutator.ball_mass, ball_radius, Cross(cp_bt - b.pos_bt, push_bt));
+        }
+    }
+    if (wheel_runtime_state) {
+        wheel_runtime_state->extra_pushback[i] = wheel.extra_pushback;
+    }
+    WheelContactOut out;
+    out.normal = wheel.contact_normal_ws;
+    out.flags = (wheel.is_in_contact ? kWheelContactInContact : 0u) |
+                (wheel.is_in_contact_with_world ? kWheelContactWithWorld : 0u) |
+                (wheel.ground_kind == ROCKETGPU_ARENA_RAY_HIT_BALL ? kWheelContactOnBall : 0u);
+    return out;
+}
+
+// The wheel-contact reductions in the order the serial loop made them: game wheel order (sim i ^ 1) for the car's
+// contact flags, count and normal sum, sim order for the world-contact sum.
+ROCKETGPU_HD WheelContactSummary CombineWheelContacts(
+    CarState& car,
+    WheelRuntimeState* wheel_runtime_state,
+    const WheelContactOut out[4]) {
+    WheelContactSummary sum;
+    for (int k = 0; k < 4; ++k) {
+        const int i = k ^ 1;
+        const bool in_contact = (out[i].flags & kWheelContactInContact) != 0;
+        const bool with_world = (out[i].flags & kWheelContactWithWorld) != 0;
+        const bool on_ball = (out[i].flags & kWheelContactOnBall) != 0;
+        car.wheels_with_contact[i] = in_contact;
+        car.world_contact.wheel_ball_mask |= static_cast<uint8_t>((in_contact && on_ball) << i);
+        sum.num_wheels_in_contact += in_contact ? 1 : 0;
+        sum.wheels_have_world_contact = sum.wheels_have_world_contact || with_world;
+        if (in_contact) {
+            sum.wheel_normal_sum += out[i].normal;
+        }
+    }
+
+    car.is_on_ground = sum.num_wheels_in_contact >= 3 ? 1 : 0;
+
+    for (int i = 0; i < 4; ++i) {
+        const bool in_contact = (out[i].flags & kWheelContactInContact) != 0;
+        if (in_contact) {
+            sum.contact_normal_sum_sim += out[i].normal;
+        }
+        if (in_contact && (out[i].flags & kWheelContactWithWorld) != 0) {
+            sum.world_normal_sum += out[i].normal;
+            ++sum.world_contacts;
+        }
+    }
+    if (wheel_runtime_state) {
+        wheel_runtime_state->cal_prev_wheel_normal_sum = sum.world_normal_sum;
+        wheel_runtime_state->cal_prev_world_wheel_contacts = sum.world_contacts;
+    }
+    return sum;
 }
 
 ROCKETGPU_HD int PreTickVehicleDynamics(
@@ -923,11 +1484,8 @@ ROCKETGPU_HD int PreTickVehicleDynamics(
     bool staged_rays_velocity_stale = false,
     CarState* dyn_hit_cars = nullptr,
     BallState* dyn_hit_ball = nullptr,
-    uint32_t* dyn_hit_pushed_mask = nullptr,
-    const float* forward_speed_override = nullptr) {
-    int num_wheels_in_contact = 0;
+    uint32_t* dyn_hit_pushed_mask = nullptr) {
     car.world_contact.wheel_ball_mask = 0;
-    bool wheels_have_world_contact = false;
 
     // v3 Car::update_wheels sticky gate reads the previous tick's wheel contacts with the world (sticky_gate_prev and
     // get_upwards_dir_from_wheel_contacts); keep them before this tick's raycasts overwrite the autoroll cache.
@@ -939,145 +1497,31 @@ ROCKETGPU_HD int PreTickVehicleDynamics(
 
     const bool landing_prev_any_contact = car.tick_count_since_update != 0 &&
         (car.wheels_with_contact[0] || car.wheels_with_contact[1] || car.wheels_with_contact[2] || car.wheels_with_contact[3]);
-    Vec3 wheel_normal_sum(0.0f, 0.0f, 0.0f);
     float cal_front_scale = 0.0f, cal_back_scale = 0.0f, cal_min_hit_dist_sq_bt = 0.0f;
     CalSuspensionForceScales(cfg, mutator.car_mass, cal_front_scale, cal_back_scale);
     cal_min_hit_dist_sq_bt = CalMinWheelHitDistSqBt(cfg);
 
-    for (int i = 0; i < 4; ++i) {
-        wheels[i] = MakeWheelStepState(car, cfg, i);
-        wheels[i].suspension_force_scale = wheels[i].is_front_wheel ? cal_front_scale : cal_back_scale;
-
-        wheels[i].extra_pushback = wheel_runtime_state ? wheel_runtime_state->extra_pushback[i] : 0.0f;
-        if (staged_rays != nullptr && staged_rays[i].valid == 2) {
-            SetWheelRayMiss(wheels[i]);
-        } else if (staged_rays != nullptr && staged_rays[i].valid) {
-            LoadWheelRayStage(wheels[i], staged_rays[i]);
-            if (staged_rays_velocity_stale && wheels[i].is_in_contact) {
-                ComputeWheelRayVelocityTerms(car, -wheels[i].wheel_dir_ws, wheels[i].contact_point_bt, wheels[i]);
-            }
-        } else
-        RayCastWheelAgainstArena(
-            car,
-            cfg,
-            wheels[i],
-            mesh_triangles,
-            mesh_triangle_count,
-            cars_in_env,
-            car_cfgs_in_env,
-            cars_in_env_count,
-            self_car_idx,
-            env_idx,
-            i,
-            ball,
-            ball_radius,
-            mesh_bvh_quantization,
-            mesh_bvh_quantization_count,
-            mesh_bvh_meshes,
-            mesh_bvh_mesh_count,
-            mesh_bvh_nodes,
-            mesh_bvh_node_count,
-            mesh_bvh_subtrees,
-            mesh_bvh_subtree_count,
-            mutator.arena_collision != 0, mutator.native_sphere_rsqrt_table, mutator.native_sphere_rsqrt_shift,
-            nullptr, cal_min_hit_dist_sq_bt);
-        if (wheels[i].is_in_contact) {
-            wheels[i].extra_pushback = 0.0f;
-        }
-        if (wheels[i].is_in_contact) {
-            const float radius_bt = wheels[i].wheel_radius * UnitsUUToBT();
-            wheels[i].suspension_len_bt = wheels[i].wheel_trace_len_bt - radius_bt;
-            wheels[i].suspension_length = wheels[i].suspension_len_bt * UnitsBTToUU();
-            wheels[i].wheel_trace_length = (wheels[i].suspension_len_bt + radius_bt) * UnitsBTToUU();
-        }
-        if (wheels[i].is_in_contact_with_world) {
-            const float solver_dt = (1.0f / 60.0f);
-
-            const float pb_rest_bt = wheels[i].suspension_rest_length * UnitsUUToBT();
-            const float pb_radius_bt = wheels[i].wheel_radius * UnitsUUToBT();
-            const float ray_pushback_thresh_bt = (pb_rest_bt + pb_radius_bt) - 0.05f;
-            const float wheel_trace_len_bt = wheels[i].wheel_trace_len_bt;
-            wheels[i].debug_pushback_dist_bt = wheel_trace_len_bt - ray_pushback_thresh_bt;
-            if (wheel_trace_len_bt < ray_pushback_thresh_bt) {
-                const float wheel_trace_dist_delta_bt = wheels[i].debug_pushback_dist_bt;
-                StaticCollisionImpulseDebug pushback_debug;
-                const float unscaled_pushback_bt = ResolveStaticCollisionImpulseMagnitudeBtInputs(
-                    car,
-                    cfg,
-                    mutator.car_mass,
-                    wheels[i].contact_point_bt,
-                    wheels[i].contact_normal_ws,
-                    wheel_trace_dist_delta_bt,
-                    solver_dt,
-                    &pushback_debug);
-                wheels[i].debug_pushback_dist_bt = wheel_trace_dist_delta_bt;
-                wheels[i].extra_pushback = unscaled_pushback_bt / 4.0f;
-            }
-        }
-        if (wheels[i].is_in_contact && !wheels[i].is_in_contact_with_world) {
-            // v3 wheel_info.rs apply_ray_cast + vehicle_rl.rs apply_single_wheel_dynamic_effects: a wheel on another
-            // car gets resolve_single_collision pushback against that car; the hit body then takes ground_stick
-            // (-normal, massed) and, for a car, -normal * full pushback, before the next wheel reads its velocity.
-            const Vec3 n_bt = wheels[i].contact_normal_ws;
-            const Vec3 cp_bt = wheels[i].contact_point_bt;
-            if (wheels[i].ground_kind == ROCKETGPU_ARENA_RAY_HIT_CAR && dyn_hit_cars != nullptr && car_cfgs_in_env != nullptr &&
-                wheels[i].ground_car_idx >= 0 && wheels[i].ground_car_idx < cars_in_env_count &&
-                wheels[i].ground_car_idx != self_car_idx) {
-                CarState& other = dyn_hit_cars[wheels[i].ground_car_idx];
-                const CarConfig& other_cfg = car_cfgs_in_env[wheels[i].ground_car_idx];
-                const float solver_dt = (1.0f / 60.0f);
-                const float ray_pushback_thresh_bt =
-                    (wheels[i].suspension_rest_length * UnitsUUToBT() + wheels[i].wheel_radius * UnitsUUToBT()) - 0.05f;
-                wheels[i].extra_pushback = 0.0f;
-                if (wheels[i].wheel_trace_len_bt < ray_pushback_thresh_bt) {
-                    wheels[i].extra_pushback = ResolveCarCarWheelPushbackMagnitudeBtInputs(
-                        car, cfg, other, other_cfg, mutator.car_mass, cp_bt, n_bt,
-                        wheels[i].wheel_trace_len_bt - ray_pushback_thresh_bt, solver_dt) / 4.0f;
-                }
-                ApplyImpulseAtPointBtRoundtripBtInputs(other, other_cfg, mutator.car_mass, -n_bt, cp_bt - other.pos_bt);
-                if (wheels[i].extra_pushback > 0.0f) {
-                    const float full_pushback = wheels[i].extra_pushback * 4.0f;
-                    ApplyImpulseAtPointBtRoundtripBtInputs(
-                        other, other_cfg, mutator.car_mass, -n_bt * full_pushback, cp_bt - other.pos_bt);
-                }
-                if (dyn_hit_pushed_mask != nullptr && wheels[i].ground_car_idx < 32) {
-                    *dyn_hit_pushed_mask |= (1u << wheels[i].ground_car_idx);
-                }
-            } else if (wheels[i].ground_kind == ROCKETGPU_ARENA_RAY_HIT_BALL && dyn_hit_ball != nullptr) {
-                BallState& b = *dyn_hit_ball;
-                const Vec3 push_bt = -n_bt;
-                SetBallLinearVelocityBt(b, b.vel_bt + push_bt * (1.0f / mutator.ball_mass));
-                b.ang_vel += ApplyInverseBallInertiaWorldBt(b.rot, mutator.ball_mass, ball_radius, Cross(cp_bt - b.pos_bt, push_bt));
-            }
-        }
-        if (wheel_runtime_state) {
-            wheel_runtime_state->extra_pushback[i] = wheels[i].extra_pushback;
-        }
-        car.wheels_with_contact[i] = wheels[i].is_in_contact;
-        car.world_contact.wheel_ball_mask |= static_cast<uint8_t>((wheels[i].is_in_contact && wheels[i].ground_kind == ROCKETGPU_ARENA_RAY_HIT_BALL) << i);
-        num_wheels_in_contact += wheels[i].is_in_contact ? 1 : 0;
-        wheels_have_world_contact = wheels_have_world_contact || wheels[i].is_in_contact_with_world;
-        if (wheels[i].is_in_contact) {
-            wheel_normal_sum += wheels[i].contact_normal_ws;
-        }
+    // v3 wheel order (front-left, front-right, back-left, back-right) is RocketGPU's i ^ 1. It matters when wheels
+    // rest on another car: each wheel's pushback reads the velocity the previous wheels' pushes left on that car.
+    WheelContactOut contact_out[4];
+    for (int k = 0; k < 4; ++k) {
+        const int i = k ^ 1;
+        contact_out[i] = WheelRayPhase(car, cfg, mutator, wheels[i], i, cal_front_scale, cal_back_scale,
+                                       cal_min_hit_dist_sq_bt, wheel_runtime_state, mesh_triangles, mesh_triangle_count,
+                                       cars_in_env, car_cfgs_in_env, cars_in_env_count, self_car_idx, env_idx, ball,
+                                       ball_radius, mesh_bvh_quantization, mesh_bvh_quantization_count, mesh_bvh_meshes,
+                                       mesh_bvh_mesh_count, mesh_bvh_nodes, mesh_bvh_node_count, mesh_bvh_subtrees,
+                                       mesh_bvh_subtree_count, staged_rays, staged_rays_velocity_stale, dyn_hit_cars,
+                                       dyn_hit_ball, dyn_hit_pushed_mask);
     }
-
-    car.is_on_ground = num_wheels_in_contact >= 3 ? 1 : 0;
-
-    if (wheel_runtime_state) {
-        Vec3 world_normal_sum(0.0f, 0.0f, 0.0f);
-        uint8_t world_contacts = 0;
-        for (int i = 0; i < 4; ++i) {
-            if (wheels[i].is_in_contact && wheels[i].is_in_contact_with_world) {
-                world_normal_sum += wheels[i].contact_normal_ws;
-                ++world_contacts;
-            }
-        }
-        wheel_runtime_state->cal_prev_wheel_normal_sum = world_normal_sum;
-        wheel_runtime_state->cal_prev_world_wheel_contacts = world_contacts;
-    }
-    // cal_flip_before_wheels: the dodge impulse already landed; drive/brake/sticky read the tick-start forward speed.
-    forward_speed_uu = forward_speed_override ? *forward_speed_override : WheelForwardSpeed(car);
+    const WheelContactSummary contact_summary = CombineWheelContacts(car, wheel_runtime_state, contact_out);
+    const int num_wheels_in_contact = contact_summary.num_wheels_in_contact;
+    const bool wheels_have_world_contact = contact_summary.wheels_have_world_contact;
+    const Vec3 wheel_normal_sum = contact_summary.wheel_normal_sum;
+    // A dodge or double-jump impulse this tick already landed (cal_flip_before_wheels): drive, brake and steer
+    // read the post-impulse forward speed, as the game does (RLBot c3 car1 f96764: a landing dodge with throttle and
+    // steer matches to 0.01 uu/s; the tick-start speed gives the drive force at 1235 uu/s instead of none past 1410).
+    forward_speed_uu = WheelForwardSpeed(car);
     const float abs_forward_speed = Abs(forward_speed_uu);
     const float friction_scale = mutator.car_mass / 3.0f;
     Vec3 car_forward(1.0f, 0.0f, 0.0f);
@@ -1121,147 +1565,22 @@ ROCKETGPU_HD int PreTickVehicleDynamics(
     const float drive_engine_force = engine_throttle * throttle_torque_bt * drive_speed_scale;
     const float drive_brake_force = real_brake * brake_torque_bt;
     const float steer_angle_base = cfg.three_wheels ? EvalSteerAngleFromSpeedThreeWheel(abs_forward_speed)
-                                                    : EvalSteerAngleFromSpeed(abs_forward_speed);
+                                                    : EvalSteerAngleFromSpeed(cfg.steer_angle_curve, abs_forward_speed);
     float next_steer_angle = steer_angle_base;
     if (car.handbrake_val > 0.0f) {
-        next_steer_angle += (EvalPowerslideSteerAngleFromSpeed(abs_forward_speed) - next_steer_angle) * car.handbrake_val;
+        next_steer_angle += (EvalPowerslideSteerAngleFromSpeed(cfg.powerslide_steer_angle_curve, abs_forward_speed) - next_steer_angle) * car.handbrake_val;
     }
     next_steer_angle *= controls.steer;
 
+    WheelDriveShared drive_shared;
+    drive_shared.car_forward = car_forward;
+    drive_shared.next_steer_angle = next_steer_angle;
+    drive_shared.drive_engine_force = drive_engine_force;
+    drive_shared.drive_brake_force = drive_brake_force;
+    drive_shared.real_throttle = real_throttle;
+    drive_shared.friction_scale = friction_scale;
     for (int i = 0; i < 4; ++i) {
-        WheelStepState& wheel = wheels[i];
-        wheel.impulse = Vec3(0.0f, 0.0f, 0.0f);
-
-        const float prev_steer_angle = wheel_runtime_state ? wheel_runtime_state->steer_angle[i] : 0.0f;
-        const float prev_engine_force = wheel_runtime_state ? wheel_runtime_state->engine_force[i] : 0.0f;
-        const float prev_brake = wheel_runtime_state ? wheel_runtime_state->brake[i] : 0.0f;
-        const float prev_lat_friction = wheel_runtime_state ? wheel_runtime_state->lat_friction[i] : 0.0f;
-        const float prev_long_friction = wheel_runtime_state ? wheel_runtime_state->long_friction[i] : 0.0f;
-        wheel.prev_steer_angle = prev_steer_angle;
-        wheel.prev_engine_force = prev_engine_force;
-        wheel.prev_brake = prev_brake;
-        wheel.prev_lat_friction = prev_lat_friction;
-        wheel.prev_long_friction = prev_long_friction;
-
-        const float current_steer_angle = wheel.is_front_wheel ? next_steer_angle : 0.0f;
-
-        const float applied_steer_angle = current_steer_angle;
-        const float applied_engine_force = drive_engine_force;
-        const float applied_brake = drive_brake_force;
-        wheel.engine_force = drive_engine_force;
-        wheel.brake = drive_brake_force;
-        wheel.steer_angle = current_steer_angle;
-
-        if (wheel_runtime_state) {
-            wheel_runtime_state->engine_force[i] = drive_engine_force;
-            wheel_runtime_state->brake[i] = drive_brake_force;
-            wheel_runtime_state->steer_angle[i] = current_steer_angle;
-        }
-
-        float current_lat_friction = prev_lat_friction;
-        float current_long_friction = prev_long_friction;
-        float base_friction = 0.0f;
-        float longitudinal_friction = 0.0f;
-        float friction_curve_input = 0.0f;
-        Vec3 friction_curve_lat_dir(0.0f, -1.0f, 0.0f);
-        Vec3 friction_curve_long_dir(1.0f, 0.0f, 0.0f);
-        Vec3 friction_curve_cross_vec(0.0f, 0.0f, 0.0f);
-        if (wheel.is_in_contact) {
-            Vec3 basis_right_col(0.0f, 0.0f, 0.0f);
-            Vec3 basis_forward_col(0.0f, 0.0f, 0.0f);
-            Vec3 basis_up_col(0.0f, 0.0f, 1.0f);
-            ComputeWheelTransformBasisFromSteer(wheel, applied_steer_angle, basis_right_col, basis_forward_col, basis_up_col, nullptr, mutator.game_mode == static_cast<uint8_t>(Mode::Soccar), NativeSseMath(mutator));
-
-            const Vec3 wheel_delta_bt = wheel.ray_source_bt - car.pos_bt;
-            const Vec3 cross_vec = (Cross(car.ang_vel, wheel_delta_bt) + car.vel_bt) * 50.0f;
-            friction_curve_cross_vec = cross_vec;
-            const Vec3 lat_dir = basis_right_col;
-            const Vec3 long_dir = Cross(lat_dir, wheel.contact_normal_ws);
-            friction_curve_lat_dir = lat_dir;
-            friction_curve_long_dir = long_dir;
-            base_friction = Abs(Dot(cross_vec, lat_dir));
-            longitudinal_friction = Abs(Dot(cross_vec, long_dir));
-            if (base_friction > 5.0f) {
-                friction_curve_input = base_friction / (longitudinal_friction + base_friction);
-            }
-
-            current_lat_friction = cfg.three_wheels ? EvalLatFrictionThreeWheel(friction_curve_input)
-                                                    : EvalLatFriction(friction_curve_input);
-            current_long_friction = EvalLongFriction(friction_curve_input);
-
-            if (car.handbrake_val > 0.0f) {
-                current_lat_friction *= (EvalHandbrakeLatFrictionFactor(friction_curve_input) - 1.0f) * car.handbrake_val + 1.0f;
-                current_long_friction *= (EvalHandbrakeLongFrictionFactor(friction_curve_input) - 1.0f) * car.handbrake_val + 1.0f;
-            } else {
-                current_long_friction = 1.0f;
-            }
-
-            const bool is_contact_sticky = real_throttle != 0.0f &&
-                !(!wheel.is_in_contact_with_world);
-            if (!is_contact_sticky) {
-                const float non_sticky = EvalNonStickyFrictionFactor(wheel.contact_normal_ws.z);
-                current_lat_friction *= non_sticky;
-                current_long_friction *= non_sticky;
-            }
-        }
-
-        wheel.lat_friction = current_lat_friction;
-        wheel.long_friction = current_long_friction;
-        if (wheel_runtime_state) {
-            wheel_runtime_state->lat_friction[i] = current_lat_friction;
-            wheel_runtime_state->long_friction[i] = current_long_friction;
-        }
-        const float applied_lat_friction = current_lat_friction;
-        const float applied_long_friction = current_long_friction;
-
-        if (!wheel.is_in_contact) {
-            continue;
-        }
-
-        Vec3 axle_dir(0.0f, -1.0f, 0.0f);
-        Vec3 forward_dir = car_forward;
-        Vec3 debug_steering[5];
-        Vec3 raw_axle_dir = axle_dir;
-        ComputeWheelBasisFromSteer(wheel, applied_steer_angle, car_forward, axle_dir, forward_dir, debug_steering, mutator.game_mode == static_cast<uint8_t>(Mode::Soccar), NativeSseMath(mutator),
-            (&raw_axle_dir));
-
-        const Vec3 contact_point_bt = wheel.contact_point_bt;
-
-        const BilateralBodyBt body1 = MakeBilateralCarBodyBt(car, cfg, mutator.car_mass);
-        BilateralBodyBt body2;
-
-        const float side_impulse = 0.0f;
-
-        const Vec3 car_rel_contact_bt = contact_point_bt - body1.com_bt;
-        const Vec3 contact_vel_bt =
-            BilateralVelocityInLocalPoint(body1, car_rel_contact_bt) -
-            BilateralVelocityInLocalPoint(body2, car_rel_contact_bt);
-        const float forward_speed_bt = Dot(contact_vel_bt, forward_dir);
-
-        float rolling_friction = 0.0f;
-        if (applied_engine_force == 0.0f) {
-            if (applied_brake != 0.0f) {
-                float rel_vel = forward_speed_bt;
-                if (dt > (1.0f / 80.0f)) {
-                    const float threshold = -(1.0f / (dt * 150.0f)) + 0.8f;
-                    if (Abs(rel_vel) < threshold) {
-                        rel_vel = 0.0f;
-                    }
-                }
-                rolling_friction = Clamp(-rel_vel * 113.73963f, -applied_brake, applied_brake);
-            }
-        } else {
-            rolling_friction = -applied_engine_force / friction_scale;
-        }
-
-        wheel.impulse = ((forward_dir * rolling_friction) * applied_long_friction +
-                         (axle_dir * side_impulse) * applied_lat_friction) * friction_scale;
-        wheel.cal_axle_dir = raw_axle_dir;
-        wheel.cal_forward_dir = forward_dir;
-        wheel.cal_rolling_friction = rolling_friction;
-        wheel.cal_lat_friction = applied_lat_friction;
-        wheel.cal_long_friction = applied_long_friction;
-        wheel.cal_friction_scale = friction_scale;
+        WheelDriveSetupPhase(car, cfg, mutator, drive_shared, wheels[i], i, wheel_runtime_state, dt);
     }
 
     if (wheel_runtime_state) {
@@ -1274,11 +1593,19 @@ ROCKETGPU_HD int PreTickVehicleDynamics(
         if (restore_tick) {
             world_normal_sum = Vec3(0.0f, 0.0f, 0.0f);
             gate = false;
-            for (int i = 0; i < 4; ++i) {
-                if (wheels[i].is_in_contact && wheels[i].is_in_contact_with_world) {
-                    world_normal_sum += wheels[i].contact_normal_ws;
-                    gate = true;
-                }
+            // A set state with the game's wheel contact normals carries the previous tick's contacts, which the game's
+            // sticky force reads (RLPR cw_high_speed_wall: a teleported car still gets the wall's sticky force on its
+            // first tick).
+            if (car.set_wheel_normals_mask) {
+                gate = SetStateWorldWheelNormals(car, cfg, wheels, ball, ball_radius, cars_in_env, car_cfgs_in_env,
+                                                 cars_in_env_count, self_car_idx, world_normal_sum,
+                                                 mesh_triangles, mesh_triangle_count, mesh_bvh_quantization,
+                                                 mesh_bvh_quantization_count, mesh_bvh_meshes, mesh_bvh_mesh_count,
+                                                 mesh_bvh_nodes, mesh_bvh_node_count, mesh_bvh_subtrees,
+                                                 mesh_bvh_subtree_count) > 0;
+            } else {
+                world_normal_sum = contact_summary.world_normal_sum;
+                gate = contact_summary.world_contacts > 0;
             }
         }
         if (gate) {
@@ -1375,7 +1702,8 @@ ROCKETGPU_HD void ApplyAirControl(
     bool update_air_control,
     WheelRuntimeState* wheel_runtime_state = nullptr,
     bool air_throttle = true,
-    float cal_pitchlock_restart_time = -1.0f) {
+    float cal_pitchlock_restart_time = -1.0f,
+    const Vec3* cal_damp_ang_vel = nullptr) {
     Vec3 basis_forward(1.0f, 0.0f, 0.0f);
     Vec3 basis_right(0.0f, 1.0f, 0.0f);
     Vec3 basis_up(0.0f, 0.0f, 1.0f);
@@ -1388,7 +1716,8 @@ ROCKETGPU_HD void ApplyAirControl(
 
     do_air_control = true;
 
-    do_air_control = do_air_control && !car.is_auto_flipping;
+    // The game applies air control while auto-flipping (RLPR AirControl impulse records on auto-flip ticks, e.g. Wisp
+    // frame 1704 car 1); v3 update_air_torque has no auto-flip gate either.
     do_air_control = do_air_control && update_air_control;
     if (do_air_control) {
         float pitch_torque_scale = 1.0f;
@@ -1407,11 +1736,12 @@ ROCKETGPU_HD void ApplyAirControl(
                 (controls.roll * dir_roll_forward * mutator.car_air_control_roll);
         }
 
-        const float damp_pitch = Dot(dir_pitch_right, car.ang_vel) * mutator.car_air_damp_pitch *
+        const Vec3 damp_ang_vel = cal_damp_ang_vel != nullptr ? *cal_damp_ang_vel : car.ang_vel;
+        const float damp_pitch = Dot(dir_pitch_right, damp_ang_vel) * mutator.car_air_damp_pitch *
             (1.0f - Min(Abs(controls.pitch * pitch_torque_scale), 1.0f));
-        const float damp_yaw = Dot(dir_yaw_up, car.ang_vel) * mutator.car_air_damp_yaw *
+        const float damp_yaw = Dot(dir_yaw_up, damp_ang_vel) * mutator.car_air_damp_yaw *
             (1.0f - Min(Abs(controls.yaw), 1.0f));
-        const float damp_roll = Dot(dir_roll_forward, car.ang_vel) * mutator.car_air_damp_roll;
+        const float damp_roll = Dot(dir_roll_forward, damp_ang_vel) * mutator.car_air_damp_roll;
         const Vec3 damping_world =
             dir_yaw_up * damp_yaw +
             dir_pitch_right * damp_pitch +
@@ -1571,7 +1901,8 @@ ROCKETGPU_HD void ContinueJump(
     float dt,
     WheelRuntimeState* wheel_runtime_state) {
     if (car.is_jumping) {
-        if (!(car.internal_jump_time < mutator.jump_min_time || (controls.jump && car.internal_jump_time < mutator.jump_max_time))) {
+        if (!(car.internal_jump_time < mutator.jump_min_time ||
+              (controls.jump && !car.jump_hold_broken && car.internal_jump_time < mutator.jump_max_time))) {
             car.is_jumping = 0;
         }
     }
@@ -1621,15 +1952,20 @@ ROCKETGPU_HD void ApplyFlipTorque(
         return;
     }
 
-    Vec3 rel_torque = car.flip_rel_torque;
+    // The game rounds the dodge torque to whole units before the pitch-cancel scale: its recorded DodgeTorque
+    // impulses are (round(rel.x * 260), round(rel.y * 224) * cancel_scale, 0) * dt in the tick-start car basis on all
+    // 65k dodge ticks of the Nexto, PartyCannon and Wisp recordings (rel (0.7071, 0.7071) gives 184 and 158, not
+    // 183.85 and 158.39).
+    const Vec3 rel_torque = car.flip_rel_torque;
+    float torque_y = rintf(rel_torque.y * mutator.flip_torque_y);
     const float cancel_pitch = DodgeCancelPitch(car, controls, mutator, dt, raw_pitch);
     if (rel_torque.y != 0.0f && cancel_pitch != 0.0f && Sign(rel_torque.y) == Sign(cancel_pitch)) {
-        rel_torque.y *= (1.0f - Min(Abs(cancel_pitch), 1.0f));
+        torque_y *= (1.0f - Min(Abs(cancel_pitch), 1.0f));
     }
 
     const Vec3 dodge_torque_local(
-        rel_torque.x * mutator.flip_torque_x,
-        rel_torque.y * mutator.flip_torque_y,
+        rintf(rel_torque.x * mutator.flip_torque_x),
+        torque_y,
         0.0f);
     const Vec3 dodge_torque_world = RotateCarBasis(car, dodge_torque_local);
     if (wheel_runtime_state) {
@@ -1694,7 +2030,10 @@ ROCKETGPU_HD void ApplyAutoFlip(
             CarBasisColumns(car, aft_fwd, aft_rgt, aft_up);
             (void)aft_rgt; (void)aft_up;
 
-            car.ang_vel += ((aft_fwd * 50.0f) * car.auto_flip_torque_scale) * dt;
+            // v3 car_consts::autoflip::ANG_VEL_DELTA: 1000 rad/s per tick (no dt), so the clamp below leaves the car spinning
+            // at the max angular speed about its forward axis. The recordings agree (Wisp frame 1704 car 1: truth
+            // omega = clamp(omega + 1000 fwd) + the recorded AirControl impulse to 1e-5 rad/s; 50 rad/s^2 misses by 0.08).
+            car.ang_vel += (aft_fwd * 1000.0f) * car.auto_flip_torque_scale;
             // v3 update_auto_flip calls limit_vels(MAX_SPEED, MAX_ANG_SPEED) right after the auto-flip increment.
             CalLimitCarVels(car, mutator);
 
@@ -1769,7 +2108,16 @@ ROCKETGPU_HD bool TryDoubleJumpOrFlip(
                 initial_dodge_vel.x *= mutator.flip_backward_impulse_scale_x;
             }
 
-            Vec3 forward_dir_2d = RocketSimVecNormalized(Vec3(forward.x, forward.y, 0.0f));
+            // The game aims the dodge with the car's integer yaw (65536 units per turn, rounded) looked up in UE3's
+            // 16384-entry sine table (index yaw >> 2), so the direction snaps to multiples of 4 units: the recorded
+            // DodgeImpulse yaw is a multiple of 4 on 868 of 870 dodges (Nexto, PartyCannon, Wisp) and equals
+            // (rint(yaw) >> 2) << 2 of the tick-start forward on 863 (the rest sit within 0.1 unit of a rounding edge).
+            const int dodge_yaw = static_cast<int>(rintf(GlibcAtan2f(forward.y, forward.x) * (32768.0f / 3.14159265f)));
+            const int dodge_yaw_idx = (dodge_yaw >> 2) & 16383;
+            constexpr double kSinTabStep = 6.283185307179586476925 / 16384.0;
+            const Vec3 forward_dir_2d(
+                static_cast<float>(sin(static_cast<double>((dodge_yaw_idx + 4096) & 16383) * kSinTabStep)),
+                static_cast<float>(sin(static_cast<double>(dodge_yaw_idx) * kSinTabStep)), 0.0f);
             Vec3 right_dir_2d(-forward_dir_2d.y, forward_dir_2d.x, 0.0f);
             Vec3 final_delta_vel = forward_dir_2d * initial_dodge_vel.x + right_dir_2d * initial_dodge_vel.y;
             ApplyCentralImpulseViaBtRoundtrip(car, final_delta_vel, mutator.car_mass);
@@ -1800,7 +2148,8 @@ ROCKETGPU_HD void UpdateJumpState(
     }
 
     if (car.is_jumping) {
-        if (!(car.internal_jump_time < mutator.jump_min_time || (controls.jump && car.internal_jump_time < mutator.jump_max_time))) {
+        if (!(car.internal_jump_time < mutator.jump_min_time ||
+              (controls.jump && !car.jump_hold_broken && car.internal_jump_time < mutator.jump_max_time))) {
             car.is_jumping = 0;
         }
     }
@@ -1993,8 +2342,12 @@ ROCKETGPU_HD void IntegrateBallTransformOnly(BallState& ball, float dt) {
 ROCKETGPU_HD void IntegrateBallTransformOnly(BallState& ball, const MutatorConfig& mutator, float dt) {
     IntegrateBallTransformOnly(ball, dt);
     if (mutator.ball_shape == 1 || !mutator.ball_no_rot) {
-        (void)IntegrateOrientationBasisColumns(
-            ball.basis_forward, ball.basis_right, ball.basis_up, ball.rot, ball.ang_vel, dt, false, NativeSseMath(mutator));
+        if (NativeSseMath(mutator)) {
+            (void)IntegrateOrientationBasisColumns(
+                ball.basis_forward, ball.basis_right, ball.basis_up, ball.rot, ball.ang_vel, dt, false, true);
+        } else {
+            GameIntegrateOrientationBasisColumns(ball.basis_forward, ball.basis_right, ball.basis_up, ball.rot, ball.ang_vel, dt);
+        }
         ball.basis_authoritative = 1;
     }
 }
@@ -2028,9 +2381,12 @@ ROCKETGPU_HD float QuantTruncOffsetV3(float x, float scale) {
     return rounded + offset;
 }
 
+// The game multiplies by the reciprocal (floor(p * 100 + 0.5) * 0.01f), where v3 divides by 100: RLPR Nexto car
+// position steps p1 = q(p0) * 0.02f + v1 / 50 * (1 / 120.f), times 50, are bit exact on 98.9% of ticks with the
+// product and 26.8% with the quotient.
 ROCKETGPU_HD float QuantRoundPosV3(float x, float scale) {
     const float scaled = x * scale;
-    return floorf(scaled + 0.5f) / scale;
+    return floorf(scaled + 0.5f) * (1.0f / scale);
 }
 
 ROCKETGPU_HD void QuantizeBallStateV3Exact(BallState& ball) {
@@ -2044,6 +2400,13 @@ ROCKETGPU_HD void QuantizeBallStateV3Exact(BallState& ball) {
     ball.ang_vel = Vec3(QuantTruncOffsetV3(ball.ang_vel.x, 10000.0f),
                         QuantTruncOffsetV3(ball.ang_vel.y, 10000.0f),
                         QuantTruncOffsetV3(ball.ang_vel.z, 10000.0f));
+    // The ball's RBState goes through the same 18-bit quaternion codec as the car's (recorded ball orientations step
+    // bit exact from the quantized previous orientation on 98.5% of Nexto ticks, and on 0% without it).
+    if (!ball.basis_authoritative) {
+        GetOfficialUploadBasisVectors(ball.rot, ball.basis_forward, ball.basis_right, ball.basis_up);
+        ball.basis_authoritative = 1;
+    }
+    ball.rot = GameQuantizeBasisColumns(ball.basis_forward, ball.basis_right, ball.basis_up);
 }
 
 ROCKETGPU_HD void QuantizeBallState(BallState& ball, bool v3_exact = false) {
@@ -2086,6 +2449,14 @@ ROCKETGPU_HD ROCKETGPU_NOINLINE void QuantizeCarState(CarState& car, bool v3_exa
         car.vel_touched_solve_stage = touched_v3;
         car.ang_vel = Vec3(QuantTruncOffsetV3(car.ang_vel.x, 10000.0f), QuantTruncOffsetV3(car.ang_vel.y, 10000.0f),
                            QuantTruncOffsetV3(car.ang_vel.z, 10000.0f));
+        // The game's state quantize also sends the rotation through the 18-bit quaternion codec every tick.
+        Vec3 fwd, right, up;
+        CarBasisColumns(car, fwd, right, up);
+        car.rot = GameQuantizeBasisColumns(fwd, right, up);
+        car.basis_forward = fwd;
+        car.basis_right = right;
+        car.basis_up = up;
+        car.basis_authoritative = 1;
         return;
     }
 
@@ -2098,21 +2469,6 @@ ROCKETGPU_HD ROCKETGPU_NOINLINE void QuantizeCarState(CarState& car, bool v3_exa
     car.vel_touched_solve_stage = touched;
     car.ang_vel = Vec3(QuantTruncOffset(car.ang_vel.x, 10000.0f), QuantTruncOffset(car.ang_vel.y, 10000.0f),
                        QuantTruncOffset(car.ang_vel.z, 10000.0f));
-}
-
-ROCKETGPU_HD void CalPreStepClampCarSpeed(CarState& car, const MutatorConfig& mutator) {
-    if (car.is_demoed || car.just_respawned) {
-        return;
-    }
-    const float max_speed_bt = mutator.car_max_speed * UnitsUUToBT();
-    const Vec3 vel_bt = car.vel_bt;
-    const float vel_bt_len_sq = LengthSq(vel_bt);
-    if (vel_bt_len_sq > max_speed_bt * max_speed_bt) {
-        const Vec3 vel_bt_normalized = mutator.native_sphere_rsqrt_table
-            ? NativeSseSphereNormalizer{mutator.native_sphere_rsqrt_table, mutator.native_sphere_rsqrt_shift}(vel_bt)
-            : vel_bt * RsqrtScalar(vel_bt_len_sq);
-        SetCarLinearVelocityBt(car, vel_bt_normalized * max_speed_bt);
-    }
 }
 
 ROCKETGPU_HD void FinishCarTick(CarState& car, const MutatorConfig& mutator) {
@@ -2155,7 +2511,9 @@ ROCKETGPU_HD void CalTickStartLimitAndQuantizeCar(CarState& car, const MutatorCo
         SetCarLinearVelocityBt(car, vel_bt_normalized * max_speed_bt);
     }
     CapCarAngularSpeed(car, mutator);
-    QuantizeCarState(car, (true & 2u) != 0);
+    // The game's RBState quantize: position k * (1 / 100), velocity and angular velocity
+    // k * inv + sign * (inv * 0.1) at scales 100 and 10000; the v3-exact branch computes exactly this.
+    QuantizeCarState(car, true);
 }
 
 // v3 Car::apply_flip_zdamp_prepass (run for every car after the tick-start limit/quantize, before any pre-tick update):
@@ -2251,18 +2609,6 @@ struct GjkSimplexSolver {
     GjkSubSimplexClosestResult cached_bc;
     bool cached_valid_closest = false;
     bool needs_update = true;
-    int32_t debug_update_region = -1;
-    int32_t debug_pre_reduce_num_vertices = 0;
-    int32_t debug_triangle_region = -1;
-    float debug_triangle_param = 0.0f;
-    Vec3 debug_triangle_closest_point = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 debug_cached_p1 = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 debug_cached_p2 = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 debug_cached_v = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 debug_simplex_w[4];
-    Vec3 debug_simplex_p[4];
-    Vec3 debug_simplex_q[4];
-    float debug_barycentric_coords[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     ROCKETGPU_HD void reset() {
         cached_valid_closest = false;
@@ -2270,20 +2616,6 @@ struct GjkSimplexSolver {
         needs_update = true;
         last_w = Vec3(1.0e18f, 1.0e18f, 1.0e18f);
         cached_bc.reset();
-        debug_update_region = -1;
-        debug_pre_reduce_num_vertices = 0;
-        debug_triangle_region = -1;
-        debug_triangle_param = 0.0f;
-        debug_triangle_closest_point = Vec3(0.0f, 0.0f, 0.0f);
-        debug_cached_p1 = Vec3(0.0f, 0.0f, 0.0f);
-        debug_cached_p2 = Vec3(0.0f, 0.0f, 0.0f);
-        debug_cached_v = Vec3(0.0f, 0.0f, 0.0f);
-        for (int i = 0; i < 4; ++i) {
-            debug_simplex_w[i] = Vec3(0.0f, 0.0f, 0.0f);
-            debug_simplex_p[i] = Vec3(0.0f, 0.0f, 0.0f);
-            debug_simplex_q[i] = Vec3(0.0f, 0.0f, 0.0f);
-            debug_barycentric_coords[i] = 0.0f;
-        }
     }
 
     ROCKETGPU_HD void add_vertex(const Vec3& w, const Vec3& p, const Vec3& q) {
@@ -2331,20 +2663,6 @@ struct GjkSimplexSolver {
         }
     }
 
-    ROCKETGPU_HD void capture_debug_update_state(int32_t region) {
-        debug_update_region = region;
-        debug_pre_reduce_num_vertices = num_vertices;
-        debug_cached_p1 = cached_p1;
-        debug_cached_p2 = cached_p2;
-        debug_cached_v = cached_v;
-        for (int i = 0; i < 4; ++i) {
-            debug_simplex_w[i] = (i < num_vertices) ? simplex_w[i] : Vec3(0.0f, 0.0f, 0.0f);
-            debug_simplex_p[i] = (i < num_vertices) ? simplex_p[i] : Vec3(0.0f, 0.0f, 0.0f);
-            debug_simplex_q[i] = (i < num_vertices) ? simplex_q[i] : Vec3(0.0f, 0.0f, 0.0f);
-            debug_barycentric_coords[i] = cached_bc.barycentric_coords[i];
-        }
-    }
-
     ROCKETGPU_HD bool closest_pt_point_triangle(
         const Vec3& p,
         const Vec3& a,
@@ -2352,9 +2670,6 @@ struct GjkSimplexSolver {
         const Vec3& c,
         GjkSubSimplexClosestResult& result) {
         result.used_vertices.reset();
-        debug_triangle_region = -1;
-        debug_triangle_param = 0.0f;
-        debug_triangle_closest_point = Vec3(0.0f, 0.0f, 0.0f);
 
         const Vec3 ab = b - a;
         const Vec3 ac = c - a;
@@ -2365,8 +2680,6 @@ struct GjkSimplexSolver {
             result.closest_point_on_simplex = a;
             result.used_vertices.used_vertex_a = true;
             result.set_barycentric_coordinates(1.0f, 0.0f, 0.0f);
-            debug_triangle_region = 0;
-            debug_triangle_closest_point = result.closest_point_on_simplex;
             return true;
         }
 
@@ -2377,8 +2690,6 @@ struct GjkSimplexSolver {
             result.closest_point_on_simplex = b;
             result.used_vertices.used_vertex_b = true;
             result.set_barycentric_coordinates(0.0f, 1.0f, 0.0f);
-            debug_triangle_region = 1;
-            debug_triangle_closest_point = result.closest_point_on_simplex;
             return true;
         }
 
@@ -2389,9 +2700,6 @@ struct GjkSimplexSolver {
             result.used_vertices.used_vertex_a = true;
             result.used_vertices.used_vertex_b = true;
             result.set_barycentric_coordinates(1.0f - v, v, 0.0f);
-            debug_triangle_region = 2;
-            debug_triangle_param = v;
-            debug_triangle_closest_point = result.closest_point_on_simplex;
             return true;
         }
 
@@ -2402,8 +2710,6 @@ struct GjkSimplexSolver {
             result.closest_point_on_simplex = c;
             result.used_vertices.used_vertex_c = true;
             result.set_barycentric_coordinates(0.0f, 0.0f, 1.0f);
-            debug_triangle_region = 3;
-            debug_triangle_closest_point = result.closest_point_on_simplex;
             return true;
         }
 
@@ -2414,9 +2720,6 @@ struct GjkSimplexSolver {
             result.used_vertices.used_vertex_a = true;
             result.used_vertices.used_vertex_c = true;
             result.set_barycentric_coordinates(1.0f - w, 0.0f, w);
-            debug_triangle_region = 4;
-            debug_triangle_param = w;
-            debug_triangle_closest_point = result.closest_point_on_simplex;
             return true;
         }
 
@@ -2427,9 +2730,6 @@ struct GjkSimplexSolver {
             result.used_vertices.used_vertex_b = true;
             result.used_vertices.used_vertex_c = true;
             result.set_barycentric_coordinates(0.0f, 1.0f - w, w);
-            debug_triangle_region = 5;
-            debug_triangle_param = w;
-            debug_triangle_closest_point = result.closest_point_on_simplex;
             return true;
         }
 
@@ -2441,9 +2741,6 @@ struct GjkSimplexSolver {
         result.used_vertices.used_vertex_b = true;
         result.used_vertices.used_vertex_c = true;
         result.set_barycentric_coordinates(1.0f - v - w, v, w);
-        debug_triangle_region = 6;
-        debug_triangle_param = w;
-        debug_triangle_closest_point = result.closest_point_on_simplex;
         return true;
     }
 
@@ -2588,7 +2885,6 @@ struct GjkSimplexSolver {
             cached_bc.reset();
             cached_bc.set_barycentric_coordinates(1.0f, 0.0f, 0.0f, 0.0f);
             cached_valid_closest = cached_bc.is_valid();
-            capture_debug_update_state(1);
             break;
         case 2: {
             const Vec3& from = simplex_w[0];
@@ -2615,7 +2911,6 @@ struct GjkSimplexSolver {
             cached_p1 = simplex_p[0] + (simplex_p[1] - simplex_p[0]) * t;
             cached_p2 = simplex_q[0] + (simplex_q[1] - simplex_q[0]) * t;
             cached_v = cached_p1 - cached_p2;
-            capture_debug_update_state(2);
             reduce_vertices(cached_bc.used_vertices);
             cached_valid_closest = cached_bc.is_valid();
             break;
@@ -2631,7 +2926,6 @@ struct GjkSimplexSolver {
                 simplex_q[1] * cached_bc.barycentric_coords[1] +
                 simplex_q[2] * cached_bc.barycentric_coords[2];
             cached_v = cached_p1 - cached_p2;
-            capture_debug_update_state(3);
             reduce_vertices(cached_bc.used_vertices);
             cached_valid_closest = cached_bc.is_valid();
             break;
@@ -2655,17 +2949,14 @@ struct GjkSimplexSolver {
                     simplex_q[2] * cached_bc.barycentric_coords[2] +
                     simplex_q[3] * cached_bc.barycentric_coords[3];
                 cached_v = cached_p1 - cached_p2;
-                capture_debug_update_state(4);
                 reduce_vertices(cached_bc.used_vertices);
                 cached_valid_closest = cached_bc.is_valid();
             } else {
                 if (cached_bc.degenerate) {
-                    capture_debug_update_state(4);
                     cached_valid_closest = false;
                 } else {
                     cached_valid_closest = true;
                     cached_v = Vec3(0.0f, 0.0f, 0.0f);
-                    capture_debug_update_state(4);
                 }
             }
             break;
@@ -2715,12 +3006,28 @@ ROCKETGPU_HD Vec3 WheelRayCarHitboxHalfExtentWithBulletSafeMarginBT(const CarCon
     return implicit_bt + Vec3(safe_margin_bt, safe_margin_bt, safe_margin_bt);
 }
 
-// v3's wheel-ray vs car-compound test (compound_shape.rs
-// internal_perform_raycast + solve_rounded_box). Slab against the child AABB (inner half + margin),
-// pure-face fast path, exact rounded-box (radius = margin) solve on edge/corner entries. No GJK
-// tolerance: the Bullet subsimplex cast above stops at dist2 < 1e-4 (0.01 bt) and reports hits up to
-// ~0.5 uu outside the box.
-ROCKETGPU_HD bool CastWheelRayAgainstCarHitboxV3Exact(
+// Closest point from p to the car's rounded hitbox (inner box + margin), as btGjkPairDetector reports it
+// for a zero-margin point vs a btBoxShape: distance to the surface and the outward normal on the box.
+ROCKETGPU_HD bool WheelRayCarHitboxClosestBT(const Vec3& p, const Vec3& center, const Vec3& f, const Vec3& r,
+    const Vec3& u, const Vec3& inner, float margin, float& dist, Vec3& normal) {
+    const Vec3 d = p - center;
+    const Vec3 l(Dot(d, f), Dot(d, r), Dot(d, u));
+    const Vec3 q(Max(-inner.x, Min(inner.x, l.x)), Max(-inner.y, Min(inner.y, l.y)), Max(-inner.z, Min(inner.z, l.z)));
+    const Vec3 dl = l - q;
+    const float len = Length(dl);
+    if (!(len > 0.0f)) {
+        return false;  // inside the core box: no penetration solver, so GJK reports no result
+    }
+    const Vec3 nl = dl * (1.0f / len);
+    normal = f * nl.x + r * nl.y + u * nl.z;
+    dist = len - margin;
+    return true;
+}
+
+// Wheel ray vs car hitbox as the game's btCollisionWorld::rayTestSingle does it (Bullet 2.82, default flags):
+// btGjkConvexCast of a point against the rounded box. Conservative advancement stops once the point is within
+// 0.001 bt of the surface, so the fraction and normal come from that point, not the exact surface hit.
+ROCKETGPU_HD bool CastWheelRayAgainstCarHitboxGjkCast(
     const Vec3& ray_source_bt,
     const Vec3& ray_dir,
     float max_len,
@@ -2730,222 +3037,59 @@ ROCKETGPU_HD bool CastWheelRayAgainstCarHitboxV3Exact(
     float max_len_bt_override) {
     constexpr float kUUToBT = 1.0f / 50.0f;
     constexpr float kBTToUU = 50.0f;
-    constexpr float kFltEps = 1.1920928955078125e-7f;
+    constexpr float kRadius = 0.001f;
+    constexpr int kMaxIterations = 32;
     const float max_len_bt = max_len_bt_override > 0.0f ? max_len_bt_override : max_len * kUUToBT;
     const Vec3 ray_to_bt = ray_source_bt + ray_dir * max_len_bt;
-
     const Vec3 half_raw = other_cfg.hitbox_size * (0.5f * kUUToBT);
-    const float margin = Min(0.1f * Min(half_raw.x, Min(half_raw.y, half_raw.z)), 0.04f);
-    const Vec3 inner_v = half_raw - Vec3(margin, margin, margin);
-    const Vec3 off_v = other_cfg.hitbox_offset * kUUToBT;
-    // Cheap reject: ray segment cannot reach the box's bounding sphere.
+    const float margin = Min(0.1f * Min(half_raw.x, Min(half_raw.y, half_raw.z)), 0.04f);  // btBoxShape setSafeMargin
+    const Vec3 inner = half_raw - Vec3(margin, margin, margin);
+    Vec3 f(1.0f, 0.0f, 0.0f), rt(0.0f, 1.0f, 0.0f), u(0.0f, 0.0f, 1.0f);
+    CarBasisColumns(other_car, f, rt, u);
+    const Vec3 center = other_car.pos_bt + RotateViaBasis(f, rt, u, other_cfg.hitbox_offset * kUUToBT);
     {
-        Vec3 f(1.0f, 0.0f, 0.0f), r(0.0f, 1.0f, 0.0f), u(0.0f, 0.0f, 1.0f);
-        CarBasisColumns(other_car, f, r, u);
-        const Vec3 c = other_car.pos_bt + RotateViaBasis(f, r, u, off_v);
         const float rr = Length(half_raw) + max_len_bt + 1.0e-3f;
-        if (LengthSq(c - ray_source_bt) > rr * rr) {
+        if (LengthSq(center - ray_source_bt) > rr * rr) {
             return false;
         }
     }
 
-    const Vec3 src_v = InverseRotateCarBasis(other_car, ray_source_bt - other_car.pos_bt);
-    const Vec3 tgt_v = InverseRotateCarBasis(other_car, ray_to_bt - other_car.pos_bt);
-    const Vec3 delta_v = tgt_v - src_v;
-    const float dist = Length(delta_v);
-    if (!(dist > 0.0f)) {
+    const Vec3 r = ray_to_bt - ray_source_bt;
+    float lambda = 0.0f;
+    float last_lambda = 0.0f;
+    float dist = 0.0f;
+    Vec3 n(0.0f, 0.0f, 0.0f);
+    if (!WheelRayCarHitboxClosestBT(ray_source_bt, center, f, rt, u, inner, margin, dist, n)) {
         return false;
     }
-    const float src[3] = {src_v.x, src_v.y, src_v.z};
-    const float dir[3] = {delta_v.x / dist, delta_v.y / dist, delta_v.z / dist};
-    const float inner[3] = {inner_v.x, inner_v.y, inner_v.z};
-    const float off[3] = {off_v.x, off_v.y, off_v.z};
-
-    float tenter = 0.0f;
-    float texit = dist;
-    int hit_axis = 0;
-    for (int axis = 0; axis < 3; ++axis) {
-        const float inv = 1.0f / dir[axis];
-        const float bmin = off[axis] - (inner[axis] + margin);
-        const float bmax = off[axis] + (inner[axis] + margin);
-        if (!(inv - inv == 0.0f)) {  // not finite
-            if (bmin > src[axis] || src[axis] > bmax) {
-                return false;
-            }
-            continue;
-        }
-        const float t1 = (bmin - src[axis]) * inv;
-        const float t2 = (bmax - src[axis]) * inv;
-        const float tmin = Min(t1, t2);
-        const float tmax = Max(t1, t2);
-        if (copysignf(1.0f, tmax) < 0.0f) {
+    bool penetrated = false;
+    int iter = 0;
+    while (dist > kRadius) {
+        if (++iter > kMaxIterations) {
             return false;
         }
-        texit = Min(texit, tmax);
-        if (tmin > tenter) {
-            tenter = tmin;
-            hit_axis = axis;
-        }
-        if (tenter > texit) {
+        lambda = lambda - dist / Dot(r, n);
+        if (lambda > 1.0f || lambda < 0.0f || lambda <= last_lambda) {
             return false;
         }
-    }
-    if (0.0f >= tenter || tenter > dist) {
-        return false;
-    }
-
-    float n_l[3] = {0.0f, 0.0f, 0.0f};
-    float t_hit = 0.0f;
-    bool inside_face = true;
-    for (int axis = 0; axis < 3; ++axis) {
-        if (axis == hit_axis) {
-            continue;
+        last_lambda = lambda;
+        float next_dist = 0.0f;
+        if (!WheelRayCarHitboxClosestBT(ray_source_bt + r * lambda, center, f, rt, u, inner, margin, next_dist, n)) {
+            return false;
         }
-        const float local = (src[axis] + dir[axis] * tenter) - off[axis];
-        if (fabsf(local) > inner[axis]) {
-            inside_face = false;
+        if (next_dist < 0.0f) {
+            penetrated = true;  // Bullet returns lastLambda (== lambda here) with this normal
             break;
         }
+        dist = next_dist;
     }
-    if (inside_face) {
-        n_l[hit_axis] = copysignf(1.0f, dir[hit_axis]) < 0.0f ? 1.0f : -1.0f;
-        t_hit = Max(tenter, 0.0f);
-    } else {
-        // solve_rounded_box in child-local space.
-        float sl[3];
-        for (int axis = 0; axis < 3; ++axis) {
-            sl[axis] = src[axis] - off[axis];
-        }
-        float pts[8];
-        pts[0] = 0.0f;
-        pts[1] = dist;
-        int count = 2;
-        for (int axis = 0; axis < 3; ++axis) {
-            const float d = dir[axis];
-            if (d == 0.0f) {
-                continue;
-            }
-            for (int sgn = 0; sgn < 2; ++sgn) {
-                const float bound = sgn == 0 ? -inner[axis] : inner[axis];
-                const float t = (bound - sl[axis]) / d;
-                if (t > 0.0f && t < dist && count < 8) {
-                    pts[count++] = t;
-                }
-            }
-        }
-        for (int i = 1; i < count; ++i) {
-            const float key = pts[i];
-            int j = i;
-            while (j > 0 && pts[j - 1] > key) {
-                pts[j] = pts[j - 1];
-                --j;
-            }
-            pts[j] = key;
-        }
-        const float margin_sq = margin * margin;
-        bool found = false;
-        for (int i = 0; i < count - 1 && !found; ++i) {
-            const float t0 = pts[i];
-            const float t1 = pts[i + 1];
-            if (t1 <= t0) {
-                continue;
-            }
-            const float mid = t0 + (t1 - t0) * 0.5f;
-            float a = 0.0f, b = 0.0f, c = 0.0f;
-            int outside = 0;
-            for (int axis = 0; axis < 3; ++axis) {
-                const float pm = sl[axis] + dir[axis] * mid;
-                const float h = inner[axis];
-                float bound;
-                if (pm < -h) {
-                    bound = -h;
-                } else if (pm > h) {
-                    bound = h;
-                } else {
-                    continue;
-                }
-                ++outside;
-                const float o = sl[axis] - bound;
-                const float d = dir[axis];
-                a += d * d;
-                b += 2.0f * d * o;
-                c += o * o;
-            }
-            if (outside == 0) {
-                continue;
-            }
-            const float cc = c - margin_sq;
-            float disc = b * b - 4.0f * a * cc;
-            if (disc < 0.0f) {
-                const float scale = b * b + fabsf(4.0f * a * cc);
-                if (disc > -kFltEps * scale) {
-                    disc = 0.0f;
-                } else {
-                    continue;
-                }
-            }
-            const float sqrt_d = sqrtf(disc);
-            float th;
-            if (disc == 0.0f) {
-                th = -b / (2.0f * a);
-            } else {
-                const float q = -0.5f * (b >= 0.0f ? b + sqrt_d : b - sqrt_d);
-                if (q == 0.0f) {
-                    th = -b / (2.0f * a);
-                } else {
-                    const float r0 = q / a;
-                    const float r1 = cc / q;
-                    th = r0 <= r1 ? r0 : r1;
-                }
-            }
-            if (th <= 0.0f || th > dist || th < t0 || th > t1) {
-                continue;
-            }
-            float n[3];
-            float len_sq = 0.0f;
-            for (int axis = 0; axis < 3; ++axis) {
-                const float hp = sl[axis] + dir[axis] * th;
-                n[axis] = hp - Min(Max(hp, -inner[axis]), inner[axis]);
-                len_sq += n[axis] * n[axis];
-            }
-            if (len_sq <= kFltEps * kFltEps) {
-                continue;
-            }
-            const float inv_len = 1.0f / sqrtf(len_sq);
-            float ndot = 0.0f;
-            for (int axis = 0; axis < 3; ++axis) {
-                n[axis] *= inv_len;
-                ndot += n[axis] * dir[axis];
-            }
-            if (ndot > 0.0f) {
-                continue;
-            }
-            // analytic_rounded_hit renormalizes and re-checks the dot.
-            const float l2 = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-            float ndot2 = 0.0f;
-            for (int axis = 0; axis < 3; ++axis) {
-                n_l[axis] = n[axis] / l2;
-                ndot2 += n_l[axis] * dir[axis];
-            }
-            if (ndot2 > 0.0f) {
-                return false;
-            }
-            t_hit = th;
-            found = true;
-        }
-        if (!found || 0.0f >= t_hit || t_hit > dist) {
-            return false;
-        }
+    if (!penetrated && Dot(n, r) >= 0.0f) {
+        return false;
     }
 
-    const float lambda = t_hit / dist;
-    Vec3 f(1.0f, 0.0f, 0.0f), r(0.0f, 1.0f, 0.0f), u(0.0f, 0.0f, 1.0f);
-    CarBasisColumns(other_car, f, r, u);
-    const Vec3 n_w = RotateViaBasis(f, r, u, Vec3(n_l[0], n_l[1], n_l[2]));
-    const float n_len_sq = LengthSq(n_w);
-    out_hit.normal = n_len_sq > 0.0f ? n_w * (1.0f / sqrtf(n_len_sq)) : Vec3(0.0f, 0.0f, 0.0f);
     out_hit.t = lambda * max_len;
-    out_hit.point_bt = ray_source_bt + (ray_to_bt - ray_source_bt) * lambda;
+    out_hit.normal = Normalize(n, Vec3(0.0f, 0.0f, 1.0f));
+    out_hit.point_bt = ray_source_bt + r * lambda;
     out_hit.point = out_hit.point_bt * kBTToUU;
     out_hit.hit = 1;
     out_hit.kind = ROCKETGPU_ARENA_RAY_HIT_CAR;

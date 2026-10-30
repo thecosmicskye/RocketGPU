@@ -23,6 +23,10 @@ void BuildArenaMeshLeafGrid(
     std::vector<int32_t>& out_cell_start,
     std::vector<ArenaMeshLeafEntry>& out_entries);
 
+// Sets free_half_x / free_half_y on every mesh info: the largest-area origin-centred XY box (any z) that no mesh AABB
+// meets, each mesh lying beyond it in x or in y. Left 0 when some mesh straddles both axes.
+void SetArenaMeshFreeBox(std::vector<ArenaMeshBvhMeshInfo>& mesh_infos);
+
 std::vector<ArenaMeshTriangle> LoadArenaMeshTriangles(
     std::vector<ArenaMeshBvhQuantization>* out_quantization = nullptr,
     std::vector<ArenaMeshBvhMeshInfo>* out_mesh_infos = nullptr,

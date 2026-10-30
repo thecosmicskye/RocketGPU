@@ -246,9 +246,8 @@ ROCKETGPU_HD void RefreshCarWorldRetainedPlaneManifold(
     }
 }
 
-ROCKETGPU_HD int CarWorldRetainedSortCachedPoints(
-    const CarWorldPlaneRetainedManifold& manifold,
-    const CarWorldPlaneRetainedPoint& pt) {
+template <typename Manifold, typename Point>
+ROCKETGPU_HD int CarWorldRetainedSortCachedPoints(const Manifold& manifold, const Point& pt) {
     int max_penetration_index = 4;
     float max_penetration = pt.distance_bt;
     for (int i = 0; i < 4; ++i) {
@@ -283,10 +282,8 @@ ROCKETGPU_HD int CarWorldRetainedSortCachedPoints(
 }
 
 // Returns the slot the point was written to.
-ROCKETGPU_HD int MergeCarWorldRetainedPlanePoint(
-    CarWorldPlaneRetainedManifold& manifold,
-    const CarWorldPlaneRetainedPoint& pt,
-    float threshold_bt) {
+template <typename Manifold, typename Point>
+ROCKETGPU_HD int MergeCarWorldRetainedPlanePoint(Manifold& manifold, const Point& pt, float threshold_bt) {
     if (manifold.count == 0) {
         manifold.points[0] = pt;
         manifold.count = 1;
@@ -723,13 +720,24 @@ struct CarWorldMeshCandidateStageMesh {
     uint8_t has_collected_normal = 0;
     Vec3 last_collected_normal = Vec3(0.0f, 0.0f, 1.0f);
 };
+// Meshes one car's query AABB overlaps at most for the stage to hold it (Octane recordings: never more than 2); a car
+// overlapping more is left unstaged (valid = 0) and the step walks it itself.
+constexpr int kCarWorldMeshStageSlots = 4;
 struct CarWorldMeshCandidateStage {
     float fingerprint[kCarWorldMeshStageFingerprintFloats] = {};
     int32_t valid = 0;
     int32_t mesh_count = 0;
     uint32_t mesh_mask = 0;  // meshes with a staged entry; the others yield no candidates
-    CarWorldMeshCandidateStageMesh meshes[kCarWorldMeshStageMeshes];
+    CarWorldMeshCandidateStageMesh meshes[kCarWorldMeshStageSlots];  // the mesh_mask meshes in mesh order
 };
+
+// Entry of a mesh in mesh_mask: the number of mask bits below it.
+ROCKETGPU_HD int CarWorldMeshStageSlot(uint32_t mesh_mask, int mesh) {
+    uint32_t v = mesh_mask & ((1u << mesh) - 1u);
+    v = v - ((v >> 1) & 0x55555555u);
+    v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+    return static_cast<int>((((v + (v >> 4)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24);
+}
 
 #if defined(__CUDACC__)
 extern __device__ CarWorldMeshCandidateStage* g_rocketgpu_car_world_stage;
@@ -907,6 +915,108 @@ ROCKETGPU_HD bool CarWorldMeshAabbMayOverlap(
            aabb_max_bt.z >= mesh_info.aabb_min.z - kMeshSkipMarginBt;
 }
 
+// Chassis early-out (car_world_early_out): conservative proofs that the car-world chassis query yields no contact
+// rows this tick, so SolveCarWorldStaticContacts can skip it with bit-identical results.
+//
+// Every point of the car box lies within reach_bt = |hitbox offset| + |half extents with margin| of the car origin.
+// The Bullet proxy AABB (current and predicted transforms, + 0.02), the compound child AABB and the mesh query AABB
+// (+ breaking threshold) therefore lie inside the box around the origin and the predicted origin pos + vel dt,
+// grown by reach_bt plus a slack that covers those expansions and a basis off unit length by rounding. A mesh whose
+// AABB misses that box has no manifold (BulletCarMeshManifoldExists), no triangle in the query AABB and no group.
+// Separation of a triangle from the car box (half extents with margin) along one box axis. GJK's distance between
+// them is at least this gap, so a gap past the breaking threshold means no candidate.
+ROCKETGPU_HD float CarWorldTriangleBoxAxisGap(
+    const ArenaMeshTriangle& tri, const Vec3& axis, const Vec3& box_center_bt, float half_extent_bt) {
+    const float c = Dot(axis, box_center_bt);
+    const float pa = Dot(axis, tri.a);
+    const float pb = Dot(axis, tri.b);
+    const float pc = Dot(axis, tri.c);
+    return Max(Min(pa, Min(pb, pc)) - (c + half_extent_bt), (c - half_extent_bt) - Max(pa, Max(pb, pc)));
+}
+
+struct CarWorldMeshReach {
+    Vec3 lo;
+    Vec3 hi;
+};
+
+ROCKETGPU_HD CarWorldMeshReach ComputeCarWorldMeshReach(const CarState& car, const CarConfig& cfg, float dt) {
+    constexpr float kUUToBT = 1.0f / 50.0f;
+    constexpr float kSlackBt = 0.2f;
+    const Vec3 half_bt = BulletBoxHalfExtentWithMarginBt(cfg);
+    const Vec3 offset_bt = cfg.hitbox_offset * kUUToBT;
+    const float reach_bt = SqrtScalar(Dot(half_bt, half_bt)) + SqrtScalar(Dot(offset_bt, offset_bt)) + kSlackBt;
+    const Vec3 pred_bt = car.pos_bt + car.vel * (kUUToBT * dt);
+    CarWorldMeshReach reach;
+    reach.lo = Vec3(Min(car.pos_bt.x, pred_bt.x) - reach_bt, Min(car.pos_bt.y, pred_bt.y) - reach_bt,
+                    Min(car.pos_bt.z, pred_bt.z) - reach_bt);
+    reach.hi = Vec3(Max(car.pos_bt.x, pred_bt.x) + reach_bt, Max(car.pos_bt.y, pred_bt.y) + reach_bt,
+                    Max(car.pos_bt.z, pred_bt.z) + reach_bt);
+    return reach;
+}
+
+ROCKETGPU_HD bool CarWorldMeshInReach(const CarWorldMeshReach& reach, const ArenaMeshBvhMeshInfo& info) {
+    return reach.lo.x <= info.aabb_max.x && reach.hi.x >= info.aabb_min.x && reach.lo.y <= info.aabb_max.y &&
+           reach.hi.y >= info.aabb_min.y && reach.lo.z <= info.aabb_max.z && reach.hi.z >= info.aabb_min.z;
+}
+
+ROCKETGPU_HD bool CarWorldMeshesOutOfReach(
+    const CarState& car,
+    const CarConfig& cfg,
+    const ArenaMeshBvhMeshInfo* mesh_infos,
+    int32_t mesh_count,
+    float dt) {
+    const CarWorldMeshReach reach = ComputeCarWorldMeshReach(car, cfg, dt);
+    for (int m = 0; m < mesh_count; ++m) {
+        if (CarWorldMeshInReach(reach, mesh_infos[m])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The four Bullet static planes (+X wall, -X wall, floor, ceiling, AppendCarWorldPlaneContactRows order). Returns -1
+// unless every plane's support distance clears the breaking threshold (no point) and sits clearly on one side of the
+// broadphase window (whether the plane gets an empty order group); otherwise bit i is set when plane i gets the
+// group. The bound is the support-vertex distance itself, so the slack only covers rounding.
+ROCKETGPU_HD int CarWorldPlanesOutOfReach(const CarState& car, const CarConfig& cfg) {
+    constexpr float kUUToBT = 1.0f / 50.0f;
+    constexpr float kSlackBt = 1.0e-3f;
+    constexpr float kBulletGContactBreakingThresholdBt = 0.02f;
+    constexpr float kBulletStaticPlaneAabbHalfSlabBt = 0.2f;
+    const float threshold_bt = CarContactBreakingThresholdUU(cfg) * kUUToBT;
+    const float window_bt = threshold_bt + kBulletStaticPlaneAabbHalfSlabBt + 2.0f * kBulletGContactBreakingThresholdBt;
+    Vec3 fwd(1.0f, 0.0f, 0.0f);
+    Vec3 right(0.0f, 1.0f, 0.0f);
+    Vec3 up(0.0f, 0.0f, 1.0f);
+    CarBasisColumns(car, fwd, right, up);
+    const Vec3 half_bt = BulletBoxHalfExtentWithMarginBt(cfg);
+    const Vec3 offset_bt = cfg.hitbox_offset * kUUToBT;
+    const Vec3 center_bt = car.pos_bt + fwd * offset_bt.x + right * offset_bt.y + up * offset_bt.z;
+    // Box extent along world x and z.
+    const float ext_x = Abs(fwd.x) * half_bt.x + Abs(right.x) * half_bt.y + Abs(up.x) * half_bt.z;
+    const float ext_z = Abs(fwd.z) * half_bt.x + Abs(right.z) * half_bt.y + Abs(up.z) * half_bt.z;
+    const float wall_bt = ArenaExtentX() * kUUToBT;
+    int mask = 0;
+    const auto classify = [&](float d, int bit) {
+        if (mask < 0) {
+            return;
+        }
+        if (d < threshold_bt + kSlackBt || Abs(d - window_bt) <= kSlackBt) {
+            mask = -1;
+        } else if (d < window_bt) {
+            mask |= bit;
+        }
+    };
+    classify(center_bt.x + wall_bt - ext_x, 1);
+    classify(wall_bt - center_bt.x - ext_x, 2);
+    classify(center_bt.z - ext_z, 4);
+    classify(ArenaHeight() * kUUToBT - center_bt.z - ext_z, 8);
+    return mask;
+}
+
+// kStagedHitsOnly: the staging kernel's build. It never runs GJK/EPA: the gather pass stops at the plane tests and
+// the merge pass takes CarWorldTriangleHitsKernel's hits (a pair without them is left to the step, see the caller).
+template <bool kStagedHitsOnly = false>
 ROCKETGPU_HD void AppendCarWorldMeshContactRows(
     const CarState& car,
     const CarConfig& cfg,
@@ -943,7 +1053,8 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
     int stage_mesh = -1,
     const ArenaMeshLeafGrid* leaf_grid = nullptr,
     const CarWorldTrianglePairs* triangle_pairs = nullptr,
-    int triangle_pairs_pass = kTrianglePairsNone) {
+    int triangle_pairs_pass = kTrianglePairsNone,
+    CarWorldMeshRetainedManifold* retained_mesh_manifolds = nullptr) {
     if (mesh_triangles == nullptr || mesh_triangle_count <= 0) {
         return;
     }
@@ -962,8 +1073,16 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
     const Vec3 box_half_extent_with_margin_bt = query_frame.box_half_extent_with_margin_bt;
     const Vec3 aabb_min_bt = query_frame.aabb_min_bt;
     const Vec3 aabb_max_bt = query_frame.aabb_max_bt;
+    // Rows pass (broadphase grid, no staging): a mesh out of reach (CarWorldMeshesOutOfReach) has no manifold, no
+    // triangle in the query AABB and no group, so it is skipped, and the proxy is built only when some mesh is in reach.
+    const bool skip_out_of_reach = broadphase_grid != nullptr && stage_out == nullptr && mesh_bvh_meshes != nullptr;
+    const CarWorldMeshReach mesh_reach = ComputeCarWorldMeshReach(car, cfg, broadphase_dt);
+    bool any_mesh_in_reach = !skip_out_of_reach;
+    for (int m = 0; !any_mesh_in_reach && m < mesh_bvh_mesh_count; ++m) {
+        any_mesh_in_reach = CarWorldMeshInReach(mesh_reach, mesh_bvh_meshes[m]);
+    }
     const BulletBroadphaseProxy car_broadphase_proxy =
-        broadphase_grid != nullptr
+        broadphase_grid != nullptr && any_mesh_in_reach
             ? ComputeBulletCarProxyAabb(car, cfg, broadphase_dt, *broadphase_grid, NativeSseMath(mutator))
             : BulletBroadphaseProxy{};
 
@@ -1149,6 +1268,15 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
                 separation_against_normal > contact_threshold_bt) {
                 return;
             }
+            // Box-axis separation: GJK would return no hit or a distance past the threshold, which adds nothing.
+            // The slack covers GJK's tolerance and rounding.
+            constexpr float kBoxAxisGapSlackBt = 1.0e-3f;
+            const float box_axis_reject_bt = contact_threshold_bt + kBoxAxisGapSlackBt;
+            if (CarWorldTriangleBoxAxisGap(tri, axis_x, box_center_bt, box_half_extent_with_margin_bt.x) > box_axis_reject_bt ||
+                CarWorldTriangleBoxAxisGap(tri, axis_y, box_center_bt, box_half_extent_with_margin_bt.y) > box_axis_reject_bt ||
+                CarWorldTriangleBoxAxisGap(tri, axis_z, box_center_bt, box_half_extent_with_margin_bt.z) > box_axis_reject_bt) {
+                return;
+            }
             if (triangle_pairs_pass == kTrianglePairsGather) {
                 if (gathered_count < kCarWorldMeshGatherTriangles) {
                     gathered_tris[gathered_count] = tri_idx;
@@ -1157,10 +1285,17 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
                 return;
             }
         }
-        const CarWorldTriangleHit hit =
-            precomputed != nullptr
+        CarWorldTriangleHit hit;
+        if constexpr (kStagedHitsOnly) {
+            if (precomputed == nullptr) {
+                return;
+            }
+            hit = *precomputed;
+        } else {
+            hit = precomputed != nullptr
                 ? *precomputed
                 : ComputeCarWorldTriangleHit(car, cfg, mutator, mesh_triangles, tri_idx, contact_threshold_bt, gjk_epa_scratch);
+        }
         if (hit.hit == 0) {
             return;
         }
@@ -1262,6 +1397,113 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
         candidates[replace_idx] = candidate;
     };
 
+    // Retained car-world mesh contacts (cal_retained_world_contacts). v3 near_callback_with_bounds keeps the
+    // compound-vs-mesh persistent manifold while the pair passes the broadphase and the compound child gate
+    // (BulletCarMeshManifoldExists), and releases it otherwise. Each tick it refreshes the cached points with the
+    // current transforms (persistent_manifold.rs refresh_contact_points: recompute the anchors and distance, cull on
+    // distance or lateral drift past the breaking threshold) and merges the fresh points into them
+    // (merge_contact_points: all pushed into an empty cache, else get_cache_entry replace / add / sort_cached_points).
+    // The merged points, not just the fresh ones, are the pair's contacts. The candidates become the merged points.
+    const auto find_retained_mesh_manifold = [&](int mesh_info_idx) -> CarWorldMeshRetainedManifold* {
+        if (retained_mesh_manifolds == nullptr || broadphase_grid == nullptr) {
+            return nullptr;
+        }
+        for (int k = 0; k < kCarWorldMeshRetainedManifoldsPerCar; ++k) {
+            if (retained_mesh_manifolds[k].count > 0 && retained_mesh_manifolds[k].mesh == mesh_info_idx) {
+                return &retained_mesh_manifolds[k];
+            }
+        }
+        return nullptr;
+    };
+    const auto merge_retained_mesh_manifold = [&](int mesh_info_idx, const ArenaMeshBvhMeshInfo& mesh_info,
+                                                  bool manifold_exists, MeshContactCandidate* candidates,
+                                                  int& candidate_count) {
+        if (retained_mesh_manifolds == nullptr || broadphase_grid == nullptr) {
+            return;
+        }
+        CarWorldMeshRetainedManifold* manifold = find_retained_mesh_manifold(mesh_info_idx);
+        if (!manifold_exists) {
+            if (manifold != nullptr) {
+                manifold->count = 0;
+            }
+            return;
+        }
+        if (manifold == nullptr) {
+            if (candidate_count == 0) {
+                return;
+            }
+            for (int k = 0; k < kCarWorldMeshRetainedManifoldsPerCar && manifold == nullptr; ++k) {
+                if (retained_mesh_manifolds[k].count == 0) {
+                    manifold = &retained_mesh_manifolds[k];
+                }
+            }
+            if (manifold == nullptr) {
+                return;
+            }
+            manifold->mesh = static_cast<uint8_t>(mesh_info_idx);
+        }
+        const Vec3 mesh_origin_bt(0.0f, mesh_info.cal_origin_y, 0.0f);
+        const auto point_distance = [&](const CarWorldMeshRetainedPoint& pt, Vec3& pwa, Vec3& pwb) {
+            pwa = CarBodyWorldPointBt(car, pt.local_point_a_bt);
+            pwb = mesh_info.cal_origin_y != 0.0f ? pt.local_point_b_bt + mesh_origin_bt : pt.local_point_b_bt;
+            return Dot(pwa - pwb, pt.normal);
+        };
+        if (manifold->count > 0) {
+            Vec3 world_a[4];
+            Vec3 world_b[4];
+            for (int i = 0; i < manifold->count; ++i) {
+                manifold->points[i].distance_bt = point_distance(manifold->points[i], world_a[i], world_b[i]);
+            }
+            // Descending swap-remove, as RefreshCarWorldRetainedPlaneManifold.
+            for (int i = static_cast<int>(manifold->count) - 1; i >= 0; --i) {
+                const CarWorldMeshRetainedPoint& pt = manifold->points[i];
+                const Vec3 projected_difference = world_b[i] - (world_a[i] - pt.normal * pt.distance_bt);
+                if (pt.distance_bt > contact_threshold_bt ||
+                    Dot(projected_difference, projected_difference) > contact_threshold_bt * contact_threshold_bt) {
+                    const int last = static_cast<int>(manifold->count) - 1;
+                    if (i != last) {
+                        manifold->points[i] = manifold->points[last];
+                        world_a[i] = world_a[last];
+                        world_b[i] = world_b[last];
+                    }
+                    manifold->count = static_cast<uint8_t>(last);
+                }
+            }
+        }
+        const bool push_all = manifold->count == 0;
+        for (int c = 0; c < candidate_count; ++c) {
+            CarWorldMeshRetainedPoint pt;
+            pt.local_point_a_bt = candidates[c].local_point_a_bt;
+            pt.local_point_b_bt = mesh_info.cal_origin_y != 0.0f ? candidates[c].point_on_b_bt - mesh_origin_bt
+                                                                 : candidates[c].point_on_b_bt;
+            pt.normal = candidates[c].normal;
+            Vec3 pwa;
+            Vec3 pwb;
+            pt.distance_bt = point_distance(pt, pwa, pwb);
+            if (push_all) {
+                manifold->points[manifold->count++] = pt;
+            } else {
+                MergeCarWorldRetainedPlanePoint(*manifold, pt, contact_threshold_bt);
+            }
+        }
+        candidate_count = manifold->count;
+        for (int i = 0; i < manifold->count; ++i) {
+            const CarWorldMeshRetainedPoint& pt = manifold->points[i];
+            Vec3 pwa;
+            Vec3 pwb;
+            point_distance(pt, pwa, pwb);
+            MeshContactCandidate& candidate = candidates[i];
+            candidate.mesh_world_idx = mesh_info.mesh_index;
+            candidate.normal = pt.normal;
+            candidate.distance_bt = pt.distance_bt;
+            candidate.local_point_a_bt = pt.local_point_a_bt;
+            candidate.cache_local_point_a_bt = pt.local_point_a_bt;
+            candidate.point_on_b_bt = pwb;
+            candidate.rel_contact_bt = pwa - car_pos_bt;
+            candidate.rel_contact = candidate.rel_contact_bt * kBTToUU;
+        }
+    };
+
     const bool have_bvh_traversal =
         mesh_bvh_quantization != nullptr &&
         mesh_bvh_meshes != nullptr &&
@@ -1281,6 +1523,9 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
             return;
         }
         if (stage_mesh < 0) {
+            if (mesh_bvh_mesh_count > kCarWorldMeshStageSlots) {
+                return;
+            }
             stage_out->mesh_count = mesh_bvh_mesh_count;
             stage_out->mesh_mask = ~0u;
         }
@@ -1298,14 +1543,29 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
             if (!CarWorldMeshInfoUsable(mesh_info, mesh_bvh_quantization_count, mesh_bvh_node_count)) {
                 continue;
             }
-            // Not staged: the query AABB misses this mesh, so it has no candidates; only a Bullet manifold with it
-            // still gives it an (empty) order group, as below.
-            if (stage_in != nullptr && broadphase_grid != nullptr && ((stage_in->mesh_mask >> mesh_info_idx) & 1u) == 0) {
-                if (BulletCarMeshManifoldExists(car_broadphase_proxy, *broadphase_grid, mesh_info)) {
-                    append_local_world_order_group(
-                        100 + Max(mesh_info.mesh_index, 0), normal_row_count, 0, friction_row_count, 0);
+            if (skip_out_of_reach && !CarWorldMeshInReach(mesh_reach, mesh_info)) {
+                // The manifold is released, as merge_retained_mesh_manifold does without one.
+                if (CarWorldMeshRetainedManifold* const retained = find_retained_mesh_manifold(mesh_info_idx)) {
+                    retained->count = 0;
                 }
                 continue;
+            }
+            // Not staged: the query AABB misses this mesh, so it has no candidates; only a Bullet manifold with it
+            // still gives it an (empty) order group, as below.
+            // A retained manifold with points still yields that mesh's contacts, below.
+            if (stage_in != nullptr && broadphase_grid != nullptr && ((stage_in->mesh_mask >> mesh_info_idx) & 1u) == 0) {
+                CarWorldMeshRetainedManifold* const retained = find_retained_mesh_manifold(mesh_info_idx);
+                const bool exists = BulletCarMeshManifoldExists(car_broadphase_proxy, *broadphase_grid, mesh_info);
+                if (!exists && retained != nullptr) {
+                    retained->count = 0;
+                }
+                if (!exists || retained == nullptr) {
+                    if (exists) {
+                        append_local_world_order_group(
+                            100 + Max(mesh_info.mesh_index, 0), normal_row_count, 0, friction_row_count, 0);
+                    }
+                    continue;
+                }
             }
 
             int candidate_count = 0;
@@ -1344,7 +1604,8 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
                 if (((stage_in->mesh_mask >> mesh_info_idx) & 1u) == 0) {
                     // Not staged: the query AABB misses this mesh, so it has no candidates.
                 } else {
-                const CarWorldMeshCandidateStageMesh& staged = stage_in->meshes[mesh_info_idx];
+                const CarWorldMeshCandidateStageMesh& staged =
+                    stage_in->meshes[CarWorldMeshStageSlot(stage_in->mesh_mask, mesh_info_idx)];
                 candidate_count = staged.candidate_count < kMaxMeshCandidates ? staged.candidate_count : kMaxMeshCandidates;
                 for (int c = 0; c < candidate_count; ++c) {
                     candidates[c] = staged.candidates[c];
@@ -1356,8 +1617,9 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
                 }
                 }
             } else if (mesh_aabb_may_overlap && triangle_pairs_pass == kTrianglePairsMerge &&
-                       stage_out->meshes[mesh_info_idx].pair_count >= 0) {
-                const CarWorldMeshCandidateStageMesh& gathered = stage_out->meshes[mesh_info_idx];
+                       stage_out->meshes[CarWorldMeshStageSlot(stage_out->mesh_mask, mesh_info_idx)].pair_count >= 0) {
+                const CarWorldMeshCandidateStageMesh& gathered =
+                    stage_out->meshes[CarWorldMeshStageSlot(stage_out->mesh_mask, mesh_info_idx)];
                 for (int k = 0; k < gathered.pair_count; ++k) {
                     consider_triangle(triangle_pairs->tri_idx[gathered.pair_start + k], candidates, candidate_count,
                                       &triangle_pairs->hits[gathered.pair_start + k]);
@@ -1387,7 +1649,7 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
             }
             }
             if (stage_out != nullptr && triangle_pairs_pass == kTrianglePairsGather) {
-                CarWorldMeshCandidateStageMesh& staged = stage_out->meshes[mesh_info_idx];
+                CarWorldMeshCandidateStageMesh& staged = stage_out->meshes[CarWorldMeshStageSlot(stage_out->mesh_mask, mesh_info_idx)];
                 staged.broadphase_hits = current_mesh_broadphase_hits;
                 staged.pair_count = -1;  // the merge pass walks this pair itself
 #if defined(__CUDA_ARCH__)
@@ -1420,7 +1682,7 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
                 continue;
             }
             if (stage_out != nullptr) {
-                CarWorldMeshCandidateStageMesh& staged = stage_out->meshes[mesh_info_idx];
+                CarWorldMeshCandidateStageMesh& staged = stage_out->meshes[CarWorldMeshStageSlot(stage_out->mesh_mask, mesh_info_idx)];
                 staged.candidate_count = candidate_count;
                 for (int c = 0; c < candidate_count && c < kMaxMeshCandidates; ++c) {
                     staged.candidates[c] = candidates[c];
@@ -1431,15 +1693,16 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
                 continue;
             }
 
+            const bool mesh_manifold_exists =
+                broadphase_grid != nullptr &&
+                BulletCarMeshManifoldExists(car_broadphase_proxy, *broadphase_grid, mesh_info);
+            merge_retained_mesh_manifold(mesh_info_idx, mesh_info, mesh_manifold_exists, candidates, candidate_count);
+
             const int group_normal_start = normal_row_count;
             const int group_friction_start = friction_row_count;
             emit_candidates(candidates, candidate_count);
             const int group_normal_count = normal_row_count - group_normal_start;
             const int group_friction_count = friction_row_count - group_friction_start;
-
-            const bool mesh_manifold_exists =
-                broadphase_grid != nullptr &&
-                BulletCarMeshManifoldExists(car_broadphase_proxy, *broadphase_grid, mesh_info);
 
             if (current_mesh_broadphase_hits > 0 ||
                 group_normal_count > 0 ||

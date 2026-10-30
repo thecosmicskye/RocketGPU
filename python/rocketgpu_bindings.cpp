@@ -117,7 +117,19 @@ PYBIND11_MODULE(rocketgpu_py, m) {
         .def_readwrite("front_suspension_rest", &rocketgpu::CarConfig::front_suspension_rest)
         .def_readwrite("back_suspension_rest", &rocketgpu::CarConfig::back_suspension_rest)
         .def_readwrite("dodge_deadzone", &rocketgpu::CarConfig::dodge_deadzone)
-        .def_readwrite("three_wheels", &rocketgpu::CarConfig::three_wheels);
+        .def_readwrite("three_wheels", &rocketgpu::CarConfig::three_wheels)
+        .def_property("steer_angle_curve",
+            [](const rocketgpu::CarConfig& c) { return std::vector<float>(c.steer_angle_curve, c.steer_angle_curve + 6); },
+            [](rocketgpu::CarConfig& c, const std::vector<float>& v) {
+                if (v.size() != 6) throw py::value_error("steer_angle_curve needs 6 values");
+                std::copy(v.begin(), v.end(), c.steer_angle_curve);
+            })
+        .def_property("powerslide_steer_angle_curve",
+            [](const rocketgpu::CarConfig& c) { return std::vector<float>(c.powerslide_steer_angle_curve, c.powerslide_steer_angle_curve + 2); },
+            [](rocketgpu::CarConfig& c, const std::vector<float>& v) {
+                if (v.size() != 2) throw py::value_error("powerslide_steer_angle_curve needs 2 values");
+                std::copy(v.begin(), v.end(), c.powerslide_steer_angle_curve);
+            });
 
     py::class_<rocketgpu::BallHitInfo>(m, "BallHitInfo")
         .def(py::init<>())
@@ -520,6 +532,8 @@ PYBIND11_MODULE(rocketgpu_py, m) {
             vec3("basis_up", offsetof(S, basis_up), f);
             scalar("basis_authoritative", "<u4", offsetof(S, basis_authoritative), f);
             vec3("vel_impulse_cache_bt", offsetof(S, vel_impulse_cache_bt), f);
+            scalar("sleeping", "<u4", offsetof(S, sleeping), f);
+            scalar("deactivation_time", "<f4", offsetof(S, deactivation_time), f);
             finish("ball_states", sizeof(S), f);
         }
         {
@@ -921,7 +935,18 @@ PYBIND11_MODULE(rocketgpu_py, m) {
                     st.hasWorldContact = !v.is_none();
                     st.worldContactNormal = v.is_none() ? rocketgpu::Vec3(0.0f, 0.0f, 0.0f) : v.cast<rocketgpu::Vec3>();
                 })
-            .def_readwrite("prev_controls", &rc::CarStateV3::prevControls);
+            .def_readwrite("prev_controls", &rc::CarStateV3::prevControls)
+            .def_property("wheel_contact_normals",
+                [](const rc::CarStateV3& st) -> py::object {
+                    if (!st.hasWheelContactNormals) return py::none();
+                    return py::cast(std::vector<rocketgpu::Vec3>(st.wheelContactNormals, st.wheelContactNormals + 4));
+                },
+                [](rc::CarStateV3& st, py::object v) {
+                    st.hasWheelContactNormals = !v.is_none();
+                    if (v.is_none()) return;
+                    const auto n = v.cast<std::vector<rocketgpu::Vec3>>();
+                    for (size_t i = 0; i < 4; ++i) st.wheelContactNormals[i] = i < n.size() ? n[i] : rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+                });
         py::class_<rc::Car, std::unique_ptr<rc::Car, py::nodelete>>(c, "Car")
             .def_readonly("id", &rc::Car::id)
             .def_readonly("team", &rc::Car::team)
