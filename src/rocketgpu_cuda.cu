@@ -1002,7 +1002,7 @@ constexpr int kStagedBlockSize = 64;
 inline bool UseStagedStep() {
     static const bool staged = [] {
         const char* v = std::getenv("ROCKETGPU_STAGED_STEP");
-        return v == nullptr || std::atoi(v) != 0;
+        return v != nullptr && std::atoi(v) != 0;
     }();
     return staged;
 }
