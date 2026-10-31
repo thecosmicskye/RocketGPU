@@ -24,6 +24,13 @@ using cudaStream_t = void*;
 #define ROCKETGPU_FORCEINLINE inline
 #endif
 
+// Added to a function already declared ROCKETGPU_HD: inline into every device caller.
+#if defined(__CUDACC__)
+#define ROCKETGPU_ALWAYS_INLINE __attribute__((always_inline))
+#else
+#define ROCKETGPU_ALWAYS_INLINE
+#endif
+
 #if defined(__CUDA_ARCH__)
 #define ROCKETGPU_WARP_SYNC() __syncwarp()
 #else

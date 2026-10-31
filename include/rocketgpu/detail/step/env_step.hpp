@@ -1444,7 +1444,7 @@ ROCKETGPU_HD void RecordArenaWorldContact(CarState& car, const ContactAccumulato
     car.world_contact.contact_normal = acc.latest_normal;
 }
 
-ROCKETGPU_HD void PreTickCar(
+ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     CarState& car,
     CarControls controls,
     const CarConfig& cfg,
@@ -1482,6 +1482,9 @@ ROCKETGPU_HD void PreTickCar(
     if (car.is_demoed) {
         return;
     }
+    // The pre-tick changes no car's rotation: its basis and inverse inertia are built once here.
+    const CarFrame car_frame = MakeCarFrame(car, cfg, mutator.car_mass);
+    const CarFrame* const frame = &car_frame;
     // supersonic_set_v3 also marks a v3-convention set state (compat SetStateV3), whose wheel contacts are per-wheel data.
     const bool cal_set_v3_tick = car.supersonic_set_v3 && car.tick_count_since_update == 0;
     if (car.supersonic_set_v3) {
@@ -1539,7 +1542,7 @@ ROCKETGPU_HD void PreTickCar(
     const bool cal_jump_blocked = cal_jump && wheel_runtime_state->cal_game_jumped;
     const uint8_t was_jumping = car.is_jumping;
     if (jump_pressed && car.is_on_ground && !car.is_jumping && !cal_jump_blocked) {
-        StartJump(car, mutator);
+        StartJump(car, mutator, frame);
         cal_air_jump_started = true;
     }
 
@@ -1568,11 +1571,11 @@ ROCKETGPU_HD void PreTickCar(
     bool cal_flip_before_wheels_vel_changed = false;
     float cal_flip_before_wheels_forward_speed = 0.0f;
     {
-        cal_flip_before_wheels_forward_speed = WheelForwardSpeed(car);
+        cal_flip_before_wheels_forward_speed = WheelForwardSpeed(car, frame);
         const Vec3 fbw_vel_bt = car.vel_bt;
         UpdateDoubleJumpOrFlipState(car, controls, cfg, mutator, air_jump_pressed && !cal_air_jump_started,
                                     cal_flip_before_wheels_forward_speed, dt, cal_press_as_air && !cal_air_jump_started,
-                                    cal_dodge_raw_pitch, &flip_started);
+                                    cal_dodge_raw_pitch, &flip_started, frame);
         cal_flip_before_wheels_done = true;
         cal_flip_before_wheels_vel_changed =
             car.vel_bt.x != fbw_vel_bt.x || car.vel_bt.y != fbw_vel_bt.y || car.vel_bt.z != fbw_vel_bt.z;
@@ -1611,7 +1614,8 @@ ROCKETGPU_HD void PreTickCar(
         cal_air_jump_started || staged_rays_velocity_stale || cal_flip_before_wheels_vel_changed,
         cal_push_cars,
         cal_push_ball,
-        cal_pushed_cars_mask);
+        cal_pushed_cars_mask,
+        frame);
 
     for (int wheel = 0; wheel < 4; ++wheel)
         if (wheels[wheel].is_in_contact && wheels[wheel].is_in_contact_with_world) {
@@ -1623,7 +1627,7 @@ ROCKETGPU_HD void PreTickCar(
 
     if (!cal_flip_before_wheels_done) {
         UpdateDoubleJumpOrFlipState(car, controls, cfg, mutator, air_jump_pressed && !cal_air_jump_started, forward_speed_uu, dt,
-                                    cal_press_as_air && !cal_air_jump_started, cal_dodge_raw_pitch, &flip_started);
+                                    cal_press_as_air && !cal_air_jump_started, cal_dodge_raw_pitch, &flip_started, frame);
     }
     // v3 Car::pre_tick_update gates the dodge torque (and the is_flipping reset) on num_wheels_in_contact read before
     // bullet_vehicle.update, i.e. the previous tick's wheel contacts and the matching cached is_on_ground; this tick's
@@ -1650,24 +1654,24 @@ ROCKETGPU_HD void PreTickCar(
     // Another car's wheel pushed this car earlier this tick (staged_rays_velocity_stale): damp its tick-start ang_vel.
     const Vec3* air_damp_ang_vel = staged_rays_velocity_stale ? &car.cal_tick_start_ang_vel : nullptr;
     if (air_gate_wheel_contacts < 3) {
-           ApplyFlipTorque(car, controls, cfg, mutator, dt, wheel_runtime_state, cal_dodge_raw_pitch);
+           ApplyFlipTorque(car, controls, cfg, mutator, dt, wheel_runtime_state, cal_dodge_raw_pitch, frame);
 
         ApplyAirControl(car, controls, cfg, mutator, dt, landing_prev_contacts == 0, wheel_runtime_state, landing_prev_contacts == 0, cal_pitchlock_restart_time,
-                        air_damp_ang_vel);
+                        air_damp_ang_vel, frame);
     } else {
         car.is_flipping = 0;
 
         if (landing_prev_contacts == 0) {
             ApplyAirControl(car, controls, cfg, mutator, dt, true, wheel_runtime_state, true, cal_pitchlock_restart_time,
-                            air_damp_ang_vel);
+                            air_damp_ang_vel, frame);
         }
     }
     const bool cal_flip_ended = air_gate_wheel_contacts < 3 &&
         cal_flipping_before_air && !car.is_flipping;
 
-    UpdateJumpState(car, controls, mutator, jump_pressed, dt, wheel_runtime_state, cal_jump_blocked);
+    UpdateJumpState(car, controls, mutator, jump_pressed, dt, wheel_runtime_state, cal_jump_blocked, frame);
 
-    ApplyAutoFlip(car, controls, mutator, dt);
+    ApplyAutoFlip(car, controls, mutator, dt, frame);
     if (cal_jump) {
         WheelRuntimeState& jw = *wheel_runtime_state;
 
@@ -1745,16 +1749,16 @@ ROCKETGPU_HD void PreTickCar(
     // cw_double_jump_dash, cw_double_dash: no auto-roll impulse on the landing-cancel tick).
     if (controls.throttle && !(car.is_flipping) && !flipping_at_start && !cal_flip_ended && autoroll_gate) {
         ApplyAutoRollReference(car, cfg, mutator, autoroll_contacts, wheels, dt, wheel_runtime_state,
-                               autoroll_cal ? &autoroll_normal_sum : nullptr);
+                               autoroll_cal ? &autoroll_normal_sum : nullptr, frame);
     }
     car.set_wheel_normals_mask = 0;
 
     car.world_contact.has_contact = 0;
 
     if (!car.just_respawned) {
-        ApplyWheelSuspensionAndFriction(car, cfg, mutator, controls, dt, wheels);
+        ApplyWheelSuspensionAndFriction(car, cfg, mutator, controls, dt, wheels, frame);
     }
-    ApplyBoost(car, controls, mutator, dt, wheel_runtime_state);
+    ApplyBoost(car, controls, mutator, dt, wheel_runtime_state, frame);
     if (wheel_runtime_state) {
         wheel_runtime_state->solver_time_step = dt;
         if (env_idx >= 0 && self_car_idx >= 0) {
@@ -1889,6 +1893,30 @@ ROCKETGPU_HD bool BallWorldMeshManifoldsEmpty(const WorldSolverScratch& scratch)
 // groups: the shared rows and groups SolveCarWorldStaticContacts appends car by car in the WorldStepSoccar loop.
 static_assert(kMaxApproxCarCarContactPoints <= kMaxCarPairRowsPerPair, "pair row caps assume <= 4 rows per car pair");
 
+// A row's words, all loaded before any is stored: a plain struct copy between global rows alternates load and store,
+// so each store waits on its load before the next load issues.
+template <typename T>
+struct RowWords {
+    static_assert(sizeof(T) % sizeof(uint32_t) == 0 && alignof(T) >= alignof(uint32_t), "rows copy by 32-bit words");
+    static constexpr int kCount = static_cast<int>(sizeof(T) / sizeof(uint32_t));
+    uint32_t w[kCount];
+
+    ROCKETGPU_HD void load(const T& src) {
+        const uint32_t* const from = reinterpret_cast<const uint32_t*>(&src);
+#pragma unroll
+        for (int k = 0; k < kCount; ++k) {
+            w[k] = from[k];
+        }
+    }
+    ROCKETGPU_HD void store(T& dst) const {
+        uint32_t* const to = reinterpret_cast<uint32_t*>(&dst);
+#pragma unroll
+        for (int k = 0; k < kCount; ++k) {
+            to[k] = w[k];
+        }
+    }
+};
+
 ROCKETGPU_HD void PackCarWorldRows(
     int count,
     const CarWorldRowsOut* outs,
@@ -1903,20 +1931,38 @@ ROCKETGPU_HD void PackCarWorldRows(
         const int velocity_shift = i * kMaxCarWorldVelocityContactRows - velocity_row_count;
         const int friction_shift = i * kMaxCarWorldFrictionContactRows - friction_row_count;
         for (int k = 0; split_from != split_row_count && k < out.split_row_count; ++k) {
-            rows.world_split_rows[split_row_count + k] = rows.world_split_rows[split_from + k];
+            RowWords<CarSharedSplitContactRow> words;
+            words.load(rows.world_split_rows[split_from + k]);
+            words.store(rows.world_split_rows[split_row_count + k]);
         }
         for (int k = 0; velocity_shift != 0 && k < out.velocity_row_count; ++k) {
-            rows.world_velocity_rows[velocity_row_count + k] = rows.world_velocity_rows[velocity_row_count + velocity_shift + k];
+            RowWords<CarSharedVelocityContactRow> words;
+            words.load(rows.world_velocity_rows[velocity_row_count + velocity_shift + k]);
+            words.store(rows.world_velocity_rows[velocity_row_count + k]);
         }
         for (int k = 0; (friction_shift != 0 || velocity_shift != 0) && k < out.friction_row_count; ++k) {
             CarSharedFrictionContactRow& row = rows.world_friction_rows[friction_row_count + k];
             if (friction_shift != 0) {
-                row = rows.world_friction_rows[friction_row_count + friction_shift + k];
+                constexpr int kIdxWord =
+                    static_cast<int>(offsetof(CarSharedFrictionContactRow, normal_row_idx) / sizeof(uint32_t));
+                RowWords<CarSharedFrictionContactRow> words;
+                words.load(rows.world_friction_rows[friction_row_count + friction_shift + k]);
+                words.w[kIdxWord] = static_cast<uint32_t>(static_cast<int32_t>(words.w[kIdxWord]) - velocity_shift);
+                words.store(row);
+            } else {
+                row.normal_row_idx -= velocity_shift;
             }
-            row.normal_row_idx -= velocity_shift;
+        }
+        // Group g + 1 is loaded before group g is stored, so the loads do not wait on the stores.
+        SharedContactOrderGroup next_group;
+        if (out.group_count > 0) {
+            next_group = out.groups[0];
         }
         for (int g = 0; g < out.group_count && group_count < kMaxSharedContactOrderGroups; ++g) {
-            SharedContactOrderGroup group = out.groups[g];
+            SharedContactOrderGroup group = next_group;
+            if (g + 1 < out.group_count) {
+                next_group = out.groups[g + 1];
+            }
             if (group.normal_row_start >= 0) {
                 group.normal_row_start -= velocity_shift;
             }
@@ -2961,6 +3007,9 @@ ROCKETGPU_HD void RocketSim_Arena_WorldStepSoccar(
         world_part);
 }
 
+// mesh_lanes: the ray's arena mesh walk and cars loop split over cooperating lanes (see ArenaRayMeshOneLane); only
+// the leader writes the stage.
+template <typename MeshLanes = ArenaRayMeshOneLane>
 ROCKETGPU_HD void StageWheelRaysForEnv(
     int lane,
     int env_idx,
@@ -2972,13 +3021,16 @@ ROCKETGPU_HD void StageWheelRaysForEnv(
     const EnvState& env,
     WorldSolverScratch& scratch,
     int base,
-    int count) {
+    int count,
+    const MeshLanes& mesh_lanes = MeshLanes{}) {
     constexpr int kStageCars = kWheelRayStageSlots / 4;
     if (lane < 0 || lane >= kWheelRayStageSlots) {
         return;
     }
     WheelRayStage& stage = scratch.wheel_ray_stage[lane];
-    stage.valid = 0;
+    if (mesh_lanes.Leader()) {
+        stage.valid = 0;
+    }
     const int car_slot = lane / 4;
     const int wheel_idx = lane % 4;
     if (car_slot >= count || car_slot >= cfg.max_cars_per_env || count > kStageCars) {
@@ -3027,9 +3079,11 @@ ROCKETGPU_HD void StageWheelRaysForEnv(
         cfg.arena_mesh_bvh_subtrees,
         cfg.arena_mesh_bvh_subtree_count,
         cfg.mutator.arena_collision != 0, cfg.mutator.native_sphere_rsqrt_table, cfg.mutator.native_sphere_rsqrt_shift,
-        no_response, CalMinWheelHitDistSqBt(car_cfg));
-    StoreWheelRayStage(wheel, stage);
-    stage.valid = 1;
+        no_response, CalMinWheelHitDistSqBt(car_cfg), mesh_lanes);
+    if (mesh_lanes.Leader()) {
+        StoreWheelRayStage(wheel, stage);
+        stage.valid = 1;
+    }
 }
 
 // Full runs a whole tick; Post skips the tick start (StepEnvPreTick*) and reads the staged wheel rays;

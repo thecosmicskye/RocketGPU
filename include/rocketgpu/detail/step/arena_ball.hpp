@@ -990,7 +990,36 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
         uint16_t quantized_query_aabb_min[3] = {0, 0, 0};
         uint16_t quantized_query_aabb_max[3] = {0, 0, 0};
 
+        // A contact point lies on its triangle within radiusWithThreshold of the ball's center, so a mesh whose
+        // AABB (the union of its triangles' AABBs) misses the query box by more than float rounding has no
+        // triangle that adds a point: its walk is skipped.
+        constexpr float kBallMeshWalkSkipMarginBt = 0.01f;
+        const auto mesh_walk_needed = [&](const ArenaMeshBvhMeshInfo& info) {
+            return !(info.aabb_max.x < aabb_min_bt.x - kBallMeshWalkSkipMarginBt ||
+                     info.aabb_min.x > aabb_max_bt.x + kBallMeshWalkSkipMarginBt ||
+                     info.aabb_max.y < aabb_min_bt.y - kBallMeshWalkSkipMarginBt ||
+                     info.aabb_min.y > aabb_max_bt.y + kBallMeshWalkSkipMarginBt ||
+                     info.aabb_max.z < aabb_min_bt.z - kBallMeshWalkSkipMarginBt ||
+                     info.aabb_min.z > aabb_max_bt.z + kBallMeshWalkSkipMarginBt);
+        };
+        // A mesh with no walk and an empty retained manifold changes nothing (its refresh has no points and its
+        // count stays 0). Those meshes are found first, in one pass whose loads overlap, and skipped below.
+        uint32_t idle_meshes = 0u;
+        if (mutator.cal_ball_world != 0 && solver_scratch != nullptr) {
+#pragma unroll
+            for (int mesh_info_idx = 0; mesh_info_idx < kMaxBallWorldMeshPersistentManifolds; ++mesh_info_idx) {
+                if (mesh_info_idx < mesh_bvh_mesh_count &&
+                    solver_scratch->ball_world_mesh_manifolds[mesh_info_idx].count == 0 &&
+                    !mesh_walk_needed(mesh_bvh_meshes[mesh_info_idx])) {
+                    idle_meshes |= 1u << mesh_info_idx;
+                }
+            }
+        }
+
         for (int mesh_info_idx = 0; mesh_info_idx < mesh_bvh_mesh_count; ++mesh_info_idx) {
+            if (mesh_info_idx < kMaxBallWorldMeshPersistentManifolds && ((idle_meshes >> mesh_info_idx) & 1u) != 0u) {
+                continue;
+            }
             const ArenaMeshBvhMeshInfo& mesh_info = mesh_bvh_meshes[mesh_info_idx];
             if (mesh_info.mesh_index >= mesh_bvh_quantization_count ||
                 mesh_info.node_offset < 0 ||
@@ -1021,9 +1050,13 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
             }
             int persistent_count = retain_ball_mesh_points ? static_cast<int>(persistent_manifold->count) : 0;
 
-            const ArenaMeshBvhQuantization& quantization = mesh_bvh_quantization[mesh_info.mesh_index];
-            QuantizeArenaMeshBvhPoint(quantization, aabb_min_bt, 0, quantized_query_aabb_min);
-            QuantizeArenaMeshBvhPoint(quantization, aabb_max_bt, 1, quantized_query_aabb_max);
+            // A skipped walk is an empty node range; the mesh's retained points are still refreshed below.
+            const bool walk_mesh = mesh_walk_needed(mesh_info);
+            if (walk_mesh) {
+                const ArenaMeshBvhQuantization& quantization = mesh_bvh_quantization[mesh_info.mesh_index];
+                QuantizeArenaMeshBvhPoint(quantization, aabb_min_bt, 0, quantized_query_aabb_min);
+                QuantizeArenaMeshBvhPoint(quantization, aabb_max_bt, 1, quantized_query_aabb_max);
+            }
 
             const float cal_origin_y = mesh_info.cal_origin_y;
 
@@ -1046,7 +1079,7 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                 quantized_query_aabb_min,
                 quantized_query_aabb_max,
                 mesh_info.node_offset,
-                mesh_info.node_count,
+                walk_mesh ? mesh_info.node_count : 0,
                 [&](int32_t local_tri_idx) {
                     if (local_tri_idx < 0 || local_tri_idx >= mesh_info.triangle_count) {
                         return;

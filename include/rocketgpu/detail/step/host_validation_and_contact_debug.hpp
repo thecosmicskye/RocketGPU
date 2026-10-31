@@ -1,5 +1,10 @@
 
 
+// Suspension constants (btWheelInfo as RL builds it).
+constexpr float kWheelSuspensionStiffness = 500.0f;
+constexpr float kWheelDampingCompression = 25.0f;
+constexpr float kWheelDampingRelaxation = 40.0f;
+
 struct WheelStepState {
     Vec3 hard_point_ws = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 ray_source_bt = Vec3(0.0f, 0.0f, 0.0f);
@@ -22,25 +27,10 @@ struct WheelStepState {
     float suspension_relative_velocity = 0.0f;
     float clipped_inv_contact_dot_suspension = 1.0f;
     float extra_pushback = 0.0f;
-    float debug_pushback_dist_bt = 0.0f;
     float wheel_radius = 0.0f;
     float suspension_rest_length = 0.0f;
     float max_suspension_travel = 12.0f;
-    float suspension_stiffness = 500.0f;
-    float wheels_damping_compression = 25.0f;
-    float wheels_damping_relaxation = 40.0f;
     float suspension_force_scale = 1.0f;
-    float wheels_suspension_force = 0.0f;
-    float steer_angle = 0.0f;
-    float engine_force = 0.0f;
-    float brake = 0.0f;
-    float lat_friction = 1.0f;
-    float long_friction = 1.0f;
-    float prev_steer_angle = 0.0f;
-    float prev_engine_force = 0.0f;
-    float prev_brake = 0.0f;
-    float prev_lat_friction = 0.0f;
-    float prev_long_friction = 0.0f;
 
     Vec3 cal_axle_dir = Vec3(0.0f, -1.0f, 0.0f);
     Vec3 cal_forward_dir = Vec3(1.0f, 0.0f, 0.0f);
@@ -214,6 +204,65 @@ ROCKETGPU_HD Vec3 BoxBodyInertiaDiagBt(const CarConfig& cfg, float mass) {
     const float z2 = z * z;
     const float scale = mass / 12.0f;
     return Vec3(scale * (y2 + z2), scale * (x2 + z2), scale * (x2 + y2));
+}
+
+// A car's chassis frame, computed once for a stretch of the tick in which its rotation does not change (the pre-tick):
+// CarBasisColumns, the Bt local inverse inertia and the Bt world inverse inertia rows. The helpers that take one give the
+// same bits as the ones that rebuild these from the car each call.
+struct CarFrame {
+    Vec3 fwd, right, up;
+    Vec3 inv_inertia_local_bt;
+    Vec3 inv_world_row0_bt, inv_world_row1_bt, inv_world_row2_bt;
+    // Filled on first use: the world inertia tensors (the inverses of the inverse-inertia rows), Bt and UU.
+    mutable bool has_inertia_world_bt = false;
+    mutable bool has_inertia_world_uu = false;
+    mutable Vec3 inertia_world_bt_row0, inertia_world_bt_row1, inertia_world_bt_row2;
+    mutable Vec3 inertia_world_uu_row0, inertia_world_uu_row1, inertia_world_uu_row2;
+};
+
+ROCKETGPU_HD CarFrame MakeCarFrame(const CarState& car, const CarConfig& cfg, float mass) {
+    CarFrame f;
+    f.fwd = Vec3(1.0f, 0.0f, 0.0f);
+    f.right = Vec3(0.0f, 1.0f, 0.0f);
+    f.up = Vec3(0.0f, 0.0f, 1.0f);
+    CarBasisColumns(car, f.fwd, f.right, f.up);
+    const Vec3 inertia_bt = BoxBodyInertiaDiagBt(cfg, mass);
+    f.inv_inertia_local_bt = Vec3(
+        inertia_bt.x != 0.0f ? 1.0f / inertia_bt.x : 0.0f,
+        inertia_bt.y != 0.0f ? 1.0f / inertia_bt.y : 0.0f,
+        inertia_bt.z != 0.0f ? 1.0f / inertia_bt.z : 0.0f);
+    const Vec3& inv = f.inv_inertia_local_bt;
+    const float b00 = f.fwd.x, b01 = f.right.x, b02 = f.up.x;
+    const float b10 = f.fwd.y, b11 = f.right.y, b12 = f.up.y;
+    const float b20 = f.fwd.z, b21 = f.right.z, b22 = f.up.z;
+    const float s00 = b00 * inv.x, s01 = b01 * inv.y, s02 = b02 * inv.z;
+    const float s10 = b10 * inv.x, s11 = b11 * inv.y, s12 = b12 * inv.z;
+    const float s20 = b20 * inv.x, s21 = b21 * inv.y, s22 = b22 * inv.z;
+    f.inv_world_row0_bt = Vec3(s00 * b00 + s01 * b01 + s02 * b02, s00 * b10 + s01 * b11 + s02 * b12,
+                               s00 * b20 + s01 * b21 + s02 * b22);
+    f.inv_world_row1_bt = Vec3(s10 * b00 + s11 * b01 + s12 * b02, s10 * b10 + s11 * b11 + s12 * b12,
+                               s10 * b20 + s11 * b21 + s12 * b22);
+    f.inv_world_row2_bt = Vec3(s20 * b00 + s21 * b01 + s22 * b02, s20 * b10 + s21 * b11 + s22 * b12,
+                               s20 * b20 + s21 * b21 + s22 * b22);
+    return f;
+}
+
+// CarBasisColumns from the frame when there is one.
+ROCKETGPU_HD void CarBasisColumns(const CarFrame* frame, const CarState& car, Vec3& fwd, Vec3& right, Vec3& up) {
+    if (frame) {
+        fwd = frame->fwd;
+        right = frame->right;
+        up = frame->up;
+        return;
+    }
+    CarBasisColumns(car, fwd, right, up);
+}
+
+ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorldBtRowDot(const CarFrame& f, const Vec3& torque_world_bt) {
+    return Vec3(
+        Dot(f.inv_world_row0_bt, torque_world_bt),
+        Dot(f.inv_world_row1_bt, torque_world_bt),
+        Dot(f.inv_world_row2_bt, torque_world_bt));
 }
 
 ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorldBtRowDot(
@@ -581,7 +630,8 @@ ROCKETGPU_HD void BuildInvInertiaTensorWorld(
     float mass,
     Vec3& out_row0,
     Vec3& out_row1,
-    Vec3& out_row2) {
+    Vec3& out_row2,
+    const CarFrame* frame = nullptr) {
     const Vec3 inertia_local = BoxBodyInertiaDiag(cfg, mass);
     const Vec3 inv_inertia_local(
         inertia_local.x != 0.0f ? (1.0f / inertia_local.x) : 0.0f,
@@ -591,7 +641,7 @@ ROCKETGPU_HD void BuildInvInertiaTensorWorld(
     Vec3 forward_col(1.0f, 0.0f, 0.0f);
     Vec3 right_col(0.0f, 1.0f, 0.0f);
     Vec3 up_col(0.0f, 0.0f, 1.0f);
-    CarBasisColumns(car, forward_col, right_col, up_col);
+    CarBasisColumns(frame, car, forward_col, right_col, up_col);
 
     const float b00 = forward_col.x, b01 = right_col.x, b02 = up_col.x;
     const float b10 = forward_col.y, b11 = right_col.y, b12 = up_col.y;
@@ -750,7 +800,19 @@ ROCKETGPU_HD Vec3 ComputeBulletStyleExternalTorqueInput(
     const CarState& car,
     const CarConfig& cfg,
     float mass,
-    const Vec3& ang_accel_world) {
+    const Vec3& ang_accel_world,
+    const CarFrame* frame = nullptr) {
+    if (frame) {
+        if (!frame->has_inertia_world_uu) {
+            Vec3 inv_r0, inv_r1, inv_r2;
+            BuildInvInertiaTensorWorld(car, cfg, mass, inv_r0, inv_r1, inv_r2, frame);
+            InverseMatrix3x3BulletStyle(inv_r0, inv_r1, inv_r2, frame->inertia_world_uu_row0,
+                                        frame->inertia_world_uu_row1, frame->inertia_world_uu_row2);
+            frame->has_inertia_world_uu = true;
+        }
+        return Mul3x3Vec(frame->inertia_world_uu_row0, frame->inertia_world_uu_row1, frame->inertia_world_uu_row2,
+                         ang_accel_world);
+    }
     Vec3 inv_r0, inv_r1, inv_r2;
     BuildInvInertiaTensorWorld(car, cfg, mass, inv_r0, inv_r1, inv_r2);
     Vec3 i_r0, i_r1, i_r2;
@@ -770,12 +832,13 @@ ROCKETGPU_HD void QueueAngularAccelWorld(
     const CarState& car,
     const CarConfig& cfg,
     float mass,
-    const Vec3& ang_accel_world) {
+    const Vec3& ang_accel_world,
+    const CarFrame* frame = nullptr) {
     if (!wheel_runtime_state) {
         return;
     }
     wheel_runtime_state->accumulated_ang_accel +=
-        ComputeBulletStyleExternalTorqueInput(car, cfg, mass, ang_accel_world);
+        ComputeBulletStyleExternalTorqueInput(car, cfg, mass, ang_accel_world, frame);
 }
 
 ROCKETGPU_HD void QueueOfficialTorqueBt(WheelRuntimeState* wheel_runtime_state, const Vec3& torque_bt) {
@@ -810,6 +873,29 @@ ROCKETGPU_HD void BuildInertiaTensorWorldBtInverse(
     Vec3 inv_r0, inv_r1, inv_r2;
     BuildInvInertiaTensorWorldBt(car, cfg, mass, inv_r0, inv_r1, inv_r2);
     InverseMatrix3x3BulletStyle(inv_r0, inv_r1, inv_r2, out_row0, out_row1, out_row2);
+}
+
+ROCKETGPU_HD void BuildInertiaTensorWorldBtInverse(
+    const CarFrame* frame,
+    const CarState& car,
+    const CarConfig& cfg,
+    float mass,
+    Vec3& out_row0,
+    Vec3& out_row1,
+    Vec3& out_row2) {
+    if (frame) {
+        if (!frame->has_inertia_world_bt) {
+            InverseMatrix3x3BulletStyle(frame->inv_world_row0_bt, frame->inv_world_row1_bt, frame->inv_world_row2_bt,
+                                        frame->inertia_world_bt_row0, frame->inertia_world_bt_row1,
+                                        frame->inertia_world_bt_row2);
+            frame->has_inertia_world_bt = true;
+        }
+        out_row0 = frame->inertia_world_bt_row0;
+        out_row1 = frame->inertia_world_bt_row1;
+        out_row2 = frame->inertia_world_bt_row2;
+        return;
+    }
+    BuildInertiaTensorWorldBtInverse(car, cfg, mass, out_row0, out_row1, out_row2);
 }
 
 ROCKETGPU_HD Vec3 VelocityAtPoint(const CarState& car, const Vec3& rel_point_world) {
@@ -1516,7 +1602,10 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
     const Vec3& ray_delta_bt,
     float max_len,
     ArenaRayHit& best,
-    const uint32_t* native_table = nullptr, int native_shift = 0) {
+    const uint32_t* native_table = nullptr, int native_shift = 0,
+    int mesh_first = 0, int mesh_step = 1, int* best_mesh = nullptr) {
+    // mesh_first / mesh_step: walk only meshes mesh_first, mesh_first + mesh_step, ...; best_mesh: the mesh of the
+    // walk's best hit (the first hit, or one that lowered the best fraction: every later update lowers it).
     if (mesh_triangles == nullptr || mesh_triangle_count <= 0 || max_len <= 0.0f ||
         mesh_bvh_quantization == nullptr || mesh_bvh_meshes == nullptr || mesh_bvh_nodes == nullptr ||
         mesh_bvh_quantization_count <= 0 || mesh_bvh_mesh_count <= 0 || mesh_bvh_node_count <= 0) {
@@ -1543,7 +1632,7 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
     uint16_t quantized_query_aabb_min[3] = {0, 0, 0};
     uint16_t quantized_query_aabb_max[3] = {0, 0, 0};
 
-    for (int mesh_info_idx = 0; mesh_info_idx < mesh_bvh_mesh_count; ++mesh_info_idx) {
+    for (int mesh_info_idx = mesh_first; mesh_info_idx < mesh_bvh_mesh_count; mesh_info_idx += mesh_step) {
         const ArenaMeshBvhMeshInfo& mesh_info = mesh_bvh_meshes[mesh_info_idx];
         // aabb_min/max is the union of this mesh's triangle AABBs, so when it misses the ray AABB every
         // triangle fails the per-triangle AABB test below: skipping the walk can't change the hit.
@@ -1580,6 +1669,8 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
         // hit keeps the first triangle on an exact fraction tie: walk the node-ordered headers, not the build-order ones.
         SelectArenaMeshBvhDfsOrderSubtrees(
             mesh_info, mesh_bvh_subtrees, mesh_bvh_subtree_count, mesh_subtrees, mesh_subtree_count);
+        const float fraction_before = best_fraction;
+        const uint8_t hit_before = best.hit;
 
         WalkArenaMeshBvhStacklessQuantizedTreeCacheFriendly(
             mesh_bvh_nodes,
@@ -1611,6 +1702,9 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
                     native_table,
                     native_shift);
             });
+        if (best_mesh != nullptr && best.hit && (!hit_before || best_fraction < fraction_before)) {
+            *best_mesh = mesh_info_idx;
+        }
     }
 
     return best.hit != 0;

@@ -647,6 +647,8 @@ struct SimConfig {
     int32_t arena_broadphase_cells_z = 0;
     // CUDA step kernels: thread i simulates env env_step_order[i] (envs grouped by car count; set by BatchSim).
     const int32_t* env_step_order = nullptr;
+    // The cars in all envs when BatchSim set env_step_order (0: unknown); the staged step sizes its env groups by it.
+    int64_t env_car_total = 0;
     CarConfig default_car = {};
     MutatorConfig mutator = {};
 

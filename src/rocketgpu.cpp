@@ -508,6 +508,7 @@ struct BatchSim::Impl {
         const size_t n = env_car_count.size();
         if (n < 128) {
             cfg.env_step_order = nullptr;
+            cfg.env_car_total = 0;
             return;
         }
         std::vector<int32_t> counts(n);
@@ -523,6 +524,8 @@ struct BatchSim::Impl {
         CheckCuda(cudaStreamSynchronize(stream), "env step order upload");
 #endif
         cfg.env_step_order = env_step_order.data();
+        cfg.env_car_total = 0;
+        for (const int32_t c : counts) cfg.env_car_total += c;
     }
 
     std::default_random_engine respawn_rng;
