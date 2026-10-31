@@ -792,7 +792,10 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
         float penetration_bt = 0.0f;
     };
     constexpr int kMaxBallWorldSpecialCps = 16;
-    BallWorldSpecialCp special_cps[kMaxBallWorldSpecialCps];
+    // Not default-constructed (local memory): only slots below special_cp_count are read, each assigned whole first
+    // (rel_pos1_bt and penetration_bt only read when has_bt).
+    UninitArray<BallWorldSpecialCp, kMaxBallWorldSpecialCps> special_cp_slots;
+    BallWorldSpecialCp* const special_cps = special_cp_slots;
     int special_cp_count = 0;
     const float collision_r = mutator.ball_radius;
     constexpr float kUUToBT_local = 1.0f / 50.0f;
@@ -823,8 +826,8 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
             special_cps[special_cp_count].penetration_uu = penetration_uu;
             special_cps[special_cp_count].rel_pos1_length_bt = rel_pos1_length_bt;
             special_cps[special_cp_count].static_id = static_id;
+            special_cps[special_cp_count].has_bt = rel_pos1_bt && penetration_bt ? 1 : 0;
             if (rel_pos1_bt && penetration_bt) {
-                special_cps[special_cp_count].has_bt = 1;
                 special_cps[special_cp_count].rel_pos1_bt = *rel_pos1_bt;
                 special_cps[special_cp_count].penetration_bt = *penetration_bt;
             }

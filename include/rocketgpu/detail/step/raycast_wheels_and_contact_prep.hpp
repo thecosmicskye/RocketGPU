@@ -13,6 +13,7 @@ ROCKETGPU_HD float WheelRealRayLengthBt(const WheelT& wheel) {
 // (or cars) first, first + step, ...; Combine merges the lanes' best hits, given each one's mesh (car) and the value
 // the loop compares, into the hit the loop over all of them finds, and sets order to the winner's mesh (car).
 struct ArenaRayMeshOneLane {
+    static constexpr bool kSplitHeaders = false;
     int first = 0;
     int step = 1;
     ROCKETGPU_HD bool Leader() const { return true; }
@@ -52,7 +53,7 @@ ROCKETGPU_HD ArenaRayHit CastArenaRayWithBtSource(
     if (mesh_bvh_nodes != nullptr && mesh_bvh_node_count > 0) {
         mesh_ray_cast_bt = true;
         int best_mesh = -1;
-        RayCastArenaMeshBvhBtSource(
+        RayCastArenaMeshBvhBtSource<MeshLanes::kSplitHeaders>(
             mesh_triangles,
             mesh_triangle_count,
             mesh_bvh_quantization,
@@ -829,21 +830,16 @@ ROCKETGPU_HD void ComputeWheelTransformBasisFromSteer(
     out_up_col = up;
 }
 
-ROCKETGPU_HD void ComputeWheelBasisFromSteer(
+// The wheel's axle and forward directions on its contact plane, from its steered transform's right and forward columns
+// (ComputeWheelTransformBasisFromSteer).
+ROCKETGPU_HD void WheelBasisFromTransformCols(
     const WheelStepState& wheel,
-    float steer_angle,
+    const Vec3& world_right_col,
+    const Vec3& world_forward_col,
     const Vec3& fallback_forward,
     Vec3& out_axle_dir,
     Vec3& out_forward_dir,
-    Vec3* out_debug_steering = nullptr,
-    bool soccar_platform_math = false,
-    bool native_sse_math = false,
-    Vec3* out_raw_axle_dir = nullptr) {
-    Vec3 world_right_col(0.0f, 0.0f, 0.0f);
-    Vec3 world_forward_col(0.0f, 0.0f, 0.0f);
-    Vec3 world_up_col(0.0f, 0.0f, 1.0f);
-    ComputeWheelTransformBasisFromSteer(wheel, steer_angle, world_right_col, world_forward_col, world_up_col, out_debug_steering, soccar_platform_math, native_sse_math);
-
+    Vec3* out_raw_axle_dir) {
     Vec3 axle_dir = world_right_col;
     const float axle_proj = Dot(axle_dir, wheel.contact_normal_ws);
     axle_dir = Normalize(axle_dir - wheel.contact_normal_ws * axle_proj, axle_dir);
@@ -1167,10 +1163,11 @@ ROCKETGPU_HD void WheelDriveSetupPhase(
     Vec3 friction_curve_lat_dir(0.0f, -1.0f, 0.0f);
     Vec3 friction_curve_long_dir(1.0f, 0.0f, 0.0f);
     Vec3 friction_curve_cross_vec(0.0f, 0.0f, 0.0f);
+    // The steered transform, computed once: the axle and forward directions below come from it too.
+    Vec3 basis_right_col(0.0f, 0.0f, 0.0f);
+    Vec3 basis_forward_col(0.0f, 0.0f, 0.0f);
+    Vec3 basis_up_col(0.0f, 0.0f, 1.0f);
     if (wheel.is_in_contact) {
-        Vec3 basis_right_col(0.0f, 0.0f, 0.0f);
-        Vec3 basis_forward_col(0.0f, 0.0f, 0.0f);
-        Vec3 basis_up_col(0.0f, 0.0f, 1.0f);
         ComputeWheelTransformBasisFromSteer(wheel, applied_steer_angle, basis_right_col, basis_forward_col, basis_up_col, nullptr, mutator.game_mode == static_cast<uint8_t>(Mode::Soccar), NativeSseMath(mutator));
 
         const Vec3 wheel_delta_bt = wheel.ray_source_bt - car.pos_bt;
@@ -1219,10 +1216,9 @@ ROCKETGPU_HD void WheelDriveSetupPhase(
 
     Vec3 axle_dir(0.0f, -1.0f, 0.0f);
     Vec3 forward_dir = shared.car_forward;
-    Vec3 debug_steering[5];
     Vec3 raw_axle_dir = axle_dir;
-    ComputeWheelBasisFromSteer(wheel, applied_steer_angle, shared.car_forward, axle_dir, forward_dir, debug_steering, mutator.game_mode == static_cast<uint8_t>(Mode::Soccar), NativeSseMath(mutator),
-        (&raw_axle_dir));
+    WheelBasisFromTransformCols(wheel, basis_right_col, basis_forward_col, shared.car_forward, axle_dir, forward_dir,
+                                &raw_axle_dir);
 
     const Vec3 contact_point_bt = wheel.contact_point_bt;
 

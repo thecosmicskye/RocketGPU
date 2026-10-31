@@ -1587,6 +1587,7 @@ ROCKETGPU_HD bool RayCastArenaMeshTriangleBtSource(
     return true;
 }
 
+template <bool kSplitHeaders = false>
 ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
     const ArenaMeshTriangle* mesh_triangles,
     int32_t mesh_triangle_count,
@@ -1606,6 +1607,10 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
     int mesh_first = 0, int mesh_step = 1, int* best_mesh = nullptr) {
     // mesh_first / mesh_step: walk only meshes mesh_first, mesh_first + mesh_step, ...; best_mesh: the mesh of the
     // walk's best hit (the first hit, or one that lowered the best fraction: every later update lowers it).
+    // With kSplitHeaders a lane instead takes subtree headers mesh_first, mesh_first + mesh_step, ... of every mesh
+    // (a mesh without headers whole, by mesh index), and best_mesh is (mesh << 16) | header: each header's walk is
+    // the one-lane walk's, so Combine's fold over the lanes in that order gives the one-lane hit.
+    constexpr bool split_headers = kSplitHeaders;
     if (mesh_triangles == nullptr || mesh_triangle_count <= 0 || max_len <= 0.0f ||
         mesh_bvh_quantization == nullptr || mesh_bvh_meshes == nullptr || mesh_bvh_nodes == nullptr ||
         mesh_bvh_quantization_count <= 0 || mesh_bvh_mesh_count <= 0 || mesh_bvh_node_count <= 0) {
@@ -1632,7 +1637,8 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
     uint16_t quantized_query_aabb_min[3] = {0, 0, 0};
     uint16_t quantized_query_aabb_max[3] = {0, 0, 0};
 
-    for (int mesh_info_idx = mesh_first; mesh_info_idx < mesh_bvh_mesh_count; mesh_info_idx += mesh_step) {
+    for (int mesh_info_idx = split_headers ? 0 : mesh_first; mesh_info_idx < mesh_bvh_mesh_count;
+         mesh_info_idx += split_headers ? 1 : mesh_step) {
         const ArenaMeshBvhMeshInfo& mesh_info = mesh_bvh_meshes[mesh_info_idx];
         // aabb_min/max is the union of this mesh's triangle AABBs, so when it misses the ray AABB every
         // triangle fails the per-triangle AABB test below: skipping the walk can't change the hit.
@@ -1669,6 +1675,57 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
         // hit keeps the first triangle on an exact fraction tie: walk the node-ordered headers, not the build-order ones.
         SelectArenaMeshBvhDfsOrderSubtrees(
             mesh_info, mesh_bvh_subtrees, mesh_bvh_subtree_count, mesh_subtrees, mesh_subtree_count);
+        auto leaf = [&](int32_t local_tri_idx) {
+            if (local_tri_idx < 0 || local_tri_idx >= mesh_info.triangle_count) {
+                return;
+            }
+            const int32_t global_tri_idx = mesh_info.triangle_start + local_tri_idx;
+            const ArenaMeshTriangle& tri = mesh_triangles[global_tri_idx];
+            if (tri.max.x < ray_min_bt.x || tri.min.x > ray_max_bt.x ||
+                tri.max.y < ray_min_bt.y || tri.min.y > ray_max_bt.y ||
+                tri.max.z < ray_min_bt.z || tri.min.z > ray_max_bt.z) {
+                return;
+            }
+            RayCastArenaMeshTriangleBtSource(
+                tri,
+                global_tri_idx,
+                ray_source_bt,
+                to_bt,
+                max_len,
+                best_fraction,
+                best,
+                native_table,
+                native_shift);
+        };
+        if constexpr (split_headers) {
+            if (mesh_subtree_count > 0) {
+                for (int h = mesh_first; h < mesh_subtree_count; h += mesh_step) {
+                    const ArenaMeshBvhSubtreeInfo& subtree = mesh_subtrees[h];
+                    if (!TestQuantizedAabbAgainstQuantizedAabb(quantized_query_aabb_min, quantized_query_aabb_max,
+                                                                subtree.quantized_aabb_min, subtree.quantized_aabb_max)) {
+                        continue;
+                    }
+                    const float fraction_before = best_fraction;
+                    const uint8_t hit_before = best.hit;
+                    WalkArenaMeshBvhStacklessQuantizedTree(mesh_bvh_nodes, quantized_query_aabb_min,
+                                                           quantized_query_aabb_max, subtree.root_node_index,
+                                                           subtree.root_node_index + subtree.subtree_size, leaf);
+                    if (best_mesh != nullptr && best.hit && (!hit_before || best_fraction < fraction_before)) {
+                        *best_mesh = (mesh_info_idx << 16) | h;
+                    }
+                }
+            } else if (mesh_info_idx % mesh_step == mesh_first) {
+                const float fraction_before = best_fraction;
+                const uint8_t hit_before = best.hit;
+                WalkArenaMeshBvhStacklessQuantizedTree(mesh_bvh_nodes, quantized_query_aabb_min,
+                                                       quantized_query_aabb_max, mesh_info.node_offset,
+                                                       mesh_info.node_offset + mesh_info.node_count, leaf);
+                if (best_mesh != nullptr && best.hit && (!hit_before || best_fraction < fraction_before)) {
+                    *best_mesh = mesh_info_idx << 16;
+                }
+            }
+            continue;
+        }
         const float fraction_before = best_fraction;
         const uint8_t hit_before = best.hit;
 
@@ -1680,28 +1737,7 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
             quantized_query_aabb_max,
             mesh_info.node_offset,
             mesh_info.node_count,
-            [&](int32_t local_tri_idx) {
-                if (local_tri_idx < 0 || local_tri_idx >= mesh_info.triangle_count) {
-                    return;
-                }
-                const int32_t global_tri_idx = mesh_info.triangle_start + local_tri_idx;
-                const ArenaMeshTriangle& tri = mesh_triangles[global_tri_idx];
-                if (tri.max.x < ray_min_bt.x || tri.min.x > ray_max_bt.x ||
-                    tri.max.y < ray_min_bt.y || tri.min.y > ray_max_bt.y ||
-                    tri.max.z < ray_min_bt.z || tri.min.z > ray_max_bt.z) {
-                    return;
-                }
-                RayCastArenaMeshTriangleBtSource(
-                    tri,
-                    global_tri_idx,
-                    ray_source_bt,
-                    to_bt,
-                    max_len,
-                    best_fraction,
-                    best,
-                    native_table,
-                    native_shift);
-            });
+            leaf);
         if (best_mesh != nullptr && best.hit && (!hit_before || best_fraction < fraction_before)) {
             *best_mesh = mesh_info_idx;
         }

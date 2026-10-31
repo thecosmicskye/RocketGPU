@@ -202,12 +202,12 @@ CarConfig MakePresetConfig(
 }
 
 CarConfig DominusConfig() {
-    return MakePresetConfig(Vec3(130.427f, 85.7799f, 33.8f), Vec3(9.0f, 0.0f, 15.75f),
+    return MakePresetConfig(Vec3(127.92678f + 2.5f, 83.27995f + 2.5f, 31.3f + 2.5f), Vec3(9.0f, 0.0f, 15.75f),
                             12.00f, 33.95f, Vec3(50.30f, 31.10f, 15.75f),
                             13.50f, 33.85f, Vec3(-34.75f, 33.00f, 15.75f), false);
 }
 CarConfig PlankConfig() {
-    CarConfig c = MakePresetConfig(Vec3(131.32f, 87.1704f, 31.8944f), Vec3(9.00857f, 0.0f, 12.0942f),
+    CarConfig c = MakePresetConfig(Vec3(128.81978f + 2.5f, 84.670364f + 2.5f, 29.394402f + 2.5f), Vec3(9.008572f, 0.0f, 12.0942f),
                                    12.50f, 31.9242f, Vec3(49.97f, 27.80f, 12.0942f),
                                    17.00f, 27.9242f, Vec3(-35.43f, 20.28f, 12.0942f), false);
     // Least-squares knots of RLPR wheel steer vs the previous tick's |forward speed| over all four Plank cars of
@@ -220,17 +220,17 @@ CarConfig PlankConfig() {
     return c;
 }
 CarConfig BreakoutConfig() {
-    return MakePresetConfig(Vec3(133.992f, 83.021f, 32.8f), Vec3(12.5f, 0.0f, 11.75f),
+    return MakePresetConfig(Vec3(131.49236f + 2.5f, 80.521f + 2.5f, 30.3f + 2.5f), Vec3(12.5f, 0.0f, 11.75f),
                             13.50f, 29.7f, Vec3(51.50f, 26.67f, 11.75f),
                             15.00f, 29.666f, Vec3(-35.75f, 35.00f, 11.75f), false);
 }
 CarConfig HybridConfig() {
-    return MakePresetConfig(Vec3(129.519f, 84.6879f, 36.6591f), Vec3(13.8757f, 0.0f, 20.755f),
+    return MakePresetConfig(Vec3(127.01919f + 2.5f, 82.18787f + 2.5f, 34.159073f + 2.5f), Vec3(13.87566f, 0.0f, 20.754988f),
                             12.50f, 38.755f, Vec3(51.25f, 25.90f, 20.755f),
                             15.00f, 37.055f, Vec3(-34.00f, 29.50f, 20.755f), false);
 }
 CarConfig MercConfig() {
-    return MakePresetConfig(Vec3(123.22f, 79.2103f, 44.1591f), Vec3(11.3757f, 0.0f, 21.505f),
+    return MakePresetConfig(Vec3(120.72023f + 2.5f, 76.71031f + 2.5f, 41.659073f + 2.5f), Vec3(11.37566f, 0.0f, 21.504988f),
                             15.00f, 39.505f, Vec3(51.25f, 25.90f, 21.505f),
                             15.00f, 39.105f, Vec3(-33.75f, 29.50f, 21.505f), false);
 }

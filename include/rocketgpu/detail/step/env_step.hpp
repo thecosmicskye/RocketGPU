@@ -1486,6 +1486,21 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     const float cal_dodge_raw_pitch = controls.pitch;
     controls = QuantizeAxisControls(controls);
 
+    // The car's jump/flip state as of the tick start, loaded before the first store (the wheel runtime state stores
+    // below go through another pointer, so later loads of the car would wait for them). StartJump is the first write.
+    const uint8_t start_is_flipping = car.is_flipping;
+    const uint8_t start_has_flipped = car.has_flipped;
+    const uint8_t start_has_jumped = car.has_jumped;
+    const uint8_t start_has_double_jumped = car.has_double_jumped;
+    const uint8_t start_is_jumping = car.is_jumping;
+    const uint8_t start_is_on_ground = car.is_on_ground;
+    const float start_internal_flip_time = car.internal_flip_time;
+    const float start_internal_jump_time = car.internal_jump_time;
+    const bool start_last_jump = car.last_controls.jump;
+    const uint64_t start_tick_count_since_update = car.tick_count_since_update;
+    const int start_wheel_contacts =
+        static_cast<int>(car.wheels_with_contact[0] != 0) + static_cast<int>(car.wheels_with_contact[1] != 0) +
+        static_cast<int>(car.wheels_with_contact[2] != 0) + static_cast<int>(car.wheels_with_contact[3] != 0);
     car.demo_no_contact_response = car.is_demoed ? 1 : 0;
     if (car.is_demoed) {
         return;
@@ -1494,7 +1509,7 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     const CarFrame car_frame = MakeCarFrame(car, cfg, mutator.car_mass);
     const CarFrame* const frame = &car_frame;
     // supersonic_set_v3 also marks a v3-convention set state (compat SetStateV3), whose wheel contacts are per-wheel data.
-    const bool cal_set_v3_tick = car.supersonic_set_v3 && car.tick_count_since_update == 0;
+    const bool cal_set_v3_tick = car.supersonic_set_v3 && start_tick_count_since_update == 0;
     if (car.supersonic_set_v3) {
         car.supersonic_set_v3 = 0;
     } else {
@@ -1519,44 +1534,42 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
         wheel_runtime_state->pre_solve_basis_authoritative = basis_authoritative;
     }
     car.vel_touched_solve_stage = 0;
-    const uint8_t flipping_at_start = car.is_flipping;
+    const uint8_t flipping_at_start = start_is_flipping;
     bool flip_started = false;
 
-    const bool jump_pressed = controls.jump && !car.last_controls.jump;
-    const uint8_t cal_has_flipped_at_start = car.has_flipped;
+    const bool jump_pressed = controls.jump && !start_last_jump;
+    const uint8_t cal_has_flipped_at_start = start_has_flipped;
     // v3 update_air_torque (base.rs:507-514) locks pitch while prev_flip_time < PITCHLOCK_EXTRA_TIME, where flip_time is
     // the restart timer once no flip is active. Tick-start value, as v3's prev_flip_time.
     // flip_time == 0 with no flip active means "unknown" (a set state without the timer, e.g. RocketSim-convention 0): no lock.
     const float cal_pitchlock_restart_time =
-        (!cal_has_flipped_at_start && !car.is_flipping && car.internal_flip_time > 0.0f) ? car.internal_flip_time : -1.0f;
+        (!cal_has_flipped_at_start && !start_is_flipping && start_internal_flip_time > 0.0f) ? start_internal_flip_time : -1.0f;
 
     bool cal_air_jump_started = false;
 
     const bool cal_jump = wheel_runtime_state != nullptr;
-    const bool cal_jump_g = cal_jump &&
-        (static_cast<int>(car.wheels_with_contact[0] != 0) + static_cast<int>(car.wheels_with_contact[1] != 0) +
-         static_cast<int>(car.wheels_with_contact[2] != 0) + static_cast<int>(car.wheels_with_contact[3] != 0)) >= 3;
+    const bool cal_jump_g = cal_jump && start_wheel_contacts >= 3;
     if (cal_jump) {
         WheelRuntimeState& jw = *wheel_runtime_state;
-        if (car.tick_count_since_update == 0) {
-            jw.cal_game_jumped = car.has_jumped ? 1 : 0;
-            jw.cal_game_double_jumped = (car.has_double_jumped || car.has_flipped) ? 1 : 0;
+        if (start_tick_count_since_update == 0) {
+            jw.cal_game_jumped = start_has_jumped ? 1 : 0;
+            jw.cal_game_double_jumped = (start_has_double_jumped || start_has_flipped) ? 1 : 0;
             jw.cal_cached_ground = cal_jump_g ? 1 : 0;
-            jw.cal_jump_inactive_time = car.is_jumping ? 0.0f : car.internal_jump_time;
+            jw.cal_jump_inactive_time = start_is_jumping ? 0.0f : start_internal_jump_time;
         }
         if (cal_jump_g && !jw.cal_cached_ground) {
             jw.cal_game_jumped = 0;
             jw.cal_game_double_jumped = 0;
         }
         jw.cal_cached_ground = cal_jump_g ? 1 : 0;
-        if (jw.cal_game_jumped && cal_jump_g && !car.is_jumping && jw.cal_jump_inactive_time >= 0.125f) {
+        if (jw.cal_game_jumped && cal_jump_g && !start_is_jumping && jw.cal_jump_inactive_time >= 0.125f) {
             jw.cal_game_jumped = 0;
             jw.cal_game_double_jumped = 0;
         }
     }
     const bool cal_jump_blocked = cal_jump && wheel_runtime_state->cal_game_jumped;
-    const uint8_t was_jumping = car.is_jumping;
-    if (jump_pressed && car.is_on_ground && !car.is_jumping && !cal_jump_blocked) {
+    const uint8_t was_jumping = start_is_jumping;
+    if (jump_pressed && start_is_on_ground && !start_is_jumping && !cal_jump_blocked) {
         StartJump(car, mutator, frame);
         cal_air_jump_started = true;
     }
@@ -2057,29 +2070,33 @@ ROCKETGPU_HD void WorldStepPrestepCar(
     Vec3& deferred_linear_delta, Vec3& deferred_angular_delta) {
     // No speed cap before the world step (v3 caps at tick start and after jump/dodge impulses only): the
     // game keeps pre-tick pushes past 2300, e.g. PartyCannon 28636 k14 car 3 ends the tick at 2508 uu/s.
-    pre_contact_car = MakePreContactCar(car);
-    deferred_linear_delta = ComputeDeferredLinearVelocityDelta(car, wheel_runtime_state, mutator, sub_dt);
+    // Everything is computed before the first store: none of it reads a field stored here, and through generic
+    // pointers each load would otherwise wait for the stores before it.
+    const PreContactCar pre_contact = MakePreContactCar(car);
+    const ::rocketgpu::Vec3 linear_delta =
+        ComputeDeferredLinearVelocityDelta(car, wheel_runtime_state, mutator, sub_dt);
+    const bool inactive = car.is_demoed || car.just_respawned;
+    const ::rocketgpu::Vec3 ext_force_impulse_bt = inactive
+        ? ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f)
+        : ComputeOfficialExternalForceImpulseBt(wheel_runtime_state, mutator, sub_dt);
+    ::rocketgpu::Vec3 ext_torque(0.0f, 0.0f, 0.0f);
+    if (wheel_runtime_state && !inactive) {
+        ::rocketgpu::Vec3 inv_r0, inv_r1, inv_r2;
+        BuildPreSolveInvInertiaTensorWorldBt(
+            *wheel_runtime_state, car_config, mutator.car_mass, inv_r0, inv_r1, inv_r2);
+        ext_torque = VecMul3x3(wheel_runtime_state->accumulated_torque_bt, inv_r0, inv_r1, inv_r2) * sub_dt;
+    }
+    const ::rocketgpu::Vec3 angular_delta = ComputeDeferredAngularVelocityDelta(
+        car, car_config, mutator.car_mass, wheel_runtime_state, sub_dt);
 
-    car.ext_force_impulse_bt =
-        (car.is_demoed || car.just_respawned)
-            ? ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f)
-            : ComputeOfficialExternalForceImpulseBt(wheel_runtime_state, mutator, sub_dt);
+    pre_contact_car = pre_contact;
+    deferred_linear_delta = linear_delta;
+    car.ext_force_impulse_bt = ext_force_impulse_bt;
     car.ext_force_impulse_bt_valid = 1;
-
     car.solve_delta_linear_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
     car.solve_delta_angular = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-    {
-        ::rocketgpu::Vec3 ext_torque(0.0f, 0.0f, 0.0f);
-        if (wheel_runtime_state && !(car.is_demoed || car.just_respawned)) {
-            ::rocketgpu::Vec3 inv_r0, inv_r1, inv_r2;
-            BuildPreSolveInvInertiaTensorWorldBt(
-                *wheel_runtime_state, car_config, mutator.car_mass, inv_r0, inv_r1, inv_r2);
-            ext_torque = VecMul3x3(wheel_runtime_state->accumulated_torque_bt, inv_r0, inv_r1, inv_r2) * sub_dt;
-        }
-        car.ext_torque_impulse = ext_torque;
-    }
-    deferred_angular_delta = ComputeDeferredAngularVelocityDelta(
-        car, car_config, mutator.car_mass, wheel_runtime_state, sub_dt);
+    car.ext_torque_impulse = ext_torque;
+    deferred_angular_delta = angular_delta;
 }
 
 // A car's world-step end, after the solve: its deferred velocity deltas, then its transform.
@@ -2481,10 +2498,11 @@ ROCKETGPU_HD void WorldStepSoccar(
                     // The entries are the packed pair keys of bp_manifolds (contiguous in the env's scratch) with their
                     // bodies' islands (BuildBulletManifoldList): sort and rewrite them from those, not the strided list.
                     const uint32_t* const packed = solver_scratch->bp.bp_manifolds;
-                    int order[kMaxBulletManifoldEntries];
-                    int island_ids[kMaxBulletManifoldEntries];
+                    // Bytes, not ints: entries < 96, islands < 9; both arrays live in local memory.
+                    int8_t order[kMaxBulletManifoldEntries];
+                    int8_t island_ids[kMaxBulletManifoldEntries];
                     for (int i = 0; i < built; ++i) {
-                        order[i] = i;
+                        order[i] = static_cast<int8_t>(i);
                         const BulletManifoldEntry key = UnpackBulletPairKey(packed[i]);
                         island_ids[i] = manifold_body_islands[key.kind <= 1 ? 0 : key.body_a + 1];
                     }

@@ -65,10 +65,10 @@ RTX 5090, random controls, 55% 1v1, 27% 2v2 and 18% 3v3 arenas:
 
 | Arenas | Arena-ticks/s |
 |---|---|
-| 1,024 | 2.79M |
-| 4,096 | 7.66M |
-| 8,192 | 12.16M |
-| 16,384 | 15.40M |
+| 1,024 | 2.78M |
+| 4,096 | 7.62M |
+| 8,192 | 12.10M |
+| 16,384 | 15.53M |
 
 ## Accuracy
 
@@ -78,17 +78,17 @@ Compared against RocketSim v3 (latest).
 
 | | RocketGPU | v3 (latest) |
 |---|---|---|
-| Mean position error after 1 s, all 2342 match windows (uu) | 0.577 | 2.409 |
+| Mean position error after 1 s, all 2342 match windows (uu) | 0.576 | 2.409 |
 | Mean position error, 393 plan trials (uu) | 0.0999 | 0.271 |
 
 **v3's suite**: v3's real-game recordings, scored with its `rlpr_metric` (pass %: higher is better; error norm: lower is better)
 
 | | RocketGPU | v3 (latest) |
 |---|---|---|
-| Games, pass % (709,990 car-ticks) | 98.74 | 92.29 |
-| Games, mean error norm | 0.314 | 2.88 |
-| Special cases, pass % (15,586 car-ticks) | 97.77 | 90.12 |
-| Special cases, mean error norm | 0.181 | 1.82 |
+| Games, pass % (709,990 car-ticks) | 99.02 | 92.29 |
+| Games, mean error norm | 0.253 | 2.88 |
+| Special cases, pass % (15,586 car-ticks) | 97.81 | 90.12 |
+| Special cases, mean error norm | 0.214 | 1.82 |
 
 ## License
 

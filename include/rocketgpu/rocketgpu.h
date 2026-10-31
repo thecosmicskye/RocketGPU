@@ -120,8 +120,11 @@ struct CarControls {
 };
 
 struct CarConfig {
-    Vec3 hitbox_size = Vec3(120.507f, 86.6994f, 38.6591f);
-    Vec3 hitbox_offset = Vec3(13.8757f, 0.0f, 20.755f);
+    // Hitbox rule (every body): Psyonix's published hitbox (as the game reports it) plus the 2.5 uu the game's Bullet
+    // box adds; offsets as published. RocketSim's numbers are these rounded to 6 digits, which leaves the Octane
+    // front face 1.5e-4 uu short (a constant split-impulse ball push deficit on front hits).
+    Vec3 hitbox_size = Vec3(118.00738f + 2.5f, 84.19941f + 2.5f, 36.159073f + 2.5f);
+    Vec3 hitbox_offset = Vec3(13.87566f, 0.0f, 20.754988f);
     Vec3 front_wheels_offset = Vec3(51.25f, 25.90f, 20.755f);
     Vec3 back_wheels_offset = Vec3(-33.75f, 29.50f, 20.755f);
     float front_wheel_radius = 12.50f;

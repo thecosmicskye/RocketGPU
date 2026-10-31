@@ -3429,7 +3429,10 @@ ROCKETGPU_HD int BuildBulletManifoldList(
     // body's pairs and manifolds (see ResolveBallActivationAtTickStart).
     constexpr int kMaxBodies = 9;
 
-    BulletBroadphaseProxy proxies[kMaxBodies];
+    // Not default-constructed (it lives in local memory): bodies past body_count are never read, a demoed car's proxy
+    // only for valid, and the ball's child_axis never (local_overlap's first body is a car).
+    UninitArray<BulletBroadphaseProxy, kMaxBodies> proxy_slots;
+    BulletBroadphaseProxy* const proxies = proxy_slots;
 
     {
         BulletBroadphaseProxy& proxy = proxies[0];
@@ -4176,11 +4179,11 @@ ROCKETGPU_HD void QuickSortSharedContactOrderIndices(
     int lo,
     int hi) {
     constexpr int kMaxPendingRanges = 32;
-    int range_lo[kMaxPendingRanges];
-    int range_hi[kMaxPendingRanges];
+    Index range_lo[kMaxPendingRanges];  // positions in order, so they fit its index type (local memory)
+    Index range_hi[kMaxPendingRanges];
     int depth = 0;
-    range_lo[depth] = lo;
-    range_hi[depth] = hi;
+    range_lo[depth] = static_cast<Index>(lo);
+    range_hi[depth] = static_cast<Index>(hi);
     ++depth;
     while (depth > 0) {
         --depth;
@@ -4211,8 +4214,8 @@ ROCKETGPU_HD void QuickSortSharedContactOrderIndices(
             const int range_start = right ? i : cur_lo;
             const int range_end = right ? cur_hi : j;
             if (range_start < range_end && depth < kMaxPendingRanges) {
-                range_lo[depth] = range_start;
-                range_hi[depth] = range_end;
+                range_lo[depth] = static_cast<Index>(range_start);
+                range_hi[depth] = static_cast<Index>(range_end);
                 ++depth;
             }
         }
