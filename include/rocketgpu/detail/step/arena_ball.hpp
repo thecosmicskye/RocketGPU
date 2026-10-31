@@ -191,7 +191,7 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
 #else
     constexpr bool kEarlyOut = true;
 #endif
-    if (kEarlyOut && mutator.arena_collision && !mutator.physics_events.windows && mesh_triangles != nullptr &&
+    if (kEarlyOut && mutator.arena_collision && !mutator.physics_events.HasNonGoalEvents() && mesh_triangles != nullptr &&
         mesh_triangle_count > 0) {
         bool has_retained_mesh_points = false;
         for (int k = 0; retained_mesh_manifolds != nullptr && k < kCarWorldMeshRetainedManifoldsPerCar; ++k) {

@@ -2382,7 +2382,7 @@ ROCKETGPU_HD void WorldStepSoccar(
                 int settle_world_count = 0;
                 bool settle_candidate =
                     !ball_sleeping && mutator.arena_collision != 0 &&
-                    mutator.game_mode == static_cast<uint8_t>(Mode::Soccar) && !mutator.physics_events.windows &&
+                    mutator.game_mode == static_cast<uint8_t>(Mode::Soccar) && !mutator.physics_events.HasNonGoalEvents() &&
                     split_row_count == 0 && normal_row_count == 0 && friction_row_count == 0 &&
                     ball.vel.y == 0.0f && ball.vel.z == 0.0f &&
                     ball.ang_vel.x == 0.0f && ball.ang_vel.y == 0.0f && ball.ang_vel.z == 0.0f;
@@ -3145,7 +3145,7 @@ ROCKETGPU_HD void BuildCarWorldRowsForCar(
 }
 
 ROCKETGPU_HD bool VehicleUpdatesIndependent(const SimConfig& cfg, const WheelRayStage* staged_rays_for_env, int count) {
-    if (staged_rays_for_env == nullptr || cfg.mutator.physics_events.windows != nullptr || count > kWheelRayStageSlots / 4) {
+    if (staged_rays_for_env == nullptr || cfg.mutator.physics_events.HasNonGoalEvents() || count > kWheelRayStageSlots / 4) {
         return false;
     }
     for (int lane = 0; lane < 4 * count; ++lane) {

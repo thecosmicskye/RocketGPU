@@ -357,8 +357,7 @@ ROCKETGPU_GLOBAL void StepKernel(
     const int stride = cfg.max_cars_per_env;
     const int count = active ? env_car_count[env_idx] : 0;
     const bool apart = lanes > 1;
-    // Physics events must come out in env step order, so their car-world rows stay in the world step.
-    const bool rows_apart = apart && !cfg.mutator.physics_events.windows;
+    const bool rows_apart = apart && !cfg.mutator.physics_events.HasNonGoalEvents();
     if (apart && active && VehicleUpdatesIndependent(cfg, solver_scratch[env_idx].wheel_ray_stage, count)) {
         for (int slot = lane; slot < count; slot += lanes) {
             uint32_t pushed_cars_mask = 0u;
@@ -1278,7 +1277,7 @@ inline void LaunchStepTicksDirect(
     uint64_t seed,
     int32_t ticks,
     cudaStream_t stream) {
-    EnsureCudaStepStackLimit(!UseStagedStep(cfg) || cfg.mutator.physics_events.windows != nullptr);
+    EnsureCudaStepStackLimit(!UseStagedStep(cfg) || cfg.mutator.physics_events.HasNonGoalEvents());
     EnsureEpaScratchPool();
     constexpr int kPreTickEnvsPerBlock = 32;
     const int pre_block_size = kPreTickEnvsPerBlock * cfg.max_cars_per_env;
@@ -1305,9 +1304,8 @@ inline void LaunchStepTicksDirect(
     }
     const bool local_state = lanes == 1 && cfg.max_cars_per_env <= kLocalStepMaxSlots &&
                              cfg.env_count > StepKernelResidentThreads(block_size);
-    // Physics events come out in env step order, so they keep the one-kernel step.
     bullet_port::btGjkEpaScratch* const staged_gjk_pool =
-        (UseStagedStep(cfg) && !cfg.mutator.physics_events.windows) ? EnsureGjkScratchPool(CarWorldStagingThreads(), stream) : nullptr;
+        (UseStagedStep(cfg) && !cfg.mutator.physics_events.HasNonGoalEvents()) ? EnsureGjkScratchPool(CarWorldStagingThreads(), stream) : nullptr;
     if (staged_gjk_pool != nullptr) {
         const long long car_slots = static_cast<long long>(cfg.env_count) * cfg.max_cars_per_env;
         const unsigned car_blocks = static_cast<unsigned>((car_slots + kStagedBlockSize - 1) / kStagedBlockSize);

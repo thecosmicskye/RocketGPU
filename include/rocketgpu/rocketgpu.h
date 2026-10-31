@@ -64,8 +64,12 @@ struct PhysicsEventStream {
     uint32_t capacity_per_env = 0;
     uint32_t env_count = 0;
     uint32_t cars_per_env = 0;
+    bool goal_only = false;
+
+    ROCKETGPU_HD bool HasNonGoalEvents() const { return windows && !goal_only; }
 
     ROCKETGPU_HD void Emit(uint32_t env, PhysicsEvent event) const {
+        if (goal_only && event.type != PhysicsEventType::Goal) return;
         if (!windows || env >= env_count) return;
         auto& window = windows[env];
         event.tick = window.tick;

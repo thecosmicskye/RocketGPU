@@ -576,15 +576,16 @@ PYBIND11_MODULE(rocketgpu_py, m) {
         .def_property_readonly("config", &rocketgpu::BatchSim::config, py::return_value_policy::reference_internal)
         .def("device_view", &rocketgpu::BatchSim::device_view)
         .def("set_physics_event_stream", [](rocketgpu::BatchSim& sim, uintptr_t records,
-              uintptr_t windows, uint32_t capacity) {
+              uintptr_t windows, uint32_t capacity, bool goal_only) {
             rocketgpu::PhysicsEventStream stream;
             stream.records = reinterpret_cast<rocketgpu::PhysicsEvent*>(records);
             stream.windows = reinterpret_cast<rocketgpu::PhysicsEventWindow*>(windows);
             stream.capacity_per_env = capacity;
+            stream.goal_only = goal_only;
             stream.env_count = static_cast<uint32_t>(sim.env_count());
             stream.cars_per_env = static_cast<uint32_t>(sim.car_capacity()/sim.env_count());
             sim.set_physics_event_stream(stream);
-        })
+        }, py::arg("records"), py::arg("windows"), py::arg("capacity"), py::arg("goal_only") = false)
         .def("device_arrays",
              [](rocketgpu::BatchSim& sim) {
                  const rocketgpu::DeviceView v = sim.device_view();
