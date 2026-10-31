@@ -3087,6 +3087,7 @@ ROCKETGPU_HD void StepEnvVehicleUpdateCar(
 // recorded (they are emitted in visit order). Each update then reads and writes only its own car.
 // Car slot i's turn in the WorldStepSoccar car-world loop, between kWorldStepContacts and kWorldStepRows: its rows go
 // to the env's shared world rows at the car's slot and its order groups to its CarWorldRowsOut (see PackCarWorldRows).
+template <bool kMeshesOutOfReach = false>
 ROCKETGPU_HD void BuildCarWorldRowsForCar(
     int env_idx,
     int i,
@@ -3113,7 +3114,7 @@ ROCKETGPU_HD void BuildCarWorldRowsForCar(
         }
     } else {
         const ArenaBroadphaseGrid grid = MakeArenaBroadphaseGrid(cfg);
-        const ContactAccumulator acc = SolveCarWorldStaticContacts(
+        const ContactAccumulator acc = SolveCarWorldStaticContacts<kMeshesOutOfReach>(
             cars[car_idx], car_configs[car_idx], cfg.mutator,
             scratch.deferred_linear_deltas[i], scratch.deferred_angular_deltas[i],
             cfg.tick_dt / static_cast<float>(DebugWorldSubsteps()), env_idx, i,
@@ -3385,7 +3386,8 @@ ROCKETGPU_HD void StepEnvGeneric(
         const uint64_t current_tick = static_cast<uint64_t>(env.tick);
 
         uint32_t cal_pushed_cars_mask = 0u;
-        const bool vehicle_updates_done = WorldPartIsRows(world_part) ||
+        // kWorldStepContactsCarsApart runs only envs whose vehicle updates were independent, so ran a thread per car.
+        const bool vehicle_updates_done = WorldPartIsRows(world_part) || world_part == kWorldStepContactsCarsApart ||
             (phase == kStepEnvPhasePostVehiclesDone && VehicleUpdatesIndependent(cfg, staged_rays_for_env, count));
         for (int k = 0; !vehicle_updates_done && k < count; ++k) {
             const int i = CarVisitSlot(env_states[env_idx], k, count);

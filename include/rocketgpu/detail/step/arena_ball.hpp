@@ -141,6 +141,9 @@ ROCKETGPU_HD void ApplyGameCarWorldContactNormal(
 }
 
 
+// kMeshesOutOfReach: the caller found no usable arena mesh in reach (CarWorldUsableMeshesOutOfReach), so the mesh
+// query reduces to releasing the retained mesh manifolds.
+template <bool kMeshesOutOfReach = false>
 ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     CarState& car,
     const CarConfig& cfg,
@@ -180,10 +183,15 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     // car_world_early_out: a car out of reach of every arena mesh and clear of the four planes gets no rows, so skip
     // the query and leave only what it would: an empty World group for each plane inside its broadphase window, and
     // the retained plane manifolds emptied (their refresh culls every point). Retained mesh points and physics events
-    // take the full query. Host only: on the GPU the per-car test costs more than the queries it skips (a warp
-    // saves nothing unless all its cars skip), and the full query gives the same result.
-#if !defined(__CUDA_ARCH__)
-    if (mutator.arena_collision && !mutator.physics_events.windows && mesh_triangles != nullptr &&
+    // take the full query. Host, and the GPU's out-of-reach build (kMeshesOutOfReach), where nearly every car skips:
+    // elsewhere on the GPU the per-car test costs more than the queries it skips (a warp saves nothing unless all its
+    // cars skip), and the full query gives the same result.
+#if defined(__CUDA_ARCH__)
+    constexpr bool kEarlyOut = kMeshesOutOfReach;
+#else
+    constexpr bool kEarlyOut = true;
+#endif
+    if (kEarlyOut && mutator.arena_collision && !mutator.physics_events.windows && mesh_triangles != nullptr &&
         mesh_triangle_count > 0) {
         bool has_retained_mesh_points = false;
         for (int k = 0; retained_mesh_manifolds != nullptr && k < kCarWorldMeshRetainedManifoldsPerCar; ++k) {
@@ -217,7 +225,6 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
             return acc;
         }
     }
-#endif
 
     const CarWorldMeshCandidateStage* mesh_candidate_stage_in = nullptr;
     if (candidate_stage != nullptr && candidate_stage->valid != 0) {
@@ -364,7 +371,12 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
             retained_plane_manifolds ? &retained_plane_manifolds[3] : nullptr);
     }
 
-    if (use_mesh_world_rows) {
+    if (use_mesh_world_rows && kMeshesOutOfReach) {
+        ReleaseCarWorldMeshManifoldsOutOfReach(mesh_bvh_meshes, mesh_bvh_mesh_count, mesh_bvh_quantization_count,
+                                               mesh_bvh_node_count,
+                                               broadphase_grid != nullptr ? retained_mesh_manifolds : nullptr);
+    }
+    if (use_mesh_world_rows && !kMeshesOutOfReach) {
         AppendCarWorldMeshContactRows(
             car,
             cfg,

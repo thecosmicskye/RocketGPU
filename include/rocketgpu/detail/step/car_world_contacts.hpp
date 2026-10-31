@@ -974,6 +974,54 @@ ROCKETGPU_HD bool CarWorldMeshesOutOfReach(
     return true;
 }
 
+// No usable mesh within the car's broadphase reach. AppendCarWorldMeshContactRows' rows pass then skips every mesh,
+// releasing the car's retained manifold with it, and adds no row, group or normal (ReleaseCarWorldMeshManifoldsOutOfReach).
+ROCKETGPU_HD bool CarWorldUsableMeshesOutOfReach(
+    const CarState& car,
+    const CarConfig& cfg,
+    const ArenaMeshBvhQuantization* mesh_bvh_quantization,
+    int32_t mesh_bvh_quantization_count,
+    const ArenaMeshBvhMeshInfo* mesh_bvh_meshes,
+    int32_t mesh_bvh_mesh_count,
+    const ArenaMeshBvhNode* mesh_bvh_nodes,
+    int32_t mesh_bvh_node_count,
+    float dt) {
+    if (mesh_bvh_quantization == nullptr || mesh_bvh_meshes == nullptr || mesh_bvh_nodes == nullptr ||
+        mesh_bvh_mesh_count <= 0 || mesh_bvh_node_count <= 0) {
+        return false;
+    }
+    const CarWorldMeshReach reach = ComputeCarWorldMeshReach(car, cfg, dt);
+    for (int m = 0; m < mesh_bvh_mesh_count; ++m) {
+        if (CarWorldMeshInfoUsable(mesh_bvh_meshes[m], mesh_bvh_quantization_count, mesh_bvh_node_count) &&
+            CarWorldMeshInReach(reach, mesh_bvh_meshes[m])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+ROCKETGPU_HD void ReleaseCarWorldMeshManifoldsOutOfReach(
+    const ArenaMeshBvhMeshInfo* mesh_bvh_meshes,
+    int32_t mesh_bvh_mesh_count,
+    int32_t mesh_bvh_quantization_count,
+    int32_t mesh_bvh_node_count,
+    CarWorldMeshRetainedManifold* retained_mesh_manifolds) {
+    if (retained_mesh_manifolds == nullptr) {
+        return;
+    }
+    for (int m = 0; m < mesh_bvh_mesh_count; ++m) {
+        if (!CarWorldMeshInfoUsable(mesh_bvh_meshes[m], mesh_bvh_quantization_count, mesh_bvh_node_count)) {
+            continue;
+        }
+        for (int k = 0; k < kCarWorldMeshRetainedManifoldsPerCar; ++k) {
+            if (retained_mesh_manifolds[k].count > 0 && retained_mesh_manifolds[k].mesh == m) {
+                retained_mesh_manifolds[k].count = 0;
+                break;
+            }
+        }
+    }
+}
+
 // The four Bullet static planes (+X wall, -X wall, floor, ceiling, AppendCarWorldPlaneContactRows order). Returns -1
 // unless every plane's support distance clears the breaking threshold (no point) and sits clearly on one side of the
 // broadphase window (whether the plane gets an empty order group); otherwise bit i is set when plane i gets the
