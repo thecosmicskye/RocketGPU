@@ -1430,6 +1430,11 @@ ROCKETGPU_HD void ResetCarCommonState(CarState& car, const MutatorConfig& mutato
     car.demo_respawn_timer = 0.0f;
     car.tick_count_since_update = 0;
     car.is_on_ground = 1;
+    car.air_state = 0;
+    car.dodge_timeout = -1.0f;
+    car.dodge_elapsed = 0.0f;
+    car.dodge_dir_x = 0.0f;
+    car.dodge_dir_y = 0.0f;
 
     const uint8_t spawn_contact = 0;
     car.wheels_with_contact[0] = spawn_contact;
