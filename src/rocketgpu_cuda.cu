@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -391,6 +393,19 @@ ROCKETGPU_GLOBAL void StepKernel(
     }
 }
 
+// Each env's VehicleUpdatesIndependent, a thread per env, after the staged wheel rays: StagedCarPreKernel and the
+// contacts kernels read it, so the envs whose updates are not independent can step apart from StagedCarPreKernel.
+ROCKETGPU_GLOBAL void StagedVehicleIndependenceKernel(
+    SimConfig cfg, const int32_t* env_car_count, WorldSolverScratch* solver_scratch) {
+    int env_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (env_idx >= cfg.env_count) {
+        return;
+    }
+    MapStepEnv(cfg, env_idx);
+    solver_scratch[env_idx].vehicle_updates_independent =
+        VehicleUpdatesIndependent(cfg, solver_scratch[env_idx].wheel_ray_stage, env_car_count[env_idx]) ? 1 : 0;
+}
+
 // The staged step: StepKernel's lanes as kernels, each over all envs. A thread per car slot runs the independent
 // vehicle updates and later the car-world rows; a thread per env runs the world step's contact stages, then its
 // solve and the tick's end. Each env sees the same calls in the same order as StepKernel with lanes > 1.
@@ -406,10 +421,7 @@ ROCKETGPU_GLOBAL void StagedCarPreKernel(
     }
     MapStepEnv(cfg, env_idx);
     const int count = env_car_count[env_idx];
-    const bool independent = VehicleUpdatesIndependent(cfg, solver_scratch[env_idx].wheel_ray_stage, count);
-    if (slot == 0) {
-        solver_scratch[env_idx].vehicle_updates_independent = independent ? 1 : 0;
-    }
+    const bool independent = solver_scratch[env_idx].vehicle_updates_independent != 0;
     if (slot >= count || !independent) {
         return;
     }
@@ -561,6 +573,12 @@ ROCKETGPU_GLOBAL void StageWheelRaysKernel(
 // pair's triangles that pass the plane test, CarWorldTriangleHitsKernel runs their GJK/EPA a thread per
 // car-triangle, and the merge pass folds the hits into the pair's candidates in walk order. Every pair writes only
 // its own entry, so the list orders do not affect the result.
+ROCKETGPU_GLOBAL void ZeroInt32Kernel(int32_t* data, int count) {
+    for (int i = static_cast<int>(threadIdx.x); i < count; i += static_cast<int>(blockDim.x)) {
+        data[i] = 0;
+    }
+}
+
 ROCKETGPU_GLOBAL void PrefilterCarWorldMeshCandidatesKernel(
     SimConfig cfg,
     const CarState* cars,
@@ -568,7 +586,8 @@ ROCKETGPU_GLOBAL void PrefilterCarWorldMeshCandidatesKernel(
     const int32_t* env_car_count,
     CarWorldMeshCandidateStage* stages,
     int32_t* mesh_work,
-    int32_t* mesh_work_count) {
+    int32_t* mesh_work_count,
+    CarState* car_snapshots) {
     // Every car tests the same mesh infos: read them into shared memory once per block.
     __shared__ alignas(ArenaMeshBvhMeshInfo) unsigned char mesh_storage[kCarWorldMeshStageMeshes * sizeof(ArenaMeshBvhMeshInfo)];
     ArenaMeshBvhMeshInfo* const meshes = reinterpret_cast<ArenaMeshBvhMeshInfo*>(mesh_storage);
@@ -618,6 +637,12 @@ ROCKETGPU_GLOBAL void PrefilterCarWorldMeshCandidatesKernel(
     // is cheap, and it saves the fingerprint write here and its check in the step.
     if (staged_meshes == 0 || staged_meshes > kCarWorldMeshStageSlots) {
         return;
+    }
+    // The later staging passes read this copy of each listed car, so the contacts kernels may move the cars
+    // meanwhile: the step checks each stage's fingerprint against the live car, and a moved car walks its meshes
+    // itself. (car_snapshots is null when nothing moves the cars before the staging joins.)
+    if (car_snapshots != nullptr) {
+        car_snapshots[car_idx] = car;
     }
     FillCarWorldMeshCandidateFingerprint(car, car_cfg, stage.fingerprint);
     stage.mesh_count = cfg.arena_mesh_bvh_mesh_count;
@@ -837,6 +862,7 @@ struct CarWorldStageBuffers {
     CarWorldTrianglePairs pairs{};       // count lives in mesh_work_count[kCarWorldMeshStageMeshes]
     size_t capacity = 0;
     CarWorldMeshCandidateStage* published = nullptr;
+    CarState* car_snapshots = nullptr;   // the cars as the prefilter saw them, read by the later staging passes
     int published_stride = 0;
 };
 inline CarWorldStageBuffers& GetCarWorldStageBuffers() {
@@ -873,6 +899,7 @@ inline bool EnsureCarWorldStageArmed(const SimConfig& cfg, cudaStream_t stream) 
         CheckCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize(car-world stage grow)");
         if (b.stages != nullptr) {
             cudaFree(b.stages);
+            cudaFree(b.car_snapshots);
             cudaFree(b.mesh_work);
             cudaFree(b.pairs.car_idx);
             cudaFree(b.pairs.tri_idx);
@@ -894,6 +921,7 @@ inline bool EnsureCarWorldStageArmed(const SimConfig& cfg, cudaStream_t stream) 
         b.published = nullptr;
         CheckCuda(cudaMalloc(&b.mesh_work, count * kCarWorldMeshStageMeshes * sizeof(int32_t)), "cudaMalloc(car-world mesh work)");
         CheckCuda(cudaMalloc(&b.stages, count * sizeof(CarWorldMeshCandidateStage)), "cudaMalloc(car-world stage)");
+        CheckCuda(cudaMalloc(&b.car_snapshots, count * sizeof(CarState)), "cudaMalloc(car-world stage car snapshots)");
         CheckCuda(cudaMemset(b.stages, 0, count * sizeof(CarWorldMeshCandidateStage)), "cudaMemset(car-world stage)");
         b.capacity = count;
         ++StepResourceEpoch();
@@ -926,7 +954,59 @@ inline void EnsureEpaScratchPool() {
     ready = true;
 }
 
+// The step's process-wide resources (scratch pools, staging buffers, side streams, graph cache) serve one step at a
+// time. StepResourcesGuard holds a process-wide lock while a step is queued, and a step queued on another stream than
+// the last one waits on the GPU for that one. The resources live on the first GPU a step ran on; stepping a simulator
+// on another GPU is an error.
+class StepResourcesGuard {
+public:
+    explicit StepResourcesGuard(cudaStream_t stream)
+        : lock_(Mutex()), stream_(stream), ordered_(!StreamIsCapturing(stream)) {
+        State& s = GetState();
+        int device = 0;
+        CheckCuda(cudaGetDevice(&device), "cudaGetDevice(step)");
+        if (s.device < 0) {
+            CheckCuda(cudaEventCreateWithFlags(&s.done, cudaEventDisableTiming), "cudaEventCreate(step done)");
+            s.device = device;
+        } else if (s.device != device) {
+            throw std::runtime_error("RocketGPU: every simulator in a process must step on the same GPU");
+        }
+        if (ordered_ && s.has_last && s.last_stream != stream) {
+            CheckCuda(cudaStreamWaitEvent(stream, s.done, 0), "cudaStreamWaitEvent(previous step)");
+        }
+    }
+    ~StepResourcesGuard() {
+        State& s = GetState();
+        if (ordered_ && cudaEventRecord(s.done, stream_) == cudaSuccess) {
+            s.last_stream = stream_;
+            s.has_last = true;
+        }
+    }
+    StepResourcesGuard(const StepResourcesGuard&) = delete;
+    StepResourcesGuard& operator=(const StepResourcesGuard&) = delete;
+
+private:
+    struct State {
+        int device = -1;
+        cudaEvent_t done = nullptr;
+        cudaStream_t last_stream = nullptr;
+        bool has_last = false;
+    };
+    static std::recursive_mutex& Mutex() {
+        static std::recursive_mutex mutex;
+        return mutex;
+    }
+    static State& GetState() {
+        static State state;
+        return state;
+    }
+    std::lock_guard<std::recursive_mutex> lock_;
+    cudaStream_t stream_;
+    bool ordered_;
+};
+
 void PrepareCarWorldStage(int env_count, int max_cars_per_env, cudaStream_t stream) {
+    const StepResourcesGuard guard(stream);
     EnsureEpaScratchPool();
     SimConfig cfg;
     cfg.env_count = env_count;
@@ -938,23 +1018,38 @@ inline void LaunchStageCarWorldMeshCandidates(
     const CarState* cars,
     const CarConfig* car_configs,
     const int32_t* env_car_count,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    cudaEvent_t prefilter_done = nullptr) {
+    // prefilter_done: recorded once the cars are copied (after the prefilter), when the caller passes one.
+    const auto mark_prefilter_done = [&] {
+        if (prefilter_done != nullptr) {
+            CheckCuda(cudaEventRecord(prefilter_done, stream), "cudaEventRecord(car-world prefilter)");
+        }
+    };
     bullet_port::btGjkEpaScratch* const gjk_pool = EnsureGjkScratchPool(CarWorldStagingThreads(), stream);
     if (gjk_pool == nullptr || !EnsureCarWorldStageArmed(cfg, stream)) {
         if (!StreamIsCapturing(stream)) {
             PublishCarWorldStage(nullptr, 0, stream);
         }
+        mark_prefilter_done();
         return;
     }
     CarWorldStageBuffers& b = GetCarWorldStageBuffers();
     const size_t car_slots = static_cast<size_t>(cfg.env_count) * static_cast<size_t>(cfg.max_cars_per_env);
     const int block_size = kCudaRayKernelBlockSize;
-    CheckCuda(cudaMemsetAsync(b.mesh_work_count, 0, (kCarWorldMeshStageMeshes + 1) * sizeof(int32_t), stream),
-              "cudaMemsetAsync(car-world mesh work count)");
+    // A kernel rather than cudaMemsetAsync: in a captured step the memset node held this branch back until
+    // StagedCarPreKernel on the other branch had finished.
+    ZeroInt32Kernel<<<1, 32, 0, stream>>>(b.mesh_work_count, kCarWorldMeshStageMeshes + 1);
+    CheckCuda(cudaGetLastError(), "ZeroInt32Kernel launch (car-world mesh work count)");
     PrefilterCarWorldMeshCandidatesKernel<<<static_cast<unsigned>((car_slots + block_size - 1) / block_size),
                                             static_cast<unsigned>(block_size), 0, stream>>>(
-        cfg, cars, car_configs, env_car_count, b.stages, b.mesh_work, b.mesh_work_count);
+        cfg, cars, car_configs, env_car_count, b.stages, b.mesh_work, b.mesh_work_count,
+        prefilter_done != nullptr ? b.car_snapshots : nullptr);
     CheckCuda(cudaGetLastError(), "PrefilterCarWorldMeshCandidatesKernel launch");
+    mark_prefilter_done();
+    if (prefilter_done != nullptr) {
+        cars = b.car_snapshots;
+    }
     const int meshes = std::max(0, std::min(cfg.arena_mesh_bvh_mesh_count, kCarWorldMeshStageMeshes));
     const size_t pair_count = car_slots * static_cast<size_t>(meshes);
     if (pair_count == 0) {
@@ -985,7 +1080,8 @@ inline void LaunchStageWheelRays(
     const EnvState* env_states,
     WorldSolverScratch* solver_scratch,
     const int32_t* env_car_count,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    bool with_car_world_stage = true) {
     const long long rays = static_cast<long long>(cfg.env_count) * 4ll * static_cast<long long>(cfg.max_cars_per_env);
     if (rays <= 0) {
         return;
@@ -995,16 +1091,54 @@ inline void LaunchStageWheelRays(
     StageWheelRaysKernel<<<static_cast<unsigned>(blocks), static_cast<unsigned>(block_size), 0, stream>>>(
         cfg, cars, car_configs, wheel_runtime_states, balls, env_states, solver_scratch, env_car_count);
     CheckCuda(cudaGetLastError(), "StageWheelRaysKernel launch");
-    LaunchStageCarWorldMeshCandidates(cfg, cars, car_configs, env_car_count, stream);
+    if (with_car_world_stage) {
+        LaunchStageCarWorldMeshCandidates(cfg, cars, car_configs, env_car_count, stream);
+    }
 }
 
 constexpr int kStagedBlockSize = 64;
-inline bool UseStagedStep() {
-    static const bool staged = [] {
-        const char* v = std::getenv("ROCKETGPU_STAGED_STEP");
-        return v != nullptr && std::atoi(v) != 0;
+inline bool UseStagedConcurrency() {
+    static const bool concurrent = [] {
+        const char* v = std::getenv("ROCKETGPU_STAGED_CONCURRENT");
+        return v == nullptr || std::atoi(v) != 0;
     }();
-    return staged;
+    return concurrent;
+}
+// Side streams and fork/join events of the staged step's concurrent branches (created once, kept for the process,
+// used under StepResourcesGuard).
+struct StagedStreams {
+    cudaStream_t stage = nullptr;
+    cudaStream_t dependent = nullptr;
+    cudaEvent_t pre_done = nullptr;
+    cudaEvent_t prefilter_done = nullptr;
+    cudaEvent_t stage_done = nullptr;
+    cudaEvent_t independence_done = nullptr;
+    cudaEvent_t dependent_done = nullptr;
+};
+inline StagedStreams& GetStagedStreams() {
+    static StagedStreams streams = [] {
+        StagedStreams s;
+        CheckCuda(cudaStreamCreateWithFlags(&s.stage, cudaStreamNonBlocking), "cudaStreamCreate(staged stage)");
+        CheckCuda(cudaStreamCreateWithFlags(&s.dependent, cudaStreamNonBlocking), "cudaStreamCreate(staged dependent)");
+        for (cudaEvent_t* e : {&s.pre_done, &s.prefilter_done, &s.stage_done, &s.independence_done, &s.dependent_done}) {
+            CheckCuda(cudaEventCreateWithFlags(e, cudaEventDisableTiming), "cudaEventCreate(staged)");
+        }
+        return s;
+    }();
+    return streams;
+}
+// The staged step (kernels per phase, car-world staging and the contacts on concurrent branches) unless
+// ROCKETGPU_STAGED_STEP says otherwise. With many envs the one-kernel step wins (RTX 5090, 1v1, M arena-ticks/s,
+// staged vs one-kernel: 2.59 vs 2.40 at 1k envs, 7.7 vs 6.5 at 4k, 14.7 vs 12.3 at 16k, 15.6 vs 13.9 at 32k,
+// 14.4 vs 14.0 at 49k, 14.5 vs 15.1 at 65k; 2v2 4k: 5.4 vs 4.1; 3v3: 1.63 vs 1.37 at 1k, 5.0 vs 4.0 at 8k,
+// 5.7 vs 4.9 at 16k, 5.7 vs 5.3 at 32k).
+constexpr int kStagedStepMaxEnvs = 65535;
+inline bool UseStagedStep(const SimConfig& cfg) {
+    static const int forced = [] {
+        const char* v = std::getenv("ROCKETGPU_STAGED_STEP");
+        return v == nullptr ? -1 : (std::atoi(v) != 0 ? 1 : 0);
+    }();
+    return forced >= 0 ? forced != 0 : cfg.env_count <= kStagedStepMaxEnvs;
 }
 
 // Each tick: PreTickKernel, the staged wheel rays and car-world candidates, then StepKernel. controls_by_tick and
@@ -1033,7 +1167,7 @@ inline void LaunchStepTicksDirect(
     uint64_t seed,
     int32_t ticks,
     cudaStream_t stream) {
-    EnsureCudaStepStackLimit(!UseStagedStep() || cfg.mutator.physics_events.windows != nullptr);
+    EnsureCudaStepStackLimit(!UseStagedStep(cfg) || cfg.mutator.physics_events.windows != nullptr);
     EnsureEpaScratchPool();
     constexpr int kPreTickEnvsPerBlock = 32;
     const int pre_block_size = kPreTickEnvsPerBlock * cfg.max_cars_per_env;
@@ -1062,7 +1196,7 @@ inline void LaunchStepTicksDirect(
                              cfg.env_count > StepKernelResidentThreads(block_size);
     // Physics events come out in env step order, so they keep the one-kernel step.
     bullet_port::btGjkEpaScratch* const staged_gjk_pool =
-        (UseStagedStep() && !cfg.mutator.physics_events.windows) ? EnsureGjkScratchPool(CarWorldStagingThreads(), stream) : nullptr;
+        (UseStagedStep(cfg) && !cfg.mutator.physics_events.windows) ? EnsureGjkScratchPool(CarWorldStagingThreads(), stream) : nullptr;
     if (staged_gjk_pool != nullptr) {
         const long long car_slots = static_cast<long long>(cfg.env_count) * cfg.max_cars_per_env;
         const unsigned car_blocks = static_cast<unsigned>((car_slots + kStagedBlockSize - 1) / kStagedBlockSize);
@@ -1072,24 +1206,57 @@ inline void LaunchStepTicksDirect(
         const unsigned pad_post_blocks = static_cast<unsigned>((pad_slots + kStagedBlockSize - 1) / kStagedBlockSize);
         const unsigned row_blocks = static_cast<unsigned>(
             (std::min<long long>(car_slots, static_cast<long long>(CarWorldStagingThreads())) + kStagedBlockSize - 1) / kStagedBlockSize);
+        // Branches of the tick that touch disjoint data run on side streams (graph branches when captured):
+        //  - the car-world mesh staging reads the cars' transforms, which nothing writes before the contacts
+        //    kernels (car-car split pushes and demos move cars there). Its prefilter copies the cars and the later
+        //    passes read the copies, so only the prefilter runs before the contacts; the rest joins before
+        //    StagedCarWorldRowsKernel, whose fingerprint check drops the stage of a car the contacts moved;
+        //  - the contacts of envs whose vehicle updates are not independent (StagedWorldKernel<kWorldStepContacts>)
+        //    touch only those envs, so they run beside StagedCarPreKernel and the other envs' contacts.
+        const bool concurrent = UseStagedConcurrency();
+        StagedStreams& side = GetStagedStreams();
+        const cudaStream_t stage_stream = concurrent ? side.stage : stream;
+        const cudaStream_t dep_stream = concurrent ? side.dependent : stream;
         for (int32_t t = 0; t < ticks; ++t) {
             PreTickKernel<<<pre_blocks, pre_block_size, 0, stream>>>(
                 cfg, teams, env_car_count, cars, solver_scratch, controls, balls, env_states, pads,
                 controls_by_tick, control_stride, env_commands_by_tick, env_command_stride,
                 respawn_slots, writable_respawn_slots, respawn_rng, respawn_order, seed, t);
             CheckCuda(cudaGetLastError(), "PreTickKernel launch");
-            LaunchStageWheelRays(cfg, cars, car_configs, wheel_runtime_states, balls, env_states, solver_scratch, env_car_count, stream);
+            if (concurrent) {
+                CheckCuda(cudaEventRecord(side.pre_done, stream), "cudaEventRecord(pre tick)");
+                CheckCuda(cudaStreamWaitEvent(stage_stream, side.pre_done, 0), "cudaStreamWaitEvent(stage)");
+                LaunchStageCarWorldMeshCandidates(cfg, cars, car_configs, env_car_count, stage_stream, side.prefilter_done);
+                CheckCuda(cudaEventRecord(side.stage_done, stage_stream), "cudaEventRecord(stage)");
+            }
+            LaunchStageWheelRays(cfg, cars, car_configs, wheel_runtime_states, balls, env_states, solver_scratch,
+                                 env_car_count, stream, !concurrent);
+            StagedVehicleIndependenceKernel<<<env_blocks, kStagedBlockSize, 0, stream>>>(cfg, env_car_count, solver_scratch);
+            CheckCuda(cudaGetLastError(), "StagedVehicleIndependenceKernel launch");
+            if (concurrent) {
+                CheckCuda(cudaEventRecord(side.independence_done, stream), "cudaEventRecord(independence)");
+                CheckCuda(cudaStreamWaitEvent(dep_stream, side.independence_done, 0), "cudaStreamWaitEvent(dependent)");
+                CheckCuda(cudaStreamWaitEvent(dep_stream, side.prefilter_done, 0), "cudaStreamWaitEvent(dependent prefilter)");
+            }
             StagedCarPreKernel<<<car_blocks, kStagedBlockSize, 0, stream>>>(
                 cfg, env_car_count, cars, wheel_runtime_states, solver_scratch, controls, car_configs, balls);
             CheckCuda(cudaGetLastError(), "StagedCarPreKernel launch");
-            StagedWorldKernel<kWorldStepContacts><<<env_blocks, kStagedBlockSize, 0, stream>>>(
+            StagedWorldKernel<kWorldStepContacts><<<env_blocks, kStagedBlockSize, 0, dep_stream>>>(
                 cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls, car_configs,
                 balls, env_states, pads, seed);
             CheckCuda(cudaGetLastError(), "StagedWorldKernel contacts launch");
+            if (concurrent) {
+                CheckCuda(cudaEventRecord(side.dependent_done, dep_stream), "cudaEventRecord(dependent)");
+                CheckCuda(cudaStreamWaitEvent(stream, side.prefilter_done, 0), "cudaStreamWaitEvent(prefilter)");
+            }
             StagedWorldKernel<kWorldStepContactsCarsApart><<<env_blocks, kStagedBlockSize, 0, stream>>>(
                 cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls, car_configs,
                 balls, env_states, pads, seed);
             CheckCuda(cudaGetLastError(), "StagedWorldKernel contacts (cars apart) launch");
+            if (concurrent) {
+                CheckCuda(cudaStreamWaitEvent(stream, side.dependent_done, 0), "cudaStreamWaitEvent(join dependent)");
+                CheckCuda(cudaStreamWaitEvent(stream, side.stage_done, 0), "cudaStreamWaitEvent(join stage)");
+            }
             StagedCarWorldRowsKernel<<<row_blocks, kStagedBlockSize, 0, stream>>>(
                 cfg, env_car_count, cars, car_configs, solver_scratch, row_pool, staged_gjk_pool);
             CheckCuda(cudaGetLastError(), "StagedCarWorldRowsKernel launch");
@@ -1110,13 +1277,28 @@ inline void LaunchStepTicksDirect(
         }
         return;
     }
+    // The car-world mesh staging and the wheel rays read the cars and write apart, so with
+    // ROCKETGPU_STAGED_CONCURRENT they run side by side and join before StepKernel.
+    const bool concurrent = UseStagedConcurrency();
     for (int32_t t = 0; t < ticks; ++t) {
         PreTickKernel<<<pre_blocks, pre_block_size, 0, stream>>>(
             cfg, teams, env_car_count, cars, solver_scratch, controls, balls, env_states, pads,
             controls_by_tick, control_stride, env_commands_by_tick, env_command_stride,
             respawn_slots, writable_respawn_slots, respawn_rng, respawn_order, seed, t);
         CheckCuda(cudaGetLastError(), "PreTickKernel launch");
-        LaunchStageWheelRays(cfg, cars, car_configs, wheel_runtime_states, balls, env_states, solver_scratch, env_car_count, stream);
+        if (concurrent) {
+            StagedStreams& side = GetStagedStreams();
+            CheckCuda(cudaEventRecord(side.pre_done, stream), "cudaEventRecord(pre tick)");
+            CheckCuda(cudaStreamWaitEvent(side.stage, side.pre_done, 0), "cudaStreamWaitEvent(stage)");
+            LaunchStageCarWorldMeshCandidates(cfg, cars, car_configs, env_car_count, side.stage);
+            CheckCuda(cudaEventRecord(side.stage_done, side.stage), "cudaEventRecord(stage)");
+            LaunchStageWheelRays(cfg, cars, car_configs, wheel_runtime_states, balls, env_states, solver_scratch,
+                                 env_car_count, stream, false);
+            CheckCuda(cudaStreamWaitEvent(stream, side.stage_done, 0), "cudaStreamWaitEvent(join stage)");
+        } else {
+            LaunchStageWheelRays(cfg, cars, car_configs, wheel_runtime_states, balls, env_states, solver_scratch,
+                                 env_car_count, stream);
+        }
         StepKernel<<<blocks, block_size, 0, stream>>>(
             cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls, car_configs,
             balls, env_states, pads, seed, lanes, step_gjk_pool, local_state);
@@ -1178,6 +1360,7 @@ inline void LaunchStepTicks(
     uint64_t seed,
     int32_t ticks,
     cudaStream_t stream) {
+    const StepResourcesGuard guard(stream);
     const auto direct = [&](cudaStream_t s) {
         LaunchStepTicksDirect(cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls,
                               controls_by_tick, control_stride, env_commands_by_tick, env_command_stride, car_configs,
