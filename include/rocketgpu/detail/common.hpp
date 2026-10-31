@@ -31,6 +31,19 @@ using cudaStream_t = void*;
 #define ROCKETGPU_ALWAYS_INLINE
 #endif
 
+// Index of the lowest set bit of a nonzero mask.
+ROCKETGPU_HD int CountTrailingZeros64(uint64_t mask) {
+#if defined(__CUDA_ARCH__)
+    return __ffsll(static_cast<long long>(mask)) - 1;
+#else
+    int bit = 0;
+    while (((mask >> bit) & 1u) == 0) {
+        ++bit;
+    }
+    return bit;
+#endif
+}
+
 #if defined(__CUDA_ARCH__)
 #define ROCKETGPU_WARP_SYNC() __syncwarp()
 #else

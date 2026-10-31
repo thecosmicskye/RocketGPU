@@ -314,6 +314,11 @@ ROCKETGPU_HD int MergeCarWorldRetainedPlanePoint(Manifold& manifold, const Point
     return slot;
 }
 
+#if defined(__CUDA_ARCH__)
+#define ROCKETGPU_CAR_WORLD_ALWAYS_INLINE __attribute__((always_inline))
+#else
+#define ROCKETGPU_CAR_WORLD_ALWAYS_INLINE
+#endif
 ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
     const CarState& car,
     const CarConfig& cfg,
@@ -779,15 +784,16 @@ ROCKETGPU_HD bool CarWorldMeshCandidateStageMatches(const CarWorldMeshCandidateS
                                                 const CarConfig& cfg) {
     float fp[kCarWorldMeshStageFingerprintFloats];
     FillCarWorldMeshCandidateFingerprint(car, cfg, fp);
+    // Every word compared (no early exit), so the stage loads issue together.
+    uint32_t differ = 0u;
+#pragma unroll
     for (int i = 0; i < kCarWorldMeshStageFingerprintFloats; ++i) {
         union { float f; uint32_t u; } a, b;
         a.f = fp[i];
         b.f = stage.fingerprint[i];
-        if (a.u != b.u) {
-            return false;
-        }
+        differ |= a.u ^ b.u;
     }
-    return true;
+    return differ == 0u;
 }
 
 ROCKETGPU_HD int SelectCarWorldMeshContactReplaceIndexBulletStyle(
@@ -959,6 +965,62 @@ ROCKETGPU_HD bool CarWorldMeshInReach(const CarWorldMeshReach& reach, const Aren
            reach.hi.y >= info.aabb_min.y && reach.lo.z <= info.aabb_max.z && reach.hi.z >= info.aabb_min.z;
 }
 
+// Bit m set when mesh m (m < mesh_count <= 32) meets the reach box, as CarWorldMeshInReach. Every term is evaluated
+// and up to 16 meshes the loop is unrolled, so the mesh loads issue together instead of a round trip per mesh.
+ROCKETGPU_HD uint32_t CarWorldMeshReachMask(
+    const CarWorldMeshReach& reach, const ArenaMeshBvhMeshInfo* mesh_infos, int32_t mesh_count) {
+    uint32_t mask = 0u;
+    const auto test = [&](int m) {
+        const Vec3 lo = mesh_infos[m].aabb_min;
+        const Vec3 hi = mesh_infos[m].aabb_max;
+        const bool in = (reach.lo.x <= hi.x) & (reach.hi.x >= lo.x) & (reach.lo.y <= hi.y) & (reach.hi.y >= lo.y) &
+                        (reach.lo.z <= hi.z) & (reach.hi.z >= lo.z);
+        mask |= static_cast<uint32_t>(in) << m;
+    };
+    if (mesh_count <= 16) {
+#pragma unroll
+        for (int m = 0; m < 16; ++m) {
+            if (m < mesh_count) {
+                test(m);
+            }
+        }
+    } else {
+        for (int m = 0; m < mesh_count && m < 32; ++m) {
+            test(m);
+        }
+    }
+    return mask;
+}
+
+// Bit m set when mesh m (m < mesh_count <= 32) is CarWorldMeshInfoUsable, every term evaluated as above.
+ROCKETGPU_HD uint32_t CarWorldMeshUsableMask(
+    const ArenaMeshBvhMeshInfo* mesh_infos, int32_t mesh_count, int32_t mesh_bvh_quantization_count,
+    int32_t mesh_bvh_node_count) {
+    uint32_t mask = 0u;
+    const auto test = [&](int m) {
+        const ArenaMeshBvhMeshInfo& info = mesh_infos[m];
+        const int32_t mesh_index = info.mesh_index;
+        const int32_t node_offset = info.node_offset;
+        const int32_t node_count = info.node_count;
+        const bool usable = (mesh_index >= 0) & (mesh_index < mesh_bvh_quantization_count) & (node_offset >= 0) &
+                            (node_count > 0) & (node_offset + node_count <= mesh_bvh_node_count);
+        mask |= static_cast<uint32_t>(usable) << m;
+    };
+    if (mesh_count <= 16) {
+#pragma unroll
+        for (int m = 0; m < 16; ++m) {
+            if (m < mesh_count) {
+                test(m);
+            }
+        }
+    } else {
+        for (int m = 0; m < mesh_count && m < 32; ++m) {
+            test(m);
+        }
+    }
+    return mask;
+}
+
 ROCKETGPU_HD bool CarWorldMeshesOutOfReach(
     const CarState& car,
     const CarConfig& cfg,
@@ -966,6 +1028,9 @@ ROCKETGPU_HD bool CarWorldMeshesOutOfReach(
     int32_t mesh_count,
     float dt) {
     const CarWorldMeshReach reach = ComputeCarWorldMeshReach(car, cfg, dt);
+    if (mesh_count <= 32) {
+        return CarWorldMeshReachMask(reach, mesh_infos, mesh_count) == 0u;
+    }
     for (int m = 0; m < mesh_count; ++m) {
         if (CarWorldMeshInReach(reach, mesh_infos[m])) {
             return false;
@@ -991,6 +1056,11 @@ ROCKETGPU_HD bool CarWorldUsableMeshesOutOfReach(
         return false;
     }
     const CarWorldMeshReach reach = ComputeCarWorldMeshReach(car, cfg, dt);
+    if (mesh_bvh_mesh_count <= 32) {
+        return (CarWorldMeshReachMask(reach, mesh_bvh_meshes, mesh_bvh_mesh_count) &
+                CarWorldMeshUsableMask(mesh_bvh_meshes, mesh_bvh_mesh_count, mesh_bvh_quantization_count,
+                                       mesh_bvh_node_count)) == 0u;
+    }
     for (int m = 0; m < mesh_bvh_mesh_count; ++m) {
         if (CarWorldMeshInfoUsable(mesh_bvh_meshes[m], mesh_bvh_quantization_count, mesh_bvh_node_count) &&
             CarWorldMeshInReach(reach, mesh_bvh_meshes[m])) {
@@ -1007,6 +1077,27 @@ ROCKETGPU_HD void ReleaseCarWorldMeshManifoldsOutOfReach(
     int32_t mesh_bvh_node_count,
     CarWorldMeshRetainedManifold* retained_mesh_manifolds) {
     if (retained_mesh_manifolds == nullptr) {
+        return;
+    }
+    static_assert(kCarWorldMeshRetainedManifoldsPerCar == 2, "the slot form below covers two slots");
+    if (mesh_bvh_mesh_count <= 32) {
+        // The loop below by slot: a usable mesh's first slot holding points is released.
+        const uint32_t usable =
+            CarWorldMeshUsableMask(mesh_bvh_meshes, mesh_bvh_mesh_count, mesh_bvh_quantization_count, mesh_bvh_node_count);
+        CarWorldMeshRetainedManifold& s0 = retained_mesh_manifolds[0];
+        CarWorldMeshRetainedManifold& s1 = retained_mesh_manifolds[1];
+        const int m0 = s0.mesh;
+        const int m1 = s1.mesh;
+        const bool held0 = s0.count > 0;
+        const bool held1 = s1.count > 0;
+        const bool release0 = held0 && m0 < mesh_bvh_mesh_count && ((usable >> m0) & 1u) != 0u;
+        const bool release1 = held1 && m1 < mesh_bvh_mesh_count && ((usable >> m1) & 1u) != 0u && !(held0 && m0 == m1);
+        if (release0) {
+            s0.count = 0;
+        }
+        if (release1) {
+            s1.count = 0;
+        }
         return;
     }
     for (int m = 0; m < mesh_bvh_mesh_count; ++m) {
@@ -1064,8 +1155,10 @@ ROCKETGPU_HD int CarWorldPlanesOutOfReach(const CarState& car, const CarConfig& 
 
 // kStagedHitsOnly: the staging kernel's build. It never runs GJK/EPA: the gather pass stops at the plane tests and
 // the merge pass takes CarWorldTriangleHitsKernel's hits (a pair without them is left to the step, see the caller).
+// Inlined into SolveCarWorldStaticContacts on the device (an ABI call there saves and restores most of the caller's
+// registers); the staging kernel goes through AppendCarWorldMeshContactRows below.
 template <bool kStagedHitsOnly = false>
-ROCKETGPU_HD void AppendCarWorldMeshContactRows(
+ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRowsBody(
     const CarState& car,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
@@ -1102,7 +1195,8 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
     const ArenaMeshLeafGrid* leaf_grid = nullptr,
     const CarWorldTrianglePairs* triangle_pairs = nullptr,
     int triangle_pairs_pass = kTrianglePairsNone,
-    CarWorldMeshRetainedManifold* retained_mesh_manifolds = nullptr) {
+    CarWorldMeshRetainedManifold* retained_mesh_manifolds = nullptr,
+    uint32_t mesh_reach_hint = 0u) {
     if (mesh_triangles == nullptr || mesh_triangle_count <= 0) {
         return;
     }
@@ -1113,7 +1207,21 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
     constexpr int kMaxMeshRows = 4;
 
     const float contact_threshold_bt = CarContactBreakingThresholdUU(cfg) * kUUToBT;
-    const CarWorldMeshQueryFrame query_frame = ComputeCarWorldMeshQueryFrame(car, cfg);
+    const bool have_bvh_traversal =
+        mesh_bvh_quantization != nullptr &&
+        mesh_bvh_meshes != nullptr &&
+        mesh_bvh_nodes != nullptr &&
+        mesh_bvh_mesh_count > 0 &&
+        mesh_bvh_node_count > 0;
+    if (stage_in != nullptr &&
+        (stage_in->valid == 0 || !have_bvh_traversal || stage_in->mesh_count != mesh_bvh_mesh_count)) {
+        stage_in = nullptr;
+    }
+    // The query frame feeds only the BVH walk and the subtree overlap count; rows from a usable stage with the
+    // broadphase grid run neither.
+    const bool query_frame_used = stage_in == nullptr || broadphase_grid == nullptr;
+    const CarWorldMeshQueryFrame query_frame =
+        query_frame_used ? ComputeCarWorldMeshQueryFrame(car, cfg) : CarWorldMeshQueryFrame{};
     const Vec3 axis_x = query_frame.axis_x;
     const Vec3 axis_y = query_frame.axis_y;
     const Vec3 axis_z = query_frame.axis_z;
@@ -1124,10 +1232,29 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
     // Rows pass (broadphase grid, no staging): a mesh out of reach (CarWorldMeshesOutOfReach) has no manifold, no
     // triangle in the query AABB and no group, so it is skipped, and the proxy is built only when some mesh is in reach.
     const bool skip_out_of_reach = broadphase_grid != nullptr && stage_out == nullptr && mesh_bvh_meshes != nullptr;
-    const CarWorldMeshReach mesh_reach = ComputeCarWorldMeshReach(car, cfg, broadphase_dt);
+    // mesh_reach_hint (nonzero): the usable meshes in reach, as the caller computed them with this dt. The loop skips
+    // an unusable mesh before anything else, so its bit changes nothing.
+    const bool reach_hinted = mesh_reach_hint != 0u && skip_out_of_reach && mesh_bvh_mesh_count <= 32;
+    const CarWorldMeshReach mesh_reach =
+        reach_hinted ? CarWorldMeshReach{} : ComputeCarWorldMeshReach(car, cfg, broadphase_dt);
     bool any_mesh_in_reach = !skip_out_of_reach;
-    for (int m = 0; !any_mesh_in_reach && m < mesh_bvh_mesh_count; ++m) {
-        any_mesh_in_reach = CarWorldMeshInReach(mesh_reach, mesh_bvh_meshes[m]);
+    // Rows pass: the meshes the mesh loop below visits. It skips one out of reach without a retained manifold, which
+    // does nothing there (merging and releasing a mesh's manifold never touch another mesh's).
+    uint32_t mesh_visit_mask = ~0u;
+    if (skip_out_of_reach && mesh_bvh_mesh_count <= 32) {
+        const uint32_t in_reach =
+            reach_hinted ? mesh_reach_hint : CarWorldMeshReachMask(mesh_reach, mesh_bvh_meshes, mesh_bvh_mesh_count);
+        any_mesh_in_reach = in_reach != 0u;
+        mesh_visit_mask = in_reach;
+        for (int k = 0; retained_mesh_manifolds != nullptr && k < kCarWorldMeshRetainedManifoldsPerCar; ++k) {
+            if (retained_mesh_manifolds[k].count > 0 && retained_mesh_manifolds[k].mesh < 32) {
+                mesh_visit_mask |= 1u << retained_mesh_manifolds[k].mesh;
+            }
+        }
+    } else {
+        for (int m = 0; !any_mesh_in_reach && m < mesh_bvh_mesh_count; ++m) {
+            any_mesh_in_reach = CarWorldMeshInReach(mesh_reach, mesh_bvh_meshes[m]);
+        }
     }
     const BulletBroadphaseProxy car_broadphase_proxy =
         broadphase_grid != nullptr && any_mesh_in_reach
@@ -1552,12 +1679,6 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
         }
     };
 
-    const bool have_bvh_traversal =
-        mesh_bvh_quantization != nullptr &&
-        mesh_bvh_meshes != nullptr &&
-        mesh_bvh_nodes != nullptr &&
-        mesh_bvh_mesh_count > 0 &&
-        mesh_bvh_node_count > 0;
 
     static_assert(kMaxMeshCandidates == kCarWorldMeshStageCandidates,
                   "CarWorldMeshCandidateStage holds every mesh candidate");
@@ -1578,20 +1699,20 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
             stage_out->mesh_mask = ~0u;
         }
     }
-    if (stage_in != nullptr &&
-        (stage_in->valid == 0 || !have_bvh_traversal || stage_in->mesh_count != mesh_bvh_mesh_count)) {
-        stage_in = nullptr;
-    }
     if (have_bvh_traversal) {
         UninitArray<MeshContactCandidate, kMaxMeshCandidates> candidates;
         const int mesh_begin = stage_mesh >= 0 ? stage_mesh : 0;
         const int mesh_end = stage_mesh >= 0 && stage_mesh < mesh_bvh_mesh_count ? stage_mesh + 1 : (stage_mesh >= 0 ? 0 : mesh_bvh_mesh_count);
         for (int mesh_info_idx = mesh_begin; mesh_info_idx < mesh_end; ++mesh_info_idx) {
-            const ArenaMeshBvhMeshInfo& mesh_info = mesh_bvh_meshes[mesh_info_idx];
+            if (mesh_info_idx < 32 && ((mesh_visit_mask >> mesh_info_idx) & 1u) == 0u) {
+                continue;
+            }
+            const ArenaMeshBvhMeshInfo mesh_info = mesh_bvh_meshes[mesh_info_idx];  // a copy: one load round trip, not one per field
             if (!CarWorldMeshInfoUsable(mesh_info, mesh_bvh_quantization_count, mesh_bvh_node_count)) {
                 continue;
             }
-            if (skip_out_of_reach && !CarWorldMeshInReach(mesh_reach, mesh_info)) {
+            if (skip_out_of_reach && !(reach_hinted ? ((mesh_reach_hint >> mesh_info_idx) & 1u) != 0u
+                                                    : CarWorldMeshInReach(mesh_reach, mesh_info))) {
                 // The manifold is released, as merge_retained_mesh_manifold does without one.
                 if (CarWorldMeshRetainedManifold* const retained = find_retained_mesh_manifold(mesh_info_idx)) {
                     retained->count = 0;
@@ -1620,8 +1741,10 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
             current_mesh_broadphase_hits = 0;
             gathered_count = 0;
             const ArenaMeshBvhQuantization& quantization = mesh_bvh_quantization[mesh_info.mesh_index];
-            QuantizeArenaMeshBvhPoint(quantization, aabb_min_bt, 0, quantized_query_aabb_min);
-            QuantizeArenaMeshBvhPoint(quantization, aabb_max_bt, 1, quantized_query_aabb_max);
+            if (query_frame_used) {
+                QuantizeArenaMeshBvhPoint(quantization, aabb_min_bt, 0, quantized_query_aabb_min);
+                QuantizeArenaMeshBvhPoint(quantization, aabb_max_bt, 1, quantized_query_aabb_max);
+            }
 
             int mesh_subtree_overlap_count = 0;
             const ArenaMeshBvhSubtreeInfo* mesh_subtrees = nullptr;
@@ -1647,7 +1770,8 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
                 }
             }
 
-            const bool mesh_aabb_may_overlap = CarWorldMeshAabbMayOverlap(mesh_info, aabb_min_bt, aabb_max_bt);
+            const bool mesh_aabb_may_overlap =
+                query_frame_used && CarWorldMeshAabbMayOverlap(mesh_info, aabb_min_bt, aabb_max_bt);
             if (stage_in != nullptr) {
                 if (((stage_in->mesh_mask >> mesh_info_idx) & 1u) == 0) {
                     // Not staged: the query AABB misses this mesh, so it has no candidates.
@@ -1803,4 +1927,9 @@ ROCKETGPU_HD void AppendCarWorldMeshContactRows(
         acc.hit = 1;
         acc.latest_normal = last_collected_normal;
     }
+}
+
+template <bool kStagedHitsOnly = false, typename... Args>
+ROCKETGPU_HD void AppendCarWorldMeshContactRows(Args&&... args) {
+    AppendCarWorldMeshContactRowsBody<kStagedHitsOnly>(static_cast<Args&&>(args)...);
 }

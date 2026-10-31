@@ -1486,6 +1486,32 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometry(
         out_rel_car_contact);
 }
 
+// The first two early-outs of RecordBallCarCollisionInfoIfOverlapping (demoed or just respawned; the
+// BulletRsBroadphaseAllowsBallCarPair reach test), which the caller runs over every car first. Every load is issued
+// before the first branch.
+ROCKETGPU_HD bool BallCarCollisionInfoMayOverlap(
+    const BallState& ball, const CarState& car, const CarConfig& cfg, const MutatorConfig& mutator, float dt,
+    int env_idx) {
+    const uint8_t is_demoed = car.is_demoed;
+    const uint8_t just_respawned = car.just_respawned;
+    const float bounding_radius = BoundingSphereRadius(cfg);
+    const float ball_radius = mutator.ball_radius;
+    const Vec3 car_vel_bt = car.vel_bt;
+    const Vec3 ball_vel_bt = ball.vel_bt;
+    const Vec3 ball_pos_bt = ball.pos_bt;
+    const Vec3 car_pos_bt = car.pos_bt;
+    if (is_demoed || just_respawned) {
+        return false;
+    }
+    if (dt <= 0.0f || env_idx < 0) {
+        return true;
+    }
+    const float reach_bt = (bounding_radius + ball_radius) * (1.0f / 50.0f) +
+                           (Length(car_vel_bt) + Length(ball_vel_bt)) * dt + 2.0f;
+    const Vec3 gap_bt = ball_pos_bt - car_pos_bt;
+    return !(Abs(gap_bt.x) > reach_bt || Abs(gap_bt.y) > reach_bt || Abs(gap_bt.z) > reach_bt);
+}
+
 ROCKETGPU_HD void RecordBallCarCollisionInfoIfOverlapping(
     const BallState& ball,
     const CarState& car,
@@ -1980,6 +2006,51 @@ ROCKETGPU_HD void AddBallCarRetainedPoint(
     manifold.points[biggest] = point;
 }
 
+// The early-out of AppendBallCarContactRowsRetained, which the caller runs first (retained.count = 0 when false): the
+// car is not demoed (unless allowed) or just respawned, and the car box child AABB overlaps the ball AABB. Every load
+// is issued before the first branch.
+ROCKETGPU_HD bool BallCarRetainedPairOverlaps(
+    const BallState& ball, const CarState& car, const CarConfig& cfg, const MutatorConfig& mutator,
+    bool allow_midtick_demo_contact) {
+    const uint8_t is_demoed = car.is_demoed;
+    const uint8_t just_respawned = car.just_respawned;
+    const uint8_t basis_authoritative = car.basis_authoritative;
+    const Vec3 basis_forward = car.basis_forward;
+    const Vec3 basis_right = car.basis_right;
+    const Vec3 basis_up = car.basis_up;
+    const Quat rot = car.rot;
+    const Vec3 car_pos_bt = car.pos_bt;
+    const Vec3 hitbox_offset = cfg.hitbox_offset;
+    const Vec3 half = BulletBoxHalfExtentWithMarginBt(cfg);
+    const float ball_radius = mutator.ball_radius;
+    const Vec3 ball_pos_bt = ball.pos_bt;
+    if ((!allow_midtick_demo_contact && is_demoed) || just_respawned) {
+        return false;
+    }
+    constexpr float kUUToBT = 1.0f / 50.0f;
+    Vec3 ax(1.0f, 0.0f, 0.0f), ay(0.0f, 1.0f, 0.0f), az(0.0f, 0.0f, 1.0f);
+    if (basis_authoritative) {
+        ax = basis_forward;
+        ay = basis_right;
+        az = basis_up;
+    } else {
+        GetBasisVectors(rot, ax, ay, az);
+    }
+    const Vec3 off = hitbox_offset * kUUToBT;
+    const Vec3 center = car_pos_bt + ax * off.x + ay * off.y + az * off.z;
+    const Vec3 ext(
+        Abs(ax.x) * half.x + Abs(ay.x) * half.y + Abs(az.x) * half.z,
+        Abs(ax.y) * half.x + Abs(ay.y) * half.y + Abs(az.y) * half.z,
+        Abs(ax.z) * half.x + Abs(ay.z) * half.y + Abs(az.z) * half.z);
+    const float r = ball_radius * kUUToBT + 0.08f;
+    const Vec3 bmin = ball_pos_bt - Vec3(r, r, r);
+    const Vec3 bmax = ball_pos_bt + Vec3(r, r, r);
+    const Vec3 cmin = center - ext;
+    const Vec3 cmax = center + ext;
+    return !(cmin.x > bmax.x || cmax.x < bmin.x || cmin.y > bmax.y || cmax.y < bmin.y ||
+             cmin.z > bmax.z || cmax.z < bmin.z);
+}
+
 // cal_ball_car_manifold: v3 near_callback_with_bounds for the ball-car pair. The car box child AABB must overlap
 // the ball AABB (radius + SPHERE_RADIUS_MARGIN) or the manifold is released; the fresh sphere-OBB point (same
 // narrowphase as AppendBallCarContactRows) merges into the refreshed retained manifold, and every retained point,
@@ -2008,34 +2079,7 @@ ROCKETGPU_HD void AppendBallCarContactRowsRetained(
     const Vec3* bt_ball_linear_velocity_override,
     int8_t car_team,
     BallCarRetainedManifold& retained) {
-    if ((!allow_midtick_demo_contact && car.is_demoed) || car.just_respawned) {
-        retained.count = 0;
-        return;
-    }
     constexpr float kUUToBT = 1.0f / 50.0f;
-    {
-        Vec3 ax(1.0f, 0.0f, 0.0f), ay(0.0f, 1.0f, 0.0f), az(0.0f, 0.0f, 1.0f);
-        CarBasisColumns(car, ax, ay, az);
-        const Vec3 off = cfg.hitbox_offset * kUUToBT;
-        const Vec3 center = car.pos_bt + ax * off.x + ay * off.y + az * off.z;
-        const Vec3 half = BulletBoxHalfExtentWithMarginBt(cfg);
-        const Vec3 ext(
-            Abs(ax.x) * half.x + Abs(ay.x) * half.y + Abs(az.x) * half.z,
-            Abs(ax.y) * half.x + Abs(ay.y) * half.y + Abs(az.y) * half.z,
-            Abs(ax.z) * half.x + Abs(ay.z) * half.y + Abs(az.z) * half.z);
-        const float r = mutator.ball_radius * kUUToBT + 0.08f;
-        const Vec3 bmin = ball.pos_bt - Vec3(r, r, r);
-        const Vec3 bmax = ball.pos_bt + Vec3(r, r, r);
-        const Vec3 cmin = center - ext;
-        const Vec3 cmax = center + ext;
-        const bool overlap =
-            !(cmin.x > bmax.x || cmax.x < bmin.x || cmin.y > bmax.y || cmax.y < bmin.y ||
-              cmin.z > bmax.z || cmax.z < bmin.z);
-        if (!overlap) {
-            retained.count = 0;
-            return;
-        }
-    }
     const float threshold_bt = BallCarContactBreakingThresholdBT(cfg, mutator.ball_radius);
 
     Vec3 normal(1.0f, 0.0f, 0.0f);

@@ -167,13 +167,12 @@ ROCKETGPU_HD bool CarCarPairRejectedByCcmGate(
 }
 
 // CarCarPairRejectedByCcmGate for every pair of the first 8 cars at once, as bit CarCarRetainedSlot(lo, hi)
-// (a = hi, b = lo, as the pair loop calls it), with each pair's cached-contact valid flag. All loads are independent,
-// so they overlap instead of costing a memory round trip per pair; valid until a pair's ResolveCarCarCollision runs.
+// (a = hi, b = lo, as the pair loop calls it). All loads are independent, so they overlap instead of costing a memory
+// round trip per pair; valid until a pair's ResolveCarCarCollision runs.
 ROCKETGPU_HD void CarCarCcmGateMasks(
     int count, const CarState* cars, const CarConfig* car_configs, const CarCarRetainedManifold* retained,
-    const CarCarPairCacheView& pair_contact_cache, uint32_t& reject_slots, uint32_t& cache_valid_slots) {
+    uint32_t& reject_slots) {
     reject_slots = 0;
-    cache_valid_slots = 0;
     if (count < 2) {
         return;
     }
@@ -192,8 +191,6 @@ ROCKETGPU_HD void CarCarCcmGateMasks(
         live |= static_cast<uint32_t>((k < count) & (car.is_demoed == 0) & (car.just_respawned == 0)) << k;
     }
     uint32_t reject = 0;
-    uint32_t cache_valid = 0;
-    const bool has_cache = pair_contact_cache && pair_contact_cache.cars > 0;
 #if defined(__CUDA_ARCH__)
 #pragma unroll
 #endif
@@ -208,15 +205,9 @@ ROCKETGPU_HD void CarCarCcmGateMasks(
             const uint32_t empty = retained[hi < count ? slot : 0].count == 0;
             const uint32_t beyond = CarCarCentersBeyondBoundingSpheres(pos[hi], pos[lo], radius[hi], radius[lo]);
             reject |= (pair_live & empty & beyond) << slot;
-            if (has_cache) {
-                const bool in_cache = hi < count && hi < pair_contact_cache.cars;
-                const int idx = in_cache ? pair_contact_cache.index(hi, lo) : 0;
-                cache_valid |= static_cast<uint32_t>(in_cache & (pair_contact_cache.slots[idx].valid != 0)) << slot;
-            }
         }
     }
     reject_slots = reject;
-    cache_valid_slots = cache_valid;
 }
 
 ROCKETGPU_HD void ResolveCarCarCollision(
@@ -1344,14 +1335,16 @@ ROCKETGPU_HD int BoostPadGridIndexY(float y) {
            (BoostPadGridCellsY() / 2);
 }
 
-ROCKETGPU_HD void CheckBoostPadCollisionForCar(
+// The pads (bit p for pad p, kMaxBoostPads <= 64) whose pickup cylinder holds the car this tick.
+ROCKETGPU_HD uint64_t BoostPadCollisionMaskForCar(
     int env_idx,
     const SimConfig& cfg,
     const CarState& car,
-    uint32_t car_id,
-    BoostPadState* pads) {
+    const BoostPadState* pads) {
+    static_assert(kMaxBoostPads <= 64, "pad mask");
+    uint64_t hits = 0u;
     if (!cfg.enable_boost_pads || car.is_demoed || car.boost >= cfg.mutator.boost_max) {
-        return;
+        return hits;
     }
 
     const int pad_base = env_idx * BoostPadCount(cfg);
@@ -1376,7 +1369,7 @@ ROCKETGPU_HD void CheckBoostPadCollisionForCar(
             Abs(car_bt.z - pad_pos.z * kUUToBT) > (110.0f * kUUToBT)) {
             continue;
         }
-        BoostPadState& pad = pads[pad_base + p];
+        const BoostPadState& pad = pads[pad_base + p];
         const int pad_cell_x = BoostPadGridIndexX(pad_pos.x);
         const int pad_cell_y = BoostPadGridIndexY(pad_pos.y);
 
@@ -1388,9 +1381,24 @@ ROCKETGPU_HD void CheckBoostPadCollisionForCar(
         if (!official_grid_visit) {
             continue;
         }
-        const bool colliding = BoostPadCheckCollideBt(pad_pos, pad, car_bt);
-        if (colliding) {
-            pad.cur_locked_car_id = car_id;
+        if (BoostPadCheckCollideBt(pad_pos, pad, car_bt)) {
+            hits |= uint64_t{1} << p;
+        }
+    }
+    return hits;
+}
+
+ROCKETGPU_HD void CheckBoostPadCollisionForCar(
+    int env_idx,
+    const SimConfig& cfg,
+    const CarState& car,
+    uint32_t car_id,
+    BoostPadState* pads) {
+    const uint64_t hits = BoostPadCollisionMaskForCar(env_idx, cfg, car, pads);
+    const int pad_base = env_idx * BoostPadCount(cfg);
+    for (int p = 0; p < BoostPadCount(cfg); ++p) {
+        if ((hits >> p) & 1u) {
+            pads[pad_base + p].cur_locked_car_id = car_id;
         }
     }
 }
@@ -1494,14 +1502,21 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     }
 
     if (wheel_runtime_state) {
+        // The car's fields loaded before any store: through generic pointers each load would wait for the store
+        // before it.
+        const auto rot = car.rot;
+        const Vec3 basis_forward = car.basis_forward;
+        const Vec3 basis_right = car.basis_right;
+        const Vec3 basis_up = car.basis_up;
+        const auto basis_authoritative = car.basis_authoritative;
         wheel_runtime_state->accumulated_force = Vec3(0.0f, 0.0f, 0.0f);
         wheel_runtime_state->accumulated_ang_accel = Vec3(0.0f, 0.0f, 0.0f);
         wheel_runtime_state->accumulated_torque_bt = Vec3(0.0f, 0.0f, 0.0f);
-        wheel_runtime_state->pre_solve_rot = car.rot;
-        wheel_runtime_state->pre_solve_basis_forward = car.basis_forward;
-        wheel_runtime_state->pre_solve_basis_right = car.basis_right;
-        wheel_runtime_state->pre_solve_basis_up = car.basis_up;
-        wheel_runtime_state->pre_solve_basis_authoritative = car.basis_authoritative;
+        wheel_runtime_state->pre_solve_rot = rot;
+        wheel_runtime_state->pre_solve_basis_forward = basis_forward;
+        wheel_runtime_state->pre_solve_basis_right = basis_right;
+        wheel_runtime_state->pre_solve_basis_up = basis_up;
+        wheel_runtime_state->pre_solve_basis_authoritative = basis_authoritative;
     }
     car.vel_touched_solve_stage = 0;
     const uint8_t flipping_at_start = car.is_flipping;
@@ -1818,8 +1833,8 @@ ROCKETGPU_HD bool ResolveBallActivationAtTickStart(
     }
     if (ball.sleeping == 0 && ball.deactivation_time > kBulletDeactivationTime) {
         bool car_in_island = false;
-        for (int i = 0; scratch != nullptr && i < scratch->bp_pair_count; ++i) {
-            car_in_island = car_in_island || scratch->bp_pairs[i].kind == 1;
+        for (int i = 0; scratch != nullptr && i < scratch->bp.bp_pair_count; ++i) {
+            car_in_island = car_in_island || BulletPairKeyKind(scratch->bp.bp_pairs[i]) == 1;
         }
         if (!car_in_island) {
             ball.sleeping = 1;
@@ -1882,7 +1897,7 @@ ROCKETGPU_HD bool BallSettleStateEqual(const BallState& a, const BallState& b) {
 
 ROCKETGPU_HD bool BallWorldMeshManifoldsEmpty(const WorldSolverScratch& scratch) {
     for (int i = 0; i < kMaxBallWorldMeshPersistentManifolds; ++i) {
-        if (scratch.ball_world_mesh_manifolds[i].count != 0) {
+        if (((scratch.ball_mesh_maybe_retained >> i) & 1u) != 0u && scratch.ball_world_mesh_manifolds[i].count != 0) {
             return false;
         }
     }
@@ -1917,6 +1932,33 @@ struct RowWords {
     }
 };
 
+// Moves n rows from [src, src + n) down to [dst, dst + n), dst <= src, two rows per load round trip: both are loaded
+// before either is stored, and a store never lands on a source row still to be loaded. A friction row's
+// normal_row_idx drops by normal_shift on the way.
+template <typename T>
+ROCKETGPU_HD void MoveRowsDown(EnvStridedArray<T> arr, int dst, int src, int n, int normal_shift) {
+    for (int k = 0; k < n; k += 2) {
+        const bool two = k + 1 < n;
+        RowWords<T> a;
+        RowWords<T> b;
+        a.load(arr[src + k]);
+        if (two) {
+            b.load(arr[src + k + 1]);
+        }
+        if constexpr (std::is_same<T, CarSharedFrictionContactRow>::value) {
+            constexpr int kIdxWord =
+                static_cast<int>(offsetof(CarSharedFrictionContactRow, normal_row_idx) / sizeof(uint32_t));
+            a.w[kIdxWord] = static_cast<uint32_t>(static_cast<int32_t>(a.w[kIdxWord]) - normal_shift);
+            if (two) {
+                b.w[kIdxWord] = static_cast<uint32_t>(static_cast<int32_t>(b.w[kIdxWord]) - normal_shift);
+            }
+        }
+        a.store(arr[dst + k]);
+        if (two) {
+            b.store(arr[dst + k + 1]);
+        }
+    }
+}
 ROCKETGPU_HD void PackCarWorldRows(
     int count,
     const CarWorldRowsOut* outs,
@@ -1925,42 +1967,59 @@ ROCKETGPU_HD void PackCarWorldRows(
     int& velocity_row_count,
     int& friction_row_count,
     int& group_count) {
+    // Every car's four counts load before any row move, byte-packed into registers (unrolled, constant shifts), so
+    // the loads share one trip instead of each waiting behind the previous car's moves. Cars past 8 read in place.
+    static_assert(kMaxCarWorldSplitContactRows < 256 && kMaxCarWorldVelocityContactRows < 256 &&
+                      kMaxCarWorldFrictionContactRows < 256 && kMaxCarWorldMeshesPerCar + 4 < 256,
+                  "a car's row and group counts fit a byte");
+    uint64_t split_counts = 0;
+    uint64_t velocity_counts = 0;
+    uint64_t friction_counts = 0;
+    uint64_t group_counts = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        if (i < count) {
+            split_counts |= static_cast<uint64_t>(outs[i].split_row_count & 0xff) << (8 * i);
+            velocity_counts |= static_cast<uint64_t>(outs[i].velocity_row_count & 0xff) << (8 * i);
+            friction_counts |= static_cast<uint64_t>(outs[i].friction_row_count & 0xff) << (8 * i);
+            group_counts |= static_cast<uint64_t>(outs[i].group_count & 0xff) << (8 * i);
+        }
+    }
     for (int i = 0; i < count; ++i) {
         const CarWorldRowsOut& out = outs[i];
+        const int shift = 8 * (i & 7);
+        const int out_split_count = i < 8 ? static_cast<int>((split_counts >> shift) & 0xff) : out.split_row_count;
+        const int out_velocity_count =
+            i < 8 ? static_cast<int>((velocity_counts >> shift) & 0xff) : out.velocity_row_count;
+        const int out_friction_count =
+            i < 8 ? static_cast<int>((friction_counts >> shift) & 0xff) : out.friction_row_count;
+        const int out_group_count = i < 8 ? static_cast<int>((group_counts >> shift) & 0xff) : out.group_count;
         const int split_from = i * kMaxCarWorldSplitContactRows;
         const int velocity_shift = i * kMaxCarWorldVelocityContactRows - velocity_row_count;
         const int friction_shift = i * kMaxCarWorldFrictionContactRows - friction_row_count;
-        for (int k = 0; split_from != split_row_count && k < out.split_row_count; ++k) {
-            RowWords<CarSharedSplitContactRow> words;
-            words.load(rows.world_split_rows[split_from + k]);
-            words.store(rows.world_split_rows[split_row_count + k]);
+        if (split_from != split_row_count) {
+            MoveRowsDown(rows.world_split_rows, split_row_count, split_from, out_split_count, 0);
         }
-        for (int k = 0; velocity_shift != 0 && k < out.velocity_row_count; ++k) {
-            RowWords<CarSharedVelocityContactRow> words;
-            words.load(rows.world_velocity_rows[velocity_row_count + velocity_shift + k]);
-            words.store(rows.world_velocity_rows[velocity_row_count + k]);
+        if (velocity_shift != 0) {
+            MoveRowsDown(rows.world_velocity_rows, velocity_row_count, velocity_row_count + velocity_shift,
+                         out_velocity_count, 0);
         }
-        for (int k = 0; (friction_shift != 0 || velocity_shift != 0) && k < out.friction_row_count; ++k) {
-            CarSharedFrictionContactRow& row = rows.world_friction_rows[friction_row_count + k];
-            if (friction_shift != 0) {
-                constexpr int kIdxWord =
-                    static_cast<int>(offsetof(CarSharedFrictionContactRow, normal_row_idx) / sizeof(uint32_t));
-                RowWords<CarSharedFrictionContactRow> words;
-                words.load(rows.world_friction_rows[friction_row_count + friction_shift + k]);
-                words.w[kIdxWord] = static_cast<uint32_t>(static_cast<int32_t>(words.w[kIdxWord]) - velocity_shift);
-                words.store(row);
-            } else {
-                row.normal_row_idx -= velocity_shift;
+        if (friction_shift != 0) {
+            MoveRowsDown(rows.world_friction_rows, friction_row_count, friction_row_count + friction_shift,
+                         out_friction_count, velocity_shift);
+        } else {
+            for (int k = 0; velocity_shift != 0 && k < out_friction_count; ++k) {
+                rows.world_friction_rows[friction_row_count + k].normal_row_idx -= velocity_shift;
             }
         }
         // Group g + 1 is loaded before group g is stored, so the loads do not wait on the stores.
         SharedContactOrderGroup next_group;
-        if (out.group_count > 0) {
+        if (out_group_count > 0) {
             next_group = out.groups[0];
         }
-        for (int g = 0; g < out.group_count && group_count < kMaxSharedContactOrderGroups; ++g) {
+        for (int g = 0; g < out_group_count && group_count < kMaxSharedContactOrderGroups; ++g) {
             SharedContactOrderGroup group = next_group;
-            if (g + 1 < out.group_count) {
+            if (g + 1 < out_group_count) {
                 next_group = out.groups[g + 1];
             }
             if (group.normal_row_start >= 0) {
@@ -1971,9 +2030,9 @@ ROCKETGPU_HD void PackCarWorldRows(
             }
             rows.shared_contact_order_groups[group_count++] = group;
         }
-        split_row_count += out.split_row_count;
-        velocity_row_count += out.velocity_row_count;
-        friction_row_count += out.friction_row_count;
+        split_row_count += out_split_count;
+        velocity_row_count += out_velocity_count;
+        friction_row_count += out_friction_count;
     }
 }
 
@@ -2126,15 +2185,26 @@ ROCKETGPU_HD void WorldStepSoccar(
             // Pair slots are [j * cars + i] for local car indices, so only those of the last tick's cars can be valid.
             const int pair_cache_cars = Min(Max(count, static_cast<int>(solver_scratch->pair_cache_cars)), pair_contact_cache.cars);
             solver_scratch->pair_cache_cars = static_cast<uint8_t>(Min(count, pair_contact_cache.cars));
-            for (int pair_idx = 0; pair_contact_cache && pair_idx < pair_contact_cache.size(); ++pair_idx) {
-                if (pair_idx / pair_contact_cache.cars >= pair_cache_cars || pair_idx % pair_contact_cache.cars >= pair_cache_cars) {
-                    continue;
+            // Only slots a car-car resolve may have set valid since the last clear are read.
+            uint64_t valid_pairs = 0;
+            for (uint32_t maybe = pair_contact_cache ? solver_scratch->pair_cache_maybe_valid : 0; maybe != 0;
+                 maybe &= maybe - 1) {
+                const int retained_slot = CountTrailingZeros64(maybe);
+                int a = 1;
+                while (CarCarRetainedSlot(0, a + 1) <= retained_slot) {
+                    ++a;
                 }
-                CarCarPairCachedContact& slot = pair_contact_cache.slots[pair_idx];
+                const int b = retained_slot - CarCarRetainedSlot(0, a);
+                if (a < pair_cache_cars && b < pair_cache_cars &&
+                    pair_contact_cache.slots[a * pair_contact_cache.cars + b].valid != 0) {
+                    valid_pairs |= 1ull << (a * 8 + b);
+                }
+            }
+            solver_scratch->pair_cache_maybe_valid = 0;
+            for (; valid_pairs != 0; valid_pairs &= valid_pairs - 1) {
+                const int bit = static_cast<int>(CountTrailingZeros64(valid_pairs));
+                CarCarPairCachedContact& slot = pair_contact_cache.slots[(bit / 8) * pair_contact_cache.cars + bit % 8];
                 // Points are only written with slot.valid set (or cleared whole), so an invalid slot is already clear.
-                if (slot.valid == 0) {
-                    continue;
-                }
                 slot.valid = 0;
                 slot.contact_count = 0;
                 for (int k = 0; k < kMaxCarCarCachedPoints; ++k) {
@@ -2158,7 +2228,16 @@ ROCKETGPU_HD void WorldStepSoccar(
                 ApplyBulletLinearDampingBall(ball, mutator, sub_dt);
             }
 
+            uint32_t ball_car_info_mask = 0;
             for (int i = 0; i < count; ++i) {
+                if (BallCarCollisionInfoMayOverlap(ball, cars[base + i], car_configs[base + i], mutator, sub_dt, env_idx)) {
+                    ball_car_info_mask |= 1u << i;
+                }
+            }
+            for (int i = 0; i < count; ++i) {
+                if (!(ball_car_info_mask & (1u << i))) {
+                    continue;
+                }
                 RecordBallCarCollisionInfoIfOverlapping(
                     ball,
                     cars[base + i],
@@ -2178,6 +2257,7 @@ ROCKETGPU_HD void WorldStepSoccar(
             }
 
             int prebuilt_manifold_count = -1;
+            int8_t manifold_body_islands[9];  // BuildBulletManifoldList's bodies: the ball, then up to 8 cars
             if (enable_car_car_collisions) {
                 const bool shared_rows_active =
                     pair_velocity_rows && pair_friction_rows;
@@ -2199,28 +2279,18 @@ ROCKETGPU_HD void WorldStepSoccar(
                         kMaxBulletManifoldEntries,
                         mutator.arena_collision != 0,
                         solver_scratch,
-                        NativeSseMath(mutator));
+                        NativeSseMath(mutator),
+                        manifold_body_islands);
                 }
                 uint32_t ccm_reject_slots = 0;
-                uint32_t ccm_cache_valid_slots = 0;
                 CarCarCcmGateMasks(
-                    count, cars + base, car_configs + base, rows.car_car_retained_manifolds,
-                    pair_contact_cache, ccm_reject_slots, ccm_cache_valid_slots);
+                    count, cars + base, car_configs + base, rows.car_car_retained_manifolds, ccm_reject_slots);
                 // Every pair of the first 8 cars rejected (the usual case): no pair reaches ResolveCarCarCollision on any
-                // pass, so the loop would only clear the rejected pairs' cached contacts.
+                // pass, so the loop would only clear the rejected pairs' cached contacts, which are already clear.
                 const int ccm_pair_cars = Min(count, 8);
                 const uint32_t ccm_all_slots =
                     ccm_pair_cars >= 2 ? (1u << (ccm_pair_cars * (ccm_pair_cars - 1) / 2)) - 1u : 0u;
                 const bool ccm_all_rejected = ccm_reject_slots == ccm_all_slots;
-                if (ccm_all_rejected && pair_contact_cache) {
-                    for (int hi = 1; hi < ccm_pair_cars; ++hi) {
-                        for (int lo = 0; lo < hi; ++lo) {
-                            if ((ccm_cache_valid_slots >> CarCarRetainedSlot(lo, hi)) & 1u) {
-                                ClearCarCarPairCachedContact(pair_contact_cache.slots[pair_contact_cache.index(hi, lo)]);
-                            }
-                        }
-                    }
-                }
                 int8_t pair_order_i[28];
                 int8_t pair_order_j[28];
                 int pair_order_count = 0;
@@ -2260,8 +2330,9 @@ ROCKETGPU_HD void WorldStepSoccar(
                                 : CarCarPairRejectedByCcmGate(
                                       cars[base + j], cars[base + i], car_configs[base + j], car_configs[base + i],
                                       rows.car_car_retained_manifolds[CarCarRetainedSlot(i, j)])) {
-                            if (pair_contact_cache && pair_contact_cache.index(j, i) >= 0 &&
-                                (!ccm_masks_current || (ccm_cache_valid_slots & slot_bit) != 0)) {
+                            // The tick-start clear left these cars' pair slots invalid; only ResolveCarCarCollision sets
+                            // one, so while the masks are current the slot is already clear.
+                            if (pair_contact_cache && pair_contact_cache.index(j, i) >= 0 && !ccm_masks_current) {
                                 ClearCarCarPairCachedContact(pair_contact_cache.slots[pair_contact_cache.index(j, i)]);
                             }
                             continue;
@@ -2298,6 +2369,9 @@ ROCKETGPU_HD void WorldStepSoccar(
                                 (i < j && j < 8)
                                     ? &rows.car_car_retained_manifolds[CarCarRetainedSlot(i, j)]
                                     : nullptr);
+                            if (pair_contact_cache && pair_contact_cache.index(j, i) >= 0) {
+                                solver_scratch->pair_cache_maybe_valid |= 1u << CarCarRetainedSlot(i, j);
+                            }
                             if (pair_velocity_row_count > pair_velocity_rows_before) {
                                 AppendSharedContactOrderGroup(
                                     rows.shared_contact_order_groups,
@@ -2319,8 +2393,19 @@ ROCKETGPU_HD void WorldStepSoccar(
             if (should_stop_after_stage(1)) {
                 return;
             }
+            uint32_t ball_car_overlap_mask = 0;
+            for (int i = 0; i < count && i < kMaxBallCarRetainedManifolds; ++i) {
+                if (BallCarRetainedPairOverlaps(
+                        ball, cars[base + i], car_configs[base + i], mutator, pre_contact_cars[i].is_demoed == 0)) {
+                    ball_car_overlap_mask |= 1u << i;
+                }
+            }
             for (int i = 0; i < count; ++i) {
                 if (i < kMaxBallCarRetainedManifolds) {
+                    if (!(ball_car_overlap_mask & (1u << i))) {
+                        rows.ball_car_retained_manifolds[i].count = 0;
+                        continue;
+                    }
                     AppendBallCarContactRowsRetained(
                         ball,
                         cars[base + i],
@@ -2390,27 +2475,26 @@ ROCKETGPU_HD void WorldStepSoccar(
                     kMaxBulletManifoldEntries,
                     mutator.arena_collision != 0,
                     solver_scratch,
-                    NativeSseMath(mutator));
+                    NativeSseMath(mutator),
+                    manifold_body_islands);
                 if (built > 1) {
+                    // The entries are the packed pair keys of bp_manifolds (contiguous in the env's scratch) with their
+                    // bodies' islands (BuildBulletManifoldList): sort and rewrite them from those, not the strided list.
+                    const uint32_t* const packed = solver_scratch->bp.bp_manifolds;
                     int order[kMaxBulletManifoldEntries];
                     int island_ids[kMaxBulletManifoldEntries];
                     for (int i = 0; i < built; ++i) {
                         order[i] = i;
-                        island_ids[i] = rows.bullet_manifolds[i].island_id;
+                        const BulletManifoldEntry key = UnpackBulletPairKey(packed[i]);
+                        island_ids[i] = manifold_body_islands[key.kind <= 1 ? 0 : key.body_a + 1];
                     }
                     QuickSortSharedContactOrderIndices(order, island_ids, 0, built - 1);
 
-                    bool moved = false;
                     for (int i = 0; i < built; ++i) {
-                        moved |= order[i] != i;
-                    }
-                    if (moved) {
-                        UninitArray<BulletManifoldEntry, kMaxBulletManifoldEntries> sorted;
-                        for (int i = 0; i < built; ++i) {
-                            sorted[i] = rows.bullet_manifolds[order[i]];
-                        }
-                        for (int i = 0; i < built; ++i) {
-                            rows.bullet_manifolds[i] = sorted[i];
+                        if (order[i] != i) {
+                            BulletManifoldEntry entry = UnpackBulletPairKey(packed[order[i]]);
+                            entry.island_id = island_ids[order[i]];
+                            rows.bullet_manifolds[i] = entry;
                         }
                     }
                 }
@@ -3142,7 +3226,7 @@ ROCKETGPU_HD void StepEnvVehicleUpdateCar(
 // Car slot i's turn in the WorldStepSoccar car-world loop, between kWorldStepContacts and kWorldStepRows: its rows go
 // to the env's shared world rows at the car's slot and its order groups to its CarWorldRowsOut (see PackCarWorldRows).
 template <bool kMeshesOutOfReach = false>
-ROCKETGPU_HD void BuildCarWorldRowsForCar(
+ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void BuildCarWorldRowsForCar(
     int env_idx,
     int i,
     const SimConfig& cfg,
@@ -3150,7 +3234,8 @@ ROCKETGPU_HD void BuildCarWorldRowsForCar(
     const CarConfig* car_configs,
     WorldSolverScratch& scratch,
     const WorldSolverScratchRows& rows,
-    bullet_port::btGjkEpaScratch* gjk_scratch) {
+    bullet_port::btGjkEpaScratch* gjk_scratch,
+    uint32_t mesh_reach_hint = 0u) {
     const int car_idx = env_idx * cfg.max_cars_per_env + i;
     CarWorldRowsOut& out = scratch.car_world_rows_out[i];
     out.group_count = 0;
@@ -3190,7 +3275,8 @@ ROCKETGPU_HD void BuildCarWorldRowsForCar(
             (i < kMaxCarWorldMeshPersistentCars)
                 ? &rows.car_world_mesh_manifolds[i * kCarWorldMeshRetainedManifoldsPerCar]
                 : nullptr,
-            rows.car_world_local_rows ? &rows.car_world_local_rows[i] : nullptr);
+            rows.car_world_local_rows ? &rows.car_world_local_rows[i] : nullptr,
+            mesh_reach_hint);
         RecordArenaWorldContact(cars[car_idx], acc);
     }
     out.split_row_count = split_end - i * kMaxCarWorldSplitContactRows;
@@ -3349,12 +3435,12 @@ ROCKETGPU_HD void StepEnvPostCar(
 }
 
 // The env's tick end after every car's StepEnvPostCar: boost pads (cars in visit order; the pads' own tick end too
-// unless pads_post is false), the ball and scoring.
+// unless pads_post is false), the ball and scoring. car_pad_checks false: the cars' pad checks already ran.
 ROCKETGPU_HD void StepEnvTail(
     int env_idx, int count, const SimConfig& cfg, CarState* cars, BallState& ball, EnvState& env, BoostPadState* pads,
-    bool pads_post) {
+    bool pads_post, bool car_pad_checks = true) {
     const int base = env_idx * cfg.max_cars_per_env;
-    if (cfg.enable_boost_pads) {
+    if (car_pad_checks && cfg.enable_boost_pads) {
         for (int k = 0; k < count; ++k) {
             const int i = CarVisitSlot(env, k, count);
             RocketSim_BoostPad_CheckCollide(env_idx, cfg, cars[base + i], static_cast<uint32_t>(base + i + 1), pads);

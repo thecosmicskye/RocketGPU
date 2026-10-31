@@ -176,7 +176,8 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     const CarWorldMeshCandidateStage* candidate_stage = nullptr,
     CarWorldPlaneRetainedManifold* retained_plane_manifolds = nullptr,
     CarWorldMeshRetainedManifold* retained_mesh_manifolds = nullptr,
-    CarWorldLocalRows* local_rows = nullptr) {
+    CarWorldLocalRows* local_rows = nullptr,
+    uint32_t mesh_reach_hint = 0u) {
     ContactAccumulator acc;
     acc.history_car = &car;
 
@@ -377,7 +378,7 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
                                                broadphase_grid != nullptr ? retained_mesh_manifolds : nullptr);
     }
     if (use_mesh_world_rows && !kMeshesOutOfReach) {
-        AppendCarWorldMeshContactRows(
+        AppendCarWorldMeshContactRowsBody<false>(
             car,
             cfg,
             mutator,
@@ -414,7 +415,8 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
             nullptr,
             nullptr,
             kTrianglePairsNone,
-            retained_mesh_manifolds);
+            retained_mesh_manifolds,
+            mesh_reach_hint);
     }
 
     AppendCarWorldPlaneContactRows(
@@ -772,9 +774,9 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
     int32_t mesh_bvh_subtree_count = 0,
     const Vec3* bt_ball_linear_velocity_override = nullptr,
     int event_env_idx = -1) {
-    if (solver_scratch) {
-        solver_scratch->hs_world_normal_count = 0;
-    }
+    // Heatseeker world normals: counted in a register and the count stored once below, so appending a point is not a
+    // load-increment-store chain through the scratch.
+    int hs_world_normal_count = 0;
 
     BallWorldContactAggregate aggregate;
     struct BallWorldSpecialCp {
@@ -813,8 +815,8 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
     };
     const auto append_special_cp_with_len = [&](const Vec3& normal, float penetration_uu, float rel_pos1_length_bt, int16_t static_id, const Vec3* rel_pos1_bt = nullptr, const float* penetration_bt = nullptr, bool emit_event = true) {
         if (emit_event) emit_world_event(normal);
-        if (solver_scratch && solver_scratch->hs_world_normal_count < WorldSolverScratch::kMaxHeatseekerWorldNormals) {
-            solver_scratch->hs_world_normals[solver_scratch->hs_world_normal_count++] = normal;
+        if (solver_scratch && hs_world_normal_count < WorldSolverScratch::kMaxHeatseekerWorldNormals) {
+            solver_scratch->hs_world_normals[hs_world_normal_count++] = normal;
         }
         if (special_cp_count < kMaxBallWorldSpecialCps) {
             special_cps[special_cp_count].normal = normal;
@@ -902,6 +904,14 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
     };
     const float plane_breaking_threshold_bt = (ball_radius_bt + 0.08f) * 0.02f;
     const bool retain_plane_points = solver_scratch != nullptr;
+    // Each plane's call changes only its own manifold, so the four counts load together up front, a byte each.
+    uint32_t plane_manifold_counts = 0;
+    if (retain_plane_points) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            plane_manifold_counts |= static_cast<uint32_t>(solver_scratch->ball_world_plane_manifolds[k].count) << (8 * k);
+        }
+    }
     const auto append_plane_cp = [&](const Vec3& inward_normal, float boundary, const Vec3& plane_pos_uu, int plane_slot) {
         const float margin = Dot(ball.pos, inward_normal) - boundary;
         if (retain_plane_points) {
@@ -909,7 +919,7 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
             // fresh convex_plane_collision_alg point (get_cache_entry on the ball-local point); every retained point
             // stays a special sample (persistent_manifold.rs refresh_contact_points / merge_contact_points).
             BallMeshPersistentManifold& m = solver_scratch->ball_world_plane_manifolds[plane_slot];
-            int count = static_cast<int>(m.count);
+            int count = static_cast<int>((plane_manifold_counts >> (8 * plane_slot)) & 0xFFu);
             if (count > 0) {
                 RefreshBallMeshPersistentManifold(m.points, count, ball.pos_bt, ball, plane_breaking_threshold_bt, 0.0f, true);
             }
@@ -967,11 +977,28 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
             &plane_pen_bt);
     };
 
-    append_plane_cp(Vec3(0.0f, 0.0f, 1.0f), arena_margin, Vec3(0.0f, 0.0f, 0.0f), 0);
-    append_plane_cp(Vec3(0.0f, 0.0f, -1.0f), -(ArenaHeight() - arena_margin), Vec3(0.0f, 0.0f, ArenaHeight()), 1);
-
-    append_plane_cp(Vec3(-1.0f, 0.0f, 0.0f), -(ArenaExtentX() - arena_margin), Vec3(ArenaExtentX(), 0.0f, ArenaHeight() / 2.0f), 2);
-    append_plane_cp(Vec3(1.0f, 0.0f, 0.0f), -(ArenaExtentX() - arena_margin), Vec3(-ArenaExtentX(), 0.0f, ArenaHeight() / 2.0f), 3);
+    // One rolled loop, so the four planes share one copy of the plane code (the call is rare and runs from a cold
+    // instruction cache).
+#pragma unroll 1
+    for (int plane_slot = 0; plane_slot < 4; ++plane_slot) {
+        Vec3 inward_normal(0.0f, 0.0f, 1.0f);
+        float boundary = arena_margin;
+        Vec3 plane_pos_uu(0.0f, 0.0f, 0.0f);
+        if (plane_slot == 1) {
+            inward_normal = Vec3(0.0f, 0.0f, -1.0f);
+            boundary = -(ArenaHeight() - arena_margin);
+            plane_pos_uu = Vec3(0.0f, 0.0f, ArenaHeight());
+        } else if (plane_slot == 2) {
+            inward_normal = Vec3(-1.0f, 0.0f, 0.0f);
+            boundary = -(ArenaExtentX() - arena_margin);
+            plane_pos_uu = Vec3(ArenaExtentX(), 0.0f, ArenaHeight() / 2.0f);
+        } else if (plane_slot == 3) {
+            inward_normal = Vec3(1.0f, 0.0f, 0.0f);
+            boundary = -(ArenaExtentX() - arena_margin);
+            plane_pos_uu = Vec3(-ArenaExtentX(), 0.0f, ArenaHeight() / 2.0f);
+        }
+        append_plane_cp(inward_normal, boundary, plane_pos_uu, plane_slot);
+    }
 
     if (mesh_triangles != nullptr && mesh_triangle_count > 0 &&
         mesh_bvh_quantization != nullptr && mesh_bvh_meshes != nullptr &&
@@ -1004,12 +1031,21 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
         };
         // A mesh with no walk and an empty retained manifold changes nothing (its refresh has no points and its
         // count stays 0). Those meshes are found first, in one pass whose loads overlap, and skipped below.
+        // The retained counts it loads (3 bits per mesh) are reused below: each mesh's pass changes only its own. Only
+        // meshes in ball_mesh_maybe_retained can hold points; the others' counts are 0 without a load.
         uint32_t idle_meshes = 0u;
-        if (mutator.cal_ball_world != 0 && solver_scratch != nullptr) {
+        uint64_t retained_counts = 0u;
+        const bool track_retained = mutator.cal_ball_world != 0 && solver_scratch != nullptr;
+        const uint32_t maybe_retained = track_retained ? solver_scratch->ball_mesh_maybe_retained : 0u;
+        uint32_t next_maybe_retained = maybe_retained;
+        if (track_retained) {
 #pragma unroll
             for (int mesh_info_idx = 0; mesh_info_idx < kMaxBallWorldMeshPersistentManifolds; ++mesh_info_idx) {
-                if (mesh_info_idx < mesh_bvh_mesh_count &&
-                    solver_scratch->ball_world_mesh_manifolds[mesh_info_idx].count == 0 &&
+                const uint64_t retained = ((maybe_retained >> mesh_info_idx) & 1u) != 0u
+                    ? solver_scratch->ball_world_mesh_manifolds[mesh_info_idx].count
+                    : 0u;
+                retained_counts |= retained << (3 * mesh_info_idx);
+                if (mesh_info_idx < mesh_bvh_mesh_count && retained == 0 &&
                     !mesh_walk_needed(mesh_bvh_meshes[mesh_info_idx])) {
                     idle_meshes |= 1u << mesh_info_idx;
                 }
@@ -1018,6 +1054,7 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
 
         for (int mesh_info_idx = 0; mesh_info_idx < mesh_bvh_mesh_count; ++mesh_info_idx) {
             if (mesh_info_idx < kMaxBallWorldMeshPersistentManifolds && ((idle_meshes >> mesh_info_idx) & 1u) != 0u) {
+                next_maybe_retained &= ~(1u << mesh_info_idx);
                 continue;
             }
             const ArenaMeshBvhMeshInfo& mesh_info = mesh_bvh_meshes[mesh_info_idx];
@@ -1048,7 +1085,8 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
             if (!retain_ball_mesh_points) {
                 ResetBallMeshPersistentManifold(*persistent_manifold);
             }
-            int persistent_count = retain_ball_mesh_points ? static_cast<int>(persistent_manifold->count) : 0;
+            int persistent_count =
+                retain_ball_mesh_points ? static_cast<int>((retained_counts >> (3 * mesh_info_idx)) & 7u) : 0;
 
             // A skipped walk is an empty node range; the mesh's retained points are still refreshed below.
             const bool walk_mesh = mesh_walk_needed(mesh_info);
@@ -1173,6 +1211,10 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                 cal_origin_y,
                 retain_ball_mesh_points);
             persistent_manifold->count = static_cast<uint8_t>(persistent_count);
+            if (track_retained && mesh_info_idx < kMaxBallWorldMeshPersistentManifolds) {
+                next_maybe_retained = persistent_count > 0 ? (next_maybe_retained | (1u << mesh_info_idx))
+                                                           : (next_maybe_retained & ~(1u << mesh_info_idx));
+            }
 
             for (int i = 0; i < persistent_count; ++i) {
                 const float mesh_slot_pen_bt = -persistent_manifold->points[i].distance_bt;
@@ -1184,6 +1226,9 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                     &persistent_manifold->points[i].rel_pos1_bt,
                     &mesh_slot_pen_bt, false);
             }
+        }
+        if (track_retained) {
+            solver_scratch->ball_mesh_maybe_retained = static_cast<uint16_t>(next_maybe_retained);
         }
     }
 
@@ -1220,7 +1265,8 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
             }
         }
     }
-    for (int probe_i = 0; probe_i < special_cp_count; ++probe_i) {
+    if (solver_scratch) {
+        solver_scratch->hs_world_normal_count = hs_world_normal_count;
     }
 
     if (!aggregate.valid) {

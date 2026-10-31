@@ -1315,14 +1315,22 @@ ROCKETGPU_HD WheelContactOut WheelRayPhase(
     BallState* dyn_hit_ball,
     uint32_t* dyn_hit_pushed_mask,
     const CarFrame* frame = nullptr) {
+    // The wheel's runtime and staged-ray loads go ahead of the wheel's stores: through generic pointers they would
+    // otherwise each wait for the stores before them.
+    const float extra_pushback = wheel_runtime_state ? wheel_runtime_state->extra_pushback[i] : 0.0f;
+    WheelRayStage stage;
+    stage.valid = 0;
+    if (staged_rays != nullptr) {
+        stage = staged_rays[i];
+    }
     wheel = MakeWheelStepState(car, cfg, i, frame);
     wheel.suspension_force_scale = wheel.is_front_wheel ? cal_front_scale : cal_back_scale;
 
-    wheel.extra_pushback = wheel_runtime_state ? wheel_runtime_state->extra_pushback[i] : 0.0f;
-    if (staged_rays != nullptr && staged_rays[i].valid == 2) {
+    wheel.extra_pushback = extra_pushback;
+    if (stage.valid == 2) {
         SetWheelRayMiss(wheel);
-    } else if (staged_rays != nullptr && staged_rays[i].valid) {
-        LoadWheelRayStage(wheel, staged_rays[i]);
+    } else if (stage.valid) {
+        LoadWheelRayStage(wheel, stage);
         if (staged_rays_velocity_stale && wheel.is_in_contact) {
             ComputeWheelRayVelocityTerms(car, -wheel.wheel_dir_ws, wheel.contact_point_bt, wheel);
         }
