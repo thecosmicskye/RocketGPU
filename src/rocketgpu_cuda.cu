@@ -150,6 +150,9 @@ ROCKETGPU_DEVICE void ApplyEnvCommandForEnv(
             solver_scratch[env_idx].ball_world_plane_manifolds[manifold_idx] = BallMeshPersistentManifold{};
         }
         solver_scratch[env_idx].retained_reset_pending = 1;
+        for (int k = 0; k < 8; ++k) {
+            solver_scratch[env_idx].car_world_reset[k] = 1;
+        }
     }
 }
 
@@ -219,8 +222,12 @@ ROCKETGPU_GLOBAL void CanonicalizeImportedBallsKernel(BallState* balls, int32_t 
 // per env for the ball. Each env's ball thread first applies the env's command, stream controls and respawn slots;
 // then every car, and the ball and pads, start the tick in parallel. The balls have a warp of their own so their
 // tick start runs beside the cars' instead of after them in the same warp.
-ROCKETGPU_GLOBAL void PreTickKernel(
-    const __grid_constant__ SimConfig cfg,
+// A block's tick start for block_env_count envs from block_env0: the first block_env_count * slots threads take the
+// cars, the next block_env_count the envs' balls; threads past those only join the pads.
+__device__ __forceinline__ void PreTickBlock(
+    const SimConfig& cfg,
+    int block_env_count,
+    int block_env0,
     Team* teams,
     int32_t* env_car_count,
     CarState* cars,
@@ -239,17 +246,23 @@ ROCKETGPU_GLOBAL void PreTickKernel(
     const int32_t* respawn_order,
     uint64_t seed,
     int32_t tick_idx,
-    bool pad_pre_tick = true) {
+    bool pad_pre_tick,
+    int32_t* zero_ints,
+    int zero_count) {
+    // zero_ints: the tick's car-world mesh work counts, emptied here so the stage branch starts with its prefilter.
+    if (zero_ints != nullptr && blockIdx.x == 0) {
+        for (int i = static_cast<int>(threadIdx.x); i < zero_count; i += static_cast<int>(blockDim.x)) {
+            zero_ints[i] = 0;
+        }
+    }
     const int slots = cfg.max_cars_per_env;
-    const int block_env_count = static_cast<int>(blockDim.x) / (slots + 1);
     const int car_threads = block_env_count * slots;
     const int t = static_cast<int>(threadIdx.x);
     const bool ball_thread = t >= car_threads;
     const int local_env = ball_thread ? t - car_threads : t / slots;
     const int slot = ball_thread ? 0 : t - local_env * slots;
-    const int block_env0 = static_cast<int>(blockIdx.x) * block_env_count;
     int env_idx = block_env0 + local_env;
-    const bool active = env_idx < cfg.env_count;
+    const bool active = local_env < block_env_count && env_idx < cfg.env_count;
     if (active) {
         MapStepEnv(cfg, env_idx);
     }
@@ -291,6 +304,35 @@ ROCKETGPU_GLOBAL void PreTickKernel(
             }
         }
     }
+}
+ROCKETGPU_GLOBAL void PreTickKernel(
+    const __grid_constant__ SimConfig cfg,
+    Team* teams,
+    int32_t* env_car_count,
+    CarState* cars,
+    WorldSolverScratch* solver_scratch,
+    CarControls* controls,
+    BallState* balls,
+    EnvState* env_states,
+    BoostPadState* pads,
+    const CarControls* controls_by_tick,
+    int32_t control_stride,
+    const EnvCommand* env_commands_by_tick,
+    int32_t env_command_stride,
+    const uint8_t* respawn_slots,
+    uint8_t* writable_respawn_slots,
+    RespawnRngState* respawn_rng,
+    const int32_t* respawn_order,
+    uint64_t seed,
+    int32_t tick_idx,
+    bool pad_pre_tick = true,
+    int32_t* zero_ints = nullptr,
+    int zero_count = 0) {
+    const int block_env_count = static_cast<int>(blockDim.x) / (cfg.max_cars_per_env + 1);
+    PreTickBlock(cfg, block_env_count, static_cast<int>(blockIdx.x) * block_env_count, teams, env_car_count, cars,
+                 solver_scratch, controls, balls, env_states, pads, controls_by_tick, control_stride,
+                 env_commands_by_tick, env_command_stride, respawn_slots, writable_respawn_slots, respawn_rng,
+                 respawn_order, seed, tick_idx, pad_pre_tick, zero_ints, zero_count);
 }
 
 // The rest of the tick, after PreTickKernel and the staged wheel rays, `lanes` threads per env (a power of two):
@@ -462,8 +504,9 @@ __device__ __forceinline__ bool StagedVehiclesIndependent(const SimConfig& cfg, 
     return fails == 0u;
 }
 // The cars of a not-independent env that update apart: a car whose wheel rests on another car pushes that car, so
-// both keep their turn in visit order; every other car reads and writes only itself. A wheel on the ball or an
-// unstaged ray keeps the whole env in order.
+// both keep their turn in visit order; a car whose wheel rests on the ball pushes it, so the cars on the ball keep
+// theirs (no other car's update reads the ball's velocity); every other car reads and writes only itself. An unstaged
+// ray keeps the whole env in order.
 __device__ __forceinline__ uint8_t StagedVehicleApartMask(const SimConfig& cfg, const WorldSolverScratch& scratch, int count) {
     if (cfg.mutator.physics_events.HasNonGoalEvents() || count > kWheelRayStageSlots / 4) {
         return 0u;
@@ -479,7 +522,9 @@ __device__ __forceinline__ uint8_t StagedVehicleApartMask(const SimConfig& cfg, 
             all_ordered = all_ordered || lane < 4 * count;
         } else if (((w >> 8) & 0xFFu) != 0u && ((w >> 16) & 0xFFu) == 0u) {
             const int target = scratch.wheel_ray_stage[lane].ground_car_idx;
-            if ((w & 0xFFu) != ROCKETGPU_ARENA_RAY_HIT_CAR || target < 0 || target >= count) {
+            if ((w & 0xFFu) == ROCKETGPU_ARENA_RAY_HIT_BALL) {
+                ordered |= 1u << (lane / 4);
+            } else if ((w & 0xFFu) != ROCKETGPU_ARENA_RAY_HIT_CAR || target < 0 || target >= count) {
                 all_ordered = true;
             } else {
                 ordered |= (1u << (lane / 4)) | (1u << target);
@@ -530,19 +575,21 @@ ROCKETGPU_GLOBAL void StagedCarPreKernel(
         return;
     }
     MapStepEnv(cfg, env_idx);
+    const int car_idx = env_idx * stride + slot;
+    // The controls' load goes out beside the env's count and independence loads; its first use is PreTickCar's entry.
+    const CarControls car_controls = controls[car_idx];
     const int count = env_car_count[env_idx];
     if (slot >= count || !EnvVehiclesIndependent(cfg, solver_scratch[env_idx], count, rays_inline)) {
         return;
     }
     uint32_t pushed_cars_mask = 0u;
-    const int car_idx = env_idx * stride + slot;
     // At 8k 3v3 the car's working set comes from DRAM: start all of its lines at once.
     PrefetchLinesL2(&cars[car_idx]);
     if (wheel_runtime_states != nullptr) PrefetchLinesL2(&wheel_runtime_states[car_idx]);
     PrefetchLinesL2(&car_configs[car_idx]);
     for (int w = 0; w < 4; ++w) PrefetchLinesL2(&solver_scratch[env_idx].wheel_ray_stage[4 * slot + w]);
-    StepEnvVehicleUpdateCar(env_idx, slot, count, cfg, cars, wheel_runtime_states, car_configs, balls,
-                            controls[car_idx], solver_scratch[env_idx].wheel_ray_stage, pushed_cars_mask);
+    StepEnvVehicleUpdateCarInline(env_idx, slot, count, cfg, cars, wheel_runtime_states, car_configs, balls,
+                                  car_controls, solver_scratch[env_idx].wheel_ray_stage, pushed_cars_mask);
     WorldSolverScratch& scratch = solver_scratch[env_idx];
     WorldStepPrestepCar(cars[car_idx], car_configs[car_idx], wheel_runtime_states ? &wheel_runtime_states[car_idx] : nullptr,
                         cfg.mutator, cfg.tick_dt / static_cast<float>(DebugWorldSubsteps()),
@@ -681,8 +728,8 @@ ROCKETGPU_GLOBAL void StagedPadPostKernel(const __grid_constant__ SimConfig cfg,
 // StagedCarPostKernel, StagedEnvTailKernel and StagedPadPostKernel in one launch: a block takes envs_per_block whole envs
 // through the three in turn, a __syncthreads apart (each reads only its own envs' writes from the one before), so a
 // block that finishes one starts the next without the launch edge or the slowest block of the other envs.
-ROCKETGPU_GLOBAL void StagedPostFusedKernel(
-    const __grid_constant__ SimConfig cfg, int32_t* env_car_count, CarState* cars, WheelRuntimeState* wheel_runtime_states,
+__device__ __forceinline__ void PostFusedBlock(
+    const SimConfig& cfg, int32_t* env_car_count, CarState* cars, WheelRuntimeState* wheel_runtime_states,
     WorldSolverScratch* solver_scratch, CarControls* controls, CarConfig* car_configs, BallState* balls,
     EnvState* env_states, BoostPadState* pads, bool pads_apart, int envs_per_block) {
     const long long e0 = static_cast<long long>(blockIdx.x) * envs_per_block;
@@ -704,6 +751,34 @@ ROCKETGPU_GLOBAL void StagedPostFusedKernel(
             StagedPadPostOne(cfg, e0 * pad_count + t, env_car_count, cars, pads);
         }
     }
+}
+ROCKETGPU_GLOBAL void StagedPostFusedKernel(
+    const __grid_constant__ SimConfig cfg, int32_t* env_car_count, CarState* cars, WheelRuntimeState* wheel_runtime_states,
+    WorldSolverScratch* solver_scratch, CarControls* controls, CarConfig* car_configs, BallState* balls,
+    EnvState* env_states, BoostPadState* pads, bool pads_apart, int envs_per_block) {
+    PostFusedBlock(cfg, env_car_count, cars, wheel_runtime_states, solver_scratch, controls, car_configs, balls,
+                   env_states, pads, pads_apart, envs_per_block);
+}
+
+// StagedPostFusedKernel of a tick, then PreTickKernel of the next for the same envs_per_block envs, a __syncthreads
+// apart: both touch only the block's envs (PreTick's block 0 also empties the next tick's stage counts, which nothing
+// reads after World<4>), so a block that ends its envs' tick starts their next one without the launch edge.
+// envs_per_block * (max_cars_per_env + 1) <= blockDim.x (see UsePostPreFused).
+ROCKETGPU_GLOBAL void StagedPostPreFusedKernel(
+    const __grid_constant__ SimConfig cfg, Team* teams, int32_t* env_car_count, CarState* cars,
+    WheelRuntimeState* wheel_runtime_states, WorldSolverScratch* solver_scratch, CarControls* controls,
+    CarConfig* car_configs, BallState* balls, EnvState* env_states, BoostPadState* pads, bool pads_apart,
+    int envs_per_block, const CarControls* controls_by_tick, int32_t control_stride,
+    const EnvCommand* env_commands_by_tick, int32_t env_command_stride, const uint8_t* respawn_slots,
+    uint8_t* writable_respawn_slots, RespawnRngState* respawn_rng, const int32_t* respawn_order, uint64_t seed,
+    int32_t next_tick_idx, bool pad_pre_tick, int32_t* zero_ints, int zero_count) {
+    PostFusedBlock(cfg, env_car_count, cars, wheel_runtime_states, solver_scratch, controls, car_configs, balls,
+                   env_states, pads, pads_apart, envs_per_block);
+    __syncthreads();
+    PreTickBlock(cfg, envs_per_block, static_cast<int>(blockIdx.x) * envs_per_block, teams, env_car_count, cars,
+                 solver_scratch, controls, balls, env_states, pads, controls_by_tick, control_stride,
+                 env_commands_by_tick, env_command_stride, respawn_slots, writable_respawn_slots, respawn_rng,
+                 respawn_order, seed, next_tick_idx, pad_pre_tick, zero_ints, zero_count);
 }
 
 // A kernel per world part (a compile-time constant), so each holds only its part's code and registers.
@@ -772,6 +847,8 @@ ROCKETGPU_GLOBAL void StagedWorldKernel(
                 slot = __ffs(static_cast<int>(left)) - 1;
                 left &= left - 1u;
             }
+            // The env's lanes enter each round's update together (they update different cars).
+            __syncwarp(env_lanes);
             if (slot >= 0) {
                 StepEnvVehicleUpdateCar(env_idx, slot, count, cfg, cars, wheel_runtime_states, car_configs, balls,
                                         controls[env_idx * stride + slot], scratch.wheel_ray_stage, pushed_cars_mask);
@@ -964,36 +1041,46 @@ struct WarpRayMeshLanes {
     __device__ bool Leader() const { return first == 0; }
     __device__ ArenaRayHit Combine(const ArenaRayHit& hit, int& order, float key) const {
         constexpr int kNoMesh = 0x7fffffff;
+        // Indexed only by unrolled constants, and the picks carried as values: a runtime index would put the arrays
+        // in local memory.
         int meshes[kLanes];
         float fractions[kLanes];
+#pragma unroll
         for (int l = 0; l < kLanes; ++l) {
             meshes[l] = __shfl_sync(group_mask, hit.hit ? order : kNoMesh, l, kLanes);
             fractions[l] = __shfl_sync(group_mask, key, l, kLanes);
         }
         // The lanes' hits in mesh order: the first one, then any with a strictly lower fraction.
         int winner = -1;
+        int winner_mesh = kNoMesh;
         float winner_fraction = 0.0f;
         int last_mesh = -1;
         for (int k = 0; k < kLanes; ++k) {
             int next = -1;
+            int next_mesh = kNoMesh;
+            float next_fraction = 0.0f;
+#pragma unroll
             for (int l = 0; l < kLanes; ++l) {
-                if (meshes[l] != kNoMesh && meshes[l] > last_mesh && (next < 0 || meshes[l] < meshes[next])) {
+                if (meshes[l] != kNoMesh && meshes[l] > last_mesh && (next < 0 || meshes[l] < next_mesh)) {
                     next = l;
+                    next_mesh = meshes[l];
+                    next_fraction = fractions[l];
                 }
             }
             if (next < 0) {
                 break;
             }
-            last_mesh = meshes[next];
-            if (winner < 0 || fractions[next] < winner_fraction) {
+            last_mesh = next_mesh;
+            if (winner < 0 || next_fraction < winner_fraction) {
                 winner = next;
-                winner_fraction = fractions[next];
+                winner_mesh = next_mesh;
+                winner_fraction = next_fraction;
             }
         }
         if (winner < 0) {
             return hit;  // no lane hit: every lane holds the same empty hit (and order)
         }
-        order = meshes[winner];
+        order = winner_mesh;
         constexpr int kWords = static_cast<int>(sizeof(ArenaRayHit) / sizeof(uint32_t));
         static_assert(sizeof(ArenaRayHit) % sizeof(uint32_t) == 0, "ArenaRayHit is copied by 32-bit words");
         uint32_t words[kWords];
@@ -1070,54 +1157,74 @@ ROCKETGPU_GLOBAL void PrefilterCarWorldMeshCandidatesKernel(
     const int stride = cfg.max_cars_per_env;
     const long long car_slots = static_cast<long long>(cfg.env_count) * stride;
     const long long tid = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (tid >= car_slots) {
-        return;
-    }
-    int env_idx = static_cast<int>(tid / stride);
-    const int slot = static_cast<int>(tid - static_cast<long long>(env_idx) * stride);
-    MapStepEnv(cfg, env_idx);
-    const int car_idx = env_idx * stride + slot;
-    CarWorldMeshCandidateStage& stage = stages[car_idx];
-    stage.valid = 0;
-    if (slot >= env_car_count[env_idx]) {
-        return;
-    }
-    const CarState& car = cars[car_idx];
-    if (car.is_demoed || car.just_respawned || !cfg.mutator.arena_collision ||
-        cfg.arena_mesh_tris == nullptr || cfg.arena_mesh_tri_count <= 0) {
-        return;
-    }
-    const CarConfig& car_cfg = car_configs[car_idx];
-    const bool have_bvh_traversal =
-        cfg.arena_mesh_bvh_quantization != nullptr && cfg.arena_mesh_bvh_meshes != nullptr &&
-        cfg.arena_mesh_bvh_nodes != nullptr && cfg.arena_mesh_bvh_mesh_count > 0 && cfg.arena_mesh_bvh_node_count > 0 &&
-        cfg.arena_mesh_bvh_mesh_count <= kCarWorldMeshStageMeshes;
-    if (!have_bvh_traversal) {
-        return;
-    }
-    const CarWorldMeshQueryFrame frame = ComputeCarWorldMeshQueryFrame(car, car_cfg);
+    // The car to stage (its index, or -1) and the meshes its query AABB may touch.
     uint32_t mesh_mask = 0;
-    int staged_meshes = 0;
-    for (int mesh = 0; mesh < cfg.arena_mesh_bvh_mesh_count; ++mesh) {
-        const ArenaMeshBvhMeshInfo& mesh_info = meshes[mesh];
-        if (CarWorldMeshInfoUsable(mesh_info, cfg.arena_mesh_bvh_quantization_count, cfg.arena_mesh_bvh_node_count) &&
-            CarWorldMeshAabbMayOverlap(mesh_info, frame.aabb_min_bt, frame.aabb_max_bt)) {
-            mesh_mask |= 1u << mesh;
-            ++staged_meshes;
+    const int staged_car = [&]() -> int {
+        if (tid >= car_slots) {
+            return -1;
         }
-    }
-    // No mesh, or more meshes than stage entries: valid stays 0 and the step walks this car itself. The empty walk
-    // is cheap, and it saves the fingerprint write here and its check in the step.
-    if (staged_meshes == 0 || staged_meshes > kCarWorldMeshStageSlots) {
-        return;
-    }
+        int env_idx = static_cast<int>(tid / stride);
+        const int slot = static_cast<int>(tid - static_cast<long long>(env_idx) * stride);
+        MapStepEnv(cfg, env_idx);
+        const int car_idx = env_idx * stride + slot;
+        stages[car_idx].valid = 0;
+        if (slot >= env_car_count[env_idx]) {
+            return -1;
+        }
+        const CarState& car = cars[car_idx];
+        if (car.is_demoed || car.just_respawned || !cfg.mutator.arena_collision ||
+            cfg.arena_mesh_tris == nullptr || cfg.arena_mesh_tri_count <= 0) {
+            return -1;
+        }
+        const bool have_bvh_traversal =
+            cfg.arena_mesh_bvh_quantization != nullptr && cfg.arena_mesh_bvh_meshes != nullptr &&
+            cfg.arena_mesh_bvh_nodes != nullptr && cfg.arena_mesh_bvh_mesh_count > 0 && cfg.arena_mesh_bvh_node_count > 0 &&
+            cfg.arena_mesh_bvh_mesh_count <= kCarWorldMeshStageMeshes;
+        if (!have_bvh_traversal) {
+            return -1;
+        }
+        const CarWorldMeshQueryFrame frame = ComputeCarWorldMeshQueryFrame(car, car_configs[car_idx]);
+        int staged_meshes = 0;
+        for (int mesh = 0; mesh < cfg.arena_mesh_bvh_mesh_count; ++mesh) {
+            const ArenaMeshBvhMeshInfo& mesh_info = meshes[mesh];
+            if (CarWorldMeshInfoUsable(mesh_info, cfg.arena_mesh_bvh_quantization_count, cfg.arena_mesh_bvh_node_count) &&
+                CarWorldMeshAabbMayOverlap(mesh_info, frame.aabb_min_bt, frame.aabb_max_bt)) {
+                mesh_mask |= 1u << mesh;
+                ++staged_meshes;
+            }
+        }
+        // No mesh, or more meshes than stage entries: valid stays 0 and the step walks this car itself. The empty walk
+        // is cheap, and it saves the fingerprint write here and its check in the step.
+        return staged_meshes == 0 || staged_meshes > kCarWorldMeshStageSlots ? -1 : car_idx;
+    }();
     // The later staging passes read this copy of each listed car, so the contacts kernels may move the cars
     // meanwhile: the step checks each stage's fingerprint against the live car, and a moved car walks its meshes
-    // itself. (car_snapshots is null when nothing moves the cars before the staging joins.)
+    // itself. (car_snapshots is null when nothing moves the cars before the staging joins.) The warp copies its
+    // listed cars one at a time, a word per lane: a thread copying its own 664-byte car touched a line per lane on
+    // each of its 83 loads.
     if (car_snapshots != nullptr) {
-        car_snapshots[car_idx] = car;
+        static_assert(sizeof(CarState) % sizeof(unsigned long long) == 0 &&
+                          alignof(CarState) >= alignof(unsigned long long),
+                      "the snapshot copies CarState in 8-byte words");
+        constexpr int kCarWords = static_cast<int>(sizeof(CarState) / sizeof(unsigned long long));
+        const unsigned warp_first = threadIdx.x & ~31u;
+        const unsigned warp_lanes = blockDim.x - warp_first < 32u ? blockDim.x - warp_first : 32u;
+        const unsigned warp_mask = warp_lanes == 32u ? 0xffffffffu : (1u << warp_lanes) - 1u;
+        for (unsigned rest = __ballot_sync(warp_mask, staged_car >= 0); rest != 0; rest &= rest - 1u) {
+            const int car_idx = __shfl_sync(warp_mask, staged_car, __ffs(static_cast<int>(rest)) - 1);
+            const unsigned long long* const src = reinterpret_cast<const unsigned long long*>(&cars[car_idx]);
+            unsigned long long* const dst = reinterpret_cast<unsigned long long*>(&car_snapshots[car_idx]);
+            for (int w = static_cast<int>(threadIdx.x - warp_first); w < kCarWords; w += static_cast<int>(warp_lanes)) {
+                dst[w] = src[w];
+            }
+        }
     }
-    FillCarWorldMeshCandidateFingerprint(car, car_cfg, stage.fingerprint);
+    if (staged_car < 0) {
+        return;
+    }
+    const int car_idx = staged_car;
+    CarWorldMeshCandidateStage& stage = stages[car_idx];
+    FillCarWorldMeshCandidateFingerprint(cars[car_idx], car_configs[car_idx], stage.fingerprint);
     stage.mesh_count = cfg.arena_mesh_bvh_mesh_count;
     stage.mesh_mask = mesh_mask;
     stage.valid = 1;
@@ -1126,6 +1233,31 @@ ROCKETGPU_GLOBAL void PrefilterCarWorldMeshCandidatesKernel(
         const int item = atomicAdd(&mesh_work_count[mesh], 1);
         mesh_work[static_cast<long long>(mesh) * car_slots + item] = car_idx;
     }
+}
+
+// The staging passes' pair mapping: each warp takes `per_warp` consecutive listed pairs on its first lanes, with the
+// listed pairs spread evenly over the launched warps (a pass's slowest warp follows its pairs' summed work). Every
+// pair's work and output are its own, so only the lane a pair runs on changes.
+__device__ __forceinline__ int StagePairsPerWarp(const int32_t* mesh_work_count, int meshes) {
+    long long listed = 0;
+    for (int mesh = 0; mesh < meshes; ++mesh) {
+        listed += mesh_work_count[mesh];
+    }
+    const long long lanes = blockDim.x < 32u ? blockDim.x : 32u;
+    const long long warps = static_cast<long long>(gridDim.x) * blockDim.x / lanes;
+    const long long per_warp = (listed + warps - 1) / warps;
+    return static_cast<int>(per_warp < 1 ? 1 : per_warp > lanes ? lanes : per_warp);
+}
+// Pair index of this thread in round `round` of the grid-stride loop (past every listed pair on lanes >= per_warp).
+__device__ __forceinline__ long long StagePairIndex(long long round, int per_warp) {
+    const long long lanes = blockDim.x < 32u ? blockDim.x : 32u;
+    const long long thread = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int lane = static_cast<int>(thread % lanes);
+    if (lane >= per_warp) {
+        return 1ll << 60;
+    }
+    const long long warps = static_cast<long long>(gridDim.x) * blockDim.x / lanes;
+    return (thread / lanes + round * warps) * per_warp + lane;
 }
 
 ROCKETGPU_GLOBAL void StageCarWorldMeshCandidatesKernel(
@@ -1146,10 +1278,11 @@ ROCKETGPU_GLOBAL void StageCarWorldMeshCandidatesKernel(
     bullet_port::btGjkEpaScratch* const gjk_scratch = gjk_pool + first;
     const ArenaMeshLeafGrid leaf_grid = MakeArenaBroadphaseGrid(cfg).leaf_grid;
     const int meshes = Min(cfg.arena_mesh_bvh_mesh_count, kCarWorldMeshStageMeshes);
-    // Listed pairs in mesh-major order (a warp walks one mesh's BVH): pair t is item t - (pairs of earlier meshes).
-    for (long long tid = first;; tid += static_cast<long long>(gridDim.x) * blockDim.x) {
+    // Listed pairs in mesh-major order: pair t is item t - (pairs of earlier meshes).
+    const int per_warp = StagePairsPerWarp(mesh_work_count, meshes);
+    for (long long round = 0;; ++round) {
         int mesh = 0;
-        long long item = tid;
+        long long item = StagePairIndex(round, per_warp);
         for (; mesh < meshes; ++mesh) {
             const long long listed = mesh_work_count[mesh];
             if (item < listed) {
@@ -1186,6 +1319,323 @@ ROCKETGPU_GLOBAL void StageCarWorldMeshCandidatesKernel(
             cfg.arena_mesh_bvh_subtrees, cfg.arena_mesh_bvh_subtree_count,
             env_idx, slot, gjk_scratch, nullptr, nullptr, nullptr, 0.0f,
             &stages[car_idx], nullptr, mesh, &leaf_grid, &pairs, pairs_pass);
+    }
+}
+
+// The gather pass (kTrianglePairsGather) with the warp's leaf-grid scans shared out. A pair whose query fits one grid
+// cell (the usual case) owns that cell's entries; the warp lays its pairs' entries end to end and tests them a lane
+// per entry, so a warp waits on its total entries over its lanes rather than on its longest cell. A pair's entries
+// sit on consecutive lanes in entry order, so ballots keep each pair's broadphase hits and gathered triangles in the
+// walk's order: a first scan counts them, each pair reserves its range as the walk does, and a second scan over the
+// pairs with gathered triangles writes them. Pairs off the grid take AppendCarWorldMeshContactRows' gather path
+// on their own lane, as StageCarWorldMeshCandidatesKernel runs it.
+ROCKETGPU_GLOBAL void StageCarWorldGatherKernel(
+    const __grid_constant__ SimConfig cfg,
+    const CarState* cars,
+    const CarConfig* car_configs,
+    CarWorldMeshCandidateStage* stages,
+    const int32_t* mesh_work,
+    const int32_t* mesh_work_count,
+    CarWorldTrianglePairs pairs,
+    bullet_port::btGjkEpaScratch* gjk_pool) {
+    const int stride = cfg.max_cars_per_env;
+    const long long car_slots = static_cast<long long>(cfg.env_count) * stride;
+    const long long first = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    bullet_port::btGjkEpaScratch* const gjk_scratch = gjk_pool + first;
+    const ArenaMeshLeafGrid leaf_grid = MakeArenaBroadphaseGrid(cfg).leaf_grid;
+    const int meshes = Min(cfg.arena_mesh_bvh_mesh_count, kCarWorldMeshStageMeshes);
+    const unsigned warp_first = threadIdx.x & ~31u;
+    const int warp_lanes = static_cast<int>(blockDim.x - warp_first < 32u ? blockDim.x - warp_first : 32u);
+    const unsigned warp_mask = warp_lanes == 32 ? 0xffffffffu : (1u << warp_lanes) - 1u;
+    const int lane = static_cast<int>(threadIdx.x - warp_first);
+    // A gathered-triangle buffer for each of a block's first 4 warps, entries packed as triangle << 12 | owner lane << 7
+    // | rank (later warps, in a forced block over 128 threads, and arenas over 2^20 triangles scan twice instead).
+    constexpr int kGatherBufferWarps = 4;
+    constexpr int kGatherBufferEntries = 256;
+    static_assert(kCarWorldMeshGatherTriangles <= 128, "a reserved pair's rank fits in 7 bits");
+    __shared__ uint32_t gather_buffer[kGatherBufferWarps][kGatherBufferEntries];
+    const int warp_buffer_size =
+        threadIdx.x < 32u * kGatherBufferWarps && cfg.arena_mesh_tri_count <= (1 << 20) ? kGatherBufferEntries : 0;
+    const bool have_bvh_traversal =
+        cfg.arena_mesh_tris != nullptr && cfg.arena_mesh_tri_count > 0 && cfg.arena_mesh_bvh_quantization != nullptr &&
+        cfg.arena_mesh_bvh_meshes != nullptr && cfg.arena_mesh_bvh_nodes != nullptr && cfg.arena_mesh_bvh_mesh_count > 0 &&
+        cfg.arena_mesh_bvh_node_count > 0 && cfg.arena_mesh_bvh_mesh_count <= kCarWorldMeshStageMeshes &&
+        leaf_grid.infos != nullptr;
+    const int per_warp = StagePairsPerWarp(mesh_work_count, meshes);
+    for (long long round = 0;; ++round) {
+        int mesh = 0;
+        long long item = StagePairIndex(round, per_warp);
+        for (; mesh < meshes; ++mesh) {
+            const long long listed = mesh_work_count[mesh];
+            if (item < listed) {
+                break;
+            }
+            item -= listed;
+        }
+        const bool have = mesh < meshes;
+        if (__ballot_sync(warp_mask, have) == 0u) {
+            break;
+        }
+        int car_idx = 0;
+        int env_idx = 0;
+        int slot = 0;
+        // This lane's pair on the grid: its query frame, quantized query AABB, cell entries and triangle range.
+        bool on_grid = false;
+        CarWorldMeshQueryFrame frame;
+        float threshold_bt = 0.0f;
+        uint16_t qmin[3] = {0, 0, 0};
+        uint16_t qmax[3] = {0, 0, 0};
+        int entry_first = 0;
+        int entries = 0;
+        int tri_start = 0;
+        int tri_count = 0;
+        if (have) {
+            car_idx = mesh_work[static_cast<long long>(mesh) * car_slots + item];
+            env_idx = car_idx / stride;
+            slot = car_idx - env_idx * stride;
+            const ArenaMeshBvhMeshInfo mesh_info = have_bvh_traversal ? cfg.arena_mesh_bvh_meshes[mesh] : ArenaMeshBvhMeshInfo{};
+            if (have_bvh_traversal && leaf_grid.infos[mesh].cell_offset >= 0 &&
+                CarWorldMeshInfoUsable(mesh_info, cfg.arena_mesh_bvh_quantization_count, cfg.arena_mesh_bvh_node_count)) {
+                const CarConfig& car_cfg = car_configs[car_idx];
+                frame = ComputeCarWorldMeshQueryFrame(cars[car_idx], car_cfg);
+                if (CarWorldMeshAabbMayOverlap(mesh_info, frame.aabb_min_bt, frame.aabb_max_bt)) {
+                    const ArenaMeshBvhQuantization& quantization = cfg.arena_mesh_bvh_quantization[mesh_info.mesh_index];
+                    QuantizeArenaMeshBvhPoint(quantization, frame.aabb_min_bt, 0, qmin);
+                    QuantizeArenaMeshBvhPoint(quantization, frame.aabb_max_bt, 1, qmax);
+                    // The cell WalkArenaMeshLeafGrid scans; a query wider than a cell walks the BVH instead.
+                    const ArenaMeshLeafGridInfo& info = leaf_grid.infos[mesh];
+                    on_grid = true;
+                    int cell[3];
+                    for (int a = 0; a < 3; ++a) {
+                        if (qmax[a] - qmin[a] > info.cell_width[a]) {
+                            on_grid = false;
+                            break;
+                        }
+                        cell[a] = qmin[a] / info.cell_width[a];
+                        cell[a] = cell[a] < info.cells[a] ? cell[a] : info.cells[a] - 1;
+                    }
+                    if (on_grid) {
+                        const int cell_idx = info.cell_offset + (cell[2] * info.cells[1] + cell[1]) * info.cells[0] + cell[0];
+                        entry_first = leaf_grid.cell_start[cell_idx];
+                        entries = leaf_grid.cell_start[cell_idx + 1] - entry_first;
+                        threshold_bt = CarContactBreakingThresholdUU(car_cfg) * (1.0f / 50.0f);
+                        tri_start = mesh_info.triangle_start;
+                        tri_count = mesh_info.triangle_count;
+                    }
+                }
+            }
+            if (!on_grid) {
+                ContactAccumulator acc;
+                int split_row_count = 0;
+                int normal_row_count = 0;
+                int friction_row_count = 0;
+                AppendCarWorldMeshContactRows<true>(
+                    cars[car_idx], car_configs[car_idx], cfg.mutator, Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 0.0f), acc,
+                    nullptr, split_row_count, nullptr, normal_row_count, nullptr, friction_row_count, 0.0f,
+                    cfg.arena_mesh_tris, cfg.arena_mesh_tri_count,
+                    cfg.arena_mesh_bvh_quantization, cfg.arena_mesh_bvh_quantization_count,
+                    cfg.arena_mesh_bvh_meshes, cfg.arena_mesh_bvh_mesh_count,
+                    cfg.arena_mesh_bvh_nodes, cfg.arena_mesh_bvh_node_count,
+                    cfg.arena_mesh_bvh_subtrees, cfg.arena_mesh_bvh_subtree_count,
+                    env_idx, slot, gjk_scratch, nullptr, nullptr, nullptr, 0.0f,
+                    &stages[car_idx], nullptr, mesh, &leaf_grid, &pairs, kTrianglePairsGather);
+            }
+        }
+        // The quantized query packed two values a word, for the shuffles.
+        const uint32_t q01 = static_cast<uint32_t>(qmin[0]) | (static_cast<uint32_t>(qmin[1]) << 16);
+        const uint32_t q23 = static_cast<uint32_t>(qmin[2]) | (static_cast<uint32_t>(qmax[0]) << 16);
+        const uint32_t q45 = static_cast<uint32_t>(qmax[1]) | (static_cast<uint32_t>(qmax[2]) << 16);
+        const int car_global = env_idx * pairs.car_stride + slot;
+        int broadphase_hits = 0;
+        int gathered = 0;
+        int pair_start = -1;
+        // The warp's gathered triangles in scan order, kept until each pair has its range; a warp that gathers more
+        // than its buffer holds scans again to write them.
+        uint32_t* const warp_buffer = gather_buffer[(threadIdx.x >> 5) % kGatherBufferWarps];
+        int buffered = 0;
+        // One scan over the warp's listed entries: owners with `scan_entries` > 0 take part. Each owner's running
+        // gathered count is `gathered`. With `write`, each gathered triangle goes to pair_start + its rank; without,
+        // it goes to the warp buffer.
+        const auto scan = [&](int scan_entries, bool write) {
+            int prefix = scan_entries;
+            for (int d = 1; d < 32; d <<= 1) {
+                const int v = __shfl_up_sync(warp_mask, prefix, d);
+                if (lane >= d) {
+                    prefix += v;
+                }
+            }
+            const int total = __shfl_sync(warp_mask, prefix, warp_lanes - 1);
+            prefix -= scan_entries;
+            constexpr int kRoundEntries = 4;  // entries per lane per round; their entry and triangle loads issue together
+            for (int base = 0; base < total; base += kRoundEntries * warp_lanes) {
+                int owner[kRoundEntries];
+                uint4 raw[kRoundEntries];
+#pragma unroll
+                for (int k = 0; k < kRoundEntries; ++k) {
+                    const int g = base + k * warp_lanes + lane;
+                    // The owner is the last lane whose first entry is at or before g (empty lanes end no earlier).
+                    int o = 0;
+                    for (int step = 16; step > 0; step >>= 1) {
+                        const int c = o + step;
+                        const int p = __shfl_sync(warp_mask, prefix, c < warp_lanes ? c : warp_lanes - 1);
+                        if (c < warp_lanes && p <= g) {
+                            o = c;
+                        }
+                    }
+                    owner[k] = o;
+                    const int e = __shfl_sync(warp_mask, entry_first, o) + (g - __shfl_sync(warp_mask, prefix, o));
+                    raw[k] = g < total ? __ldg(reinterpret_cast<const uint4*>(&leaf_grid.entries[e])) : make_uint4(0u, 0u, 0u, 0u);
+                }
+                // The entries' leaf tests, then the loads of the triangles that pass them.
+                int tri[kRoundEntries];
+                ArenaMeshTriangle tris[kRoundEntries];
+#pragma unroll
+                for (int k = 0; k < kRoundEntries; ++k) {
+                    const int g = base + k * warp_lanes + lane;
+                    const int o = owner[k];
+                    ArenaMeshLeafEntry entry;
+                    memcpy(&entry, &raw[k], sizeof(entry));
+                    const uint32_t o01 = __shfl_sync(warp_mask, q01, o);
+                    const uint32_t o23 = __shfl_sync(warp_mask, q23, o);
+                    const uint32_t o45 = __shfl_sync(warp_mask, q45, o);
+                    const uint16_t oqmin[3] = {static_cast<uint16_t>(o01), static_cast<uint16_t>(o01 >> 16), static_cast<uint16_t>(o23)};
+                    const uint16_t oqmax[3] = {static_cast<uint16_t>(o23 >> 16), static_cast<uint16_t>(o45), static_cast<uint16_t>(o45 >> 16)};
+                    const int o_tri_start = __shfl_sync(warp_mask, tri_start, o);
+                    const int o_tri_count = __shfl_sync(warp_mask, tri_count, o);
+                    const int local = entry.triangle_index;
+                    const bool leaf = g < total &&
+                        TestQuantizedAabbAgainstQuantizedAabb(oqmin, oqmax, entry.quantized_aabb_min, entry.quantized_aabb_max) &&
+                        local >= 0 && local < o_tri_count;
+                    tri[k] = leaf ? o_tri_start + local : -1;
+                    if (leaf) {
+                        const ArenaMeshTriangle& src = cfg.arena_mesh_tris[tri[k]];
+                        tris[k].a = src.a;
+                        tris[k].b = src.b;
+                        tris[k].c = src.c;
+                        tris[k].normal = src.normal;
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < kRoundEntries; ++k) {
+                    const int round_first = base + k * warp_lanes;
+                    if (round_first >= total) {
+                        break;
+                    }
+                    const int o = owner[k];
+                    int test = 0;
+                    if (__any_sync(warp_mask, tri[k] >= 0)) {
+                        CarWorldMeshQueryFrame of;
+                        const auto shfl3 = [&](const Vec3& v) {
+                            return Vec3(__shfl_sync(warp_mask, v.x, o), __shfl_sync(warp_mask, v.y, o), __shfl_sync(warp_mask, v.z, o));
+                        };
+                        of.axis_x = shfl3(frame.axis_x);
+                        of.axis_y = shfl3(frame.axis_y);
+                        of.axis_z = shfl3(frame.axis_z);
+                        of.box_center_bt = shfl3(frame.box_center_bt);
+                        of.box_half_extent_with_margin_bt = shfl3(frame.box_half_extent_with_margin_bt);
+                        of.aabb_min_bt = shfl3(frame.aabb_min_bt);
+                        of.aabb_max_bt = shfl3(frame.aabb_max_bt);
+                        const float o_threshold_bt = __shfl_sync(warp_mask, threshold_bt, o);
+                        if (tri[k] >= 0) {
+                            test = CarWorldTriangleQueryTest(tris[k], of, o_threshold_bt);
+                        }
+                    }
+                    const unsigned hit_bits = __ballot_sync(warp_mask, test >= 1);
+                    const unsigned gather_bits = __ballot_sync(warp_mask, test == 2);
+                    // A gathered entry's rank: its owner's count before this round plus the owner's gathered entries on
+                    // lower lanes (a pair's entries in a round are consecutive lanes from o_lo).
+                    const int o_gathered_before = __shfl_sync(warp_mask, gathered, o);
+                    const int o_lo = Max(__shfl_sync(warp_mask, prefix, o) - round_first, 0);
+                    const unsigned below = (1u << lane) - 1u;
+                    const int rank = o_gathered_before + __popc(gather_bits & below & ~((1u << o_lo) - 1u));
+                    if (write) {
+                        const int o_pair_start = __shfl_sync(warp_mask, pair_start, o);
+                        const int o_car = __shfl_sync(warp_mask, car_global, o);
+                        if (test == 2) {
+                            pairs.car_idx[o_pair_start + rank] = o_car;
+                            pairs.tri_idx[o_pair_start + rank] = tri[k];
+                        }
+                    } else {
+                        const int at = buffered + __popc(gather_bits & below);
+                        if (test == 2 && at < warp_buffer_size) {
+                            // A rank past 127 belongs to a pair with no range, whose entries are skipped.
+                            warp_buffer[at] = (static_cast<uint32_t>(tri[k]) << 12) | (static_cast<uint32_t>(o) << 7) |
+                                static_cast<uint32_t>(Min(rank, 127));
+                        }
+                        buffered += __popc(gather_bits);
+                    }
+                    // Each owner's lanes in this round: entries [prefix, prefix + scan_entries) of [round_first, +lanes).
+                    const int lo = Max(prefix - round_first, 0);
+                    const int hi = Min(prefix + scan_entries - round_first, warp_lanes);
+                    const unsigned range = hi > lo ? ((hi - lo == 32 ? 0xffffffffu : ((1u << (hi - lo)) - 1u)) << lo) : 0u;
+                    broadphase_hits += __popc(hit_bits & range);
+                    gathered += __popc(gather_bits & range);
+                }
+            }
+        };
+        scan(on_grid ? entries : 0, false);
+        // Each pair's range in the pair list, as the walk reserves it (a pair past kCarWorldMeshGatherTriangles gets
+        // none), for the whole warp at once: a pair whose range does not fit has pair_count -1 and is walked by the
+        // merge pass, as it is when its own reservation fails.
+        const int need = on_grid && gathered > 0 && gathered <= kCarWorldMeshGatherTriangles ? gathered : 0;
+        int need_before = need;
+        for (int d = 1; d < 32; d <<= 1) {
+            const int v = __shfl_up_sync(warp_mask, need_before, d);
+            if (lane >= d) {
+                need_before += v;
+            }
+        }
+        const int need_total = __shfl_sync(warp_mask, need_before, warp_lanes - 1);
+        need_before -= need;
+        int warp_start = 0;
+        if (lane == 0 && need_total > 0) {
+            warp_start = atomicAdd(pairs.count, 0);
+            while (true) {
+                if (warp_start > pairs.capacity - need_total) {
+                    warp_start = -1;
+                    break;
+                }
+                const int observed = atomicCAS(pairs.count, warp_start, warp_start + need_total);
+                if (observed == warp_start) {
+                    break;
+                }
+                warp_start = observed;
+            }
+        }
+        warp_start = __shfl_sync(warp_mask, warp_start, 0);
+        if (on_grid) {
+            CarWorldMeshCandidateStage& stage = stages[car_idx];
+            CarWorldMeshCandidateStageMesh& staged = stage.meshes[CarWorldMeshStageSlot(stage.mesh_mask, mesh)];
+            staged.broadphase_hits = broadphase_hits;
+            staged.pair_count = -1;  // the merge pass walks this pair itself
+            if (gathered <= kCarWorldMeshGatherTriangles) {
+                const int start = gathered == 0 ? 0 : (warp_start >= 0 ? warp_start + need_before : -1);
+                if (start >= 0) {
+                    staged.pair_start = start;
+                    staged.pair_count = gathered;
+                    pair_start = start;
+                }
+            }
+        }
+        if (buffered <= warp_buffer_size) {
+            __syncwarp(warp_mask);
+            for (int base = 0; base < buffered; base += warp_lanes) {
+                const int i = base + lane;
+                const uint32_t v = i < buffered ? warp_buffer[i] : 0u;
+                const int o = static_cast<int>((v >> 7) & 31u);
+                const int o_pair_start = __shfl_sync(warp_mask, pair_start, o);
+                const int o_car = __shfl_sync(warp_mask, car_global, o);
+                if (i < buffered && o_pair_start >= 0) {
+                    pairs.car_idx[o_pair_start + static_cast<int>(v & 127u)] = o_car;
+                    pairs.tri_idx[o_pair_start + static_cast<int>(v & 127u)] = static_cast<int>(v >> 12);
+                }
+            }
+            __syncwarp(warp_mask);
+        } else {
+            const bool write = on_grid && pair_start >= 0 && gathered > 0;
+            gathered = 0;
+            scan(write ? entries : 0, true);
+        }
     }
 }
 
@@ -1227,6 +1677,7 @@ inline void EnsureCudaStepStackLimit(bool step_kernel) {
         reinterpret_cast<const void*>(&StageWheelRaysLanesKernel<8>),
         reinterpret_cast<const void*>(&PrefilterCarWorldMeshCandidatesKernel),
         reinterpret_cast<const void*>(&StageCarWorldMeshCandidatesKernel),
+        reinterpret_cast<const void*>(&StageCarWorldGatherKernel),
         reinterpret_cast<const void*>(&CarWorldTriangleHitsKernel),
         reinterpret_cast<const void*>(&StagedCarPreKernel),
         reinterpret_cast<const void*>(&StagedVehicleIndependenceKernel),
@@ -1239,6 +1690,7 @@ inline void EnsureCudaStepStackLimit(bool step_kernel) {
         reinterpret_cast<const void*>(&StagedEnvTailKernel),
         reinterpret_cast<const void*>(&StagedPadPostKernel),
         reinterpret_cast<const void*>(&StagedPostFusedKernel),
+        reinterpret_cast<const void*>(&StagedPostPreFusedKernel),
         reinterpret_cast<const void*>(&StagedPadPreKernel),
         reinterpret_cast<const void*>(&StagedCarWorldRowsKernel),
         reinterpret_cast<const void*>(&StagedCarWorldRowsSplitKernel),
@@ -1646,7 +2098,9 @@ inline void LaunchStageCarWorldMeshCandidates(
     const int32_t* env_car_count,
     cudaStream_t stream,
     cudaEvent_t prefilter_done = nullptr,
-    const CarWorldStageSlice* slice = nullptr) {
+    const CarWorldStageSlice* slice = nullptr,
+    bool counts_zeroed = false) {
+    // counts_zeroed: PreTickKernel already emptied the mesh work counts of the tick.
     // prefilter_done: recorded once the cars are copied (after the prefilter), when the caller passes one.
     const auto mark_prefilter_done = [&] {
         if (prefilter_done != nullptr) {
@@ -1670,8 +2124,10 @@ inline void LaunchStageCarWorldMeshCandidates(
     const int block_size = StagedBlockSize(kBlockStage, kCudaRayKernelBlockSize);
     // A kernel rather than cudaMemsetAsync: in a captured step the memset node held this branch back until
     // StagedCarPreKernel on the other branch had finished. It also empties the car-world rows lists of the tick.
-    ZeroInt32Kernel<<<1, 32, 0, stream>>>(mesh_work_count, kCarWorldMeshStageMeshes + 4 + kRowsFullKeys);
-    CheckCuda(cudaGetLastError(), "ZeroInt32Kernel launch (car-world mesh work count)");
+    if (!counts_zeroed) {
+        ZeroInt32Kernel<<<1, 32, 0, stream>>>(mesh_work_count, kCarWorldMeshStageMeshes + 4 + kRowsFullKeys);
+        CheckCuda(cudaGetLastError(), "ZeroInt32Kernel launch (car-world mesh work count)");
+    }
     PrefilterCarWorldMeshCandidatesKernel<<<static_cast<unsigned>((car_slots + block_size - 1) / block_size),
                                             static_cast<unsigned>(block_size), 0, stream>>>(
         cfg, cars, car_configs, env_car_count, b.stages, mesh_work, mesh_work_count,
@@ -1691,9 +2147,9 @@ inline void LaunchStageCarWorldMeshCandidates(
     pairs.car_stride = cfg.max_cars_per_env;
     const size_t stage_threads = std::min(pair_count, staging_threads);
     const unsigned stage_blocks = PoolBlocks(stage_threads, staging_threads, block_size);
-    StageCarWorldMeshCandidatesKernel<<<stage_blocks, static_cast<unsigned>(block_size), 0, stream>>>(
-        cfg, cars, car_configs, b.stages, mesh_work, mesh_work_count, pairs, kTrianglePairsGather, gjk_pool);
-    CheckCuda(cudaGetLastError(), "StageCarWorldMeshCandidatesKernel gather launch");
+    StageCarWorldGatherKernel<<<stage_blocks, static_cast<unsigned>(block_size), 0, stream>>>(
+        cfg, cars, car_configs, b.stages, mesh_work, mesh_work_count, pairs, gjk_pool);
+    CheckCuda(cudaGetLastError(), "StageCarWorldGatherKernel launch");
     const size_t hit_threads = std::min<size_t>(static_cast<size_t>(pairs.capacity), staging_threads);
     CarWorldTriangleHitsKernel<<<PoolBlocks(hit_threads, staging_threads, block_size),
                                  static_cast<unsigned>(block_size), 0, stream>>>(cfg, cars, car_configs, pairs, gjk_pool);
@@ -1820,6 +2276,7 @@ struct StagedStreams {
     cudaStream_t stage = nullptr;
     cudaStream_t dependent = nullptr;
     cudaStream_t ball = nullptr;
+    cudaStream_t world3 = nullptr;
     cudaEvent_t pre_done = nullptr;
     cudaEvent_t prefilter_done = nullptr;
     cudaEvent_t stage_done = nullptr;
@@ -1828,14 +2285,17 @@ struct StagedStreams {
     cudaEvent_t rows_split_done = nullptr;
     cudaEvent_t rows_light_done = nullptr;
     cudaEvent_t ball_done = nullptr;
+    cudaEvent_t world3_ready = nullptr;
+    cudaEvent_t world3_done = nullptr;
 };
 inline StagedStreams MakeStagedStreams() {
     StagedStreams s;
     CheckCuda(cudaStreamCreateWithFlags(&s.stage, cudaStreamNonBlocking), "cudaStreamCreate(staged stage)");
     CheckCuda(cudaStreamCreateWithFlags(&s.dependent, cudaStreamNonBlocking), "cudaStreamCreate(staged dependent)");
     CheckCuda(cudaStreamCreateWithFlags(&s.ball, cudaStreamNonBlocking), "cudaStreamCreate(staged ball)");
+    CheckCuda(cudaStreamCreateWithFlags(&s.world3, cudaStreamNonBlocking), "cudaStreamCreate(staged world3)");
     for (cudaEvent_t* e : {&s.pre_done, &s.prefilter_done, &s.stage_done, &s.independence_done, &s.dependent_done,
-                          &s.rows_split_done, &s.rows_light_done, &s.ball_done}) {
+                          &s.rows_split_done, &s.rows_light_done, &s.ball_done, &s.world3_ready, &s.world3_done}) {
         CheckCuda(cudaEventCreateWithFlags(e, cudaEventDisableTiming), "cudaEventCreate(staged)");
     }
     return s;
@@ -1843,6 +2303,16 @@ inline StagedStreams MakeStagedStreams() {
 inline StagedStreams& GetStagedStreams() {
     static StagedStreams streams = MakeStagedStreams();
     return streams;
+}
+// The car-world rows beside the cars-apart contacts (StagedWorldKernel<kWorldStepContactsCarsApart>): those contacts
+// write nothing the rows read (they move no car; the kickoff reset of the car-world manifolds and the rows'
+// RecordWorldSurface are the rows' own), so only the rows part waits for both.
+inline bool UseWorld3Branch() {
+    static const bool on = [] {
+        const char* v = std::getenv("ROCKETGPU_W3_BRANCH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
 }
 inline bool UseCarWorldRowsConcurrent() {
     static const bool on = [] {
@@ -2123,17 +2593,32 @@ inline void LaunchStepTicksDirect(
         const bool concurrent_rows = concurrent && UseCarWorldRowsConcurrent();
         const cudaStream_t stage_stream = concurrent ? side.stage : stream;
         const cudaStream_t dep_stream = concurrent ? side.dependent : stream;
+        // With the stage branch armed, PreTickKernel empties its mesh work counts, and the pads' tick start runs on
+        // the ball branch (nothing before the ball join reads the pads), so the branch starts with its prefilter.
+        int32_t* const pre_zero_counts =
+            !concurrent ? nullptr
+            : slice != nullptr ? slice->mesh_work_count
+            : split_rows && EnsureGjkScratchPool(CarWorldStagingThreads(), stream) != nullptr
+                ? GetCarWorldStageBuffers().mesh_work_count : nullptr;
+        const bool pad_pre_on_ball = concurrent && ball_stages != nullptr;
+        // One env group with the fused post: each tick's post and the next tick's start run as one kernel.
+        const int tail_envs_per_block = static_cast<int>(env_tail.threads) / kEnvTailLanes;
+        const bool post_pre_fused = post_fused && slice == nullptr &&
+                                    tail_envs_per_block * (cfg.max_cars_per_env + 1) <= static_cast<int>(env_tail.threads);
         for (int32_t t = 0; t < ticks; ++t) {
-            PreTickKernel<<<pre_blocks, pre_block_size, 0, stream>>>(
-                cfg, teams, env_car_count, cars, solver_scratch, controls, balls, env_states, pads,
-                controls_by_tick, control_stride, env_commands_by_tick, env_command_stride,
-                respawn_slots, writable_respawn_slots, respawn_rng, respawn_order, seed, t, pad_pre_blocks == 0);
-            CheckCuda(cudaGetLastError(), "PreTickKernel launch");
+            if (!post_pre_fused || t == 0) {
+                PreTickKernel<<<pre_blocks, pre_block_size, 0, stream>>>(
+                    cfg, teams, env_car_count, cars, solver_scratch, controls, balls, env_states, pads,
+                    controls_by_tick, control_stride, env_commands_by_tick, env_command_stride,
+                    respawn_slots, writable_respawn_slots, respawn_rng, respawn_order, seed, t, pad_pre_blocks == 0,
+                    pre_zero_counts, kCarWorldMeshStageMeshes + 4 + kRowsFullKeys);
+                CheckCuda(cudaGetLastError(), "PreTickKernel launch");
+            }
             if (concurrent) {
                 CheckCuda(cudaEventRecord(side.pre_done, stream), "cudaEventRecord(pre tick)");
                 CheckCuda(cudaStreamWaitEvent(stage_stream, side.pre_done, 0), "cudaStreamWaitEvent(stage)");
             }
-            if (pad_pre_blocks > 0) {
+            if (pad_pre_blocks > 0 && !pad_pre_on_ball) {
                 StagedPadPreKernel<<<pad_pre.blocks, pad_pre.threads, 0, stage_stream>>>(cfg, env_car_count, pads);
                 CheckCuda(cudaGetLastError(), "StagedPadPreKernel launch");
             }
@@ -2141,10 +2626,15 @@ inline void LaunchStepTicksDirect(
                 CheckCuda(cudaStreamWaitEvent(side.ball, side.pre_done, 0), "cudaStreamWaitEvent(ball stage)");
                 StagedBallWorldKernel<<<env_k.blocks, env_k.threads, 0, side.ball>>>(cfg, balls, env_states, ball_stages);
                 CheckCuda(cudaGetLastError(), "StagedBallWorldKernel launch");
+                if (pad_pre_blocks > 0) {
+                    StagedPadPreKernel<<<pad_pre.blocks, pad_pre.threads, 0, side.ball>>>(cfg, env_car_count, pads);
+                    CheckCuda(cudaGetLastError(), "StagedPadPreKernel launch");
+                }
                 CheckCuda(cudaEventRecord(side.ball_done, side.ball), "cudaEventRecord(ball stage)");
             }
             if (concurrent) {
-                LaunchStageCarWorldMeshCandidates(cfg, cars, car_configs, env_car_count, stage_stream, side.prefilter_done, slice);
+                LaunchStageCarWorldMeshCandidates(cfg, cars, car_configs, env_car_count, stage_stream, side.prefilter_done,
+                                                  slice, pre_zero_counts != nullptr);
                 CheckCuda(cudaEventRecord(side.stage_done, stage_stream), "cudaEventRecord(stage)");
             }
             LaunchStageWheelRays(cfg, cars, car_configs, wheel_runtime_states, balls, env_states, solver_scratch,
@@ -2181,10 +2671,19 @@ inline void LaunchStepTicksDirect(
                     CheckCuda(cudaStreamWaitEvent(stream, side.ball_done, 0), "cudaStreamWaitEvent(ball stage)");
                 }
             }
-            StagedWorldKernel<kWorldStepContactsCarsApart><<<world3.blocks, world3.threads, 0, stream>>>(
+            const bool world3_branch = concurrent && UseWorld3Branch();
+            const cudaStream_t world3_stream = world3_branch ? side.world3 : stream;
+            if (world3_branch) {
+                CheckCuda(cudaEventRecord(side.world3_ready, stream), "cudaEventRecord(world3 ready)");
+                CheckCuda(cudaStreamWaitEvent(side.world3, side.world3_ready, 0), "cudaStreamWaitEvent(world3)");
+            }
+            StagedWorldKernel<kWorldStepContactsCarsApart><<<world3.blocks, world3.threads, 0, world3_stream>>>(
                 cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls, car_configs,
                 balls, env_states, pads, seed, rays_inline);
             CheckCuda(cudaGetLastError(), "StagedWorldKernel contacts (cars apart) launch");
+            if (world3_branch) {
+                CheckCuda(cudaEventRecord(side.world3_done, side.world3), "cudaEventRecord(world3)");
+            }
             if (concurrent) {
                 CheckCuda(cudaStreamWaitEvent(stream, side.dependent_done, 0), "cudaStreamWaitEvent(join dependent)");
                 CheckCuda(cudaStreamWaitEvent(stream, side.stage_done, 0), "cudaStreamWaitEvent(join stage)");
@@ -2218,6 +2717,9 @@ inline void LaunchStepTicksDirect(
                     cfg, env_car_count, cars, car_configs, solver_scratch, row_pool, rows_gjk_pool);
                 CheckCuda(cudaGetLastError(), "StagedCarWorldRowsKernel launch");
             }
+            if (world3_branch) {
+                CheckCuda(cudaStreamWaitEvent(stream, side.world3_done, 0), "cudaStreamWaitEvent(join world3)");
+            }
             if (register_iterations) {
                 StagedWorldKernel<kWorldStepRowsCarsApart, 1, true><<<world4.blocks, world4.threads, 0, stream>>>(
                     cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls,
@@ -2228,6 +2730,16 @@ inline void LaunchStepTicksDirect(
                     car_configs, balls, env_states, pads, seed);
             }
             CheckCuda(cudaGetLastError(), "StagedWorldKernel rows launch");
+            if (post_pre_fused && t + 1 < ticks) {
+                StagedPostPreFusedKernel<<<env_tail.blocks, env_tail.threads, 0, stream>>>(
+                    cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, controls, car_configs, balls,
+                    env_states, pads, pads_apart, tail_envs_per_block, controls_by_tick, control_stride,
+                    env_commands_by_tick, env_command_stride, respawn_slots, writable_respawn_slots, respawn_rng,
+                    respawn_order, seed, t + 1, pad_pre_blocks == 0, pre_zero_counts,
+                    kCarWorldMeshStageMeshes + 4 + kRowsFullKeys);
+                CheckCuda(cudaGetLastError(), "StagedPostPreFusedKernel launch");
+                continue;
+            }
             if (post_fused) {
                 // The env tail's shape: kEnvTailLanes threads per env, blocks a multiple of them.
                 StagedPostFusedKernel<<<env_tail.blocks, env_tail.threads, 0, stream>>>(

@@ -663,17 +663,18 @@ ROCKETGPU_HD float GameQuatQuantizeComponent(float c) {
 
 ROCKETGPU_HD Quat GameRbStateQuantizeQuat(const Quat& q_in) {
     const Quat q = GameQuatNormalizeScalar(q_in, 1e-8f);
-    const float c[4] = {q.x, q.y, q.z, q.w};
-    const float a[4] = {fabsf(c[0]), fabsf(c[1]), fabsf(c[2]), fabsf(c[3])};
-    const int i01 = a[0] < a[1] ? 1 : 0;
-    const int i23 = a[2] < a[3] ? 3 : 2;
-    const int big = a[i01] >= a[i23] ? i01 : i23;
-    const float sign = c[big] < 0.0f ? -1.0f : 1.0f;
-    float d[3];
-    for (int i = 0, n = 0; i < 4; ++i) {
-        if (i != big) d[n++] = GameQuatQuantizeComponent(c[i] * sign);
-    }
-    const float rest = ((1.0f - d[0] * d[0]) - d[1] * d[1]) - d[2] * d[2];
+    // Selects, not indexed arrays: a runtime index would put the arrays in local memory.
+    const float a0 = fabsf(q.x), a1 = fabsf(q.y), a2 = fabsf(q.z), a3 = fabsf(q.w);
+    const int i01 = a0 < a1 ? 1 : 0;
+    const int i23 = a2 < a3 ? 3 : 2;
+    const int big = (i01 == 1 ? a1 : a0) >= (i23 == 3 ? a3 : a2) ? i01 : i23;
+    const float c_big = big == 0 ? q.x : big == 1 ? q.y : big == 2 ? q.z : q.w;
+    const float sign = c_big < 0.0f ? -1.0f : 1.0f;
+    // The three kept components in x, y, z, w order.
+    const float d0 = GameQuatQuantizeComponent((big == 0 ? q.y : q.x) * sign);
+    const float d1 = GameQuatQuantizeComponent((big <= 1 ? q.z : q.y) * sign);
+    const float d2 = GameQuatQuantizeComponent((big <= 2 ? q.w : q.z) * sign);
+    const float rest = ((1.0f - d0 * d0) - d1 * d1) - d2 * d2;
     // The game takes this root in double and rounds to float; for rest >= 0 that equals the correctly rounded sqrtf
     // (53 >= 2 * 24 + 2 bits, so double rounding is innocuous), which keeps FP64 off the GPU.
 #if defined(__CUDA_ARCH__)
@@ -681,9 +682,11 @@ ROCKETGPU_HD Quat GameRbStateQuantizeQuat(const Quat& q_in) {
 #else
     const float dropped = sqrtf(rest);
 #endif
-    float o[4];
-    for (int i = 0, n = 0; i < 4; ++i) o[i] = i == big ? dropped : d[n++];
-    return GameQuatNormalizeScalar(Quat(o[3], o[0], o[1], o[2]), 1e-8f);
+    const float ox = big == 0 ? dropped : d0;
+    const float oy = big == 1 ? dropped : (big == 0 ? d0 : d1);
+    const float oz = big == 2 ? dropped : (big <= 1 ? d1 : d2);
+    const float ow = big == 3 ? dropped : d2;
+    return GameQuatNormalizeScalar(Quat(ow, ox, oy, oz), 1e-8f);
 }
 
 // Quantize an orientation given as basis columns, as the game's tick-start state quantize does; returns the quat.
@@ -980,6 +983,13 @@ ROCKETGPU_HD float GlibcAtan2f(float y, float x) {
         case 2: return pi - (z - pi_lo);
         default: return (z - pi_lo) - pi;
     }
+}
+
+// UE3's 16384-entry sine table: entry j = sinf(((float)j + (float)j) * PI_f * 2^-14), with the
+// argument rounded in float as the game does. The float sine is taken as the double sine of that argument, rounded.
+ROCKETGPU_HD float Ue3SinTab(int j) {
+    const float a = ((static_cast<float>(j) + static_cast<float>(j)) * 3.14159274f) * 6.103515625e-05f;
+    return static_cast<float>(sin(static_cast<double>(a)));
 }
 
 ROCKETGPU_HD float SafeAtan2(float y, float x) {

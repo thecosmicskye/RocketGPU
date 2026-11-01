@@ -308,6 +308,11 @@ __device__ inline ArenaMeshBvhNode LoadArenaMeshBvhNode(const ArenaMeshBvhNode* 
 }
 #endif
 
+// Nodes the device walk loads at once (WalkArenaMeshBvhStacklessQuantizedTree); 1 = one node at a time.
+#ifndef ROCKETGPU_WALK_WINDOW
+#define ROCKETGPU_WALK_WINDOW 4
+#endif
+
 template <typename Callback>
 ROCKETGPU_HD void WalkArenaMeshBvhStacklessQuantizedTree(
     const ArenaMeshBvhNode* nodes,
@@ -316,6 +321,52 @@ ROCKETGPU_HD void WalkArenaMeshBvhStacklessQuantizedTree(
     int start_node_index,
     int end_node_index,
     Callback&& callback) {
+#if defined(__CUDA_ARCH__) && ROCKETGPU_WALK_WINDOW > 1
+    // Window walk: load the next W nodes in memory at once (independent loads), then follow the same visit rule
+    // through them: a node is visited when the walk lands on it, and the walk moves to +1 (overlap or leaf) or
+    // +escape. Only a landing past the window waits on a new load. The visit order and the callbacks (made in
+    // order after each window; they don't steer the walk) are the one-node walk's.
+    {
+        constexpr int W = ROCKETGPU_WALK_WINDOW;
+        int cur = start_node_index;
+        while (cur < end_node_index) {
+            ArenaMeshBvhNode win[W];
+#pragma unroll
+            for (int k = 0; k < W; ++k) {
+                win[k] = cur + k < end_node_index ? LoadArenaMeshBvhNode(nodes + cur + k) : ArenaMeshBvhNode{};
+            }
+            int pos = 0;
+            unsigned hits = 0u;
+            int32_t tri[W];
+#pragma unroll
+            for (int k = 0; k < W; ++k) {
+                tri[k] = win[k].get_triangle_index();
+                if (k == pos && cur + k < end_node_index) {
+                    const bool overlap = TestQuantizedAabbAgainstQuantizedAabb(
+                        quantized_query_aabb_min, quantized_query_aabb_max, win[k].quantized_aabb_min,
+                        win[k].quantized_aabb_max);
+                    const bool leaf = win[k].is_leaf_node();
+                    if (leaf && overlap) {
+                        hits |= 1u << k;
+                    }
+                    pos = (overlap || leaf) ? k + 1 : k + win[k].get_escape_index();
+                }
+            }
+            while (hits != 0u) {
+                const int k = __ffs(static_cast<int>(hits)) - 1;
+                hits &= hits - 1u;
+                int32_t t = tri[0];
+#pragma unroll
+                for (int j = 1; j < W; ++j) {
+                    t = k == j ? tri[j] : t;
+                }
+                callback(t);
+            }
+            cur += pos;
+        }
+        return;
+    }
+#endif
     int cur_index = start_node_index;
     const ArenaMeshBvhNode* root_node = &nodes[start_node_index];
 #if defined(__CUDA_ARCH__)

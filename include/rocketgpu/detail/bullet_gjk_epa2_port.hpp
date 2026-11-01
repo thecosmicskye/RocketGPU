@@ -337,6 +337,23 @@ enum btShapeKind : uint8_t {
     BT_SHAPE_CONVEX_HULL = 3,
 };
 
+// Out of line: only the Snowday puck is a hull, and inlined into every support call the unrolled loop is about 7k
+// SASS of EPA::Evaluate alone, between the box/triangle paths that run. Arguments by value (see SPEED_TRIED:
+// no address of a local into a noinline call).
+ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE int btHullSupportIndex(const btVector3* points, int count, btVector3 vec) {
+    btScalar max_dot = -3.402823466e+38f;
+    int max_index = -1;
+    for (int i = 0; i < count; ++i) {
+        const btVector3& p = points[i];
+        const btScalar dot = (p.x() * vec.x() + p.y() * vec.y()) + p.z() * vec.z();
+        if (dot > max_dot) {
+            max_dot = dot;
+            max_index = i;
+        }
+    }
+    return max_index;
+}
+
 struct btConvexShape {
     btShapeKind m_kind = BT_SHAPE_BOX;
     btVector3 m_implicitShapeDimensions = btVector3(0.0f, 0.0f, 0.0f);
@@ -349,17 +366,7 @@ struct btConvexShape {
     btVector3 m_hull_local_aabb_max = btVector3(-1.0f, -1.0f, -1.0f);
 
     ROCKETGPU_HD int hullSupportIndex(const btVector3& vec) const {
-        btScalar max_dot = -3.402823466e+38f;
-        int max_index = -1;
-        for (int i = 0; i < m_hull_point_count; ++i) {
-            const btVector3& p = m_hull_points[i];
-            const btScalar dot = (p.x() * vec.x() + p.y() * vec.y()) + p.z() * vec.z();
-            if (dot > max_dot) {
-                max_dot = dot;
-                max_index = i;
-            }
-        }
-        return max_index;
+        return btHullSupportIndex(m_hull_points, m_hull_point_count, vec);
     }
 
     ROCKETGPU_HD btVector3 localGetSupportVertexWithoutMarginNonVirtual(const btVector3& vec) const {
@@ -751,6 +758,7 @@ struct GJK
         m_status = eStatus::Failed;
         m_current = 0;
         m_distance = 0;
+#if defined(ROCKETGPU_GJK_EPA_DEBUG)
         m_debug_seed_query_dir = btVector3(0, 0, 0);
         m_debug_seed_support_d = btVector3(0, 0, 0);
         m_debug_seed_support_w = btVector3(0, 0, 0);
@@ -758,6 +766,7 @@ struct GJK
         m_debug_seed_support1_dir_local = btVector3(0, 0, 0);
         m_debug_seed_support1_local = btVector3(0, 0, 0);
         m_debug_seed_support1 = btVector3(0, 0, 0);
+#endif
     }
 
     ROCKETGPU_HD eStatus::_ Evaluate(
@@ -785,6 +794,7 @@ struct GJK
         const btVector3 seed_query_dir = sqrl > 0 ? -m_ray : btVector3(1, 0, 0);
         appendvertice(m_simplices[0], seed_query_dir);
         m_simplices[0].p[0] = 1;
+#if defined(ROCKETGPU_GJK_EPA_DEBUG)
         m_debug_seed_query_dir = seed_query_dir;
         m_debug_seed_support_d = m_simplices[0].c[0]->d;
         m_debug_seed_support_w = m_simplices[0].c[0]->w;
@@ -808,6 +818,7 @@ struct GJK
             m_debug_seed_support1_local = seed_support1_local;
             m_debug_seed_support1 = seed_support1;
         }
+#endif
         m_ray = m_simplices[0].c[0]->w;
         sqdist = sqrl;
         lastw[0] =
@@ -1293,6 +1304,7 @@ struct EPA
         m_nextsv = 0;
         m_hull = sList();
         m_stock = sList();
+#if defined(ROCKETGPU_GJK_EPA_DEBUG)
         m_debug_first_iteration = -1;
         m_debug_last_iteration = -1;
         m_debug_first_support1_max_axis = -1;
@@ -1337,6 +1349,7 @@ struct EPA
         m_debug_last_support1_local = btVector3(0.0f, 0.0f, 0.0f);
         m_debug_last_support1 = btVector3(0.0f, 0.0f, 0.0f);
         m_debug_last_support_w = btVector3(0.0f, 0.0f, 0.0f);
+#endif
         for (U i = 0; i < EPA_MAX_FACES; ++i)
         {
             append(m_stock, &m_fc_store[EPA_MAX_FACES - i - 1]);
@@ -1464,6 +1477,7 @@ struct EPA
                         bool valid = true;
                         best->pass = (U1)(++pass);
                         gjk.getsupport(best->n, *w);
+#if defined(ROCKETGPU_GJK_EPA_DEBUG)
                         const btVector3 support0 = gjk.m_shape.Support0(w->d);
                         const btVector3 support1_dir_local = gjk.m_shape.m_toshape1 * (-w->d);
                         const btVector3 support1_toshape1_row0 = gjk.m_shape.m_toshape1[0];
@@ -1491,7 +1505,7 @@ struct EPA
                             ? gjk.m_shape.m_shapes[1]->localGetSupportVertexNonVirtual(support1_dir_local)
                             : gjk.m_shape.m_shapes[1]->localGetSupportVertexWithoutMarginNonVirtual(support1_dir_local);
                         const btVector3 support1 = gjk.m_shape.Support1(-w->d);
-                        const btScalar wdist = btDot(best->n, w->w) - best->d;
+                        const btScalar wdist_debug = btDot(best->n, w->w) - best->d;
                         CaptureIterationDebug(
                             static_cast<int32_t>(iterations),
                             best,
@@ -1509,7 +1523,9 @@ struct EPA
                             support1_max_axis,
                             support1_local,
                             support1,
-                            wdist);
+                            wdist_debug);
+#endif
+                        const btScalar wdist = btDot(best->n, w->w) - best->d;
                         if (wdist > EPA_ACCURACY)
                         {
                             for (U j = 0; (j < 3) && valid; ++j)
@@ -1949,6 +1965,7 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::Penetration(co
             EPA::eStatus::_ epa_status = epa.Evaluate(gjk, -guess);
             if (epa_status != EPA::eStatus::Failed)
             {
+#if defined(ROCKETGPU_GJK_EPA_DEBUG)
                 btVector3 debug_dirs[4] = {
                     btVector3(0, 0, 0),
                     btVector3(0, 0, 0),
@@ -1966,6 +1983,7 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::Penetration(co
                     debug_dirs[i] = epa.m_result.c[i] ? epa.m_result.c[i]->d : btVector3(0, 0, 0);
                     debug_ws[i] = epa.m_result.c[i] ? epa.m_result.c[i]->w : btVector3(0, 0, 0);
                 }
+#endif
                 btVector3 w0 = btVector3(0, 0, 0);
                 btVector3 support0_dir_norm[4] = {
                     btVector3(0, 0, 0),
@@ -2055,6 +2073,7 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::PenetrationWit
             EPA::eStatus::_ epa_status = epa.Evaluate(scratch.gjk, -guess);
             if (epa_status != EPA::eStatus::Failed)
             {
+#if defined(ROCKETGPU_GJK_EPA_DEBUG)
                 btVector3 debug_dirs[4] = {
                     btVector3(0, 0, 0),
                     btVector3(0, 0, 0),
@@ -2072,6 +2091,7 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::PenetrationWit
                     debug_dirs[i] = epa.m_result.c[i] ? epa.m_result.c[i]->d : btVector3(0, 0, 0);
                     debug_ws[i] = epa.m_result.c[i] ? epa.m_result.c[i]->w : btVector3(0, 0, 0);
                 }
+#endif
                 btVector3 w0 = btVector3(0, 0, 0);
                 btVector3 support0_dir_norm[4] = {
                     btVector3(0, 0, 0),

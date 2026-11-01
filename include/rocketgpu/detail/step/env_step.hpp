@@ -274,11 +274,15 @@ ROCKETGPU_HD void ResolveCarCarCollision(
         return;
     }
 
-    // Predicted states only after the retained-manifold gate, which most pairs fail.
-    const CarState predicted_a = use_cached_contact
+    // Predicted states only after the retained-manifold gate, which most pairs fail. With cal_ccm nothing reads them
+    // or the OBBs built from them: the gap test and the predicted OBB test need !cal_ccm, and every cal_ccm path past
+    // the have_contact gate has force_current_contact_seed or use_cached_contact (seeds a/b, no skipped impulse, no
+    // re-anchor, current OBBs wherever an OBB is read). So they are the current states there, as with a cached contact.
+    const bool predicted_unused = use_cached_contact || cal_ccm;
+    const CarState predicted_a = predicted_unused
         ? a
         : BuildPredictedCarSolverState(a, external_linear_delta_a, external_angular_delta_a, dt, NativeSseMath(mutator));
-    const CarState predicted_b = use_cached_contact
+    const CarState predicted_b = predicted_unused
         ? b
         : BuildPredictedCarSolverState(b, external_linear_delta_b, external_angular_delta_b, dt, NativeSseMath(mutator));
     const Vec3 solver_external_linear_delta_a = external_linear_delta_a;
@@ -307,10 +311,10 @@ ROCKETGPU_HD void ResolveCarCarCollision(
         force_current_from_broadphase_gap = true;
     }
 
-    ObbData obb_a = MakeCarObb(force_current_contact_seed ? a : predicted_a, cfg_a);
-    ObbData obb_b = MakeCarObb(force_current_contact_seed ? b : predicted_b, cfg_b);
     const ObbData current_obb_a = MakeCarObb(a, cfg_a);
     const ObbData current_obb_b = MakeCarObb(b, cfg_b);
+    ObbData obb_a = (force_current_contact_seed || predicted_unused) ? current_obb_a : MakeCarObb(predicted_a, cfg_a);
+    ObbData obb_b = (force_current_contact_seed || predicted_unused) ? current_obb_b : MakeCarObb(predicted_b, cfg_b);
     Vec3 normal(1.0f, 0.0f, 0.0f);
 
     constexpr float kFreshContactThresholdUU = 0.0f;
@@ -672,6 +676,12 @@ ROCKETGPU_HD void ResolveCarCarCollision(
     float normal_row_rhs_bt[kMaxApproxCarCarContactPoints] = {};
     uint8_t normal_row_valid[kMaxApproxCarCarContactPoints] = {};
 
+    // From here on the pair's solver states keep their seeds' rotations (impulses change only velocities), so each car's
+    // inverse-inertia rows are built once instead of at every row (same expressions, same bits).
+    const CarFrame cc_frame_a = MakeCarFrame(solver_seed_a, cfg_a, mutator.car_mass);
+    const CarFrame cc_frame_b = MakeCarFrame(solver_seed_b, cfg_b, mutator.car_mass);
+    const CarInvInertiaRowsUu cc_inv_uu_a = MakeCarInvInertiaRowsUu(solver_seed_a, cfg_a, mutator.car_mass);
+    const CarInvInertiaRowsUu cc_inv_uu_b = MakeCarInvInertiaRowsUu(solver_seed_b, cfg_b, mutator.car_mass);
     for (int contact_idx = 0; contact_idx < contact_point_count; ++contact_idx) {
         const Vec3 normal = cc_point_normals[contact_idx];
         const Vec3 rel_a_bt = contact_points_a_bt[contact_idx] - solver_a.pos_bt;
@@ -711,12 +721,12 @@ ROCKETGPU_HD void ResolveCarCarCollision(
         {
             const Vec3 denom_normal_axis = -normal;
             const Vec3 denom_torque_a = Cross(rel_a_bt, denom_normal_axis);
-            const Vec3 denom_ang_a = ApplyInverseBodyInertiaWorldBt(solver_a_bt, cfg_a, mutator.car_mass, denom_torque_a);
+            const Vec3 denom_ang_a = ApplyInverseBodyInertiaWorldBtRowDot(cc_frame_a, denom_torque_a);
             const Vec3 denom_vec_a = Cross(denom_ang_a, rel_a_bt);
             denom_a = denom_inv_mass_bt + Dot(denom_normal_axis, denom_vec_a);
 
             const Vec3 denom_torque_b = Cross(rel_b_bt, -denom_normal_axis);
-            const Vec3 denom_ang_b = ApplyInverseBodyInertiaWorldBt(solver_b_bt, cfg_b, mutator.car_mass, denom_torque_b);
+            const Vec3 denom_ang_b = ApplyInverseBodyInertiaWorldBtRowDot(cc_frame_b, denom_torque_b);
             const Vec3 denom_vec_b = Cross(-denom_ang_b, rel_b_bt);
             denom_b = denom_inv_mass_bt + Dot(denom_normal_axis, denom_vec_b);
         }
@@ -784,16 +794,8 @@ ROCKETGPU_HD void ResolveCarCarCollision(
             const Vec3 shared_normal_b = normal;
             const Vec3 shared_rel_a_cross_normal = Cross(rel_a, shared_normal_a);
             const Vec3 shared_rel_b_cross_normal = Cross(rel_b, shared_normal_b);
-            const Vec3 shared_angular_component_a = ApplyInverseBodyInertiaWorld(
-                solver_seed_a,
-                cfg_a,
-                mutator.car_mass,
-                shared_rel_a_cross_normal);
-            const Vec3 shared_angular_component_b = ApplyInverseBodyInertiaWorld(
-                solver_seed_b,
-                cfg_b,
-                mutator.car_mass,
-                shared_rel_b_cross_normal);
+            const Vec3 shared_angular_component_a = ApplyInverseBodyInertiaWorld(cc_inv_uu_a, shared_rel_a_cross_normal);
+            const Vec3 shared_angular_component_b = ApplyInverseBodyInertiaWorld(cc_inv_uu_b, shared_rel_b_cross_normal);
             CarSharedVelocityContactRow& shared_row = shared_velocity_rows[*shared_velocity_row_count];
             shared_row = CarSharedVelocityContactRow{};
             shared_row.valid = 1;
@@ -822,9 +824,9 @@ ROCKETGPU_HD void ResolveCarCarCollision(
                 shared_row.rel_a_cross_normal_bt = rel_a_cross_normal_bt_row;
                 shared_row.rel_b_cross_normal_bt = rel_b_cross_normal_bt_row;
                 shared_row.angular_component_a_bt =
-                    ApplyInverseBodyInertiaWorldBt(solver_a, cfg_a, mutator.car_mass, rel_a_cross_normal_bt_row);
+                    ApplyInverseBodyInertiaWorldBtRowDot(cc_frame_a, rel_a_cross_normal_bt_row);
                 shared_row.angular_component_b_bt =
-                    ApplyInverseBodyInertiaWorldBt(solver_b, cfg_b, mutator.car_mass, rel_b_cross_normal_bt_row);
+                    ApplyInverseBodyInertiaWorldBtRowDot(cc_frame_b, rel_b_cross_normal_bt_row);
                 shared_row.has_bt = 1;
             }
             shared_row.applied_impulse = resolved_normal_impulse[contact_idx];
@@ -862,28 +864,12 @@ ROCKETGPU_HD void ResolveCarCarCollision(
 
             const Vec3 tangent_a = tangent;
             const Vec3 tangent_b = -tangent;
-            const Vec3 tangent_angular_component_a = ApplyInverseBodyInertiaWorld(
-                solver_seed_a,
-                cfg_a,
-                mutator.car_mass,
-                Cross(rel_a, tangent_a));
-            const Vec3 tangent_angular_component_b = ApplyInverseBodyInertiaWorld(
-                solver_seed_b,
-                cfg_b,
-                mutator.car_mass,
-                Cross(rel_b, tangent_b));
+            const Vec3 tangent_angular_component_a = ApplyInverseBodyInertiaWorld(cc_inv_uu_a, Cross(rel_a, tangent_a));
+            const Vec3 tangent_angular_component_b = ApplyInverseBodyInertiaWorld(cc_inv_uu_b, Cross(rel_b, tangent_b));
             const Vec3 rel_a_cross_tangent_bt = Cross(rel_a_bt, tangent_a);
             const Vec3 rel_b_cross_tangent_bt = Cross(rel_b_bt, tangent_b);
-            const Vec3 denom_angular_component_a_bt = ApplyInverseBodyInertiaWorldBt(
-                solver_seed_a,
-                cfg_a,
-                mutator.car_mass,
-                rel_a_cross_tangent_bt);
-            const Vec3 denom_angular_component_b_bt = ApplyInverseBodyInertiaWorldBt(
-                solver_seed_b,
-                cfg_b,
-                mutator.car_mass,
-                rel_b_cross_tangent_bt);
+            const Vec3 denom_angular_component_a_bt = ApplyInverseBodyInertiaWorldBtRowDot(cc_frame_a, rel_a_cross_tangent_bt);
+            const Vec3 denom_angular_component_b_bt = ApplyInverseBodyInertiaWorldBtRowDot(cc_frame_b, rel_b_cross_tangent_bt);
             const Vec3 denom_vec_a_bt = Cross(denom_angular_component_a_bt, rel_a_bt);
             const Vec3 denom_vec_b_bt = Cross(-denom_angular_component_b_bt, rel_b_bt);
             const float denom_dot_a_bt = Dot(tangent_a, denom_vec_a_bt);
@@ -1049,9 +1035,9 @@ ROCKETGPU_HD void ResolveCarCarCollision(
                 const Vec3 rel_a_cross_normal = Cross(rel_a, normal_a);
                 const Vec3 rel_b_cross_normal = Cross(rel_b, normal_b);
                 const Vec3 angular_component_a =
-                    ApplyInverseBodyInertiaWorld(solver_seed_a, cfg_a, mutator.car_mass, rel_a_cross_normal);
+                    ApplyInverseBodyInertiaWorld(cc_inv_uu_a, rel_a_cross_normal);
                 const Vec3 angular_component_b =
-                    ApplyInverseBodyInertiaWorld(solver_seed_b, cfg_b, mutator.car_mass, rel_b_cross_normal);
+                    ApplyInverseBodyInertiaWorld(cc_inv_uu_b, rel_b_cross_normal);
 
                 float denom = 0.0f;
                 denom += inv_mass_a + Dot(normal_a, Cross(angular_component_a, rel_a));
@@ -1073,9 +1059,9 @@ ROCKETGPU_HD void ResolveCarCarCollision(
                 const Vec3 rel_a_cross_normal_bt = Cross(rel_a_bt, normal_a);
                 const Vec3 rel_b_cross_normal_bt = Cross(rel_b_bt, normal_b);
                 const Vec3 angular_component_a_bt =
-                    ApplyInverseBodyInertiaWorldBt(solver_seed_a, cfg_a, mutator.car_mass, rel_a_cross_normal_bt);
+                    ApplyInverseBodyInertiaWorldBtRowDot(cc_frame_a, rel_a_cross_normal_bt);
                 const Vec3 angular_component_b_bt =
-                    ApplyInverseBodyInertiaWorldBt(solver_seed_b, cfg_b, mutator.car_mass, rel_b_cross_normal_bt);
+                    ApplyInverseBodyInertiaWorldBtRowDot(cc_frame_b, rel_b_cross_normal_bt);
                 float denom_bt = 0.0f;
                 denom_bt += inv_mass_a + Dot(normal_a, Cross(angular_component_a_bt, rel_a_bt));
                 denom_bt += inv_mass_b + Dot(normal_b, Cross(angular_component_b_bt, rel_b_bt));
@@ -1138,9 +1124,9 @@ ROCKETGPU_HD void ResolveCarCarCollision(
                 const Vec3 rel_a_cross_normal = Cross(rel_a, normal_a);
                 const Vec3 rel_b_cross_normal = Cross(rel_b, normal_b);
                 const Vec3 angular_component_a =
-                    ApplyInverseBodyInertiaWorldBt(solver_seed_a, cfg_a, mutator.car_mass, rel_a_cross_normal);
+                    ApplyInverseBodyInertiaWorldBtRowDot(cc_frame_a, rel_a_cross_normal);
                 const Vec3 angular_component_b =
-                    ApplyInverseBodyInertiaWorldBt(solver_seed_b, cfg_b, mutator.car_mass, rel_b_cross_normal);
+                    ApplyInverseBodyInertiaWorldBtRowDot(cc_frame_b, rel_b_cross_normal);
 
                 float denom = 0.0f;
                 denom += inv_mass_a + Dot(normal_a, Cross(angular_component_a, rel_a));
@@ -1449,7 +1435,7 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     const CarConfig& cfg,
     const MutatorConfig& mutator,
     float dt,
-    WheelRuntimeState* wheel_runtime_state = nullptr,
+    WheelRuntimeState* ROCKETGPU_RESTRICT wheel_runtime_state = nullptr,
     const ArenaMeshTriangle* mesh_triangles = nullptr,
     int32_t mesh_triangle_count = 0,
     const CarState* cars_in_env = nullptr,
@@ -1788,7 +1774,8 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
                     && (selected < 0 || wheels[wheel].contact_normal_ws.z > wheels[selected].contact_normal_ws.z))
                     selected = wheel;
             bool previous = false;
-            if (selected >= 0 && car.tick_count_since_update != 0) {
+            // The last contact's loads only feed an event, so a run that records none skips them.
+            if (selected >= 0 && mutator.physics_events.windows && car.tick_count_since_update != 0) {
                 const auto normal = wheels[selected].contact_normal_ws;
                 for (int wheel = 0; wheel < 4; ++wheel) {
                     const auto old = wheel_runtime_state->event_world_normals[wheel];
@@ -1914,14 +1901,29 @@ ROCKETGPU_HD bool BallWorldMeshManifoldsEmpty(const WorldSolverScratch& scratch)
 static_assert(kMaxApproxCarCarContactPoints <= kMaxCarPairRowsPerPair, "pair row caps assume <= 4 rows per car pair");
 
 // A row's words, all loaded before any is stored: a plain struct copy between global rows alternates load and store,
-// so each store waits on its load before the next load issues.
+// so each store waits on its load before the next load issues. 16-byte aligned rows move as 16-byte vectors.
 template <typename T>
 struct RowWords {
     static_assert(sizeof(T) % sizeof(uint32_t) == 0 && alignof(T) >= alignof(uint32_t), "rows copy by 32-bit words");
     static constexpr int kCount = static_cast<int>(sizeof(T) / sizeof(uint32_t));
-    uint32_t w[kCount];
+    static constexpr bool kVec4 = alignof(T) >= 16 && sizeof(T) % 16 == 0;
+    alignas(16) uint32_t w[kCount];
 
     ROCKETGPU_HD void load(const T& src) {
+#if defined(__CUDA_ARCH__)
+        if constexpr (kVec4) {
+            const uint4* const from = reinterpret_cast<const uint4*>(&src);
+#pragma unroll
+            for (int k = 0; k < kCount / 4; ++k) {
+                const uint4 v = from[k];
+                w[4 * k] = v.x;
+                w[4 * k + 1] = v.y;
+                w[4 * k + 2] = v.z;
+                w[4 * k + 3] = v.w;
+            }
+            return;
+        }
+#endif
         const uint32_t* const from = reinterpret_cast<const uint32_t*>(&src);
 #pragma unroll
         for (int k = 0; k < kCount; ++k) {
@@ -1929,6 +1931,16 @@ struct RowWords {
         }
     }
     ROCKETGPU_HD void store(T& dst) const {
+#if defined(__CUDA_ARCH__)
+        if constexpr (kVec4) {
+            uint4* const to = reinterpret_cast<uint4*>(&dst);
+#pragma unroll
+            for (int k = 0; k < kCount / 4; ++k) {
+                to[k] = make_uint4(w[4 * k], w[4 * k + 1], w[4 * k + 2], w[4 * k + 3]);
+            }
+            return;
+        }
+#endif
         uint32_t* const to = reinterpret_cast<uint32_t*>(&dst);
 #pragma unroll
         for (int k = 0; k < kCount; ++k) {
@@ -1937,30 +1949,53 @@ struct RowWords {
     }
 };
 
-// Moves n rows from [src, src + n) down to [dst, dst + n), dst <= src, two rows per load round trip: both are loaded
-// before either is stored, and a store never lands on a source row still to be loaded. A friction row's
-// normal_row_idx drops by normal_shift on the way.
-template <typename T>
-ROCKETGPU_HD void MoveRowsDown(EnvStridedArray<T> arr, int dst, int src, int n, int normal_shift) {
-    for (int k = 0; k < n; k += 2) {
-        const bool two = k + 1 < n;
-        RowWords<T> a;
-        RowWords<T> b;
-        a.load(arr[src + k]);
-        if (two) {
-            b.load(arr[src + k + 1]);
+// Moves a car's split, velocity and friction rows down to their packed slots (each dst <= src): row j of all three
+// kinds loads in one round trip before any is stored, and a store never lands on a source row still to be loaded. A
+// moved friction row's normal_row_idx drops by normal_shift; with friction rows in place it is adjusted where they
+// stand.
+ROCKETGPU_HD void MoveCarWorldRowsDown(const WorldSolverScratchRows& rows, bool move_split, int split_dst,
+                                       int split_src, int split_n, bool move_velocity, int velocity_dst,
+                                       int velocity_src, int velocity_n, bool move_friction, int friction_dst,
+                                       int friction_src, int friction_n, int normal_shift) {
+    constexpr int kIdxWord =
+        static_cast<int>(offsetof(CarSharedFrictionContactRow, normal_row_idx) / sizeof(uint32_t));
+    const bool adjust_friction = move_friction || normal_shift != 0;
+    const int n_split = move_split ? split_n : 0;
+    const int n_velocity = move_velocity ? velocity_n : 0;
+    const int n_friction = adjust_friction ? friction_n : 0;
+    const int n = n_split > n_velocity ? (n_split > n_friction ? n_split : n_friction)
+                                       : (n_velocity > n_friction ? n_velocity : n_friction);
+    for (int j = 0; j < n; ++j) {
+        RowWords<CarSharedSplitContactRow> split;
+        RowWords<CarSharedVelocityContactRow> velocity;
+        RowWords<CarSharedFrictionContactRow> friction;
+        int32_t friction_idx = 0;
+        if (j < n_split) {
+            split.load(rows.world_split_rows[split_src + j]);
         }
-        if constexpr (std::is_same<T, CarSharedFrictionContactRow>::value) {
-            constexpr int kIdxWord =
-                static_cast<int>(offsetof(CarSharedFrictionContactRow, normal_row_idx) / sizeof(uint32_t));
-            a.w[kIdxWord] = static_cast<uint32_t>(static_cast<int32_t>(a.w[kIdxWord]) - normal_shift);
-            if (two) {
-                b.w[kIdxWord] = static_cast<uint32_t>(static_cast<int32_t>(b.w[kIdxWord]) - normal_shift);
+        if (j < n_velocity) {
+            velocity.load(rows.world_velocity_rows[velocity_src + j]);
+        }
+        if (j < n_friction) {
+            if (move_friction) {
+                friction.load(rows.world_friction_rows[friction_src + j]);
+            } else {
+                friction_idx = rows.world_friction_rows[friction_dst + j].normal_row_idx;
             }
         }
-        a.store(arr[dst + k]);
-        if (two) {
-            b.store(arr[dst + k + 1]);
+        if (j < n_split) {
+            split.store(rows.world_split_rows[split_dst + j]);
+        }
+        if (j < n_velocity) {
+            velocity.store(rows.world_velocity_rows[velocity_dst + j]);
+        }
+        if (j < n_friction) {
+            if (move_friction) {
+                friction.w[kIdxWord] = static_cast<uint32_t>(static_cast<int32_t>(friction.w[kIdxWord]) - normal_shift);
+                friction.store(rows.world_friction_rows[friction_dst + j]);
+            } else {
+                rows.world_friction_rows[friction_dst + j].normal_row_idx = friction_idx - normal_shift;
+            }
         }
     }
 }
@@ -2002,21 +2037,10 @@ ROCKETGPU_HD void PackCarWorldRows(
         const int split_from = i * kMaxCarWorldSplitContactRows;
         const int velocity_shift = i * kMaxCarWorldVelocityContactRows - velocity_row_count;
         const int friction_shift = i * kMaxCarWorldFrictionContactRows - friction_row_count;
-        if (split_from != split_row_count) {
-            MoveRowsDown(rows.world_split_rows, split_row_count, split_from, out_split_count, 0);
-        }
-        if (velocity_shift != 0) {
-            MoveRowsDown(rows.world_velocity_rows, velocity_row_count, velocity_row_count + velocity_shift,
-                         out_velocity_count, 0);
-        }
-        if (friction_shift != 0) {
-            MoveRowsDown(rows.world_friction_rows, friction_row_count, friction_row_count + friction_shift,
-                         out_friction_count, velocity_shift);
-        } else {
-            for (int k = 0; velocity_shift != 0 && k < out_friction_count; ++k) {
-                rows.world_friction_rows[friction_row_count + k].normal_row_idx -= velocity_shift;
-            }
-        }
+        MoveCarWorldRowsDown(rows, split_from != split_row_count, split_row_count, split_from, out_split_count,
+                             velocity_shift != 0, velocity_row_count, velocity_row_count + velocity_shift,
+                             out_velocity_count, friction_shift != 0, friction_row_count,
+                             friction_row_count + friction_shift, out_friction_count, velocity_shift);
         // Group g + 1 is loaded before group g is stored, so the loads do not wait on the stores.
         SharedContactOrderGroup next_group;
         if (out_group_count > 0) {
@@ -2196,7 +2220,12 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
         if (!WorldPartIsRows(world_part)) {
             solver_scratch->shared_contact_order_group_count = 0;
             if (solver_scratch->retained_reset_pending) {
-                ClearRetainedContactManifolds(rows);
+                // The cars-apart contacts run beside the car-world rows, which clear their own car-world manifolds.
+                const bool car_world = world_part != kWorldStepContactsCarsApart;
+                ClearRetainedContactManifolds(rows, car_world);
+                for (int k = 0; car_world && k < 8; ++k) {
+                    solver_scratch->car_world_reset[k] = 0;
+                }
                 solver_scratch->retained_reset_pending = 0;
             }
 
@@ -2641,6 +2670,11 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
         const bool ball_settled_rows_ok = normal_row_count > 0;
 
         if (WorldPartIsRows(world_part)) {
+            for (int i = 0; i < count && i < 8; ++i) {
+                if (solver_scratch->car_world_rows_out[i].world_surface) {
+                    cars[base + i].RecordWorldSurface(true);
+                }
+            }
             PackCarWorldRows(count, solver_scratch->car_world_rows_out, rows, world_split_row_count,
                              world_velocity_row_count, world_friction_row_count,
                              solver_scratch->shared_contact_order_group_count);
@@ -2894,13 +2928,14 @@ ROCKETGPU_HD void ApplyEnvCommand(
     env.goal_scored_this_tick = 0;
 }
 
-ROCKETGPU_HD void RocketSim_Car_PreTickUpdate(
+// Always inlined, so StagedCarPreKernel (through StepEnvVehicleUpdateCarInline) runs the vehicle update without an ABI call.
+ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void RocketSim_Car_PreTickUpdate(
     CarState& car,
     CarControls controls,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
     float dt,
-    WheelRuntimeState* wheel_runtime_state,
+    WheelRuntimeState* ROCKETGPU_RESTRICT wheel_runtime_state,
     const ArenaMeshTriangle* mesh_triangles = nullptr,
     int32_t mesh_triangle_count = 0,
     const CarState* cars_in_env = nullptr,
@@ -3161,12 +3196,15 @@ ROCKETGPU_HD void StageWheelRaysForEnv(
         return;
     }
     const CarState& car = cars[base + car_slot];
-    if (car.is_demoed) {
+    // A car set with wheel contact normals reads the other cars' velocities in its update (SetStateWorldWheelNormals),
+    // which their updates write: leaving its rays unstaged keeps the env's updates in visit order.
+    if (car.is_demoed || car.set_wheel_normals_mask != 0) {
         return;
     }
-    uint8_t no_response[kStageCars];
+    // One bit per car slot: a runtime-indexed byte array would live in local memory.
+    int32_t no_response = 0;
     for (int j = 0; j < count; ++j) {
-        no_response[j] = cars[base + j].demo_no_contact_response;
+        no_response |= (cars[base + j].demo_no_contact_response != 0 ? 1 : 0) << j;
     }
     for (int k = 0; k < count; ++k) {
         const int j = CarVisitSlot(env, k, count);
@@ -3174,7 +3212,7 @@ ROCKETGPU_HD void StageWheelRaysForEnv(
             break;
         }
         if (j >= 0 && j < count) {
-            no_response[j] = cars[base + j].is_demoed ? 1 : 0;
+            no_response = cars[base + j].is_demoed ? (no_response | (1 << j)) : (no_response & ~(1 << j));
         }
     }
     const CarConfig& car_cfg = car_configs[base + car_slot];
@@ -3216,7 +3254,8 @@ enum : int { kStepEnvPhaseFull = 0, kStepEnvPhasePost = 2, kStepEnvPhasePostVehi
 
 // Vehicle update of car slot i at the start of the physics tick (RocketSim_Car_PreTickUpdate). A wheel resting on
 // another car or the ball pushes that body, which the cars visited after it then see.
-ROCKETGPU_HD void StepEnvVehicleUpdateCar(
+// Always inlined for StagedCarPreKernel; the other callers share the outlined StepEnvVehicleUpdateCar below.
+ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void StepEnvVehicleUpdateCarInline(
     int env_idx,
     int i,
     int count,
@@ -3260,6 +3299,22 @@ ROCKETGPU_HD void StepEnvVehicleUpdateCar(
         i < 32 && ((pushed_cars_mask >> i) & 1u));
 }
 
+ROCKETGPU_HD void StepEnvVehicleUpdateCar(
+    int env_idx,
+    int i,
+    int count,
+    const SimConfig& cfg,
+    CarState* cars,
+    WheelRuntimeState* wheel_runtime_states,
+    CarConfig* car_configs,
+    BallState* balls,
+    const CarControls& controls,
+    const WheelRayStage* staged_rays_for_env,
+    uint32_t& pushed_cars_mask) {
+    StepEnvVehicleUpdateCarInline(env_idx, i, count, cfg, cars, wheel_runtime_states, car_configs, balls, controls,
+                                  staged_rays_for_env, pushed_cars_mask);
+}
+
 // Whether the cars' vehicle updates can run in any order: every wheel ray is staged (no live raycast against the
 // other cars) and none rests on a car or the ball (the only bodies an update pushes), and no physics events are
 // recorded (they are emitted in visit order). Each update then reads and writes only its own car.
@@ -3279,6 +3334,16 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void BuildCarWorldRowsForCar(
     const int car_idx = env_idx * cfg.max_cars_per_env + i;
     CarWorldRowsOut& out = scratch.car_world_rows_out[i];
     out.group_count = 0;
+    out.world_surface = 0;
+    if (i < kMaxCarWorldMeshPersistentCars && scratch.car_world_reset[i]) {
+        for (int plane_idx = 0; plane_idx < kCarWorldPlaneRetainedManifoldsPerCar; ++plane_idx) {
+            rows.car_world_plane_manifolds[i * kCarWorldPlaneRetainedManifoldsPerCar + plane_idx].count = 0;
+        }
+        for (int k = 0; k < kCarWorldMeshRetainedManifoldsPerCar; ++k) {
+            rows.car_world_mesh_manifolds[i * kCarWorldMeshRetainedManifoldsPerCar + k].count = 0;
+        }
+        scratch.car_world_reset[i] = 0;
+    }
     int split_end = i * kMaxCarWorldSplitContactRows;
     int velocity_end = i * kMaxCarWorldVelocityContactRows;
     int friction_end = i * kMaxCarWorldFrictionContactRows;
@@ -3316,8 +3381,10 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void BuildCarWorldRowsForCar(
                 ? &rows.car_world_mesh_manifolds[i * kCarWorldMeshRetainedManifoldsPerCar]
                 : nullptr,
             rows.car_world_local_rows ? &rows.car_world_local_rows[i] : nullptr,
-            mesh_reach_hint);
+            mesh_reach_hint,
+            true);
         RecordArenaWorldContact(cars[car_idx], acc);
+        out.world_surface = acc.surface;
     }
     out.split_row_count = split_end - i * kMaxCarWorldSplitContactRows;
     out.velocity_row_count = velocity_end - i * kMaxCarWorldVelocityContactRows;
@@ -3378,6 +3445,9 @@ ROCKETGPU_HD void StepEnvPreTickEnv(
             ResetBallMeshPersistentManifold(solver_scratch[env_idx].ball_world_plane_manifolds[manifold_idx]);
         }
         solver_scratch[env_idx].retained_reset_pending = 1;
+        for (int k = 0; k < 8; ++k) {
+            solver_scratch[env_idx].car_world_reset[k] = 1;
+        }
     }
 }
 

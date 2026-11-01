@@ -450,7 +450,7 @@ ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
         debug_gjk_axis_bt = cached_axis;
         debug_gjk_len_sqr = len_sqr;
         debug_gjk_squared_distance = squared_distance;
-        if (len_sqr < 0.0001f) {
+        if (len_sqr <= 0.0001f) {  // game: float len2 widened, < 0.0001 (double); same as <= 0.0001f
             degenerate_simplex = 5;
         }
         if (len_sqr > 1.1920929e-7f * 1.1920929e-7f) {
@@ -468,7 +468,7 @@ ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
 
                 {
                     const bool catch_degenerate_penetration_case_cuda =
-                        degenerate_simplex && ((distance_bt + margin_bt) < 0.01f);
+                        degenerate_simplex && ((distance_bt + margin_bt) <= 0.01f);  // game: < 0.01 (double); same as <= 0.01f
                     if (catch_degenerate_penetration_case_cuda) {
                         // Fall through to the shared catch_degenerate +
                     } else {
@@ -500,7 +500,7 @@ ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
     }
 
     const bool catch_degenerate_penetration_case =
-        degenerate_simplex && ((distance_bt + margin_bt) < 0.01f);
+        degenerate_simplex && ((distance_bt + margin_bt) <= 0.01f);  // game: < 0.01 (double); same as <= 0.01f
 
 #if defined(__CUDA_ARCH__)
     const volatile int32_t method_before_penetration = last_used_method;
@@ -793,7 +793,7 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
     simplex.compute_points(point_on_a_bt, point_on_b_bt);
 
     const float len_sqr = LengthSq(cached_axis);
-    if (len_sqr < 0.0001f) {
+    if (len_sqr <= 0.0001f) {  // game: float len2 widened, < 0.0001 (double); same as <= 0.0001f
         degenerate_simplex = 5;
     }
 
@@ -816,7 +816,7 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
     }
 
     const bool catch_degenerate_penetration_case =
-        degenerate_simplex && ((distance_bt + margin_a_bt + margin_b_bt) < 0.01f);
+        degenerate_simplex && ((distance_bt + (margin_a_bt + margin_b_bt)) <= 0.01f);  // game: distance + (mA + mB), < 0.01 (double)
     if (!is_valid || catch_degenerate_penetration_case) {
         bullet_port::btVector3 cached_separating_axis(0.0f, 0.0f, 0.0f);
         bullet_port::btVector3 tmp_point_on_a_world(0.0f, 0.0f, 0.0f);
@@ -1074,7 +1074,7 @@ ROCKETGPU_HD void TraceBallCarContactGeometryGjkShadow(
     simplex.compute_points(point_on_a_bt, point_on_b_bt);
 
     const float len_sqr = LengthSq(cached_axis);
-    if (len_sqr < 0.0001f) {
+    if (len_sqr <= 0.0001f) {  // game: float len2 widened, < 0.0001 (double); same as <= 0.0001f
         degenerate_simplex = 5;
     }
 
@@ -1100,7 +1100,7 @@ ROCKETGPU_HD void TraceBallCarContactGeometryGjkShadow(
 
     const float distance_plus_margin = distance_bt + margin_bt;
     const bool catch_degenerate_penetration_case =
-        degenerate_simplex && (distance_plus_margin < 0.01f);
+        degenerate_simplex && (distance_plus_margin <= 0.01f);  // game: < 0.01 (double); same as <= 0.01f
     const bool needs_penetration = !is_valid || catch_degenerate_penetration_case;
     if (needs_penetration) {
         bullet_port::btVector3 cached_separating_axis(0.0f, 0.0f, 0.0f);
@@ -1617,8 +1617,7 @@ ROCKETGPU_HD void RecordBallCarCollisionInfoIfOverlapping(
             const int fwd_yaw = ue3_round(GlibcAtan2f(ei_fwd.y, ei_fwd.x) * 32768.0f / 3.14159274f);
             const float fwd_xy = static_cast<float>(sqrt(static_cast<double>(ei_fwd.y * ei_fwd.y + ei_fwd.x * ei_fwd.x)));
             const int fwd_pitch = ue3_round(GlibcAtan2f(ei_fwd.z, fwd_xy) * 32768.0f / 3.14159274f);
-            constexpr double kSinTabStep = 6.283185307179586476925 / 16384.0;
-            const auto sin_tab = [&](int a) { return static_cast<float>(sin(static_cast<double>((a >> 2) & 16383) * kSinTabStep)); };
+            const auto sin_tab = [&](int a) { return Ue3SinTab((a >> 2) & 16383); };
             const float cos_pitch = sin_tab(fwd_pitch + 16384);
             const Vec3 car_forward(
                 cos_pitch * sin_tab(fwd_yaw + 16384), cos_pitch * sin_tab(fwd_yaw), sin_tab(fwd_pitch));
@@ -2161,7 +2160,7 @@ struct FaceClipPoint {
 };
 
 constexpr int kMaxApproxCarCarContactPoints = 4;
-constexpr float kLargeFaceClipFloat = 1.0e30f;
+constexpr float kLargeFaceClipFloat = 1.0e18f;  // BT_LARGE_FLOAT, cullPoints2's degenerate-area fallback
 
 ROCKETGPU_HD float ObbHalfExtentComponent(const ObbData& obb, int idx) {
     return (&obb.half_extent.x)[idx];
@@ -2253,7 +2252,7 @@ ROCKETGPU_HD void CullFacePoints2(int count, float points[16], int max_points, i
         }
         q = points[count * 2 - 2] * points[1] - points[0] * points[count * 2 - 1];
         const float denom = area_sum + q;
-        const float scale = Abs(denom) > 1.0e-8f ? (1.0f / (3.0f * denom)) : kLargeFaceClipFloat;
+        const float scale = Abs(denom) > 1.1920929e-7f ? (1.0f / (3.0f * denom)) : kLargeFaceClipFloat;  // SIMD_EPSILON
         cx = scale * (cx + q * (points[count * 2 - 2] + points[0]));
         cy = scale * (cy + q * (points[count * 2 - 1] + points[1]));
     }
@@ -2566,7 +2565,7 @@ ROCKETGPU_HD bool ComputeObbContact(
     };
 
     constexpr float kEdgeFudgeFactor = 1.05f;
-    constexpr float kEdgeSepEps = 1.0e-6f;
+    constexpr float kEdgeSepEps = 1.1920929e-7f;  // dBoxBox2 edge-axis TST: SIMD_EPSILON for the exit and the |n| test
     bool have_best_axis = false;
     float best_s2 = -1.0e30f;
     Vec3 best_axis(1.0f, 0.0f, 0.0f);

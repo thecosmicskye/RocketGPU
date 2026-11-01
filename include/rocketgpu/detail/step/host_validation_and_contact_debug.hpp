@@ -135,7 +135,17 @@ ROCKETGPU_HD Vec3 BoxBodyInertiaDiag(const CarConfig& cfg, float mass) {
     return Vec3(scale * (y2 + z2), scale * (x2 + z2), scale * (x2 + y2));
 }
 
-ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorld(const CarState& car, const CarConfig& cfg, float mass, const Vec3& torque_world) {
+// ApplyInverseBodyInertiaWorld's world inverse-inertia rows (UU), for callers that apply them to several vectors while
+// the car's rotation is fixed.
+struct CarInvInertiaRowsUu {
+    Vec3 row0, row1, row2;
+};
+
+ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorld(const CarInvInertiaRowsUu& r, const Vec3& torque_world) {
+    return Vec3(Dot(r.row0, torque_world), Dot(r.row1, torque_world), Dot(r.row2, torque_world));
+}
+
+ROCKETGPU_HD CarInvInertiaRowsUu MakeCarInvInertiaRowsUu(const CarState& car, const CarConfig& cfg, float mass) {
     const Vec3 inertia = BoxBodyInertiaDiag(cfg, mass);
 
     Vec3 forward_m, right_m, up_m;
@@ -168,10 +178,11 @@ ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorld(const CarState& car, const CarCon
         s20 * row0.x + s21 * row0.y + s22 * row0.z,
         s20 * row1.x + s21 * row1.y + s22 * row1.z,
         s20 * row2.x + s21 * row2.y + s22 * row2.z);
-    return Vec3(
-        Dot(inv_inertia_world_row0, torque_world),
-        Dot(inv_inertia_world_row1, torque_world),
-        Dot(inv_inertia_world_row2, torque_world));
+    return CarInvInertiaRowsUu{inv_inertia_world_row0, inv_inertia_world_row1, inv_inertia_world_row2};
+}
+
+ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorld(const CarState& car, const CarConfig& cfg, float mass, const Vec3& torque_world) {
+    return ApplyInverseBodyInertiaWorld(MakeCarInvInertiaRowsUu(car, cfg, mass), torque_world);
 }
 
 ROCKETGPU_HD void ApplyCentralForce(CarState& car, float mass, const Vec3& force_world, float dt) {
@@ -1207,184 +1218,49 @@ ROCKETGPU_HD void MaybeUpdateBestHit(
     }
 }
 
-ROCKETGPU_HD void PlaneSpace1LikeBullet(const Vec3& n, Vec3& p, Vec3& q) {
-    constexpr float kSqrtHalf = 0.70710678118654752440f;
-    if (Abs(n.z) > kSqrtHalf) {
-        const float a = n.y * n.y + n.z * n.z;
-        const float k = RsqrtScalar(a);
-        p = Vec3(0.0f, -n.z * k, n.y * k);
-        q = Vec3(a * k, -n.x * p.z, n.x * p.y);
-    } else {
-        const float a = n.x * n.x + n.y * n.y;
-        const float k = RsqrtScalar(a);
-        p = Vec3(-n.y * k, n.x * k, 0.0f);
-        q = Vec3(-n.z * p.y, n.z * p.x, a * k);
-    }
-}
-
-ROCKETGPU_HD void RayCastTriangleLikeBullet(
-    const Vec3& from,
-    const Vec3& to,
-    const Vec3& v0,
-    const Vec3& v1,
-    const Vec3& v2,
-    float& hit_fraction,
-    Vec3& hit_normal,
-    bool& hit,
-    const uint32_t* native_table = nullptr, int native_shift = 0) {
-    const Vec3 v10 = v1 - v0;
-    const Vec3 v20 = v2 - v0;
-    Vec3 triangle_normal = Cross(v10, v20);
-
-    const float dist = Dot(v0, triangle_normal);
-    float dist_a = Dot(triangle_normal, from);
-    dist_a -= dist;
-    float dist_b = Dot(triangle_normal, to);
-    dist_b -= dist;
-
-    if (dist_a * dist_b >= 0.0f) {
-        return;
-    }
-
-    const float proj_length = dist_a - dist_b;
-    const float distance = dist_a / proj_length;
-    if (distance >= hit_fraction) {
-        return;
-    }
-
-    float edge_tolerance = LengthSq(triangle_normal);
-    edge_tolerance *= -0.0001f;
-
-    const Vec3 point = (1.0f - distance) * from + distance * to;
-    const Vec3 v0p = v0 - point;
-    const Vec3 v1p = v1 - point;
-    const Vec3 cp0 = Cross(v0p, v1p);
-    if (Dot(cp0, triangle_normal) < edge_tolerance) {
-        return;
-    }
-
-    const Vec3 v2p = v2 - point;
-    const Vec3 cp1 = Cross(v1p, v2p);
-    if (Dot(cp1, triangle_normal) < edge_tolerance) {
-        return;
-    }
-
-    const Vec3 cp2 = Cross(v2p, v0p);
-    if (Dot(cp2, triangle_normal) < edge_tolerance) {
-        return;
-    }
-
-    triangle_normal = native_table
-        ? NativeSseSphereNormalizer{native_table, native_shift}(triangle_normal)
-        : Normalize(triangle_normal, triangle_normal);
-    hit_fraction = distance;
-    hit_normal = dist_a <= 0.0f ? -triangle_normal : triangle_normal;
-    hit = true;
-}
-
-// The arena planes are axis-aligned, so CastStaticPlaneLikeBullet's two triangles lie exactly in the plane and their
-// normal is exactly along it: each triangle cast returns at dist_a * dist_b >= 0 unless the ray endpoints are strictly
-// on opposite sides. False only when the cast cannot hit (NaN endpoints return true and take the full cast).
-ROCKETGPU_HD bool StaticPlaneRayMayCross(
-    const Vec3& source_bt, const Vec3& to_bt, const Vec3& plane_origin_bt, const Vec3& plane_normal) {
-    const float side_from = Dot(plane_normal, source_bt - plane_origin_bt);
-    const float side_to = Dot(plane_normal, to_bt - plane_origin_bt);
-    return !((side_from >= 0.0f && side_to >= 0.0f) || (side_from <= 0.0f && side_to <= 0.0f));
-}
-
-ROCKETGPU_HD void CastStaticPlaneLikeBullet(
+// RL's rayTestSingleInternal has its own static-plane branch (shape type 28) instead of Bullet's
+// two-triangle cast: the plane is the object's transform (normal = basis Z column, point = origin), and with
+// denom = -((to - from) . n), numer = -((origin - from) . n) a hit needs FLT_EPSILON < denom, FLT_EPSILON < numer,
+// numer <= denom and t = numer / denom below the closest fraction so far. The reported normal is n itself.
+ROCKETGPU_HD void CastStaticPlaneLikeRL(
     const Vec3& source_bt,
     const Vec3& to_bt,
     const Vec3& plane_origin_bt,
     const Vec3& plane_normal,
     float max_len,
-    ArenaRayHit& best,
-    const uint32_t* native_table = nullptr, int native_shift = 0) {
-    const Vec3 from_local = source_bt - plane_origin_bt;
-    const Vec3 to_local = to_bt - plane_origin_bt;
-    Vec3 aabb_min = from_local;
-    aabb_min.x = Min(aabb_min.x, to_local.x);
-    aabb_min.y = Min(aabb_min.y, to_local.y);
-    aabb_min.z = Min(aabb_min.z, to_local.z);
-    Vec3 aabb_max = from_local;
-    aabb_max.x = Max(aabb_max.x, to_local.x);
-    aabb_max.y = Max(aabb_max.y, to_local.y);
-    aabb_max.z = Max(aabb_max.z, to_local.z);
-
-    const Vec3 half_extents = (aabb_max - aabb_min) * 0.5f;
-    const float radius = Length(half_extents);
-    const Vec3 center = (aabb_max + aabb_min) * 0.5f;
-
-    Vec3 tangent0(0.0f, 0.0f, 0.0f);
-    Vec3 tangent1(0.0f, 0.0f, 0.0f);
-    PlaneSpace1LikeBullet(plane_normal, tangent0, tangent1);
-    const Vec3 projected_center = center - (Dot(plane_normal, center) * plane_normal);
-
-    const Vec3 tri0[3] = {
-        projected_center + tangent0 * radius + tangent1 * radius,
-        projected_center + tangent0 * radius - tangent1 * radius,
-        projected_center - tangent0 * radius - tangent1 * radius,
-    };
-    const Vec3 tri1[3] = {
-        projected_center - tangent0 * radius - tangent1 * radius,
-        projected_center - tangent0 * radius + tangent1 * radius,
-        projected_center + tangent0 * radius + tangent1 * radius,
-    };
-
-    float fraction = best.hit ? best.ray_fraction : 1.0f;
-    Vec3 normal(0.0f, 0.0f, 1.0f);
-    bool hit = false;
-    RayCastTriangleLikeBullet(from_local, to_local, tri0[0], tri0[1], tri0[2], fraction, normal, hit, native_table, native_shift);
-    RayCastTriangleLikeBullet(from_local, to_local, tri1[0], tri1[1], tri1[2], fraction, normal, hit, native_table, native_shift);
-    if (!hit) {
+    ArenaRayHit& best) {
+    constexpr float kFltEpsilon = 1.1920929e-07f;
+    const Vec3 delta = to_bt - source_bt;
+    const Vec3 offset = plane_origin_bt - source_bt;
+    const float denom = -(delta.y * plane_normal.y + delta.x * plane_normal.x + delta.z * plane_normal.z);
+    const float numer = -(offset.y * plane_normal.y + offset.x * plane_normal.x + offset.z * plane_normal.z);
+    if (!(kFltEpsilon < denom && kFltEpsilon < numer && numer <= denom)) {
         return;
     }
-
+    const float fraction = numer / denom;
+    if (!(fraction < (best.hit ? best.ray_fraction : 1.0f))) {
+        return;
+    }
     const float one_minus_fraction = 1.0f - fraction;
     const Vec3 point_bt(
         source_bt.x * one_minus_fraction + to_bt.x * fraction,
         source_bt.y * one_minus_fraction + to_bt.y * fraction,
         source_bt.z * one_minus_fraction + to_bt.z * fraction);
-
     MaybeUpdateBestHitFraction(
-        true,
-        fraction,
-        max_len,
-        point_bt * 50.0f,
-        point_bt,
-        normal,
-        best,
-        ROCKETGPU_ARENA_RAY_HIT_STATIC_PLANE);
+        true, fraction, max_len, point_bt * 50.0f, point_bt, plane_normal, best, ROCKETGPU_ARENA_RAY_HIT_STATIC_PLANE);
 }
 
 ROCKETGPU_HD void CastArenaRayPlanesImpl(const Vec3& source_bt, const Vec3& ray_delta_bt, float max_len, ArenaRayHit& best,
     const uint32_t* native_table = nullptr, int native_shift = 0) {
-    constexpr float kEps = 1e-5f;
     constexpr float kUUToBT = 1.0f / 50.0f;
-    constexpr float kBTToUU = 50.0f;
     const Vec3 to_bt = source_bt + ray_delta_bt;
+    (void)native_table;
+    (void)native_shift;
 
-    if (Abs(ray_delta_bt.z) > kEps) {
-        if (StaticPlaneRayMayCross(source_bt, to_bt, Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 1.0f))) {
-            CastStaticPlaneLikeBullet(source_bt, to_bt, Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 1.0f), max_len, best, native_table, native_shift);
-        }
-        if (StaticPlaneRayMayCross(source_bt, to_bt, Vec3(0.0f, 0.0f, ArenaHeight() * kUUToBT), Vec3(0.0f, 0.0f, -1.0f))) {
-            CastStaticPlaneLikeBullet(source_bt, to_bt, Vec3(0.0f, 0.0f, ArenaHeight() * kUUToBT), Vec3(0.0f, 0.0f, -1.0f), max_len, best, native_table, native_shift);
-        }
-    }
-
-    if (Abs(ray_delta_bt.x) > kEps) {
-        if (StaticPlaneRayMayCross(source_bt, to_bt, Vec3(ArenaExtentX() * kUUToBT, 0.0f, ArenaHeight() * 0.5f * kUUToBT), Vec3(-1.0f, 0.0f, 0.0f))) {
-            CastStaticPlaneLikeBullet(source_bt, to_bt, Vec3(ArenaExtentX() * kUUToBT, 0.0f, ArenaHeight() * 0.5f * kUUToBT), Vec3(-1.0f, 0.0f, 0.0f), max_len, best, native_table, native_shift);
-        }
-        if (StaticPlaneRayMayCross(source_bt, to_bt, Vec3(-ArenaExtentX() * kUUToBT, 0.0f, ArenaHeight() * 0.5f * kUUToBT), Vec3(1.0f, 0.0f, 0.0f))) {
-            CastStaticPlaneLikeBullet(source_bt, to_bt, Vec3(-ArenaExtentX() * kUUToBT, 0.0f, ArenaHeight() * 0.5f * kUUToBT), Vec3(1.0f, 0.0f, 0.0f), max_len, best, native_table, native_shift);
-        }
-    }
-
-    if (Abs(ray_delta_bt.y) > kEps) {
-        (void)kBTToUU;
-    }
+    CastStaticPlaneLikeRL(source_bt, to_bt, Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 1.0f), max_len, best);
+    CastStaticPlaneLikeRL(source_bt, to_bt, Vec3(0.0f, 0.0f, ArenaHeight() * kUUToBT), Vec3(0.0f, 0.0f, -1.0f), max_len, best);
+    CastStaticPlaneLikeRL(source_bt, to_bt, Vec3(ArenaExtentX() * kUUToBT, 0.0f, ArenaHeight() * 0.5f * kUUToBT), Vec3(-1.0f, 0.0f, 0.0f), max_len, best);
+    CastStaticPlaneLikeRL(source_bt, to_bt, Vec3(-ArenaExtentX() * kUUToBT, 0.0f, ArenaHeight() * 0.5f * kUUToBT), Vec3(1.0f, 0.0f, 0.0f), max_len, best);
 }
 
 ROCKETGPU_HD void CastArenaRayCornerCylindersImpl(const Vec3& source_bt, const Vec3& ray_delta_bt, float max_len, ArenaRayHit& best) {

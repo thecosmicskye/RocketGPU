@@ -31,6 +31,13 @@ using cudaStream_t = void*;
 #define ROCKETGPU_ALWAYS_INLINE
 #endif
 
+// A pointer parameter whose object no other pointer in the function reaches (device code only).
+#if defined(__CUDACC__)
+#define ROCKETGPU_RESTRICT __restrict__
+#else
+#define ROCKETGPU_RESTRICT
+#endif
+
 // Index of the lowest set bit of a nonzero mask.
 ROCKETGPU_HD int CountTrailingZeros64(uint64_t mask) {
 #if defined(__CUDA_ARCH__)

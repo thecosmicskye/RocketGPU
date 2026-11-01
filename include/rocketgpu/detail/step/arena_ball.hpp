@@ -177,9 +177,10 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     CarWorldPlaneRetainedManifold* retained_plane_manifolds = nullptr,
     CarWorldMeshRetainedManifold* retained_mesh_manifolds = nullptr,
     CarWorldLocalRows* local_rows = nullptr,
-    uint32_t mesh_reach_hint = 0u) {
+    uint32_t mesh_reach_hint = 0u,
+    bool defer_world_surface = false) {  // true: acc.surface only; the caller applies RecordWorldSurface later
     ContactAccumulator acc;
-    acc.history_car = &car;
+    acc.history_car = defer_world_surface ? nullptr : &car;
 
     // car_world_early_out: a car out of reach of every arena mesh and clear of the four planes gets no rows, so skip
     // the query and leave only what it would: an empty World group for each plane inside its broadphase window, and
@@ -905,11 +906,11 @@ ROCKETGPU_HD void BallWorldPlane(int slot, float arena_margin, Vec3& inward_norm
     } else if (slot == 2) {
         inward_normal = Vec3(-1.0f, 0.0f, 0.0f);
         boundary = -(ArenaExtentX() - arena_margin);
-        plane_pos_uu = Vec3(ArenaExtentX(), 0.0f, ArenaHeight() / 2.0f);
+        plane_pos_uu = Vec3(ArenaExtentX(), 0.0f, 992.0f);  // Stadium_P side-wall planes sit at z = 992
     } else if (slot == 3) {
         inward_normal = Vec3(1.0f, 0.0f, 0.0f);
         boundary = -(ArenaExtentX() - arena_margin);
-        plane_pos_uu = Vec3(-ArenaExtentX(), 0.0f, ArenaHeight() / 2.0f);
+        plane_pos_uu = Vec3(-ArenaExtentX(), 0.0f, 992.0f);
     }
 }
 
@@ -1379,7 +1380,10 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                 } else {
                     rel_len = official_plane_rel_len(inward_normal, plane_pos_uu, &rel_bt, &distance_bt, &local_a_bt, &point_b_bt);
                 }
-                if (distance_bt < plane_breaking_threshold_bt) {
+                const bool within_extent =
+                    mutator.game_mode != static_cast<uint8_t>(Mode::Soccar) ||
+                    SoccarPlaneExtentContainsBt(inward_normal, point_b_bt, plane_breaking_threshold_bt);
+                if (distance_bt < plane_breaking_threshold_bt && within_extent) {
                     BallMeshManifoldPoint new_pt;
                     new_pt.normal = inward_normal;
                     new_pt.pen_uu = -distance_bt * 50.0f;
@@ -1689,19 +1693,28 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
 
     const float inv_count = 1.0f / static_cast<float>(aggregate.count);
     Vec3 normal = aggregate.normal_sum * inv_count;
+    float synthetic_distance_bt = aggregate.rel_pos1_length_sum_bt / static_cast<float>(aggregate.count);
+    float synthetic_friction = mutator.ball_friction;
+    float synthetic_restitution = mutator.ball_restitution;
     if (mutator.cal_ball_world) {
-        const float l2 = Dot(normal, normal);
-        if (l2 >= SIMD_EPSILON * SIMD_EPSILON) {
-            normal = normal * (1.0f / SqrtScalar(l2));
-        } else {
-            normal = Vec3(1.0f, 0.0f, 0.0f);
+        // The game's per-body average (solveGroupCacheFriendlySetup): one sample is used as is; more are scaled by
+        // 1/count (friction, restitution, lever) and the normal sum is normalized directly.
+        normal = aggregate.normal_sum;
+        synthetic_distance_bt = aggregate.rel_pos1_length_sum_bt;
+        if (aggregate.count > 1) {
+            float friction_sum = synthetic_friction;
+            float restitution_sum = synthetic_restitution;
+            for (int i = 1; i < aggregate.count; ++i) {
+                friction_sum += synthetic_friction;
+                restitution_sum += synthetic_restitution;
+            }
+            synthetic_friction = inv_count * friction_sum;
+            synthetic_restitution = inv_count * restitution_sum;
+            const float l2 = Dot(normal, normal);
+            normal = l2 >= SIMD_EPSILON * SIMD_EPSILON ? normal * (1.0f / SqrtScalar(l2)) : Vec3(1.0f, 0.0f, 0.0f);
+            synthetic_distance_bt = inv_count * synthetic_distance_bt;
         }
     }
-
-    const float synthetic_total_dist_bt = aggregate.rel_pos1_length_sum_bt;
-
-    const float synthetic_distance_bt =
-        synthetic_total_dist_bt / static_cast<float>(aggregate.count);
     constexpr float kBTToUU = 50.0f;
     const Vec3 rel_ball_contact_bt = normal * (-synthetic_distance_bt);
     const Vec3 rel_ball_contact = rel_ball_contact_bt * kBTToUU;
@@ -1752,8 +1765,8 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
         friction_rows,
         friction_row_count,
         normal,
-        mutator.ball_restitution,
-        mutator.ball_friction,
+        synthetic_restitution,
+        synthetic_friction,
         ball_inv_mass,
         rel_ball_contact,
         ball_normal_component,

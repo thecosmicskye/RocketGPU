@@ -50,7 +50,21 @@ struct CarWorldPlaneContactGeometryBt {
 
     float add_distance_bt = 0.0f;
     Vec3 local_point_b_bt = Vec3(0.0f, 0.0f, 0.0f);
+    Vec3 support_world_bt = Vec3(0.0f, 0.0f, 0.0f);  // the support vertex the plane test checks, world space
 };
+
+// RL's btConvexPlaneCollisionAlgorithm::processCollision bounds each plane: a contact needs the support
+// vertex within threshold + half-extent of the plane origin on both in-plane axes.
+// Stadium_P's arena planes are Plane32768 (+-16384 uu) times each actor's Scale3D: floor and ceiling 4358.144 (x) by
+// 6225.92 (y) uu; side walls, centred at z = 992, 1245.184 (z) by 6225.92 (y). Soccar only.
+ROCKETGPU_HD bool SoccarPlaneExtentContainsBt(const Vec3& inward_normal, const Vec3& point_world_bt, float threshold_bt) {
+    const bool horizontal = Abs(inward_normal.z) > 0.5f;
+    const float u = horizontal ? point_world_bt.x : point_world_bt.z - 992.0f / 50.0f;
+    const float lim_u = threshold_bt + (horizontal ? 4358.144f / 50.0f : 1245.184f / 50.0f);
+    const float v = point_world_bt.y;
+    const float lim_v = threshold_bt + 6225.92f / 50.0f;
+    return !(u < -lim_u || v < -lim_v || lim_u < u || lim_v < v);
+}
 
 ROCKETGPU_HD float BulletStyleDot3Bt(const Vec3& a, const Vec3& b) {
     return bullet_port::btSseStyleDot3(a.x, a.y, a.z, b.x, b.y, b.z);
@@ -90,10 +104,10 @@ ROCKETGPU_HD Vec3 BulletStaticPlaneOriginBt(const Vec3& inward_normal) {
         return Vec3(0.0f, 0.0f, ArenaHeight() * kUUToBT);
     }
     if (inward_normal.x > 0.5f) {
-        return Vec3(-ArenaExtentX() * kUUToBT, 0.0f, ArenaHeight() * 0.5f * kUUToBT);
+        return Vec3(-ArenaExtentX() * kUUToBT, 0.0f, 992.0f * kUUToBT);  // Stadium_P side-wall planes sit at z = 992
     }
     if (inward_normal.x < -0.5f) {
-        return Vec3(ArenaExtentX() * kUUToBT, 0.0f, ArenaHeight() * 0.5f * kUUToBT);
+        return Vec3(ArenaExtentX() * kUUToBT, 0.0f, 992.0f * kUUToBT);
     }
     return Vec3(0.0f, 0.0f, 0.0f);
 }
@@ -175,6 +189,7 @@ ROCKETGPU_HD CarWorldPlaneContactGeometryBt ComputeBulletStyleCarWorldPlaneConta
     out.distance_bt = distance_refreshed;
     out.add_distance_bt = distance;
     out.local_point_b_bt = local_b;
+    out.support_world_bt = vtx_in_plane + plane_origin_bt;
     return out;
 }
 
@@ -390,7 +405,10 @@ ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
             *retained, inward_normal, retained_body_row0, retained_body_row1, retained_body_row2,
             car.pos_bt, retained_plane_origin_bt, threshold_bt, retained_world_a_bt);
     }
-    if (add_margin_bt >= threshold_bt) {
+    const bool within_extent = !has_bt_plane || mutator.game_mode != static_cast<uint8_t>(Mode::Soccar) ||
+                               SoccarPlaneExtentContainsBt(inward_normal, bullet_plane_geom.support_world_bt, threshold_bt);
+    // Off the plane's rectangle the game adds no point but keeps refreshing the manifold it has.
+    if (add_margin_bt >= threshold_bt || (!within_extent && (!retained || retained->count == 0))) {
         if (retained) {
             // No fresh point: every retained point is a box vertex no closer than the
             // support vertex, so the refresh above culls it (distance > threshold).
@@ -432,7 +450,7 @@ ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
     int emit_count = 0;
     if (retained) {
         int fresh_slot = -1;
-        if (!(margin_bt > threshold_bt)) {
+        if (!(margin_bt > threshold_bt) && within_extent) {
             CarWorldPlaneRetainedPoint fresh_point;
             fresh_point.local_point_a_bt = bullet_plane_geom.local_point_a_bt;
             fresh_point.point_on_b_bt = bullet_plane_geom.local_point_b_bt;
@@ -947,6 +965,38 @@ ROCKETGPU_HD float CarWorldTriangleBoxAxisGap(
     return Max(Min(pa, Min(pb, pc)) - (c + half_extent_bt), (c - half_extent_bt) - Max(pa, Max(pb, pc)));
 }
 
+// The mesh query's tests of one triangle before its GJK: 0 outside the query AABB, 1 in it (a broadphase hit) but
+// separated from the box along the triangle normal or a box axis, 2 a candidate (the gather pass lists it).
+ROCKETGPU_HD int CarWorldTriangleQueryTest(
+    const ArenaMeshTriangle& tri, const CarWorldMeshQueryFrame& f, float contact_threshold_bt) {
+    if (!CarWorldTriangleAgainstAabbBullet(tri, f.aabb_min_bt, f.aabb_max_bt)) {
+        return 0;
+    }
+    const Vec3 triangle_normal_world = Normalize(tri.normal, Vec3(0.0f, 0.0f, 1.0f));
+    const float center_proj = Dot(triangle_normal_world, f.box_center_bt);
+    const float support_extent =
+        Abs(Dot(triangle_normal_world, f.axis_x)) * f.box_half_extent_with_margin_bt.x +
+        Abs(Dot(triangle_normal_world, f.axis_y)) * f.box_half_extent_with_margin_bt.y +
+        Abs(Dot(triangle_normal_world, f.axis_z)) * f.box_half_extent_with_margin_bt.z;
+    const float tri_proj = Dot(triangle_normal_world, tri.a);
+    const float separation_along_normal = tri_proj - (center_proj + support_extent);
+    const float separation_against_normal = (center_proj - support_extent) - tri_proj;
+    if (separation_along_normal > contact_threshold_bt ||
+        separation_against_normal > contact_threshold_bt) {
+        return 1;
+    }
+    // Box-axis separation: GJK would return no hit or a distance past the threshold, which adds nothing.
+    // The slack covers GJK's tolerance and rounding.
+    constexpr float kBoxAxisGapSlackBt = 1.0e-3f;
+    const float box_axis_reject_bt = contact_threshold_bt + kBoxAxisGapSlackBt;
+    if (CarWorldTriangleBoxAxisGap(tri, f.axis_x, f.box_center_bt, f.box_half_extent_with_margin_bt.x) > box_axis_reject_bt ||
+        CarWorldTriangleBoxAxisGap(tri, f.axis_y, f.box_center_bt, f.box_half_extent_with_margin_bt.y) > box_axis_reject_bt ||
+        CarWorldTriangleBoxAxisGap(tri, f.axis_z, f.box_center_bt, f.box_half_extent_with_margin_bt.z) > box_axis_reject_bt) {
+        return 1;
+    }
+    return 2;
+}
+
 struct CarWorldMeshReach {
     Vec3 lo;
     Vec3 hi;
@@ -1440,30 +1490,12 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
                                  const CarWorldTriangleHit* precomputed = nullptr) {
         const ArenaMeshTriangle& tri = mesh_triangles[tri_idx];
         if (precomputed == nullptr) {
-            if (!CarWorldTriangleAgainstAabbBullet(tri, aabb_min_bt, aabb_max_bt)) {
+            const int query_test = CarWorldTriangleQueryTest(tri, query_frame, contact_threshold_bt);
+            if (query_test == 0) {
                 return;
             }
             ++current_mesh_broadphase_hits;
-            const Vec3 triangle_normal_world = Normalize(tri.normal, Vec3(0.0f, 0.0f, 1.0f));
-            const float center_proj = Dot(triangle_normal_world, box_center_bt);
-            const float support_extent =
-                Abs(Dot(triangle_normal_world, axis_x)) * box_half_extent_with_margin_bt.x +
-                Abs(Dot(triangle_normal_world, axis_y)) * box_half_extent_with_margin_bt.y +
-                Abs(Dot(triangle_normal_world, axis_z)) * box_half_extent_with_margin_bt.z;
-            const float tri_proj = Dot(triangle_normal_world, tri.a);
-            const float separation_along_normal = tri_proj - (center_proj + support_extent);
-            const float separation_against_normal = (center_proj - support_extent) - tri_proj;
-            if (separation_along_normal > contact_threshold_bt ||
-                separation_against_normal > contact_threshold_bt) {
-                return;
-            }
-            // Box-axis separation: GJK would return no hit or a distance past the threshold, which adds nothing.
-            // The slack covers GJK's tolerance and rounding.
-            constexpr float kBoxAxisGapSlackBt = 1.0e-3f;
-            const float box_axis_reject_bt = contact_threshold_bt + kBoxAxisGapSlackBt;
-            if (CarWorldTriangleBoxAxisGap(tri, axis_x, box_center_bt, box_half_extent_with_margin_bt.x) > box_axis_reject_bt ||
-                CarWorldTriangleBoxAxisGap(tri, axis_y, box_center_bt, box_half_extent_with_margin_bt.y) > box_axis_reject_bt ||
-                CarWorldTriangleBoxAxisGap(tri, axis_z, box_center_bt, box_half_extent_with_margin_bt.z) > box_axis_reject_bt) {
+            if (query_test == 1) {
                 return;
             }
             if (triangle_pairs_pass == kTrianglePairsGather) {

@@ -24,7 +24,7 @@ struct MeshVertex {
 };
 
 float GetInternalEdgeAngle(const Vec3& ref_axis0, const Vec3& ref_axis1, const Vec3& swing_axis) {
-    return atan2f(Dot(swing_axis, ref_axis0), Dot(swing_axis, ref_axis1));
+    return GlibcAtan2f(Dot(swing_axis, ref_axis0), Dot(swing_axis, ref_axis1));
 }
 
 static Vec3 SseNormalizeVec3(const Vec3& v, const Vec3& fallback) {

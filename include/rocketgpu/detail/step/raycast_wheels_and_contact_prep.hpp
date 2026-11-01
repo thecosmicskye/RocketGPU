@@ -94,57 +94,66 @@ ROCKETGPU_HD bool CastWheelRayAgainstCarHitboxGjkCast(
     ArenaRayHit& out_hit,
     float max_len_bt_override);
 
-// v3 SphereShape::perform_quad_raycast: the wheel ray is moved into ball-local space and intersected with the sphere
-// analytically (nearest root in [0, dist]); the hit normal is the local hit point / radius rotated
-// back to world, and the hit point is the ray interpolated at the hit fraction (ClosestQuadRayResultCallback).
-ROCKETGPU_HD bool CastAnalyticRayVsSphereV3(
+// Wheel ray vs the ball as the game's btCollisionWorld::rayTestSingle does it (default flags): btGjkConvexCast
+// of a point against the sphere. GJK sees the sphere as its centre plus a margin of one radius, so the
+// distance is |p - c| - r with normal (p - c)/|p - c|. Conservative advancement stops once the point is within
+// 0.001 bt of the surface (at most 64 steps), so the fraction and normal come from that point. A ray that starts
+// inside the ball hits at fraction 0 when it heads inward and misses when it heads outward.
+ROCKETGPU_HD bool CastGjkRayVsSphere(
     const Vec3& ray_from_bt,
     const Vec3& ray_to_bt,
     const Vec3& ball_center_bt,
     float ball_radius_bt,
-    const Vec3& ball_basis_forward,
-    const Vec3& ball_basis_right,
-    const Vec3& ball_basis_up,
     float& out_fraction,
     Vec3& out_normal) {
-    const Vec3 df = ray_from_bt - ball_center_bt;
-    const Vec3 dt = ray_to_bt - ball_center_bt;
-    const Vec3 src(Dot(df, ball_basis_forward), Dot(df, ball_basis_right), Dot(df, ball_basis_up));
-    const Vec3 tgt(Dot(dt, ball_basis_forward), Dot(dt, ball_basis_right), Dot(dt, ball_basis_up));
-    const float r = ball_radius_bt;
-    const float r_sq = r * r;
-    const Vec3 closest(Clamp(0.0f, Min(src.x, tgt.x), Max(src.x, tgt.x)),
-                       Clamp(0.0f, Min(src.y, tgt.y), Max(src.y, tgt.y)),
-                       Clamp(0.0f, Min(src.z, tgt.z), Max(src.z, tgt.z)));
-    if (!(Dot(closest, closest) <= r_sq)) {
+    constexpr float kRadius = 0.001f;
+    constexpr int kMaxIterations = 64;
+    auto closest = [&](const Vec3& p, float& dist, Vec3& n) {
+        const Vec3 w = p - ball_center_bt;
+        const float len2 = Dot(w, w);
+        if (!(len2 > 1.1920929e-7f * 1.1920929e-7f)) {
+            return false;  // GJK has no valid axis and no penetration solver: no result
+        }
+        const float rlen = 1.0f / SqrtScalar(len2);
+        n = w * rlen;
+        dist = (1.0f / rlen) - ball_radius_bt;
+        return true;
+    };
+    const Vec3 r = ray_to_bt - ray_from_bt;
+    float lambda = 0.0f;
+    float last_lambda = 0.0f;
+    float dist = 0.0f;
+    Vec3 n(0.0f, 0.0f, 0.0f);
+    if (!closest(ray_from_bt, dist, n)) {
         return false;
     }
-    const Vec3 delta = tgt - src;
-    const float dist = SqrtScalar(Dot(delta, delta));
-    const Vec3 dir(delta.x / dist, delta.y / dist, delta.z / dist);
-    const float b = 2.0f * Dot(src, dir);
-    const float c = Dot(src, src) - r_sq;
-    const float disc = b * b - 4.0f * c;
-    if (!(disc >= 0.0f)) {
+    int iter = 0;
+    while (dist > kRadius) {
+        if (++iter > kMaxIterations) {
+            return false;
+        }
+        lambda = lambda - dist / Dot(r, n);
+        if (lambda > 1.0f || lambda < 0.0f || lambda <= last_lambda) {
+            return false;
+        }
+        last_lambda = lambda;
+        const Vec3 p = ray_from_bt * (1.0f - lambda) + ray_to_bt * lambda;
+        float next_dist = 0.0f;
+        if (!closest(p, next_dist, n)) {
+            return false;
+        }
+        if (next_dist < 0.0f) {
+            out_fraction = last_lambda;
+            out_normal = n;
+            return true;
+        }
+        dist = next_dist;
+    }
+    if (Dot(n, r) >= 0.0f) {
         return false;
     }
-    const float sq = SqrtScalar(disc);
-    float t0 = (-b - sq) / 2.0f;
-    float t1 = (-b + sq) / 2.0f;
-    if (t0 > t1) {
-        const float tmp = t0; t0 = t1; t1 = tmp;
-    }
-    // A ray that starts inside the ball (t0 < 0 <= t1) does not hit it: Bullet's convex ray test (RocketSim v2, and
-    // the game) reports no hit from inside a convex shape, while v3's far-root exit hit put a wheel on the ball
-    // whenever the ball overlapped a wheel (deep kickoff hits, e.g. PartyCannon 15726 k18).
-    if (!(t0 >= 0.0f && t0 <= dist)) {
-        return false;
-    }
-    const float t = t0;
-    const Vec3 hit_local = src + dir * t;
-    const Vec3 n_local(hit_local.x / r, hit_local.y / r, hit_local.z / r);
-    out_normal = ball_basis_forward * n_local.x + ball_basis_right * n_local.y + ball_basis_up * n_local.z;
-    out_fraction = t / dist;
+    out_fraction = lambda;
+    out_normal = n;
     return true;
 }
 
@@ -176,16 +185,10 @@ ROCKETGPU_HD bool CastWheelRayAgainstBall(
     const Vec3 ray_from_bt = ray_source_bt;
     const Vec3 ray_to_bt = ray_source_bt + ray_dir * max_len_bt;
 
-    Vec3 ball_basis_forward(1.0f, 0.0f, 0.0f);
-    Vec3 ball_basis_right(0.0f, 1.0f, 0.0f);
-    Vec3 ball_basis_up(0.0f, 0.0f, 1.0f);
-    GetBallBasisColumns(ball, ball_basis_forward, ball_basis_right, ball_basis_up);
-
     float fraction = 0.0f;
     Vec3 normal(0.0f, 0.0f, 0.0f);
     Vec3 hit_point_bt(0.0f, 0.0f, 0.0f);
-    const bool hit = CastAnalyticRayVsSphereV3(ray_from_bt, ray_to_bt, ball_center_bt, ball_radius_bt,
-              ball_basis_forward, ball_basis_right, ball_basis_up, fraction, normal);
+    const bool hit = CastGjkRayVsSphere(ray_from_bt, ray_to_bt, ball_center_bt, ball_radius_bt, fraction, normal);
 
     const float normal_len2 = Dot(normal, normal);
     if (!hit || normal_len2 <= 0.0001f) {
@@ -236,7 +239,7 @@ ROCKETGPU_HD ArenaRayHit CastWheelRayAgainstCars(
     bool* out_best_no_response = nullptr,
     const uint32_t* native_table = nullptr, int native_shift = 0,
 
-    const uint8_t* no_response_by_car = nullptr,
+    int32_t no_response_mask = -1,
     float cal_min_hit_dist_sq_bt = 0.0f,
     const MeshLanes& lanes = MeshLanes{}) {
     ArenaRayHit best;
@@ -280,15 +283,16 @@ ROCKETGPU_HD ArenaRayHit CastWheelRayAgainstCars(
         if (!best.hit || hit.t < best.t) {
             best = hit;
             best_other_idx = i;
-            best_no_response = (no_response_by_car != nullptr ? no_response_by_car[i]
-                                                              : other.demo_no_contact_response) != 0;
+            best_no_response = no_response_mask >= 0 ? ((no_response_mask >> i) & 1) != 0
+                                                     : other.demo_no_contact_response != 0;
         }
     }
     if (lanes.step > 1) {
         best = lanes.Combine(best, best_other_idx, best.t);
         if (best.hit) {
-            best_no_response = (no_response_by_car != nullptr ? no_response_by_car[best_other_idx]
-                                                              : cars_in_env[best_other_idx].demo_no_contact_response) != 0;
+            best_no_response = no_response_mask >= 0
+                                   ? ((no_response_mask >> best_other_idx) & 1) != 0
+                                   : cars_in_env[best_other_idx].demo_no_contact_response != 0;
         }
     }
 
@@ -404,7 +408,7 @@ ROCKETGPU_HD void RayCastWheelAgainstArena(
     int32_t mesh_bvh_subtree_count = 0,
     bool arena_static = true,
     const uint32_t* native_table = nullptr, int native_shift = 0,
-    const uint8_t* no_response_by_car = nullptr,
+    int32_t no_response_mask = -1,
     float cal_min_hit_dist_sq_bt = 0.0f,
     const MeshLanes& mesh_lanes = MeshLanes{}) {
     (void)cfg;
@@ -448,7 +452,7 @@ ROCKETGPU_HD void RayCastWheelAgainstArena(
         &car_hit_other_idx,
         real_ray_length_bt,
         &car_hit_no_response, native_table, native_shift,
-        no_response_by_car, cal_min_hit_dist_sq_bt, mesh_lanes);
+        no_response_mask, cal_min_hit_dist_sq_bt, mesh_lanes);
     if (cal_too_close(car_hit)) {
         car_hit = ArenaRayHit{};
     }
@@ -1319,14 +1323,19 @@ ROCKETGPU_HD WheelContactOut WheelRayPhase(
     if (staged_rays != nullptr) {
         stage = staged_rays[i];
     }
-    wheel = MakeWheelStepState(car, cfg, i, frame);
-    wheel.suspension_force_scale = wheel.is_front_wheel ? cal_front_scale : cal_back_scale;
+    // Built in registers and stored once: written in place, the fields the stage overwrites were stored twice.
+    WheelStepState made = MakeWheelStepState(car, cfg, i, frame);
+    made.suspension_force_scale = made.is_front_wheel ? cal_front_scale : cal_back_scale;
 
-    wheel.extra_pushback = extra_pushback;
+    made.extra_pushback = extra_pushback;
     if (stage.valid == 2) {
-        SetWheelRayMiss(wheel);
+        SetWheelRayMiss(made);
     } else if (stage.valid) {
-        LoadWheelRayStage(wheel, stage);
+        LoadWheelRayStage(made, stage);
+    }
+    wheel = made;
+    if (stage.valid == 2) {
+    } else if (stage.valid) {
         if (staged_rays_velocity_stale && wheel.is_in_contact) {
             ComputeWheelRayVelocityTerms(car, -wheel.wheel_dir_ws, wheel.contact_point_bt, wheel);
         }
@@ -1354,7 +1363,7 @@ ROCKETGPU_HD WheelContactOut WheelRayPhase(
         mesh_bvh_subtrees,
         mesh_bvh_subtree_count,
         mutator.arena_collision != 0, mutator.native_sphere_rsqrt_table, mutator.native_sphere_rsqrt_shift,
-        nullptr, cal_min_hit_dist_sq_bt);
+        -1, cal_min_hit_dist_sq_bt);
     if (wheel.is_in_contact) {
         wheel.extra_pushback = 0.0f;
     }
@@ -1688,7 +1697,12 @@ ROCKETGPU_HD float QuantizeAxisInput(float x) {
     const float w = ((y + 128.0f) + (y + 128.0f)) + 0.5f;
     const int byte = (static_cast<int>(rintf(w)) >> 1) & 0xFF;
     const float s = static_cast<float>(byte) - 128.0f;
-    return byte < 0x80 ? s * (1.0f / 128.0f) : s / 127.0f;
+    // s / 127 without the division's special-case branch: for the integers s in [0, 127] the reciprocal product plus
+    // one FMA residual step is the correctly rounded quotient (checked for all 128).
+    constexpr float kInv127 = 1.0f / 127.0f;
+    const float q = s * kInv127;
+    const float s_over_127 = fmaf(fmaf(-127.0f, q, s), kInv127, q);
+    return byte < 0x80 ? s * (1.0f / 128.0f) : s_over_127;
 }
 
 ROCKETGPU_HD CarControls QuantizeAxisControls(CarControls controls) {
@@ -2145,10 +2159,7 @@ ROCKETGPU_HD bool TryDoubleJumpOrFlip(
             // (rint(yaw) >> 2) << 2 of the tick-start forward on 863 (the rest sit within 0.1 unit of a rounding edge).
             const int dodge_yaw = static_cast<int>(rintf(GlibcAtan2f(forward.y, forward.x) * (32768.0f / 3.14159265f)));
             const int dodge_yaw_idx = (dodge_yaw >> 2) & 16383;
-            constexpr double kSinTabStep = 6.283185307179586476925 / 16384.0;
-            const Vec3 forward_dir_2d(
-                static_cast<float>(sin(static_cast<double>((dodge_yaw_idx + 4096) & 16383) * kSinTabStep)),
-                static_cast<float>(sin(static_cast<double>(dodge_yaw_idx) * kSinTabStep)), 0.0f);
+            const Vec3 forward_dir_2d(Ue3SinTab((dodge_yaw_idx + 4096) & 16383), Ue3SinTab(dodge_yaw_idx), 0.0f);
             Vec3 right_dir_2d(-forward_dir_2d.y, forward_dir_2d.x, 0.0f);
             Vec3 final_delta_vel = forward_dir_2d * initial_dodge_vel.x + right_dir_2d * initial_dodge_vel.y;
             ApplyCentralImpulseViaBtRoundtrip(car, final_delta_vel, mutator.car_mass);
@@ -3071,7 +3082,7 @@ ROCKETGPU_HD bool CastWheelRayAgainstCarHitboxGjkCast(
     constexpr float kUUToBT = 1.0f / 50.0f;
     constexpr float kBTToUU = 50.0f;
     constexpr float kRadius = 0.001f;
-    constexpr int kMaxIterations = 32;
+    constexpr int kMaxIterations = 64;  // the game's btGjkConvexCast gives up after 64 steps, not 2.82's float 32
     const float max_len_bt = max_len_bt_override > 0.0f ? max_len_bt_override : max_len * kUUToBT;
     const Vec3 ray_to_bt = ray_source_bt + ray_dir * max_len_bt;
     const Vec3 half_raw = other_cfg.hitbox_size * (0.5f * kUUToBT);
@@ -3233,7 +3244,6 @@ ROCKETGPU_HD bool MaybeAdjustArenaTriangleInternalEdgeContactT(
             : io_normal * (1.0f / sqrtf(contact_len_sq));
     }
 
-    const Vec3 raw_contact_normal = io_normal;
     const Vec3 contact = (kGameMeshEdgeRules && cal_origin_y != 0.0f)
         ? Vec3(io_point_on_b_bt.x, io_point_on_b_bt.y - cal_origin_y, io_point_on_b_bt.z)
         : io_point_on_b_bt;
@@ -3271,7 +3281,9 @@ ROCKETGPU_HD bool MaybeAdjustArenaTriangleInternalEdgeContactT(
         debug->best_edge_angle = best_edge >= 0 ? ArenaTriangleEdgeAngle(tri, best_edge) : 0.0f;
     }
 
-    if (best_edge < 0 || best_edge_distance >= kEdgeDistanceThreshold) {
+    // Each edge's own [0,1] distance decides below: with the game's [1e-5, 1-1e-5] search the best edge can sit
+    // past the threshold while its [0,1] distance does not.
+    if (best_edge < 0) {
         if (debug) {
             debug->point_on_b_out = io_point_on_b_bt;
             debug->normal_out = io_normal;
@@ -3358,7 +3370,8 @@ ROCKETGPU_HD bool MaybeAdjustArenaTriangleInternalEdgeContactT(
         const bool clamped = ClampArenaTriangleInternalEdgeNormal(
                 edge,
                 tri_normal * swap_factor,
-                edge_idx == 0 ? contact_normal : raw_contact_normal,
+                // Edges after the first clamp the contact's current normal (stock re-reads cp.m_normalWorldOnB).
+                edge_idx == 0 ? contact_normal : io_normal,
                 candidate_edge_angle,
                 clamped_local_normal,
                 soccar_platform_math);
@@ -3371,8 +3384,16 @@ ROCKETGPU_HD bool MaybeAdjustArenaTriangleInternalEdgeContactT(
         if (accepted_clamp) {
             io_normal = clamped_local_normal;
             io_point_on_b_bt = point_on_a_bt - io_normal * distance_bt;
-            contact_normal = io_normal;
         }
+    }
+
+    // The back-facing tests above and the concave test below use the contact normal as it entered.
+    if (!is_near_edge) {
+        if (debug) {
+            debug->point_on_b_out = io_point_on_b_bt;
+            debug->normal_out = io_normal;
+        }
+        return false;
     }
 
     if (is_near_edge && num_concave_edge_hits > 0) {
