@@ -61,34 +61,35 @@ the step's own flags, `jump_ticks`, the grace-timer `is_supersonic`, `bump_coold
 
 ## Speed
 
-RTX 5090, random controls, 55% 1v1, 27% 2v2 and 18% 3v3 arenas:
+Arena-ticks/s. RocketGPU on an RTX 5090; RocketSim v3 0.3.4 on a Ryzen 7 9800X3D with 16 threads. Random controls,
+55% 1v1, 27% 2v2 and 18% 3v3 arenas:
 
-| Arenas | Arena-ticks/s |
-|---|---|
-| 1,024 | 3.82M |
-| 4,096 | 10.08M |
-| 8,192 | 15.56M |
-| 16,384 | 17.44M |
+| Arenas | RocketGPU | RocketSim v3 |
+|---|---|---|
+| 1,024 | 3.99M | 3.79M |
+| 4,096 | 10.37M | 3.99M |
+| 8,192 | 15.62M | 4.05M |
+| 16,384 | 17.44M | 4.34M |
 
 ## Accuracy
 
-Compared against RocketSim v3 (latest).
+Compared against RocketSim v3 0.3.4.
 
 **RLBot match suite**: real-game states captured through RLBot (lower is better)
 
-| | RocketGPU | v3 (latest) |
+| | RocketGPU | v3 0.3.4 |
 |---|---|---|
-| Mean position error after 1 s, all 2342 match windows (uu) | 0.576 | 2.409 |
+| Mean position error after 1 s, all 2342 match windows (uu) | 0.576 | 1.931 |
 | Mean position error, 393 plan trials (uu) | 0.0998 | 0.271 |
 
 **v3's suite**: v3's real-game recordings, scored with its `rlpr_metric` (pass %: higher is better; error norm: lower is better)
 
-| | RocketGPU | v3 (latest) |
+| | RocketGPU | v3 0.3.4 |
 |---|---|---|
-| Games, pass % (709,990 car-ticks) | 99.02 | 92.29 |
-| Games, mean error norm | 0.273 | 2.88 |
-| Special cases, pass % (15,586 car-ticks) | 98.11 | 90.12 |
-| Special cases, mean error norm | 0.186 | 1.82 |
+| Games, pass % (1,073,187 car-ticks) | 99.10 | 97.67 |
+| Games, mean error norm | 0.244 | 0.706 |
+| Special cases, pass % (15,595 car-ticks) | 98.03 | 93.15 |
+| Special cases, mean error norm | 0.190 | 0.753 |
 
 ## License
 

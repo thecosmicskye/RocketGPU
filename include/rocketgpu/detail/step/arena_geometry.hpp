@@ -778,6 +778,20 @@ struct CarWorldLocalRows {
     UninitArray<SharedContactOrderGroup, kMaxCarWorldMeshesPerCar + 4> order_groups;
 };
 
+// One part of SolveCarWorldStaticContacts split across two threads (kPart 1: the mesh query, kPart 2: the four
+// planes): its local row and group counts and what its contacts left in the accumulator. The planes part keeps the
+// +-X walls in [0] (counts there are the walls' alone) and the floor and ceiling in [1] (counts there are the totals);
+// the mesh part uses [0].
+struct CarWorldRowsPart {
+    int split[2];
+    int normal[2];
+    int friction[2];
+    int groups[2];
+    uint8_t hit[2];
+    uint8_t surface[2];
+    ::rocketgpu::Vec3 latest_normal[2];
+};
+
 struct BulletManifoldEntry {
     int8_t kind = 0;
     int8_t body_a = -1;
@@ -2204,39 +2218,41 @@ ROCKETGPU_HD bool SolveBallVelocityNormalRowWithAccumulators(
     BallVelocityAccumulator* car_accs,
     int env_idx = -1,
     bool use_fma = false) {
-    if (!row.valid) {
+    // All of the row's fields load before its first test (a copy); applied_impulse is still written to the row.
+    const BallVelocityContactRow r = row;
+    if (!r.valid) {
         return false;
     }
 
-    const bool trace_dynamic_row = row.other_local_idx >= 0 && row.other_local_idx < count;
-    float delta_impulse = row.rhs;
+    const bool trace_dynamic_row = r.other_local_idx >= 0 && r.other_local_idx < count;
+    float delta_impulse = r.rhs;
     float trace_delta_vel1_dotn = 0.0f;
     float trace_delta_vel2_dotn = 0.0f;
     if (trace_dynamic_row && car_accs) {
-        const BallVelocityAccumulator& other_acc = car_accs[row.other_local_idx];
+        const BallVelocityAccumulator& other_acc = car_accs[r.other_local_idx];
         const float delta_vel1_dotn =
-            SolverRowDot(-row.normal, other_acc.delta_linear, use_fma) +
-            SolverRowDot(row.rel_other_cross_normal, other_acc.delta_angular, use_fma);
+            SolverRowDot(-r.normal, other_acc.delta_linear, use_fma) +
+            SolverRowDot(r.rel_other_cross_normal, other_acc.delta_angular, use_fma);
         const float delta_vel2_dotn =
-            SolverRowDot(row.normal, ball_acc.delta_linear, use_fma) +
-            SolverRowDot(row.rel_ball_cross_normal, ball_acc.delta_angular, use_fma);
-        delta_impulse = SolverRowSubtract(delta_impulse, delta_vel1_dotn, row.jac_diag_ab_inv, use_fma);
-        delta_impulse = SolverRowSubtract(delta_impulse, delta_vel2_dotn, row.jac_diag_ab_inv, use_fma);
+            SolverRowDot(r.normal, ball_acc.delta_linear, use_fma) +
+            SolverRowDot(r.rel_ball_cross_normal, ball_acc.delta_angular, use_fma);
+        delta_impulse = SolverRowSubtract(delta_impulse, delta_vel1_dotn, r.jac_diag_ab_inv, use_fma);
+        delta_impulse = SolverRowSubtract(delta_impulse, delta_vel2_dotn, r.jac_diag_ab_inv, use_fma);
         trace_delta_vel1_dotn = delta_vel1_dotn;
         trace_delta_vel2_dotn = delta_vel2_dotn;
     } else {
         const float delta_vel =
-            SolverRowDot(row.normal, ball_acc.delta_linear, use_fma) +
-            SolverRowDot(row.rel_ball_cross_normal, ball_acc.delta_angular, use_fma);
-        delta_impulse = SolverRowSubtract(delta_impulse, delta_vel, row.jac_diag_ab_inv, use_fma);
+            SolverRowDot(r.normal, ball_acc.delta_linear, use_fma) +
+            SolverRowDot(r.rel_ball_cross_normal, ball_acc.delta_angular, use_fma);
+        delta_impulse = SolverRowSubtract(delta_impulse, delta_vel, r.jac_diag_ab_inv, use_fma);
     }
     (void)trace_delta_vel1_dotn;
     (void)trace_delta_vel2_dotn;
 
-    const float applied_before = row.applied_impulse;
-    const float sum = row.applied_impulse + delta_impulse;
+    const float applied_before = r.applied_impulse;
+    const float sum = r.applied_impulse + delta_impulse;
     if (sum < 0.0f) {
-        delta_impulse = -row.applied_impulse;
+        delta_impulse = -r.applied_impulse;
         row.applied_impulse = 0.0f;
     } else {
         row.applied_impulse = sum;
@@ -2253,15 +2269,15 @@ ROCKETGPU_HD bool SolveBallVelocityNormalRowWithAccumulators(
 
     ApplyBallVelocityAccumulatorImpulse(
         ball_acc,
-        row.normal * row.ball_inv_mass,
-        row.ball_angular_component,
+        r.normal * r.ball_inv_mass,
+        r.ball_angular_component,
         delta_impulse, use_fma);
 
     if (trace_dynamic_row && car_accs) {
         ApplyBallVelocityAccumulatorImpulse(
-            car_accs[row.other_local_idx],
-            (-row.normal) * row.other_inv_mass,
-            row.other_angular_component,
+            car_accs[r.other_local_idx],
+            (-r.normal) * r.other_inv_mass,
+            r.other_angular_component,
             delta_impulse, use_fma);
     }
 
@@ -2283,48 +2299,50 @@ ROCKETGPU_HD bool SolveBallVelocityFrictionRowWithAccumulators(
     BallVelocityAccumulator* car_accs,
     int env_idx = -1,
     bool use_fma = false) {
-    if (!row.valid || !normal_rows || row.normal_row_idx < 0 || row.normal_row_idx >= normal_row_count) {
+    // All of the row's fields load before its first test (a copy); applied_impulse is still written to the row.
+    const BallFrictionContactRow r = row;
+    if (!r.valid || !normal_rows || r.normal_row_idx < 0 || r.normal_row_idx >= normal_row_count) {
         return false;
     }
 
-    const float total_impulse = normal_rows[row.normal_row_idx].applied_impulse;
+    const float total_impulse = normal_rows[r.normal_row_idx].applied_impulse;
     if (total_impulse <= 0.0f) {
         return false;
     }
 
-    const bool trace_dynamic_row = row.other_local_idx >= 0 && row.other_local_idx < count;
-    const float max_impulse = row.friction * total_impulse;
-    float delta_impulse = row.rhs;
+    const bool trace_dynamic_row = r.other_local_idx >= 0 && r.other_local_idx < count;
+    const float max_impulse = r.friction * total_impulse;
+    float delta_impulse = r.rhs;
     float trace_delta_vel1_dotn = 0.0f;
     float trace_delta_vel2_dotn = 0.0f;
     if (trace_dynamic_row && car_accs) {
-        const BallVelocityAccumulator& other_acc = car_accs[row.other_local_idx];
+        const BallVelocityAccumulator& other_acc = car_accs[r.other_local_idx];
         const float delta_vel1_dotn =
-            SolverRowDot(-row.tangent, other_acc.delta_linear, use_fma) +
-            SolverRowDot(row.rel_other_cross_tangent, other_acc.delta_angular, use_fma);
+            SolverRowDot(-r.tangent, other_acc.delta_linear, use_fma) +
+            SolverRowDot(r.rel_other_cross_tangent, other_acc.delta_angular, use_fma);
         const float delta_vel2_dotn =
-            SolverRowDot(row.tangent, ball_acc.delta_linear, use_fma) +
-            SolverRowDot(row.rel_ball_cross_tangent, ball_acc.delta_angular, use_fma);
-        delta_impulse = SolverRowSubtract(delta_impulse, delta_vel1_dotn, row.jac_diag_ab_inv, use_fma);
-        delta_impulse = SolverRowSubtract(delta_impulse, delta_vel2_dotn, row.jac_diag_ab_inv, use_fma);
+            SolverRowDot(r.tangent, ball_acc.delta_linear, use_fma) +
+            SolverRowDot(r.rel_ball_cross_tangent, ball_acc.delta_angular, use_fma);
+        delta_impulse = SolverRowSubtract(delta_impulse, delta_vel1_dotn, r.jac_diag_ab_inv, use_fma);
+        delta_impulse = SolverRowSubtract(delta_impulse, delta_vel2_dotn, r.jac_diag_ab_inv, use_fma);
         trace_delta_vel1_dotn = delta_vel1_dotn;
         trace_delta_vel2_dotn = delta_vel2_dotn;
     } else {
         const float delta_vel =
-            SolverRowDot(row.tangent, ball_acc.delta_linear, use_fma) +
-            SolverRowDot(row.rel_ball_cross_tangent, ball_acc.delta_angular, use_fma);
-        delta_impulse = SolverRowSubtract(delta_impulse, delta_vel, row.jac_diag_ab_inv, use_fma);
+            SolverRowDot(r.tangent, ball_acc.delta_linear, use_fma) +
+            SolverRowDot(r.rel_ball_cross_tangent, ball_acc.delta_angular, use_fma);
+        delta_impulse = SolverRowSubtract(delta_impulse, delta_vel, r.jac_diag_ab_inv, use_fma);
     }
     (void)trace_delta_vel1_dotn;
     (void)trace_delta_vel2_dotn;
 
-    const float applied_before = row.applied_impulse;
-    const float sum = row.applied_impulse + delta_impulse;
+    const float applied_before = r.applied_impulse;
+    const float sum = r.applied_impulse + delta_impulse;
     if (sum < -max_impulse) {
-        delta_impulse = -max_impulse - row.applied_impulse;
+        delta_impulse = -max_impulse - r.applied_impulse;
         row.applied_impulse = -max_impulse;
     } else if (sum > max_impulse) {
-        delta_impulse = max_impulse - row.applied_impulse;
+        delta_impulse = max_impulse - r.applied_impulse;
         row.applied_impulse = max_impulse;
     } else {
         row.applied_impulse = sum;
@@ -2341,15 +2359,15 @@ ROCKETGPU_HD bool SolveBallVelocityFrictionRowWithAccumulators(
 
     ApplyBallVelocityAccumulatorImpulse(
         ball_acc,
-        row.tangent * row.ball_inv_mass,
-        row.ball_angular_component,
+        r.tangent * r.ball_inv_mass,
+        r.ball_angular_component,
         delta_impulse, use_fma);
 
     if (trace_dynamic_row && car_accs) {
         ApplyBallVelocityAccumulatorImpulse(
-            car_accs[row.other_local_idx],
-            (-row.tangent) * row.other_inv_mass,
-            row.other_angular_component,
+            car_accs[r.other_local_idx],
+            (-r.tangent) * r.other_inv_mass,
+            r.other_angular_component,
             delta_impulse, use_fma);
     }
 
@@ -2510,12 +2528,14 @@ ROCKETGPU_HD void AppendCarWorldToSharedVelocityRows(
     const CarWorldVelocityContactRow* normal_rows,
     int normal_row_count,
     const CarWorldFrictionContactRow* friction_rows,
-    int friction_row_count) {
+    int friction_row_count,
+    int normal_row_base_in = -1,     // >= 0: the car's first shared normal row (rows appended in segments)
+    int normal_row_idx_offset = 0) {  // the segment's first local normal row
     if (body_local_idx < 0) {
         return;
     }
 
-    const int normal_row_base = shared_normal_row_count;
+    const int normal_row_base = normal_row_base_in >= 0 ? normal_row_base_in : shared_normal_row_count;
     if (shared_normal_rows && normal_rows) {
         for (int row_idx = 0; row_idx < normal_row_count; ++row_idx) {
             const CarWorldVelocityContactRow src = normal_rows[row_idx];  // by value, as for split rows
@@ -2553,7 +2573,7 @@ ROCKETGPU_HD void AppendCarWorldToSharedVelocityRows(
             CarSharedFrictionContactRow& dst = shared_friction_rows[shared_friction_row_count++];
             dst = CarSharedFrictionContactRow{};
             dst.valid = 1;
-            dst.normal_row_idx = normal_row_base + src.normal_row_idx;
+            dst.normal_row_idx = normal_row_base + normal_row_idx_offset + src.normal_row_idx;
             dst.source_tag = src.source_tag;
             dst.body_a_local_idx = body_local_idx;
             dst.body_b_local_idx = -1;
@@ -2706,40 +2726,42 @@ ROCKETGPU_HD bool SolveSharedCarVelocityNormalRow(
     const char* bucket,
     int env_idx,
     bool use_fma = false) {
-    if (!row.valid || !cars || !car_configs || !car_accs) {
+    // All of the row's fields load before its first test (a copy); applied_impulse is still written to the row.
+    const CarSharedVelocityContactRow r = row;
+    if (!r.valid || !cars || !car_configs || !car_accs) {
         return false;
     }
-    if (row.body_a_local_idx < 0 || row.body_a_local_idx >= count) {
+    if (r.body_a_local_idx < 0 || r.body_a_local_idx >= count) {
         return false;
     }
 
     constexpr float kBtPerUu = 1.0f / 50.0f;
     constexpr float kUuPerBt = 50.0f;
-    const ::rocketgpu::Vec3 normal_b = (row.body_b_local_idx >= 0 && row.body_b_local_idx < count) ? -row.normal_a : ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    const ::rocketgpu::Vec3 normal_b = (r.body_b_local_idx >= 0 && r.body_b_local_idx < count) ? -r.normal_a : ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
 
-    const BallVelocityAccumulator& acc_a = car_accs[row.body_a_local_idx];
+    const BallVelocityAccumulator& acc_a = car_accs[r.body_a_local_idx];
     const float delta_impulse_vel_a_bt =
-        SolverRowDot(row.normal_a, acc_a.delta_linear, use_fma) +
-        SolverRowDot(row.rel_a_cross_normal, acc_a.delta_angular, use_fma);
+        SolverRowDot(r.normal_a, acc_a.delta_linear, use_fma) +
+        SolverRowDot(r.rel_a_cross_normal, acc_a.delta_angular, use_fma);
     float delta_impulse_vel_b_bt = 0.0f;
 
-    if (row.body_b_local_idx >= 0 && row.body_b_local_idx < count) {
-        const BallVelocityAccumulator& acc_b = car_accs[row.body_b_local_idx];
+    if (r.body_b_local_idx >= 0 && r.body_b_local_idx < count) {
+        const BallVelocityAccumulator& acc_b = car_accs[r.body_b_local_idx];
         delta_impulse_vel_b_bt =
             SolverRowDot(normal_b, acc_b.delta_linear, use_fma) +
-            SolverRowDot(row.rel_b_cross_normal, acc_b.delta_angular, use_fma);
+            SolverRowDot(r.rel_b_cross_normal, acc_b.delta_angular, use_fma);
     }
 
-    const float applied_before = row.applied_impulse;
+    const float applied_before = r.applied_impulse;
     float delta_impulse = 0.0f;
-    if (row.has_rhs_bt) {
-        float delta_impulse_bt = row.rhs_bt;
-        delta_impulse_bt = SolverRowSubtract(delta_impulse_bt, delta_impulse_vel_a_bt, row.jac_diag_ab_inv, use_fma);
-        delta_impulse_bt = SolverRowSubtract(delta_impulse_bt, delta_impulse_vel_b_bt, row.jac_diag_ab_inv, use_fma);
+    if (r.has_rhs_bt) {
+        float delta_impulse_bt = r.rhs_bt;
+        delta_impulse_bt = SolverRowSubtract(delta_impulse_bt, delta_impulse_vel_a_bt, r.jac_diag_ab_inv, use_fma);
+        delta_impulse_bt = SolverRowSubtract(delta_impulse_bt, delta_impulse_vel_b_bt, r.jac_diag_ab_inv, use_fma);
 
-        const float sum_bt = row.applied_impulse + delta_impulse_bt;
+        const float sum_bt = r.applied_impulse + delta_impulse_bt;
         if (sum_bt < 0.0f) {
-            delta_impulse = -row.applied_impulse;
+            delta_impulse = -r.applied_impulse;
             row.applied_impulse = 0.0f;
         } else {
             delta_impulse = delta_impulse_bt;
@@ -2748,10 +2770,10 @@ ROCKETGPU_HD bool SolveSharedCarVelocityNormalRow(
     } else {
         const float delta_impulse_vel_a_uu = delta_impulse_vel_a_bt * kUuPerBt;
         const float delta_impulse_vel_b_uu = delta_impulse_vel_b_bt * kUuPerBt;
-        const float applied_uu = row.applied_impulse * kUuPerBt;
-        delta_impulse = row.rhs;
-        delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_a_uu, row.jac_diag_ab_inv, use_fma);
-        delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_b_uu, row.jac_diag_ab_inv, use_fma);
+        const float applied_uu = r.applied_impulse * kUuPerBt;
+        delta_impulse = r.rhs;
+        delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_a_uu, r.jac_diag_ab_inv, use_fma);
+        delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_b_uu, r.jac_diag_ab_inv, use_fma);
 
         const float sum = applied_uu + delta_impulse;
         if (sum < 0.0f) {
@@ -2769,16 +2791,16 @@ ROCKETGPU_HD bool SolveSharedCarVelocityNormalRow(
 
     ApplySharedCarVelocityImpulse(
         car_accs,
-        row.body_a_local_idx,
-        row.normal_a * row.inv_mass_a,
-        row.angular_component_a,
+        r.body_a_local_idx,
+        r.normal_a * r.inv_mass_a,
+        r.angular_component_a,
         delta_impulse, use_fma);
-    if (row.body_b_local_idx >= 0 && row.body_b_local_idx < count) {
+    if (r.body_b_local_idx >= 0 && r.body_b_local_idx < count) {
         ApplySharedCarVelocityImpulse(
             car_accs,
-            row.body_b_local_idx,
-            normal_b * row.inv_mass_b,
-            row.angular_component_b,
+            r.body_b_local_idx,
+            normal_b * r.inv_mass_b,
+            r.angular_component_b,
             delta_impulse, use_fma);
     }
     return true;
@@ -2798,48 +2820,50 @@ ROCKETGPU_HD bool SolveSharedCarVelocityFrictionRow(
     const char* bucket,
     int env_idx,
     bool use_fma = false) {
-    if (!row.valid || !cars || !car_configs || !car_accs || !normal_rows) {
+    // All of the row's fields load before its first test (a copy); applied_impulse is still written to the row.
+    const CarSharedFrictionContactRow r = row;
+    if (!r.valid || !cars || !car_configs || !car_accs || !normal_rows) {
         return false;
     }
-    if (row.normal_row_idx < 0 || row.normal_row_idx >= normal_row_count) {
+    if (r.normal_row_idx < 0 || r.normal_row_idx >= normal_row_count) {
         return false;
     }
-    if (row.body_a_local_idx < 0 || row.body_a_local_idx >= count) {
+    if (r.body_a_local_idx < 0 || r.body_a_local_idx >= count) {
         return false;
     }
 
-    const ::rocketgpu::Vec3 tangent_b = (row.body_b_local_idx >= 0 && row.body_b_local_idx < count) ? -row.tangent_a : ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    const ::rocketgpu::Vec3 tangent_b = (r.body_b_local_idx >= 0 && r.body_b_local_idx < count) ? -r.tangent_a : ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
 
-    const float total_impulse = normal_rows[row.normal_row_idx].applied_impulse;
+    const float total_impulse = normal_rows[r.normal_row_idx].applied_impulse;
     if (total_impulse <= 0.0f) {
         return false;
     }
 
     constexpr float kBtPerUu = 1.0f / 50.0f;
-    const float max_impulse = row.friction * total_impulse;
-    float delta_impulse = row.has_rhs_bt ? row.rhs_bt : row.rhs * kBtPerUu;
-    const BallVelocityAccumulator& acc_a = car_accs[row.body_a_local_idx];
+    const float max_impulse = r.friction * total_impulse;
+    float delta_impulse = r.has_rhs_bt ? r.rhs_bt : r.rhs * kBtPerUu;
+    const BallVelocityAccumulator& acc_a = car_accs[r.body_a_local_idx];
     const float delta_impulse_vel_a_bt =
-        SolverRowDot(row.tangent_a, acc_a.delta_linear, use_fma) +
-        SolverRowDot(row.rel_a_cross_tangent, acc_a.delta_angular, use_fma);
-    delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_a_bt, row.jac_diag_ab_inv, use_fma);
+        SolverRowDot(r.tangent_a, acc_a.delta_linear, use_fma) +
+        SolverRowDot(r.rel_a_cross_tangent, acc_a.delta_angular, use_fma);
+    delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_a_bt, r.jac_diag_ab_inv, use_fma);
 
     float delta_impulse_vel_b_bt = 0.0f;
-    if (row.body_b_local_idx >= 0 && row.body_b_local_idx < count) {
-        const BallVelocityAccumulator& acc_b = car_accs[row.body_b_local_idx];
+    if (r.body_b_local_idx >= 0 && r.body_b_local_idx < count) {
+        const BallVelocityAccumulator& acc_b = car_accs[r.body_b_local_idx];
         delta_impulse_vel_b_bt =
             SolverRowDot(tangent_b, acc_b.delta_linear, use_fma) +
-            SolverRowDot(row.rel_b_cross_tangent, acc_b.delta_angular, use_fma);
-        delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_b_bt, row.jac_diag_ab_inv, use_fma);
+            SolverRowDot(r.rel_b_cross_tangent, acc_b.delta_angular, use_fma);
+        delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_b_bt, r.jac_diag_ab_inv, use_fma);
     }
 
-    const float applied_before = row.applied_impulse;
-    const float sum = row.applied_impulse + delta_impulse;
+    const float applied_before = r.applied_impulse;
+    const float sum = r.applied_impulse + delta_impulse;
     if (sum < -max_impulse) {
-        delta_impulse = -max_impulse - row.applied_impulse;
+        delta_impulse = -max_impulse - r.applied_impulse;
         row.applied_impulse = -max_impulse;
     } else if (sum > max_impulse) {
-        delta_impulse = max_impulse - row.applied_impulse;
+        delta_impulse = max_impulse - r.applied_impulse;
         row.applied_impulse = max_impulse;
     } else {
         row.applied_impulse = sum;
@@ -2851,16 +2875,16 @@ ROCKETGPU_HD bool SolveSharedCarVelocityFrictionRow(
 
     ApplySharedCarVelocityImpulse(
         car_accs,
-        row.body_a_local_idx,
-        row.tangent_a * row.inv_mass_a,
-        row.angular_component_a,
+        r.body_a_local_idx,
+        r.tangent_a * r.inv_mass_a,
+        r.angular_component_a,
         delta_impulse, use_fma);
-    if (row.body_b_local_idx >= 0 && row.body_b_local_idx < count) {
+    if (r.body_b_local_idx >= 0 && r.body_b_local_idx < count) {
         ApplySharedCarVelocityImpulse(
             car_accs,
-            row.body_b_local_idx,
-            tangent_b * row.inv_mass_b,
-            row.angular_component_b,
+            r.body_b_local_idx,
+            tangent_b * r.inv_mass_b,
+            r.angular_component_b,
             delta_impulse, use_fma);
     }
     return true;

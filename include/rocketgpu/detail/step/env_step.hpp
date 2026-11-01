@@ -3320,7 +3320,10 @@ ROCKETGPU_HD void StepEnvVehicleUpdateCar(
 // recorded (they are emitted in visit order). Each update then reads and writes only its own car.
 // Car slot i's turn in the WorldStepSoccar car-world loop, between kWorldStepContacts and kWorldStepRows: its rows go
 // to the env's shared world rows at the car's slot and its order groups to its CarWorldRowsOut (see PackCarWorldRows).
-template <bool kMeshesOutOfReach = false>
+// kPart 1 / 2 (the car passed CarWorldRowsSplitPlanes): one part of the split query, the mesh part into the car's
+// local rows and the planes part into plane_rows; FinishCarWorldRowsForCar then merges them (both parts done) and
+// clears the reset flag. Each part resets its own retained manifolds.
+template <bool kMeshesOutOfReach = false, int kPart = 0>
 ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void BuildCarWorldRowsForCar(
     int env_idx,
     int i,
@@ -3330,24 +3333,30 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void BuildCarWorldRowsForCar(
     WorldSolverScratch& scratch,
     const WorldSolverScratchRows& rows,
     bullet_port::btGjkEpaScratch* gjk_scratch,
-    uint32_t mesh_reach_hint = 0u) {
+    uint32_t mesh_reach_hint = 0u,
+    CarWorldLocalRows* plane_rows = nullptr,
+    CarWorldRowsPart* part = nullptr) {
     const int car_idx = env_idx * cfg.max_cars_per_env + i;
     CarWorldRowsOut& out = scratch.car_world_rows_out[i];
-    out.group_count = 0;
-    out.world_surface = 0;
+    if (kPart != 2) {
+        out.group_count = 0;
+        out.world_surface = 0;
+    }
     if (i < kMaxCarWorldMeshPersistentCars && scratch.car_world_reset[i]) {
-        for (int plane_idx = 0; plane_idx < kCarWorldPlaneRetainedManifoldsPerCar; ++plane_idx) {
+        for (int plane_idx = 0; kPart != 1 && plane_idx < kCarWorldPlaneRetainedManifoldsPerCar; ++plane_idx) {
             rows.car_world_plane_manifolds[i * kCarWorldPlaneRetainedManifoldsPerCar + plane_idx].count = 0;
         }
-        for (int k = 0; k < kCarWorldMeshRetainedManifoldsPerCar; ++k) {
+        for (int k = 0; kPart != 2 && k < kCarWorldMeshRetainedManifoldsPerCar; ++k) {
             rows.car_world_mesh_manifolds[i * kCarWorldMeshRetainedManifoldsPerCar + k].count = 0;
         }
-        scratch.car_world_reset[i] = 0;
+        if (kPart == 0) {
+            scratch.car_world_reset[i] = 0;
+        }
     }
     int split_end = i * kMaxCarWorldSplitContactRows;
     int velocity_end = i * kMaxCarWorldVelocityContactRows;
     int friction_end = i * kMaxCarWorldFrictionContactRows;
-    if (scratch.pre_contact_cars[i].is_demoed || cars[car_idx].just_respawned) {
+    if (kPart == 0 && (scratch.pre_contact_cars[i].is_demoed || cars[car_idx].just_respawned)) {
         if (i < kMaxCarWorldMeshPersistentCars) {
             for (int plane_idx = 0; plane_idx < kCarWorldPlaneRetainedManifoldsPerCar; ++plane_idx) {
                 rows.car_world_plane_manifolds[i * kCarWorldPlaneRetainedManifoldsPerCar + plane_idx].count = 0;
@@ -3358,7 +3367,7 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void BuildCarWorldRowsForCar(
         }
     } else {
         const ArenaBroadphaseGrid grid = MakeArenaBroadphaseGrid(cfg);
-        const ContactAccumulator acc = SolveCarWorldStaticContacts<kMeshesOutOfReach>(
+        const ContactAccumulator acc = SolveCarWorldStaticContacts<kMeshesOutOfReach, kPart>(
             cars[car_idx], car_configs[car_idx], cfg.mutator,
             scratch.deferred_linear_deltas[i], scratch.deferred_angular_deltas[i],
             cfg.tick_dt / static_cast<float>(DebugWorldSubsteps()), env_idx, i,
@@ -3380,12 +3389,48 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void BuildCarWorldRowsForCar(
             (i < kMaxCarWorldMeshPersistentCars)
                 ? &rows.car_world_mesh_manifolds[i * kCarWorldMeshRetainedManifoldsPerCar]
                 : nullptr,
-            rows.car_world_local_rows ? &rows.car_world_local_rows[i] : nullptr,
+            kPart == 2 ? plane_rows : rows.car_world_local_rows ? &rows.car_world_local_rows[i] : nullptr,
             mesh_reach_hint,
-            true);
+            true,
+            part);
+        if (kPart != 0) {
+            return;
+        }
         RecordArenaWorldContact(cars[car_idx], acc);
         out.world_surface = acc.surface;
     }
+    out.split_row_count = split_end - i * kMaxCarWorldSplitContactRows;
+    out.velocity_row_count = velocity_end - i * kMaxCarWorldVelocityContactRows;
+    out.friction_row_count = friction_end - i * kMaxCarWorldFrictionContactRows;
+}
+
+// The split query's end (both BuildCarWorldRowsForCar parts done): the rest of BuildCarWorldRowsForCar.
+ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void FinishCarWorldRowsForCar(
+    int env_idx,
+    int i,
+    const SimConfig& cfg,
+    CarState* cars,
+    WorldSolverScratch& scratch,
+    const WorldSolverScratchRows& rows,
+    const CarWorldRowsPart& mesh_part,
+    CarWorldLocalRows& plane_rows,
+    const CarWorldRowsPart& plane_part) {
+    const int car_idx = env_idx * cfg.max_cars_per_env + i;
+    CarWorldRowsOut& out = scratch.car_world_rows_out[i];
+    if (scratch.car_world_reset[i]) {
+        scratch.car_world_reset[i] = 0;
+    }
+    int split_end = i * kMaxCarWorldSplitContactRows;
+    int velocity_end = i * kMaxCarWorldVelocityContactRows;
+    int friction_end = i * kMaxCarWorldFrictionContactRows;
+    const ContactAccumulator acc = FinishCarWorldSplitRows(
+        i, rows.car_world_local_rows[i], mesh_part, plane_rows, plane_part,
+        rows.world_split_rows, &split_end,
+        rows.world_velocity_rows, &velocity_end,
+        rows.world_friction_rows, &friction_end,
+        EnvStridedArray<SharedContactOrderGroup>(out.groups), &out.group_count);
+    RecordArenaWorldContact(cars[car_idx], acc);
+    out.world_surface = acc.surface;
     out.split_row_count = split_end - i * kMaxCarWorldSplitContactRows;
     out.velocity_row_count = velocity_end - i * kMaxCarWorldVelocityContactRows;
     out.friction_row_count = friction_end - i * kMaxCarWorldFrictionContactRows;

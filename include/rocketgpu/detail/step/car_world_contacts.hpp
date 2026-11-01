@@ -354,7 +354,8 @@ ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
     EnvStridedArray<SharedContactOrderGroup> local_world_order_groups = nullptr,
     int* local_world_order_group_count = nullptr,
     int car_idx = -1,
-    CarWorldPlaneRetainedManifold* retained_manifold = nullptr) {
+    CarWorldPlaneRetainedManifold* retained_manifold = nullptr,
+    bool defer_floor_ceiling_group = false) {  // record the floor/ceiling group as valid 2: the caller decides it
     constexpr float kUUToBT = 1.0f / 50.0f;
     constexpr float kBTToUU = 50.0f;
     Vec3 basis_forward(1.0f, 0.0f, 0.0f);
@@ -604,8 +605,8 @@ ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
     const int appended_normal_count = normal_row_count - normal_row_start;
     const int appended_friction_count = friction_row_count - friction_row_start;
     bool record_order_group = true;
-    if (local_world_order_groups && local_world_order_group_count && *local_world_order_group_count > 0 &&
-        IsBtFloorCeilingPlaneSourceTag(source_tag)) {
+    if (!defer_floor_ceiling_group && local_world_order_groups && local_world_order_group_count &&
+        *local_world_order_group_count > 0 && IsBtFloorCeilingPlaneSourceTag(source_tag)) {
         const SharedContactOrderGroup& previous_group =
             local_world_order_groups[*local_world_order_group_count - 1];
 
@@ -625,6 +626,9 @@ ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
             appended_friction_count > 0 ? friction_row_start : -1,
             appended_friction_count,
             *local_world_order_group_count);
+        if (defer_floor_ceiling_group && IsBtFloorCeilingPlaneSourceTag(source_tag)) {
+            local_world_order_groups[*local_world_order_group_count - 1].valid = 2;
+        }
     }
 }
 
@@ -1170,17 +1174,15 @@ ROCKETGPU_HD void ReleaseCarWorldMeshManifoldsOutOfReach(
     }
 }
 
-// The four Bullet static planes (+X wall, -X wall, floor, ceiling, AppendCarWorldPlaneContactRows order). Returns -1
-// unless every plane's support distance clears the breaking threshold (no point) and sits clearly on one side of the
-// broadphase window (whether the plane gets an empty order group); otherwise bit i is set when plane i gets the
-// group. The bound is the support-vertex distance itself, so the slack only covers rounding.
-ROCKETGPU_HD int CarWorldPlanesOutOfReach(const CarState& car, const CarConfig& cfg) {
+constexpr float kCarWorldPlaneReachSlackBt = 1.0e-3f;
+// The four planes' support distances d (bt), with the breaking threshold and the broadphase window.
+ROCKETGPU_HD void CarWorldPlaneSupportDistances(
+    const CarState& car, const CarConfig& cfg, float d[4], float& threshold_bt, float& window_bt) {
     constexpr float kUUToBT = 1.0f / 50.0f;
-    constexpr float kSlackBt = 1.0e-3f;
     constexpr float kBulletGContactBreakingThresholdBt = 0.02f;
     constexpr float kBulletStaticPlaneAabbHalfSlabBt = 0.2f;
-    const float threshold_bt = CarContactBreakingThresholdUU(cfg) * kUUToBT;
-    const float window_bt = threshold_bt + kBulletStaticPlaneAabbHalfSlabBt + 2.0f * kBulletGContactBreakingThresholdBt;
+    threshold_bt = CarContactBreakingThresholdUU(cfg) * kUUToBT;
+    window_bt = threshold_bt + kBulletStaticPlaneAabbHalfSlabBt + 2.0f * kBulletGContactBreakingThresholdBt;
     Vec3 fwd(1.0f, 0.0f, 0.0f);
     Vec3 right(0.0f, 1.0f, 0.0f);
     Vec3 up(0.0f, 0.0f, 1.0f);
@@ -1192,6 +1194,22 @@ ROCKETGPU_HD int CarWorldPlanesOutOfReach(const CarState& car, const CarConfig& 
     const float ext_x = Abs(fwd.x) * half_bt.x + Abs(right.x) * half_bt.y + Abs(up.x) * half_bt.z;
     const float ext_z = Abs(fwd.z) * half_bt.x + Abs(right.z) * half_bt.y + Abs(up.z) * half_bt.z;
     const float wall_bt = ArenaExtentX() * kUUToBT;
+    d[0] = center_bt.x + wall_bt - ext_x;
+    d[1] = wall_bt - center_bt.x - ext_x;
+    d[2] = center_bt.z - ext_z;
+    d[3] = ArenaHeight() * kUUToBT - center_bt.z - ext_z;
+}
+
+// The four Bullet static planes (+X wall, -X wall, floor, ceiling, AppendCarWorldPlaneContactRows order). Returns -1
+// unless every plane's support distance clears the breaking threshold (no point) and sits clearly on one side of the
+// broadphase window (whether the plane gets an empty order group); otherwise bit i is set when plane i gets the
+// group. The bound is the support-vertex distance itself, so the slack only covers rounding.
+ROCKETGPU_HD int CarWorldPlanesOutOfReach(const CarState& car, const CarConfig& cfg) {
+    constexpr float kSlackBt = kCarWorldPlaneReachSlackBt;
+    float d[4];
+    float threshold_bt;
+    float window_bt;
+    CarWorldPlaneSupportDistances(car, cfg, d, threshold_bt, window_bt);
     int mask = 0;
     const auto classify = [&](float d, int bit) {
         if (mask < 0) {
@@ -1203,11 +1221,25 @@ ROCKETGPU_HD int CarWorldPlanesOutOfReach(const CarState& car, const CarConfig& 
             mask |= bit;
         }
     };
-    classify(center_bt.x + wall_bt - ext_x, 1);
-    classify(wall_bt - center_bt.x - ext_x, 2);
-    classify(center_bt.z - ext_z, 4);
-    classify(ArenaHeight() * kUUToBT - center_bt.z - ext_z, 8);
+    classify(d[0], 1);
+    classify(d[1], 2);
+    classify(d[2], 4);
+    classify(d[3], 8);
     return mask;
+}
+
+// The planes that may get a point: support distance under the breaking threshold (with the slack above). The others
+// clear it, so they add no contact and no row (AppendCarWorldPlaneContactRows returns before both).
+ROCKETGPU_HD int CarWorldPlanesInReachCount(const CarState& car, const CarConfig& cfg) {
+    float d[4];
+    float threshold_bt;
+    float window_bt;
+    CarWorldPlaneSupportDistances(car, cfg, d, threshold_bt, window_bt);
+    int count = 0;
+    for (int k = 0; k < 4; ++k) {
+        count += d[k] < threshold_bt + kCarWorldPlaneReachSlackBt ? 1 : 0;
+    }
+    return count;
 }
 
 // kStagedHitsOnly: the staging kernel's build. It never runs GJK/EPA: the gather pass stops at the plane tests and

@@ -97,17 +97,23 @@ ROCKETGPU_HD bool DebugCarWorldSolverTraceEnabledFor(int env_idx, int car_idx) {
 // then the unit sum over those objects. v3 keeps the last contact-added normal instead. RLPR records
 // the averaged normal (cw_turtle_autoroll_slope frame 17568: slope points (-0.955,0,0.297) and (-0.637,0,0.771),
 // recorded (-0.830,0,0.557)).
+// kSegs: the rows in that many segments, read in order as one list (the split RowsFull, CarWorldRowsPart).
+template <int kSegs = 1>
 ROCKETGPU_HD void ApplyGameCarWorldContactNormal(
     ContactAccumulator& acc,
-    const CarWorldVelocityContactRow* normal_rows,
-    int normal_row_count) {
-    if (!acc.hit || !normal_rows || normal_row_count <= 0) {
+    const CarWorldVelocityContactRow* const (&seg_rows)[kSegs],
+    const int (&seg_counts)[kSegs]) {
+    if (!acc.hit) {
         return;
     }
     constexpr int kMaxObjects = 8;
     int tags[kMaxObjects];
     Vec3 sums[kMaxObjects];
     int object_count = 0;
+#pragma unroll
+    for (int seg = 0; seg < kSegs; ++seg) {
+    const CarWorldVelocityContactRow* const normal_rows = seg_rows[seg];
+    const int normal_row_count = normal_rows ? seg_counts[seg] : 0;
     for (int row_idx = 0; row_idx < normal_row_count; ++row_idx) {
         if (!normal_rows[row_idx].valid) {
             continue;
@@ -127,6 +133,7 @@ ROCKETGPU_HD void ApplyGameCarWorldContactNormal(
         }
         sums[slot] += normal_rows[row_idx].normal;
     }
+    }
     Vec3 total(0.0f, 0.0f, 0.0f);
     for (int i = 0; i < object_count; ++i) {
         const float len_sq = Dot(sums[i], sums[i]);
@@ -139,11 +146,26 @@ ROCKETGPU_HD void ApplyGameCarWorldContactNormal(
         acc.latest_normal = total * (1.0f / SqrtScalar(total_len_sq));
     }
 }
+ROCKETGPU_HD void ApplyGameCarWorldContactNormal(
+    ContactAccumulator& acc,
+    const CarWorldVelocityContactRow* normal_rows,
+    int normal_row_count) {
+    if (!normal_rows || normal_row_count <= 0) {
+        return;
+    }
+    const CarWorldVelocityContactRow* const seg_rows[1] = {normal_rows};
+    const int seg_counts[1] = {normal_row_count};
+    ApplyGameCarWorldContactNormal<1>(acc, seg_rows, seg_counts);
+}
 
 
 // kMeshesOutOfReach: the caller found no usable arena mesh in reach (CarWorldUsableMeshesOutOfReach), so the mesh
 // query reduces to releasing the retained mesh manifolds.
-template <bool kMeshesOutOfReach = false>
+// kPart 1 / 2: only the mesh query / only the four planes (+-X walls, floor, ceiling), each into its own local rows,
+// for FinishCarWorldSplitRows to merge in the whole query's order (part_out: the part's counts and contacts). The
+// caller makes sure neither part's rows can reach a row cap (CarWorldRowsSplitPlanes) and gives the planes part
+// fresh local rows.
+template <bool kMeshesOutOfReach = false, int kPart = 0>
 ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     CarState& car,
     const CarConfig& cfg,
@@ -178,7 +200,8 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     CarWorldMeshRetainedManifold* retained_mesh_manifolds = nullptr,
     CarWorldLocalRows* local_rows = nullptr,
     uint32_t mesh_reach_hint = 0u,
-    bool defer_world_surface = false) {  // true: acc.surface only; the caller applies RecordWorldSurface later
+    bool defer_world_surface = false,  // true: acc.surface only; the caller applies RecordWorldSurface later
+    CarWorldRowsPart* part_out = nullptr) {
     ContactAccumulator acc;
     acc.history_car = defer_world_surface ? nullptr : &car;
 
@@ -191,7 +214,7 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
 #if defined(__CUDA_ARCH__)
     constexpr bool kEarlyOut = kMeshesOutOfReach;
 #else
-    constexpr bool kEarlyOut = true;
+    constexpr bool kEarlyOut = kPart == 0;
 #endif
     if (kEarlyOut && mutator.arena_collision && !mutator.physics_events.HasNonGoalEvents() && mesh_triangles != nullptr &&
         mesh_triangle_count > 0) {
@@ -229,7 +252,7 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     }
 
     const CarWorldMeshCandidateStage* mesh_candidate_stage_in = nullptr;
-    if (candidate_stage != nullptr && candidate_stage->valid != 0) {
+    if (kPart != 2 && candidate_stage != nullptr && candidate_stage->valid != 0) {
         if (CarWorldMeshCandidateStageMatches(*candidate_stage, car, cfg)) {
             mesh_candidate_stage_in = candidate_stage;
         }
@@ -267,6 +290,36 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
         mesh_triangles != nullptr && mesh_triangle_count > 0;
 
     const Vec3 center = car.pos + RotateCarBasis(car, cfg.hitbox_offset);
+    // Planes part: a plane whose support distance clears the breaking threshold and sits clearly on one side of the
+    // broadphase window gets only what AppendCarWorldPlaneContactRows leaves for it there (CarWorldPlanesOutOfReach):
+    // its retained manifold emptied and, inside the window, an empty group.
+    float plane_d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float plane_threshold_bt = 0.0f;
+    float plane_window_bt = 0.0f;
+    if (kPart == 2) {
+        CarWorldPlaneSupportDistances(car, cfg, plane_d, plane_threshold_bt, plane_window_bt);
+    }
+    const auto plane_out_of_reach = [&](int k, const Vec3& inward_normal, float boundary,
+                                        CarWorldPlaneRetainedManifold* retained) {
+        if (kPart != 2) {
+            return false;
+        }
+        const float d = plane_d[k];
+        if (d < plane_threshold_bt + kCarWorldPlaneReachSlackBt ||
+            Abs(d - plane_window_bt) <= kCarWorldPlaneReachSlackBt) {
+            return false;
+        }
+        if (retained != nullptr) {
+            retained->count = 0;
+        }
+        if (d < plane_window_bt) {
+            AppendSharedContactOrderGroup(
+                local_world_order_groups, local_world_order_group_count, SharedContactOrderBucket::World, car_idx, -1,
+                CarWorldPlaneSourceTag(inward_normal, boundary), normal_row_count, 0, friction_row_count, 0,
+                local_world_order_group_count);
+        }
+        return true;
+    };
 
     const float support_radius = BoundingSphereRadius(cfg);
     const bool in_goal_window_pos_y = InGoalWindow(center.x, center.z, support_radius) && center.y > 0.0f;
@@ -328,49 +381,69 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
         }
     }
 
-    {
-        AppendCarWorldPlaneContactRows(
-            car,
-            cfg,
-            mutator,
-            Vec3(1.0f, 0.0f, 0.0f),
-            -ArenaExtentX(),
-            external_linear_delta,
-            external_angular_delta,
-            acc,
-            split_rows,
-            split_row_count,
-            normal_rows,
-            normal_row_count,
-            friction_rows,
-            friction_row_count,
-            dt,
-            true,
-            local_world_order_groups,
-            &local_world_order_group_count,
-            car_idx,
-            retained_plane_manifolds ? &retained_plane_manifolds[2] : nullptr);
-        AppendCarWorldPlaneContactRows(
-            car,
-            cfg,
-            mutator,
-            Vec3(-1.0f, 0.0f, 0.0f),
-            -ArenaExtentX(),
-            external_linear_delta,
-            external_angular_delta,
-            acc,
-            split_rows,
-            split_row_count,
-            normal_rows,
-            normal_row_count,
-            friction_rows,
-            friction_row_count,
-            dt,
-            true,
-            local_world_order_groups,
-            &local_world_order_group_count,
-            car_idx,
-            retained_plane_manifolds ? &retained_plane_manifolds[3] : nullptr);
+    if (kPart != 1) {
+        if (!plane_out_of_reach(0, Vec3(1.0f, 0.0f, 0.0f), -ArenaExtentX(),
+                                retained_plane_manifolds ? &retained_plane_manifolds[2] : nullptr)) {
+            AppendCarWorldPlaneContactRows(
+                car,
+                cfg,
+                mutator,
+                Vec3(1.0f, 0.0f, 0.0f),
+                -ArenaExtentX(),
+                external_linear_delta,
+                external_angular_delta,
+                acc,
+                split_rows,
+                split_row_count,
+                normal_rows,
+                normal_row_count,
+                friction_rows,
+                friction_row_count,
+                dt,
+                true,
+                local_world_order_groups,
+                &local_world_order_group_count,
+                car_idx,
+                retained_plane_manifolds ? &retained_plane_manifolds[2] : nullptr);
+        }
+        if (!plane_out_of_reach(1, Vec3(-1.0f, 0.0f, 0.0f), -ArenaExtentX(),
+                                retained_plane_manifolds ? &retained_plane_manifolds[3] : nullptr)) {
+            AppendCarWorldPlaneContactRows(
+                car,
+                cfg,
+                mutator,
+                Vec3(-1.0f, 0.0f, 0.0f),
+                -ArenaExtentX(),
+                external_linear_delta,
+                external_angular_delta,
+                acc,
+                split_rows,
+                split_row_count,
+                normal_rows,
+                normal_row_count,
+                friction_rows,
+                friction_row_count,
+                dt,
+                true,
+                local_world_order_groups,
+                &local_world_order_group_count,
+                car_idx,
+                retained_plane_manifolds ? &retained_plane_manifolds[3] : nullptr);
+        }
+    }
+    if (kPart == 2) {
+        // The walls' share; the floor and ceiling start a fresh accumulator (only hit, surface and the latest normal
+        // are read past the query: by ApplyGameCarWorldContactNormal and the caller).
+        part_out->split[0] = split_row_count;
+        part_out->normal[0] = normal_row_count;
+        part_out->friction[0] = friction_row_count;
+        part_out->groups[0] = local_world_order_group_count;
+        part_out->hit[0] = acc.hit;
+        part_out->surface[0] = acc.surface;
+        part_out->latest_normal[0] = acc.latest_normal;
+        acc.hit = 0;
+        acc.surface = 0;
+        acc.latest_normal = Vec3(0.0f, 0.0f, 1.0f);
     }
 
     if (use_mesh_world_rows && kMeshesOutOfReach) {
@@ -378,7 +451,7 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
                                                mesh_bvh_node_count,
                                                broadphase_grid != nullptr ? retained_mesh_manifolds : nullptr);
     }
-    if (use_mesh_world_rows && !kMeshesOutOfReach) {
+    if (use_mesh_world_rows && !kMeshesOutOfReach && kPart != 2) {
         AppendCarWorldMeshContactRowsBody<false>(
             car,
             cfg,
@@ -420,48 +493,58 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
             mesh_reach_hint);
     }
 
-    AppendCarWorldPlaneContactRows(
-        car,
-        cfg,
-        mutator,
-        Vec3(0.0f, 0.0f, 1.0f),
-        0.0f,
-        external_linear_delta,
-        external_angular_delta,
-        acc,
-        split_rows,
-        split_row_count,
-        normal_rows,
-        normal_row_count,
-        friction_rows,
-        friction_row_count,
-        dt,
-        true,
-        local_world_order_groups,
-        &local_world_order_group_count,
-        car_idx,
-        retained_plane_manifolds ? &retained_plane_manifolds[0] : nullptr);
-    AppendCarWorldPlaneContactRows(
-        car,
-        cfg,
-        mutator,
-        Vec3(0.0f, 0.0f, -1.0f),
-        -ArenaHeight(),
-        external_linear_delta,
-        external_angular_delta,
-        acc,
-        split_rows,
-        split_row_count,
-        normal_rows,
-        normal_row_count,
-        friction_rows,
-        friction_row_count,
-        dt,
-        true,
-        local_world_order_groups,
-        &local_world_order_group_count,
-        car_idx,
-        retained_plane_manifolds ? &retained_plane_manifolds[1] : nullptr);
+    if (kPart != 1) {
+        if (!plane_out_of_reach(2, Vec3(0.0f, 0.0f, 1.0f), 0.0f,
+                                retained_plane_manifolds ? &retained_plane_manifolds[0] : nullptr)) {
+            AppendCarWorldPlaneContactRows(
+                car,
+                cfg,
+                mutator,
+                Vec3(0.0f, 0.0f, 1.0f),
+                0.0f,
+                external_linear_delta,
+                external_angular_delta,
+                acc,
+                split_rows,
+                split_row_count,
+                normal_rows,
+                normal_row_count,
+                friction_rows,
+                friction_row_count,
+                dt,
+                true,
+                local_world_order_groups,
+                &local_world_order_group_count,
+                car_idx,
+                retained_plane_manifolds ? &retained_plane_manifolds[0] : nullptr,
+                kPart == 2);
+        }
+        if (!plane_out_of_reach(3, Vec3(0.0f, 0.0f, -1.0f), -ArenaHeight(),
+                                retained_plane_manifolds ? &retained_plane_manifolds[1] : nullptr)) {
+            AppendCarWorldPlaneContactRows(
+                car,
+                cfg,
+                mutator,
+                Vec3(0.0f, 0.0f, -1.0f),
+                -ArenaHeight(),
+                external_linear_delta,
+                external_angular_delta,
+                acc,
+                split_rows,
+                split_row_count,
+                normal_rows,
+                normal_row_count,
+                friction_rows,
+                friction_row_count,
+                dt,
+                true,
+                local_world_order_groups,
+                &local_world_order_group_count,
+                car_idx,
+                retained_plane_manifolds ? &retained_plane_manifolds[1] : nullptr,
+                kPart == 2);
+        }
+    }
 
     if (!use_mesh_world_rows && Abs(center.y) > ArenaExtentY()) {
         if (center.z < ApproximateGoalHeight() + support_radius) {
@@ -532,6 +615,18 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
         }
     }
 
+    if (kPart != 0) {
+        const int at = kPart == 2 ? 1 : 0;
+        part_out->split[at] = split_row_count;
+        part_out->normal[at] = normal_row_count;
+        part_out->friction[at] = friction_row_count;
+        part_out->groups[at] = local_world_order_group_count;
+        part_out->hit[at] = acc.hit;
+        part_out->surface[at] = acc.surface;
+        part_out->latest_normal[at] = acc.latest_normal;
+        return acc;
+    }
+
     ApplyGameCarWorldContactNormal(acc, normal_rows, normal_row_count);
 
     if (shared_split_rows && shared_split_row_count && split_row_count > 0) {
@@ -588,6 +683,93 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
             external_linear_delta);
     }
 
+    return acc;
+}
+
+// The finish of SolveCarWorldStaticContacts for its two parts (kPart 1: mesh, rows mesh; kPart 2: planes, rows
+// planes): the rows and groups go out as the whole query's, whose local lists are the +-X walls', the meshes', then
+// the floor's and ceiling's. A floor or ceiling group with rows (valid 2) is dropped when the group before it in that
+// list is mesh 1's, as AppendCarWorldPlaneContactRows does. Neither part reached a row cap, so the whole query's rows
+// are the parts' rows in that order.
+ROCKETGPU_HD ContactAccumulator FinishCarWorldSplitRows(
+    int car_idx,
+    CarWorldLocalRows& mesh,
+    const CarWorldRowsPart& mp,
+    CarWorldLocalRows& planes,
+    const CarWorldRowsPart& pp,
+    EnvStridedArray<CarSharedSplitContactRow> shared_split_rows,
+    int* shared_split_row_count,
+    EnvStridedArray<CarSharedVelocityContactRow> shared_velocity_rows,
+    int* shared_velocity_row_count,
+    EnvStridedArray<CarSharedFrictionContactRow> shared_friction_rows,
+    int* shared_friction_row_count,
+    EnvStridedArray<SharedContactOrderGroup> shared_contact_order_groups,
+    int* shared_contact_order_group_count) {
+    ContactAccumulator acc;
+    acc.history_car = nullptr;
+    acc.hit = pp.hit[0] | mp.hit[0] | pp.hit[1];
+    acc.surface = pp.surface[0] | mp.surface[0] | pp.surface[1];
+    acc.latest_normal = pp.hit[1] ? pp.latest_normal[1] : (mp.hit[0] ? mp.latest_normal[0] : pp.latest_normal[0]);
+    const int xs = pp.split[0];
+    const int xn = pp.normal[0];
+    const int xf = pp.friction[0];
+    const int ms = mp.split[0];
+    const int mn = mp.normal[0];
+    const int mf = mp.friction[0];
+    {
+        const CarWorldVelocityContactRow* const seg_rows[3] = {
+            planes.normal_rows, mesh.normal_rows, planes.normal_rows + xn};
+        const int seg_counts[3] = {xn, mn, pp.normal[1] - xn};
+        ApplyGameCarWorldContactNormal<3>(acc, seg_rows, seg_counts);
+    }
+    if (xs + ms + (pp.split[1] - xs) > 0) {
+        AppendCarWorldToSharedSplitRows(shared_split_rows, *shared_split_row_count, car_idx, planes.split_rows, xs);
+        AppendCarWorldToSharedSplitRows(shared_split_rows, *shared_split_row_count, car_idx, mesh.split_rows, ms);
+        AppendCarWorldToSharedSplitRows(
+            shared_split_rows, *shared_split_row_count, car_idx, planes.split_rows + xs, pp.split[1] - xs);
+    }
+    const int shared_normal_base = *shared_velocity_row_count;
+    const int shared_friction_base = *shared_friction_row_count;
+    AppendCarWorldToSharedVelocityRows(
+        shared_velocity_rows, *shared_velocity_row_count, shared_friction_rows, *shared_friction_row_count, car_idx,
+        planes.normal_rows, xn, planes.friction_rows, xf, shared_normal_base, 0);
+    AppendCarWorldToSharedVelocityRows(
+        shared_velocity_rows, *shared_velocity_row_count, shared_friction_rows, *shared_friction_row_count, car_idx,
+        mesh.normal_rows, mn, mesh.friction_rows, mf, shared_normal_base, xn);
+    AppendCarWorldToSharedVelocityRows(
+        shared_velocity_rows, *shared_velocity_row_count, shared_friction_rows, *shared_friction_row_count, car_idx,
+        planes.normal_rows + xn, pp.normal[1] - xn, planes.friction_rows + xf, pp.friction[1] - xf,
+        shared_normal_base, mn);
+    int group_idx = 0;
+    int previous_tag = 0;
+    const auto append = [&](const SharedContactOrderGroup& g, int normal_offset, int friction_offset) {
+        if (g.valid == 2 && group_idx > 0 && previous_tag == 101) {
+            return;
+        }
+        AppendSharedContactOrderGroup(
+            shared_contact_order_groups,
+            *shared_contact_order_group_count,
+            SharedContactOrderBucket::World,
+            car_idx,
+            -1,
+            g.source_tag,
+            g.normal_row_count > 0 ? shared_normal_base + normal_offset + g.normal_row_start : -1,
+            g.normal_row_count,
+            g.friction_row_count > 0 ? shared_friction_base + friction_offset + g.friction_row_start : -1,
+            g.friction_row_count,
+            car_idx * 100000 + 1000 + group_idx);
+        previous_tag = g.source_tag;
+        ++group_idx;
+    };
+    for (int k = 0; k < pp.groups[0]; ++k) {
+        append(planes.order_groups[k], 0, 0);
+    }
+    for (int k = 0; k < mp.groups[0]; ++k) {
+        append(mesh.order_groups[k], xn, xf);
+    }
+    for (int k = pp.groups[0]; k < pp.groups[1]; ++k) {
+        append(planes.order_groups[k], mn, mf);
+    }
     return acc;
 }
 
