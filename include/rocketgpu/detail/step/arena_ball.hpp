@@ -749,6 +749,499 @@ ROCKETGPU_HD void RefreshBallMeshPersistentManifold(
     }
 }
 
+// convex_plane_collision_alg for the ball against an arena plane: the contact's relative position (its length is
+// returned) and, when asked, the distance, the ball-local point and the plane point (Bullet units).
+ROCKETGPU_HD float BallPlaneRelLen(const BallState& ball, float ball_radius_bt, const Vec3& inward_normal,
+                                   const Vec3& plane_pos_uu, Vec3* out_rel_bt, float* out_distance_bt,
+                                   Vec3* out_local_a_bt, Vec3* out_point_b_bt) {
+    constexpr float kUUToBT_local = 1.0f / 50.0f;
+    const Vec3 plane_pos_bt(
+        plane_pos_uu.x * kUUToBT_local,
+        plane_pos_uu.y * kUUToBT_local,
+        plane_pos_uu.z * kUUToBT_local);
+    Vec3 bx(1.0f, 0.0f, 0.0f);
+    Vec3 by(0.0f, 1.0f, 0.0f);
+    Vec3 bz(0.0f, 0.0f, 1.0f);
+    GetBallBasisColumns(ball, bx, by, bz);
+    const Vec3 neg_n = -inward_normal;
+    const Vec3 dir_local(Dot(bx, neg_n), Dot(by, neg_n), Dot(bz, neg_n));
+    const float dir_len_sq =
+        dir_local.x * dir_local.x + dir_local.y * dir_local.y + dir_local.z * dir_local.z;
+
+    const float inv_sqrt3 = 1.0f / sqrtf(3.0f);
+    Vec3 dir_unit(-inv_sqrt3, -inv_sqrt3, -inv_sqrt3);
+    if (dir_len_sq >= 1.4210854715202004e-14f) {
+        const float inv_dir_len = 1.0f / sqrtf(dir_len_sq);
+        dir_unit = Vec3(dir_local.x * inv_dir_len, dir_local.y * inv_dir_len, dir_local.z * inv_dir_len);
+    }
+    const Vec3 vtx_local = dir_unit * ball_radius_bt;
+    const Vec3 trans_origin(
+        ball.pos_bt.x - plane_pos_bt.x,
+        ball.pos_bt.y - plane_pos_bt.y,
+        ball.pos_bt.z - plane_pos_bt.z);
+    const Vec3 vtx_in_plane(
+        (bx.x * vtx_local.x + by.x * vtx_local.y + bz.x * vtx_local.z) + trans_origin.x,
+        (bx.y * vtx_local.x + by.y * vtx_local.y + bz.y * vtx_local.z) + trans_origin.y,
+        (bx.z * vtx_local.x + by.z * vtx_local.y + bz.z * vtx_local.z) + trans_origin.z);
+    const float distance = Dot(inward_normal, vtx_in_plane);
+    const Vec3 projected = vtx_in_plane - inward_normal * distance;
+    const Vec3 world = projected + plane_pos_bt;
+    const Vec3 point_a = world + inward_normal * distance;
+
+    const Vec3 raw_rel(
+        point_a.x - ball.pos_bt.x,
+        point_a.y - ball.pos_bt.y,
+        point_a.z - ball.pos_bt.z);
+    const Vec3 local_a(Dot(raw_rel, bx), Dot(raw_rel, by), Dot(raw_rel, bz));
+    const Vec3 world_a(
+        (bx.x * local_a.x + by.x * local_a.y + bz.x * local_a.z) + ball.pos_bt.x,
+        (bx.y * local_a.x + by.y * local_a.y + bz.y * local_a.z) + ball.pos_bt.y,
+        (bx.z * local_a.x + by.z * local_a.y + bz.z * local_a.z) + ball.pos_bt.z);
+    const Vec3 rel(
+        world_a.x - ball.pos_bt.x,
+        world_a.y - ball.pos_bt.y,
+        world_a.z - ball.pos_bt.z);
+    if (out_rel_bt) {
+        *out_rel_bt = rel;
+    }
+    if (out_distance_bt) {
+        *out_distance_bt = Dot(world_a - world, inward_normal);
+    }
+    if (out_local_a_bt) {
+        *out_local_a_bt = local_a;
+    }
+    if (out_point_b_bt) {
+        *out_point_b_bt = world;
+    }
+    return sqrtf(rel.x * rel.x + rel.y * rel.y + rel.z * rel.z);
+}
+
+// One triangle of the ball's mesh walk (sphere_triangle_detector plus the internal-edge adjust): true with the new
+// manifold point and the raw contact normal when the ball touches it.
+ROCKETGPU_HD bool BallMeshTriangleHit(const MutatorConfig& mutator, const BallState& ball, const Vec3& ball_center_bt,
+                                      float radius_bt, float contact_breaking_threshold_bt, float cal_origin_y,
+                                      const ArenaMeshTriangle& tri, int32_t global_tri_idx, BallMeshManifoldPoint& new_pt,
+                                      Vec3& raw_normal_out) {
+    const ArenaMeshTriangle* cal_game_tri =
+        mutator.cal_arena_local_tris != nullptr ? &mutator.cal_arena_local_tris[global_tri_idx] : nullptr;
+    Vec3 contact_normal(0.0f, 0.0f, 1.0f);
+    float pen_uu = 0.0f;
+    Vec3 contact_on_tri_bt(0.0f, 0.0f, 0.0f);
+    float depth_bt = 0.0f;
+
+    const bool mesh_local_frame = cal_origin_y != 0.0f;
+    const ArenaMeshTriangle& detect_tri = mesh_local_frame ? *cal_game_tri : tri;
+    const Vec3 detect_center_bt = mesh_local_frame
+        ? Vec3(ball_center_bt.x, ball_center_bt.y - cal_origin_y, ball_center_bt.z)
+        : ball_center_bt;
+    const bool mesh_hit = DetectBallMeshTriangleContactEx(
+            detect_center_bt,
+            radius_bt,
+            contact_breaking_threshold_bt,
+            detect_tri.a, detect_tri.b, detect_tri.c,
+            contact_normal, pen_uu, contact_on_tri_bt, &depth_bt,
+            mutator.native_sphere_rsqrt_table, mutator.native_sphere_rsqrt_shift,
+            mutator.cal_ball_world != 0);
+    if (mesh_hit && mesh_local_frame) {
+        contact_on_tri_bt = Vec3(contact_on_tri_bt.x, contact_on_tri_bt.y + cal_origin_y, contact_on_tri_bt.z);
+    }
+    if (mesh_hit) {
+        const Vec3 raw_normal = contact_normal;
+
+        raw_normal_out = raw_normal;
+
+        const float distance_bt = depth_bt;
+
+        const Vec3 point_world_on_a_bt =
+            contact_on_tri_bt + raw_normal * distance_bt;
+        const Vec3 raw_rel_pos1_bt =
+            point_world_on_a_bt - ball_center_bt;
+        Vec3 ball_basis_x;
+        Vec3 ball_basis_y;
+        Vec3 ball_basis_z;
+        GetBallBasisColumns(ball, ball_basis_x, ball_basis_y, ball_basis_z);
+        const Vec3 local_point_a_bt(
+            Dot(raw_rel_pos1_bt, ball_basis_x),
+            Dot(raw_rel_pos1_bt, ball_basis_y),
+            Dot(raw_rel_pos1_bt, ball_basis_z));
+        const float rel_pos1_length_bt = Length(raw_rel_pos1_bt);
+
+        if (EnableArenaTriangleInternalEdgeAdjust()) {
+            MaybeAdjustArenaTriangleInternalEdgeContact(
+                tri,
+                point_world_on_a_bt,
+                distance_bt,
+                contact_on_tri_bt,
+                contact_normal, nullptr,
+                mutator.game_mode == static_cast<uint8_t>(Mode::Soccar),
+                mutator.native_sphere_rsqrt_table, mutator.native_sphere_rsqrt_shift,
+                cal_game_tri);
+        }
+
+        new_pt = BallMeshManifoldPoint{};
+        new_pt.normal = contact_normal;
+        new_pt.pen_uu = pen_uu;
+        new_pt.local_point_a_bt = local_point_a_bt;
+
+        new_pt.local_point_b_bt = cal_origin_y != 0.0f
+            ? Vec3(contact_on_tri_bt.x, contact_on_tri_bt.y - cal_origin_y, contact_on_tri_bt.z)
+            : contact_on_tri_bt;
+        new_pt.triangle_index = global_tri_idx;
+        new_pt.rel_pos1_length_bt = rel_pos1_length_bt;
+        return true;
+    }
+    return false;
+}
+
+// Arena plane `slot` of the ball-world contacts: floor, ceiling, then the two side walls.
+ROCKETGPU_HD void BallWorldPlane(int slot, float arena_margin, Vec3& inward_normal, float& boundary, Vec3& plane_pos_uu) {
+    inward_normal = Vec3(0.0f, 0.0f, 1.0f);
+    boundary = arena_margin;
+    plane_pos_uu = Vec3(0.0f, 0.0f, 0.0f);
+    if (slot == 1) {
+        inward_normal = Vec3(0.0f, 0.0f, -1.0f);
+        boundary = -(ArenaHeight() - arena_margin);
+        plane_pos_uu = Vec3(0.0f, 0.0f, ArenaHeight());
+    } else if (slot == 2) {
+        inward_normal = Vec3(-1.0f, 0.0f, 0.0f);
+        boundary = -(ArenaExtentX() - arena_margin);
+        plane_pos_uu = Vec3(ArenaExtentX(), 0.0f, ArenaHeight() / 2.0f);
+    } else if (slot == 3) {
+        inward_normal = Vec3(1.0f, 0.0f, 0.0f);
+        boundary = -(ArenaExtentX() - arena_margin);
+        plane_pos_uu = Vec3(-ArenaExtentX(), 0.0f, ArenaHeight() / 2.0f);
+    }
+}
+
+// Ball-world staging: the part of AppendBallWorldSpecialContactRows that depends only on the ball's pose and the
+// arena (each plane's contact geometry, which meshes the ball's box reaches, every walked triangle's contact in walk
+// order), computed on a side stream after PreTick. World<3> takes it when the stage's key equals the ball's key at the
+// call; anything else (a moved ball, another tick or arena, too many hits, physics events) runs inline.
+constexpr int kBallWorldStageHits = 12;
+constexpr int kBallWorldStageMaxMeshes = 32;
+struct BallWorldStageKey {
+    uint64_t tick = 0;
+    Vec3 pos;
+    Vec3 pos_bt;
+    Quat rot;
+    Vec3 basis_forward;
+    Vec3 basis_right;
+    Vec3 basis_up;
+    uint32_t basis_authoritative = 0;
+    float radius = 0.0f;
+    int32_t mesh_count = 0;
+    uint32_t meshes_lo = 0;
+    uint32_t tris_lo = 0;
+    uint32_t local_tris_lo = 0;
+    uint32_t flags = 0;
+    int32_t rsqrt_shift = 0;
+    uint32_t pad = 0;
+};
+static_assert(sizeof(BallWorldStageKey) == 8 + 4 * 28, "BallWorldStageKey has no padding");
+struct BallWorldStagePlane {
+    Vec3 rel_bt;
+    float distance_bt = 0.0f;
+    Vec3 local_a_bt;
+    Vec3 point_b_bt;
+    float rel_len = 0.0f;
+};
+struct BallWorldStageHit {
+    BallMeshManifoldPoint pt;
+    int32_t mesh_info_idx = 0;
+};
+enum BallWorldStageState : uint32_t {
+    kBallWorldStageNone = 0,
+    kBallWorldStageReady = 1,
+    kBallWorldStageOverflow = 2,
+    kBallWorldStageEvents = 3,
+};
+struct BallWorldStage {
+    BallWorldStageKey key;
+    uint32_t state = kBallWorldStageNone;
+    uint32_t plane_mask = 0;  // planes within detection reach, whose geometry is in planes[]
+    uint32_t walk_mask = 0;   // meshes whose AABB the ball's query box reaches
+    int32_t hit_count = 0;
+    BallWorldStagePlane planes[4];
+    BallWorldStageHit hits[kBallWorldStageHits];
+};
+
+ROCKETGPU_HD BallWorldStageKey MakeBallWorldStageKey(const BallState& ball, const MutatorConfig& mutator, uint64_t tick,
+                                                     const ArenaMeshTriangle* mesh_triangles,
+                                                     const ArenaMeshBvhMeshInfo* mesh_bvh_meshes,
+                                                     int32_t mesh_bvh_mesh_count) {
+    BallWorldStageKey k;
+    k.tick = tick;
+    k.pos = ball.pos;
+    k.pos_bt = ball.pos_bt;
+    k.rot = ball.rot;
+    k.basis_forward = ball.basis_forward;
+    k.basis_right = ball.basis_right;
+    k.basis_up = ball.basis_up;
+    k.basis_authoritative = ball.basis_authoritative;
+    k.radius = mutator.ball_radius;
+    k.mesh_count = mesh_bvh_mesh_count;
+    k.meshes_lo = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(mesh_bvh_meshes));
+    k.tris_lo = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(mesh_triangles));
+    k.local_tris_lo = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(mutator.cal_arena_local_tris));
+    k.flags = static_cast<uint32_t>(mutator.cal_ball_world) | static_cast<uint32_t>(mutator.game_mode) << 8 |
+              static_cast<uint32_t>(mutator.arena_collision) << 16 |
+              (mutator.native_sphere_rsqrt_table != nullptr ? 1u << 24 : 0u) |
+              (EnableArenaTriangleInternalEdgeAdjust() ? 1u << 25 : 0u);
+    k.rsqrt_shift = mutator.native_sphere_rsqrt_shift;
+    return k;
+}
+
+// Bitwise key equality (a -0 or NaN difference is a mismatch).
+ROCKETGPU_HD bool BallWorldStageKeyEqual(const BallWorldStageKey& a, const BallWorldStageKey& b) {
+    const uint32_t* wa = reinterpret_cast<const uint32_t*>(&a);
+    const uint32_t* wb = reinterpret_cast<const uint32_t*>(&b);
+    uint32_t diff = 0u;
+#pragma unroll
+    for (int i = 0; i < static_cast<int>(sizeof(BallWorldStageKey) / 4); ++i) {
+        diff |= wa[i] ^ wb[i];
+    }
+    return diff == 0u;
+}
+
+ROCKETGPU_HD int BallStageLowBit(uint32_t m) {
+#if defined(__CUDA_ARCH__)
+    return __ffs(static_cast<int>(m)) - 1;
+#else
+    return __builtin_ctz(m);
+#endif
+}
+
+ROCKETGPU_HD void StageBallWorldContacts(
+    const BallState& ball,
+    const MutatorConfig& mutator,
+    uint64_t tick,
+    const ArenaMeshTriangle* mesh_triangles,
+    int32_t mesh_triangle_count,
+    const ArenaMeshBvhQuantization* mesh_bvh_quantization,
+    int32_t mesh_bvh_quantization_count,
+    const ArenaMeshBvhMeshInfo* mesh_bvh_meshes,
+    int32_t mesh_bvh_mesh_count,
+    const ArenaMeshBvhNode* mesh_bvh_nodes,
+    int32_t mesh_bvh_node_count,
+    BallWorldStage& out,
+    const ArenaMeshBvhMeshInfo* mesh_infos = nullptr) {
+    // mesh_infos: a copy of mesh_bvh_meshes (e.g. in shared memory) to read; the key keeps mesh_bvh_meshes.
+    if (mesh_infos == nullptr) {
+        mesh_infos = mesh_bvh_meshes;
+    }
+    out.key = MakeBallWorldStageKey(ball, mutator, tick, mesh_triangles, mesh_bvh_meshes, mesh_bvh_mesh_count);
+    out.hit_count = 0;
+    if (mutator.physics_events.windows != nullptr) {
+        out.state = kBallWorldStageEvents;
+        return;
+    }
+    const bool meshes_valid = mesh_triangles != nullptr && mesh_triangle_count > 0 &&
+                              mesh_bvh_quantization != nullptr && mesh_bvh_meshes != nullptr &&
+                              mesh_bvh_nodes != nullptr && mesh_bvh_mesh_count > 0 && mesh_bvh_node_count > 0;
+    if (meshes_valid && mesh_bvh_mesh_count > kBallWorldStageMaxMeshes) {
+        out.plane_mask = 0u;
+        out.walk_mask = 0u;
+        out.state = kBallWorldStageOverflow;
+        return;
+    }
+    const float collision_r = mutator.ball_radius;
+    constexpr float kUUToBT_local = 1.0f / 50.0f;
+    const float ball_radius_bt = collision_r * kUUToBT_local;
+    const float arena_margin = BallArenaMeshCollisionMargin();
+    const float plane_detection_r = collision_r * 0.02f + 50.0f * 0.08f * 0.02f;
+    constexpr float kUUToBT = 1.0f / 50.0f;
+    const Vec3 ball_center_bt = ball.pos_bt;
+    const float radius_bt = collision_r * kUUToBT;
+    const float contact_breaking_threshold_bt = (radius_bt + 0.08f) * 0.02f;
+    const float radiusWithThreshold = radius_bt + contact_breaking_threshold_bt;
+    const Vec3 aabb_min_bt = ball_center_bt - Vec3(radiusWithThreshold, radiusWithThreshold, radiusWithThreshold);
+    const Vec3 aabb_max_bt = ball_center_bt + Vec3(radiusWithThreshold, radiusWithThreshold, radiusWithThreshold);
+    constexpr float kBallMeshWalkSkipMarginBt = 0.01f;
+
+    // Reach first, the inline path's tests: planes within detection range, meshes whose AABB the ball's query box
+    // reaches. A ball that reaches neither stages nothing and stops here.
+    uint32_t plane_mask = 0u;
+#pragma unroll
+    for (int plane_slot = 0; plane_slot < 4; ++plane_slot) {
+        Vec3 inward_normal;
+        float boundary;
+        Vec3 plane_pos_uu;
+        BallWorldPlane(plane_slot, arena_margin, inward_normal, boundary, plane_pos_uu);
+        const float margin = Dot(ball.pos, inward_normal) - boundary;
+        if (margin < collision_r + plane_detection_r) {
+            plane_mask |= 1u << plane_slot;
+        }
+    }
+    uint32_t walk_mask = 0u;
+    if (meshes_valid) {
+        for (int mesh_info_idx = 0; mesh_info_idx < mesh_bvh_mesh_count; ++mesh_info_idx) {
+            const ArenaMeshBvhMeshInfo& mesh_info = mesh_infos[mesh_info_idx];
+            const bool walk_mesh = !(mesh_info.aabb_max.x < aabb_min_bt.x - kBallMeshWalkSkipMarginBt ||
+                                     mesh_info.aabb_min.x > aabb_max_bt.x + kBallMeshWalkSkipMarginBt ||
+                                     mesh_info.aabb_max.y < aabb_min_bt.y - kBallMeshWalkSkipMarginBt ||
+                                     mesh_info.aabb_min.y > aabb_max_bt.y + kBallMeshWalkSkipMarginBt ||
+                                     mesh_info.aabb_max.z < aabb_min_bt.z - kBallMeshWalkSkipMarginBt ||
+                                     mesh_info.aabb_min.z > aabb_max_bt.z + kBallMeshWalkSkipMarginBt);
+            walk_mask |= walk_mesh ? 1u << mesh_info_idx : 0u;
+        }
+    }
+    out.plane_mask = plane_mask;
+    out.walk_mask = walk_mask;
+    if ((plane_mask | walk_mask) == 0u) {
+        out.state = kBallWorldStageReady;
+        return;
+    }
+
+    for (uint32_t m = plane_mask; m != 0u; m &= m - 1u) {
+        const int plane_slot = BallStageLowBit(m);
+        Vec3 inward_normal;
+        float boundary;
+        Vec3 plane_pos_uu;
+        BallWorldPlane(plane_slot, arena_margin, inward_normal, boundary, plane_pos_uu);
+        BallWorldStagePlane& sp = out.planes[plane_slot];
+        sp.rel_len = BallPlaneRelLen(ball, ball_radius_bt, inward_normal, plane_pos_uu, &sp.rel_bt, &sp.distance_bt,
+                                     &sp.local_a_bt, &sp.point_b_bt);
+    }
+    uint32_t state = kBallWorldStageReady;
+    int hit_count = 0;
+    for (uint32_t m = walk_mask; m != 0u; m &= m - 1u) {
+        const int mesh_info_idx = BallStageLowBit(m);
+        const ArenaMeshBvhMeshInfo& mesh_info = mesh_infos[mesh_info_idx];
+        if (mesh_info.mesh_index >= mesh_bvh_quantization_count ||
+            mesh_info.node_offset < 0 ||
+            mesh_info.node_offset + mesh_info.node_count > mesh_bvh_node_count) {
+            continue;
+        }
+        uint16_t quantized_query_aabb_min[3] = {0, 0, 0};
+        uint16_t quantized_query_aabb_max[3] = {0, 0, 0};
+        const ArenaMeshBvhQuantization& quantization = mesh_bvh_quantization[mesh_info.mesh_index];
+        QuantizeArenaMeshBvhPoint(quantization, aabb_min_bt, 0, quantized_query_aabb_min);
+        QuantizeArenaMeshBvhPoint(quantization, aabb_max_bt, 1, quantized_query_aabb_max);
+        const float cal_origin_y = mesh_info.cal_origin_y;
+        const int32_t triangle_count = mesh_info.triangle_count;
+        const int32_t triangle_start = mesh_info.triangle_start;
+        WalkArenaMeshBvhStacklessQuantizedTreeCacheFriendly(
+            mesh_bvh_nodes,
+            nullptr,
+            0,
+            quantized_query_aabb_min,
+            quantized_query_aabb_max,
+            mesh_info.node_offset,
+            mesh_info.node_count,
+            [&](int32_t local_tri_idx) {
+                if (local_tri_idx < 0 || local_tri_idx >= triangle_count) {
+                    return;
+                }
+                const int32_t global_tri_idx = triangle_start + local_tri_idx;
+                if (global_tri_idx >= mesh_triangle_count) {
+                    return;
+                }
+                BallMeshManifoldPoint new_pt;
+                Vec3 raw_normal;
+                if (BallMeshTriangleHit(mutator, ball, ball_center_bt, radius_bt, contact_breaking_threshold_bt,
+                                        cal_origin_y, mesh_triangles[global_tri_idx], global_tri_idx, new_pt,
+                                        raw_normal)) {
+                    if (hit_count < kBallWorldStageHits) {
+                        out.hits[hit_count].pt = new_pt;
+                        out.hits[hit_count].mesh_info_idx = mesh_info_idx;
+                    } else {
+                        state = kBallWorldStageOverflow;
+                    }
+                    ++hit_count;
+                }
+            });
+    }
+    out.hit_count = hit_count < kBallWorldStageHits ? hit_count : kBallWorldStageHits;
+    out.state = state;
+}
+
+#if defined(__CUDACC__)
+extern __device__ BallWorldStage* g_rocketgpu_ball_world_stage;
+#if defined(ROCKETGPU_BALL_STAGE_CHECK)
+// calls, unpublished, none, overflow, events, other tick, other pose or arena, ready, ready but different from inline
+extern __device__ unsigned long long g_rocketgpu_ball_stage_counts[9];
+#endif
+#endif
+
+// The ball-world stage World<3> takes for this env: published, ready and keyed to the ball and arena as they are at
+// the call. Null: run inline.
+ROCKETGPU_HD const BallWorldStage* ConsumableBallWorldStage(
+    int env_idx, const BallState& ball, const MutatorConfig& mutator, uint64_t tick,
+    const ArenaMeshTriangle* mesh_triangles, const ArenaMeshBvhMeshInfo* mesh_bvh_meshes, int32_t mesh_bvh_mesh_count) {
+#if defined(__CUDA_ARCH__)
+    const BallWorldStage* base = g_rocketgpu_ball_world_stage;
+    if (base == nullptr || env_idx < 0) {
+        return nullptr;
+    }
+    const BallWorldStage* stage = base + env_idx;
+    if (stage->state != kBallWorldStageReady ||
+        !BallWorldStageKeyEqual(stage->key, MakeBallWorldStageKey(ball, mutator, tick, mesh_triangles, mesh_bvh_meshes,
+                                                                  mesh_bvh_mesh_count))) {
+        return nullptr;
+    }
+    return stage;
+#else
+    (void)env_idx; (void)ball; (void)mutator; (void)tick; (void)mesh_triangles; (void)mesh_bvh_meshes;
+    (void)mesh_bvh_mesh_count;
+    return nullptr;
+#endif
+}
+
+#if defined(ROCKETGPU_BALL_STAGE_CHECK) && defined(__CUDA_ARCH__)
+// Check build: counts why a World<3> ball-world call would or would not take its stage, and compares a ready stage
+// with one staged again here from the ball at the call.
+__device__ inline bool BallStageWordsEqual(const void* a, const void* b, int bytes) {
+    const uint32_t* wa = static_cast<const uint32_t*>(a);
+    const uint32_t* wb = static_cast<const uint32_t*>(b);
+    uint32_t diff = 0u;
+    for (int i = 0; i < bytes / 4; ++i) {
+        diff |= wa[i] ^ wb[i];
+    }
+    return diff == 0u;
+}
+__device__ inline void CheckBallWorldStage(
+    int env_idx, const BallState& ball, const MutatorConfig& mutator, uint64_t tick,
+    const ArenaMeshTriangle* mesh_triangles, int32_t mesh_triangle_count,
+    const ArenaMeshBvhQuantization* mesh_bvh_quantization, int32_t mesh_bvh_quantization_count,
+    const ArenaMeshBvhMeshInfo* mesh_bvh_meshes, int32_t mesh_bvh_mesh_count,
+    const ArenaMeshBvhNode* mesh_bvh_nodes, int32_t mesh_bvh_node_count) {
+    atomicAdd(&g_rocketgpu_ball_stage_counts[0], 1ull);
+    const BallWorldStage* base = g_rocketgpu_ball_world_stage;
+    if (base == nullptr || env_idx < 0) {
+        atomicAdd(&g_rocketgpu_ball_stage_counts[1], 1ull);
+        return;
+    }
+    const BallWorldStage& st = base[env_idx];
+    if (st.state != kBallWorldStageReady) {
+        atomicAdd(&g_rocketgpu_ball_stage_counts[st.state == kBallWorldStageOverflow ? 3 : st.state == kBallWorldStageEvents ? 4 : 2], 1ull);
+        return;
+    }
+    const BallWorldStageKey key =
+        MakeBallWorldStageKey(ball, mutator, tick, mesh_triangles, mesh_bvh_meshes, mesh_bvh_mesh_count);
+    if (!BallWorldStageKeyEqual(st.key, key)) {
+        atomicAdd(&g_rocketgpu_ball_stage_counts[st.key.tick != key.tick ? 5 : 6], 1ull);
+        return;
+    }
+    atomicAdd(&g_rocketgpu_ball_stage_counts[7], 1ull);
+    BallWorldStage fresh;
+    StageBallWorldContacts(ball, mutator, tick, mesh_triangles, mesh_triangle_count, mesh_bvh_quantization,
+                           mesh_bvh_quantization_count, mesh_bvh_meshes, mesh_bvh_mesh_count, mesh_bvh_nodes,
+                           mesh_bvh_node_count, fresh);
+    bool same = fresh.state == st.state && fresh.plane_mask == st.plane_mask && fresh.walk_mask == st.walk_mask &&
+                fresh.hit_count == st.hit_count;
+    for (int k = 0; same && k < 4; ++k) {
+        same = ((st.plane_mask >> k) & 1u) == 0u ||
+               BallStageWordsEqual(&fresh.planes[k], &st.planes[k], static_cast<int>(sizeof(BallWorldStagePlane)));
+    }
+    for (int h = 0; same && h < st.hit_count; ++h) {
+        same = BallStageWordsEqual(&fresh.hits[h], &st.hits[h], static_cast<int>(sizeof(BallWorldStageHit)));
+    }
+    if (!same) {
+        atomicAdd(&g_rocketgpu_ball_stage_counts[8], 1ull);
+    }
+}
+#endif
+
 ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
     const BallState& ball,
     const MutatorConfig& mutator,
@@ -773,7 +1266,8 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
     const ArenaMeshBvhSubtreeInfo* mesh_bvh_subtrees = nullptr,
     int32_t mesh_bvh_subtree_count = 0,
     const Vec3* bt_ball_linear_velocity_override = nullptr,
-    int event_env_idx = -1) {
+    int event_env_idx = -1,
+    const BallWorldStage* stage = nullptr) {
     // Heatseeker world normals: counted in a register and the count stored once below, so appending a point is not a
     // load-increment-store chain through the scratch.
     int hs_world_normal_count = 0;
@@ -838,65 +1332,8 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
     };
 
     const auto official_plane_rel_len = [&](const Vec3& inward_normal, const Vec3& plane_pos_uu, Vec3* out_rel_bt = nullptr, float* out_distance_bt = nullptr, Vec3* out_local_a_bt = nullptr, Vec3* out_point_b_bt = nullptr) -> float {
-        const Vec3 plane_pos_bt(
-            plane_pos_uu.x * kUUToBT_local,
-            plane_pos_uu.y * kUUToBT_local,
-            plane_pos_uu.z * kUUToBT_local);
-        Vec3 bx(1.0f, 0.0f, 0.0f);
-        Vec3 by(0.0f, 1.0f, 0.0f);
-        Vec3 bz(0.0f, 0.0f, 1.0f);
-        GetBallBasisColumns(ball, bx, by, bz);
-        const Vec3 neg_n = -inward_normal;
-        const Vec3 dir_local(Dot(bx, neg_n), Dot(by, neg_n), Dot(bz, neg_n));
-        const float dir_len_sq =
-            dir_local.x * dir_local.x + dir_local.y * dir_local.y + dir_local.z * dir_local.z;
-
-        const float inv_sqrt3 = 1.0f / sqrtf(3.0f);
-        Vec3 dir_unit(-inv_sqrt3, -inv_sqrt3, -inv_sqrt3);
-        if (dir_len_sq >= 1.4210854715202004e-14f) {
-            const float inv_dir_len = 1.0f / sqrtf(dir_len_sq);
-            dir_unit = Vec3(dir_local.x * inv_dir_len, dir_local.y * inv_dir_len, dir_local.z * inv_dir_len);
-        }
-        const Vec3 vtx_local = dir_unit * ball_radius_bt;
-        const Vec3 trans_origin(
-            ball.pos_bt.x - plane_pos_bt.x,
-            ball.pos_bt.y - plane_pos_bt.y,
-            ball.pos_bt.z - plane_pos_bt.z);
-        const Vec3 vtx_in_plane(
-            (bx.x * vtx_local.x + by.x * vtx_local.y + bz.x * vtx_local.z) + trans_origin.x,
-            (bx.y * vtx_local.x + by.y * vtx_local.y + bz.y * vtx_local.z) + trans_origin.y,
-            (bx.z * vtx_local.x + by.z * vtx_local.y + bz.z * vtx_local.z) + trans_origin.z);
-        const float distance = Dot(inward_normal, vtx_in_plane);
-        const Vec3 projected = vtx_in_plane - inward_normal * distance;
-        const Vec3 world = projected + plane_pos_bt;
-        const Vec3 point_a = world + inward_normal * distance;
-
-        const Vec3 raw_rel(
-            point_a.x - ball.pos_bt.x,
-            point_a.y - ball.pos_bt.y,
-            point_a.z - ball.pos_bt.z);
-        const Vec3 local_a(Dot(raw_rel, bx), Dot(raw_rel, by), Dot(raw_rel, bz));
-        const Vec3 world_a(
-            (bx.x * local_a.x + by.x * local_a.y + bz.x * local_a.z) + ball.pos_bt.x,
-            (bx.y * local_a.x + by.y * local_a.y + bz.y * local_a.z) + ball.pos_bt.y,
-            (bx.z * local_a.x + by.z * local_a.y + bz.z * local_a.z) + ball.pos_bt.z);
-        const Vec3 rel(
-            world_a.x - ball.pos_bt.x,
-            world_a.y - ball.pos_bt.y,
-            world_a.z - ball.pos_bt.z);
-        if (out_rel_bt) {
-            *out_rel_bt = rel;
-        }
-        if (out_distance_bt) {
-            *out_distance_bt = Dot(world_a - world, inward_normal);
-        }
-        if (out_local_a_bt) {
-            *out_local_a_bt = local_a;
-        }
-        if (out_point_b_bt) {
-            *out_point_b_bt = world;
-        }
-        return sqrtf(rel.x * rel.x + rel.y * rel.y + rel.z * rel.z);
+        return BallPlaneRelLen(ball, ball_radius_bt, inward_normal, plane_pos_uu, out_rel_bt, out_distance_bt,
+                               out_local_a_bt, out_point_b_bt);
     };
     const auto bullet_plane_rank = [](const Vec3& inward_normal) -> int16_t {
         if (inward_normal.z > 0.5f) return 100 + 0;
@@ -931,7 +1368,17 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                 float distance_bt = 0.0f;
                 Vec3 local_a_bt(0.0f, 0.0f, 0.0f);
                 Vec3 point_b_bt(0.0f, 0.0f, 0.0f);
-                const float rel_len = official_plane_rel_len(inward_normal, plane_pos_uu, &rel_bt, &distance_bt, &local_a_bt, &point_b_bt);
+                float rel_len;
+                if (stage != nullptr && ((stage->plane_mask >> plane_slot) & 1u) != 0u) {
+                    const BallWorldStagePlane& sp = stage->planes[plane_slot];
+                    rel_bt = sp.rel_bt;
+                    distance_bt = sp.distance_bt;
+                    local_a_bt = sp.local_a_bt;
+                    point_b_bt = sp.point_b_bt;
+                    rel_len = sp.rel_len;
+                } else {
+                    rel_len = official_plane_rel_len(inward_normal, plane_pos_uu, &rel_bt, &distance_bt, &local_a_bt, &point_b_bt);
+                }
                 if (distance_bt < plane_breaking_threshold_bt) {
                     BallMeshManifoldPoint new_pt;
                     new_pt.normal = inward_normal;
@@ -984,22 +1431,10 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
     // instruction cache).
 #pragma unroll 1
     for (int plane_slot = 0; plane_slot < 4; ++plane_slot) {
-        Vec3 inward_normal(0.0f, 0.0f, 1.0f);
-        float boundary = arena_margin;
-        Vec3 plane_pos_uu(0.0f, 0.0f, 0.0f);
-        if (plane_slot == 1) {
-            inward_normal = Vec3(0.0f, 0.0f, -1.0f);
-            boundary = -(ArenaHeight() - arena_margin);
-            plane_pos_uu = Vec3(0.0f, 0.0f, ArenaHeight());
-        } else if (plane_slot == 2) {
-            inward_normal = Vec3(-1.0f, 0.0f, 0.0f);
-            boundary = -(ArenaExtentX() - arena_margin);
-            plane_pos_uu = Vec3(ArenaExtentX(), 0.0f, ArenaHeight() / 2.0f);
-        } else if (plane_slot == 3) {
-            inward_normal = Vec3(1.0f, 0.0f, 0.0f);
-            boundary = -(ArenaExtentX() - arena_margin);
-            plane_pos_uu = Vec3(-ArenaExtentX(), 0.0f, ArenaHeight() / 2.0f);
-        }
+        Vec3 inward_normal;
+        float boundary;
+        Vec3 plane_pos_uu;
+        BallWorldPlane(plane_slot, arena_margin, inward_normal, boundary, plane_pos_uu);
         append_plane_cp(inward_normal, boundary, plane_pos_uu, plane_slot);
     }
 
@@ -1049,12 +1484,14 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                     : 0u;
                 retained_counts |= retained << (3 * mesh_info_idx);
                 if (mesh_info_idx < mesh_bvh_mesh_count && retained == 0 &&
-                    !mesh_walk_needed(mesh_bvh_meshes[mesh_info_idx])) {
+                    !(stage != nullptr ? ((stage->walk_mask >> mesh_info_idx) & 1u) != 0u
+                                       : mesh_walk_needed(mesh_bvh_meshes[mesh_info_idx]))) {
                     idle_meshes |= 1u << mesh_info_idx;
                 }
             }
         }
 
+        int stage_hit = 0;
         for (int mesh_info_idx = 0; mesh_info_idx < mesh_bvh_mesh_count; ++mesh_info_idx) {
             if (mesh_info_idx < kMaxBallWorldMeshPersistentManifolds && ((idle_meshes >> mesh_info_idx) & 1u) != 0u) {
                 next_maybe_retained &= ~(1u << mesh_info_idx);
@@ -1092,7 +1529,8 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                 retain_ball_mesh_points ? static_cast<int>((retained_counts >> (3 * mesh_info_idx)) & 7u) : 0;
 
             // A skipped walk is an empty node range; the mesh's retained points are still refreshed below.
-            const bool walk_mesh = mesh_walk_needed(mesh_info);
+            // With a stage the mesh's triangle hits come from it (below) instead of a walk.
+            const bool walk_mesh = stage == nullptr && mesh_walk_needed(mesh_info);
             if (walk_mesh) {
                 const ArenaMeshBvhQuantization& quantization = mesh_bvh_quantization[mesh_info.mesh_index];
                 QuantizeArenaMeshBvhPoint(quantization, aabb_min_bt, 0, quantized_query_aabb_min);
@@ -1131,72 +1569,11 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                     }
                     const ArenaMeshTriangle& tri = mesh_triangles[global_tri_idx];
 
-                    const ArenaMeshTriangle* cal_game_tri =
-                        mutator.cal_arena_local_tris != nullptr ? &mutator.cal_arena_local_tris[global_tri_idx] : nullptr;
-                    Vec3 contact_normal(0.0f, 0.0f, 1.0f);
-                    float pen_uu = 0.0f;
-                    Vec3 contact_on_tri_bt(0.0f, 0.0f, 0.0f);
-                    float depth_bt = 0.0f;
-
-                    const bool mesh_local_frame = cal_origin_y != 0.0f;
-                    const ArenaMeshTriangle& detect_tri = mesh_local_frame ? *cal_game_tri : tri;
-                    const Vec3 detect_center_bt = mesh_local_frame
-                        ? Vec3(ball_center_bt.x, ball_center_bt.y - cal_origin_y, ball_center_bt.z)
-                        : ball_center_bt;
-                    const bool mesh_hit = DetectBallMeshTriangleContactEx(
-                            detect_center_bt,
-                            radius_bt,
-                            contact_breaking_threshold_bt,
-                            detect_tri.a, detect_tri.b, detect_tri.c,
-                            contact_normal, pen_uu, contact_on_tri_bt, &depth_bt,
-                            mutator.native_sphere_rsqrt_table, mutator.native_sphere_rsqrt_shift,
-                            mutator.cal_ball_world != 0);
-                    if (mesh_hit && mesh_local_frame) {
-                        contact_on_tri_bt = Vec3(contact_on_tri_bt.x, contact_on_tri_bt.y + cal_origin_y, contact_on_tri_bt.z);
-                    }
-                    if (mesh_hit) {
-                        const Vec3 raw_normal = contact_normal;
-
+                    BallMeshManifoldPoint new_pt;
+                    Vec3 raw_normal;
+                    if (BallMeshTriangleHit(mutator, ball, ball_center_bt, radius_bt, contact_breaking_threshold_bt,
+                                            cal_origin_y, tri, global_tri_idx, new_pt, raw_normal)) {
                         emit_world_event(raw_normal);
-
-                        const float distance_bt = depth_bt;
-
-                        const Vec3 point_world_on_a_bt =
-                            contact_on_tri_bt + raw_normal * distance_bt;
-                        const Vec3 raw_rel_pos1_bt =
-                            point_world_on_a_bt - ball_center_bt;
-                        Vec3 ball_basis_x;
-                        Vec3 ball_basis_y;
-                        Vec3 ball_basis_z;
-                        GetBallBasisColumns(ball, ball_basis_x, ball_basis_y, ball_basis_z);
-                        const Vec3 local_point_a_bt(
-                            Dot(raw_rel_pos1_bt, ball_basis_x),
-                            Dot(raw_rel_pos1_bt, ball_basis_y),
-                            Dot(raw_rel_pos1_bt, ball_basis_z));
-                        const float rel_pos1_length_bt = Length(raw_rel_pos1_bt);
-
-                        if (EnableArenaTriangleInternalEdgeAdjust()) {
-                            MaybeAdjustArenaTriangleInternalEdgeContact(
-                                tri,
-                                point_world_on_a_bt,
-                                distance_bt,
-                                contact_on_tri_bt,
-                                contact_normal, nullptr,
-                                mutator.game_mode == static_cast<uint8_t>(Mode::Soccar),
-                                mutator.native_sphere_rsqrt_table, mutator.native_sphere_rsqrt_shift,
-                                cal_game_tri);
-                        }
-
-                        BallMeshManifoldPoint new_pt;
-                        new_pt.normal = contact_normal;
-                        new_pt.pen_uu = pen_uu;
-                        new_pt.local_point_a_bt = local_point_a_bt;
-
-                        new_pt.local_point_b_bt = cal_origin_y != 0.0f
-                            ? Vec3(contact_on_tri_bt.x, contact_on_tri_bt.y - cal_origin_y, contact_on_tri_bt.z)
-                            : contact_on_tri_bt;
-                        new_pt.triangle_index = global_tri_idx;
-                        new_pt.rel_pos1_length_bt = rel_pos1_length_bt;
                         InsertBallMeshManifoldPoint(
                             persistent_manifold->points,
                             persistent_count,
@@ -1204,6 +1581,19 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                             mutator.cal_ball_world != 0 ? contact_breaking_threshold_bt : -1.0f);
                     }
                 });
+            if (stage != nullptr) {
+                while (stage_hit < stage->hit_count && stage->hits[stage_hit].mesh_info_idx < mesh_info_idx) {
+                    ++stage_hit;
+                }
+                while (stage_hit < stage->hit_count && stage->hits[stage_hit].mesh_info_idx == mesh_info_idx) {
+                    InsertBallMeshManifoldPoint(
+                        persistent_manifold->points,
+                        persistent_count,
+                        stage->hits[stage_hit].pt,
+                        mutator.cal_ball_world != 0 ? contact_breaking_threshold_bt : -1.0f);
+                    ++stage_hit;
+                }
+            }
 
             RefreshBallMeshPersistentManifold(
                 persistent_manifold->points,

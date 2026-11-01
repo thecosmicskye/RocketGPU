@@ -218,6 +218,13 @@ struct CarFrame {
     mutable bool has_inertia_world_uu = false;
     mutable Vec3 inertia_world_bt_row0, inertia_world_bt_row1, inertia_world_bt_row2;
     mutable Vec3 inertia_world_uu_row0, inertia_world_uu_row1, inertia_world_uu_row2;
+    // The pre-tick's queued force and torques (WheelRuntimeState accumulated_*), summed here in the same order and
+    // stored once at the end of PreTickCar: each += through the runtime state's generic pointer waited for the store
+    // before it.
+    mutable bool queue_forces = false;
+    mutable Vec3 queued_force = Vec3(0.0f, 0.0f, 0.0f);
+    mutable Vec3 queued_ang_accel = Vec3(0.0f, 0.0f, 0.0f);
+    mutable Vec3 queued_torque_bt = Vec3(0.0f, 0.0f, 0.0f);
 };
 
 ROCKETGPU_HD CarFrame MakeCarFrame(const CarState& car, const CarConfig& cfg, float mass) {
@@ -820,8 +827,13 @@ ROCKETGPU_HD Vec3 ComputeBulletStyleExternalTorqueInput(
     return Mul3x3Vec(i_r0, i_r1, i_r2, ang_accel_world);
 }
 
-ROCKETGPU_HD void QueueCentralForce(WheelRuntimeState* wheel_runtime_state, const Vec3& force_bt) {
+ROCKETGPU_HD void QueueCentralForce(WheelRuntimeState* wheel_runtime_state, const Vec3& force_bt,
+                                   const CarFrame* frame = nullptr) {
     if (!wheel_runtime_state) {
+        return;
+    }
+    if (frame && frame->queue_forces) {
+        frame->queued_force += force_bt;
         return;
     }
     wheel_runtime_state->accumulated_force += force_bt;
@@ -837,12 +849,21 @@ ROCKETGPU_HD void QueueAngularAccelWorld(
     if (!wheel_runtime_state) {
         return;
     }
-    wheel_runtime_state->accumulated_ang_accel +=
-        ComputeBulletStyleExternalTorqueInput(car, cfg, mass, ang_accel_world, frame);
+    const Vec3 ang_accel = ComputeBulletStyleExternalTorqueInput(car, cfg, mass, ang_accel_world, frame);
+    if (frame && frame->queue_forces) {
+        frame->queued_ang_accel += ang_accel;
+        return;
+    }
+    wheel_runtime_state->accumulated_ang_accel += ang_accel;
 }
 
-ROCKETGPU_HD void QueueOfficialTorqueBt(WheelRuntimeState* wheel_runtime_state, const Vec3& torque_bt) {
+ROCKETGPU_HD void QueueOfficialTorqueBt(WheelRuntimeState* wheel_runtime_state, const Vec3& torque_bt,
+                                       const CarFrame* frame = nullptr) {
     if (!wheel_runtime_state) {
+        return;
+    }
+    if (frame && frame->queue_forces) {
+        frame->queued_torque_bt += torque_bt;
         return;
     }
     wheel_runtime_state->accumulated_torque_bt += torque_bt;

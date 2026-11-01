@@ -441,7 +441,44 @@ ROCKETGPU_HD bool WalkArenaMeshLeafGrid(
     }
     const int cell_idx = info.cell_offset + (cell[2] * info.cells[1] + cell[1]) * info.cells[0] + cell[0];
     const int end = grid->cell_start[cell_idx + 1];
-    for (int e = grid->cell_start[cell_idx]; e < end; ++e) {
+    int e = grid->cell_start[cell_idx];
+#if defined(__CUDA_ARCH__)
+    // A cell holds up to a few hundred entries: load and test them kLeafBatch at a time (independent loads), then
+    // call back the overlapping ones in entry order, so the scan waits on one load latency per batch, not per entry.
+    constexpr int kLeafBatch = 8;
+    for (; e + kLeafBatch <= end; e += kLeafBatch) {
+        uint4 raw[kLeafBatch];
+#pragma unroll
+        for (int k = 0; k < kLeafBatch; ++k) {
+            raw[k] = __ldg(reinterpret_cast<const uint4*>(&grid->entries[e + k]));
+        }
+        unsigned hits = 0u;
+        int32_t triangles[kLeafBatch];
+#pragma unroll
+        for (int k = 0; k < kLeafBatch; ++k) {
+            ArenaMeshLeafEntry entry;
+            memcpy(&entry, &raw[k], sizeof(entry));
+            triangles[k] = entry.triangle_index;
+            if (TestQuantizedAabbAgainstQuantizedAabb(
+                    quantized_query_aabb_min, quantized_query_aabb_max,
+                    entry.quantized_aabb_min, entry.quantized_aabb_max)) {
+                hits |= 1u << k;
+            }
+        }
+        // One call site for the callback (it is large): pick each hit's triangle out of registers.
+        while (hits != 0u) {
+            const int hit = __ffs(static_cast<int>(hits)) - 1;
+            hits &= hits - 1u;
+            int32_t triangle = triangles[0];
+#pragma unroll
+            for (int k = 1; k < kLeafBatch; ++k) {
+                triangle = k == hit ? triangles[k] : triangle;
+            }
+            callback(triangle);
+        }
+    }
+#endif
+    for (; e < end; ++e) {
 #if defined(__CUDA_ARCH__)
         ArenaMeshLeafEntry entry;
         const uint4 raw = __ldg(reinterpret_cast<const uint4*>(&grid->entries[e]));

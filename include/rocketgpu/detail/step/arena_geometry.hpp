@@ -1244,6 +1244,9 @@ struct WorldSolverScratch {
     BulletBroadphaseHistory bp;
     // Set by a kickoff reset: the next world step clears the retained manifolds in the row pool first.
     uint8_t retained_reset_pending = 0;
+    // Staged CUDA step, in an env whose vehicle updates are not independent: the cars no update pushes and that push
+    // nothing, which update and prestep on lanes of their own. Sits in the padding before bullet_manifold_count.
+    uint8_t vehicle_apart_mask = 0;
 
     int32_t bullet_manifold_count = 0;
     int32_t shared_contact_order_group_count = 0;
@@ -2202,7 +2205,8 @@ ROCKETGPU_HD float SolverRowSubtract(float rhs, float velocity, float jac, bool 
     return use_fma ? fmaf(-velocity, jac, rhs) : rhs - velocity * jac;
 }
 
-ROCKETGPU_HD void SolveBallVelocityNormalRowWithAccumulators(
+// The velocity row solves return whether the row changed its applied impulse or an accumulator.
+ROCKETGPU_HD bool SolveBallVelocityNormalRowWithAccumulators(
     int count,
     BallVelocityContactRow& row,
     int row_idx,
@@ -2211,7 +2215,7 @@ ROCKETGPU_HD void SolveBallVelocityNormalRowWithAccumulators(
     int env_idx = -1,
     bool use_fma = false) {
     if (!row.valid) {
-        return;
+        return false;
     }
 
     const bool trace_dynamic_row = row.other_local_idx >= 0 && row.other_local_idx < count;
@@ -2239,6 +2243,7 @@ ROCKETGPU_HD void SolveBallVelocityNormalRowWithAccumulators(
     (void)trace_delta_vel1_dotn;
     (void)trace_delta_vel2_dotn;
 
+    const float applied_before = row.applied_impulse;
     const float sum = row.applied_impulse + delta_impulse;
     if (sum < 0.0f) {
         delta_impulse = -row.applied_impulse;
@@ -2253,7 +2258,7 @@ ROCKETGPU_HD void SolveBallVelocityNormalRowWithAccumulators(
         } else if (!trace_dynamic_row) {
         }
 #endif
-        return;
+        return GlibcFloatBits(applied_before) != GlibcFloatBits(row.applied_impulse);
     }
 
     ApplyBallVelocityAccumulatorImpulse(
@@ -2275,9 +2280,10 @@ ROCKETGPU_HD void SolveBallVelocityNormalRowWithAccumulators(
         } else if (!trace_dynamic_row) {
         }
 #endif
+    return true;
 }
 
-ROCKETGPU_HD void SolveBallVelocityFrictionRowWithAccumulators(
+ROCKETGPU_HD bool SolveBallVelocityFrictionRowWithAccumulators(
     int count,
     EnvStridedArray<BallVelocityContactRow> normal_rows,
     int normal_row_count,
@@ -2288,12 +2294,12 @@ ROCKETGPU_HD void SolveBallVelocityFrictionRowWithAccumulators(
     int env_idx = -1,
     bool use_fma = false) {
     if (!row.valid || !normal_rows || row.normal_row_idx < 0 || row.normal_row_idx >= normal_row_count) {
-        return;
+        return false;
     }
 
     const float total_impulse = normal_rows[row.normal_row_idx].applied_impulse;
     if (total_impulse <= 0.0f) {
-        return;
+        return false;
     }
 
     const bool trace_dynamic_row = row.other_local_idx >= 0 && row.other_local_idx < count;
@@ -2322,6 +2328,7 @@ ROCKETGPU_HD void SolveBallVelocityFrictionRowWithAccumulators(
     (void)trace_delta_vel1_dotn;
     (void)trace_delta_vel2_dotn;
 
+    const float applied_before = row.applied_impulse;
     const float sum = row.applied_impulse + delta_impulse;
     if (sum < -max_impulse) {
         delta_impulse = -max_impulse - row.applied_impulse;
@@ -2339,7 +2346,7 @@ ROCKETGPU_HD void SolveBallVelocityFrictionRowWithAccumulators(
         } else if (!trace_dynamic_row) {
         }
 #endif
-        return;
+        return GlibcFloatBits(applied_before) != GlibcFloatBits(row.applied_impulse);
     }
 
     ApplyBallVelocityAccumulatorImpulse(
@@ -2361,6 +2368,7 @@ ROCKETGPU_HD void SolveBallVelocityFrictionRowWithAccumulators(
         } else if (!trace_dynamic_row) {
         }
 #endif
+    return true;
 }
 
 ROCKETGPU_HD void InitializeCarWorldSplitContactRow(
@@ -2474,7 +2482,9 @@ ROCKETGPU_HD void AppendCarWorldToSharedSplitRows(
     }
 
     for (int row_idx = 0; row_idx < row_count; ++row_idx) {
-        const CarWorldSplitContactRow& src = rows[row_idx];
+        // By value: the row is loaded before any store to dst (which the compiler cannot prove apart from it), so the
+        // loads issue together instead of one round trip per field.
+        const CarWorldSplitContactRow src = rows[row_idx];
         if (!src.valid || shared_row_count >= kMaxCarSharedSplitContactRows) {
             continue;
         }
@@ -2518,7 +2528,7 @@ ROCKETGPU_HD void AppendCarWorldToSharedVelocityRows(
     const int normal_row_base = shared_normal_row_count;
     if (shared_normal_rows && normal_rows) {
         for (int row_idx = 0; row_idx < normal_row_count; ++row_idx) {
-            const CarWorldVelocityContactRow& src = normal_rows[row_idx];
+            const CarWorldVelocityContactRow src = normal_rows[row_idx];  // by value, as for split rows
             if (!src.valid || shared_normal_row_count >= kMaxCarWorldSharedVelocityContactRows) {
                 continue;
             }
@@ -2546,7 +2556,7 @@ ROCKETGPU_HD void AppendCarWorldToSharedVelocityRows(
 
     if (shared_friction_rows && friction_rows) {
         for (int row_idx = 0; row_idx < friction_row_count; ++row_idx) {
-            const CarWorldFrictionContactRow& src = friction_rows[row_idx];
+            const CarWorldFrictionContactRow src = friction_rows[row_idx];  // by value, as for split rows
             if (!src.valid || shared_friction_row_count >= kMaxCarWorldSharedFrictionContactRows) {
                 continue;
             }
@@ -2694,7 +2704,7 @@ ROCKETGPU_HD void WarmstartSharedCarVelocityRows(
 #define ROCKETGPU_SHARED_SOLVER_BACKEND_TAG " backend=host\n"
 #endif
 
-ROCKETGPU_HD void SolveSharedCarVelocityNormalRow(
+ROCKETGPU_HD bool SolveSharedCarVelocityNormalRow(
     int count,
     ::rocketgpu::CarState* cars,
     const ::rocketgpu::CarConfig* car_configs,
@@ -2707,10 +2717,10 @@ ROCKETGPU_HD void SolveSharedCarVelocityNormalRow(
     int env_idx,
     bool use_fma = false) {
     if (!row.valid || !cars || !car_configs || !car_accs) {
-        return;
+        return false;
     }
     if (row.body_a_local_idx < 0 || row.body_a_local_idx >= count) {
-        return;
+        return false;
     }
 
     constexpr float kBtPerUu = 1.0f / 50.0f;
@@ -2730,6 +2740,7 @@ ROCKETGPU_HD void SolveSharedCarVelocityNormalRow(
             SolverRowDot(row.rel_b_cross_normal, acc_b.delta_angular, use_fma);
     }
 
+    const float applied_before = row.applied_impulse;
     float delta_impulse = 0.0f;
     if (row.has_rhs_bt) {
         float delta_impulse_bt = row.rhs_bt;
@@ -2763,7 +2774,7 @@ ROCKETGPU_HD void SolveSharedCarVelocityNormalRow(
     }
 
     if (delta_impulse == 0.0f) {
-        return;
+        return GlibcFloatBits(applied_before) != GlibcFloatBits(row.applied_impulse);
     }
 
     ApplySharedCarVelocityImpulse(
@@ -2780,9 +2791,10 @@ ROCKETGPU_HD void SolveSharedCarVelocityNormalRow(
             row.angular_component_b,
             delta_impulse, use_fma);
     }
+    return true;
 }
 
-ROCKETGPU_HD void SolveSharedCarVelocityFrictionRow(
+ROCKETGPU_HD bool SolveSharedCarVelocityFrictionRow(
     int count,
     const ::rocketgpu::CarState* cars,
     const ::rocketgpu::CarConfig* car_configs,
@@ -2797,20 +2809,20 @@ ROCKETGPU_HD void SolveSharedCarVelocityFrictionRow(
     int env_idx,
     bool use_fma = false) {
     if (!row.valid || !cars || !car_configs || !car_accs || !normal_rows) {
-        return;
+        return false;
     }
     if (row.normal_row_idx < 0 || row.normal_row_idx >= normal_row_count) {
-        return;
+        return false;
     }
     if (row.body_a_local_idx < 0 || row.body_a_local_idx >= count) {
-        return;
+        return false;
     }
 
     const ::rocketgpu::Vec3 tangent_b = (row.body_b_local_idx >= 0 && row.body_b_local_idx < count) ? -row.tangent_a : ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
 
     const float total_impulse = normal_rows[row.normal_row_idx].applied_impulse;
     if (total_impulse <= 0.0f) {
-        return;
+        return false;
     }
 
     constexpr float kBtPerUu = 1.0f / 50.0f;
@@ -2831,6 +2843,7 @@ ROCKETGPU_HD void SolveSharedCarVelocityFrictionRow(
         delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_b_bt, row.jac_diag_ab_inv, use_fma);
     }
 
+    const float applied_before = row.applied_impulse;
     const float sum = row.applied_impulse + delta_impulse;
     if (sum < -max_impulse) {
         delta_impulse = -max_impulse - row.applied_impulse;
@@ -2843,7 +2856,7 @@ ROCKETGPU_HD void SolveSharedCarVelocityFrictionRow(
     }
 
     if (delta_impulse == 0.0f) {
-        return;
+        return GlibcFloatBits(applied_before) != GlibcFloatBits(row.applied_impulse);
     }
 
     ApplySharedCarVelocityImpulse(
@@ -2860,6 +2873,7 @@ ROCKETGPU_HD void SolveSharedCarVelocityFrictionRow(
             row.angular_component_b,
             delta_impulse, use_fma);
     }
+    return true;
 }
 
 ROCKETGPU_HD void AppendCarPairSharedSplitRow(
@@ -3022,7 +3036,8 @@ ROCKETGPU_HD void MarkBtSplitAccumulators(
 
 #undef ROCKETGPU_SHARED_SOLVER_BACKEND_TAG
 
-ROCKETGPU_HD void SolveSharedCarSplitRow(
+// The split row solves return whether the row changed its applied push impulse or an accumulator.
+ROCKETGPU_HD bool SolveSharedCarSplitRow(
     int count,
     ::rocketgpu::CarState* cars,
     CarSharedSplitContactRow& row,
@@ -3032,10 +3047,10 @@ ROCKETGPU_HD void SolveSharedCarSplitRow(
     SplitImpulseAccumulator* car_splits,
     int env_idx) {
     if (!row.valid || !cars || !car_splits) {
-        return;
+        return false;
     }
     if (row.body_a_local_idx < 0 || row.body_a_local_idx >= count) {
-        return;
+        return false;
     }
 
     SplitImpulseAccumulator& split_a = car_splits[row.body_a_local_idx];
@@ -3045,8 +3060,9 @@ ROCKETGPU_HD void SolveSharedCarSplitRow(
     }
     if (row.has_bt && split_a.is_bt && (row.body_b_local_idx < 0 || (split_b_bt && split_b_bt->is_bt))) {
         if (row.rhs_penetration_bt == 0.0f) {
-            return;
+            return false;
         }
+        const float applied_before_bt = row.applied_push_impulse_bt;
 
         float delta_impulse_bt = row.rhs_penetration_bt;
         const float delta_vel_linear_bt = BtSimdDot3LikeBullet(row.normal_a, split_a.push_velocity);
@@ -3073,7 +3089,7 @@ ROCKETGPU_HD void SolveSharedCarSplitRow(
             }
         }
         (void)iter; (void)row_idx; (void)bucket; (void)env_idx; (void)false; (void)-1;
-        return;
+        return delta_impulse_bt != 0.0f || GlibcFloatBits(applied_before_bt) != GlibcFloatBits(row.applied_push_impulse_bt);
     }
     const float delta_vel_a =
         BtSimdDot3LikeBullet(row.normal_a, split_a.push_velocity) +
@@ -3088,6 +3104,7 @@ ROCKETGPU_HD void SolveSharedCarSplitRow(
             BtSimdDot3LikeBullet(row.rel_b_cross_normal, split_b->turn_velocity);
     }
 
+    const float applied_before = row.applied_push_impulse;
     float delta_impulse = row.rhs_penetration;
     delta_impulse -= (delta_vel_a + delta_vel_b) * row.jac_diag_ab_inv;
     const float sum = row.applied_push_impulse + delta_impulse;
@@ -3105,15 +3122,16 @@ ROCKETGPU_HD void SolveSharedCarSplitRow(
             split_b->turn_velocity += row.angular_component_b * delta_impulse;
         }
     }
+    return delta_impulse != 0.0f || GlibcFloatBits(applied_before) != GlibcFloatBits(row.applied_push_impulse);
 }
 
-ROCKETGPU_HD void SolveUnifiedBallSplitRow(
+ROCKETGPU_HD bool SolveUnifiedBallSplitRow(
     int count,
     BallSplitContactRow& row,
     SplitImpulseAccumulator& ball_split,
     SplitImpulseAccumulator* car_splits) {
     if (!row.valid || !car_splits) {
-        return;
+        return false;
     }
 
     SplitImpulseAccumulator* other_split_bt = nullptr;
@@ -3121,6 +3139,7 @@ ROCKETGPU_HD void SolveUnifiedBallSplitRow(
         other_split_bt = &car_splits[row.other_local_idx];
     }
     if (row.has_bt && ball_split.is_bt && (!other_split_bt || other_split_bt->is_bt)) {
+        const float applied_before_bt = row.applied_push_impulse_bt;
         float delta_impulse_bt = row.rhs_penetration_bt;
         const float ball_term_bt = (
             BtSimdDot3LikeBullet(row.normal, ball_split.push_velocity) +
@@ -3139,7 +3158,7 @@ ROCKETGPU_HD void SolveUnifiedBallSplitRow(
             row.applied_push_impulse_bt = sum_bt;
         }
         if (delta_impulse_bt == 0.0f) {
-            return;
+            return GlibcFloatBits(applied_before_bt) != GlibcFloatBits(row.applied_push_impulse_bt);
         }
 
         ball_split.push_velocity += (row.normal * row.ball_inv_mass) * delta_impulse_bt;
@@ -3148,9 +3167,10 @@ ROCKETGPU_HD void SolveUnifiedBallSplitRow(
             other_split_bt->push_velocity += ((-row.normal) * row.other_inv_mass) * delta_impulse_bt;
             other_split_bt->turn_velocity += row.other_angular_component_bt * delta_impulse_bt;
         }
-        return;
+        return true;
     }
 
+    const float applied_before = row.applied_push_impulse;
     float delta_impulse = row.rhs_penetration;
     const float ball_term = (
         BtSimdDot3LikeBullet(row.normal, ball_split.push_velocity) +
@@ -3174,7 +3194,7 @@ ROCKETGPU_HD void SolveUnifiedBallSplitRow(
     }
 
     if (delta_impulse == 0.0f) {
-        return;
+        return GlibcFloatBits(applied_before) != GlibcFloatBits(row.applied_push_impulse);
     }
 
     ball_split.push_velocity += row.normal * (row.ball_inv_mass * delta_impulse);
@@ -3183,6 +3203,7 @@ ROCKETGPU_HD void SolveUnifiedBallSplitRow(
         other_split->push_velocity += (-row.normal) * (row.other_inv_mass * delta_impulse);
         other_split->turn_velocity += row.other_angular_component * delta_impulse;
     }
+    return true;
 }
 
 ROCKETGPU_HD ArenaBroadphaseGrid MakeArenaBroadphaseGrid(const ::rocketgpu::SimConfig& cfg) {
@@ -4049,6 +4070,9 @@ ROCKETGPU_HD void SolveUnifiedSplitContactRows(
     const int split_order_count =
         unified_split_valid ? unified_split_count : active_world_rows + active_pair_rows + active_ball_rows;
     for (int iter = 0; iter < BallSplitImpulseIterations(); ++iter) {
+        // An iteration that changes no impulse and no accumulator leaves the state as it found it: later ones would
+        // repeat it exactly.
+        bool changed = false;
         for (int order_idx = 0; order_idx < split_order_count; ++order_idx) {
             int bucket;
             int row_idx;
@@ -4066,12 +4090,15 @@ ROCKETGPU_HD void SolveUnifiedSplitContactRows(
                 row_idx = order_idx - active_world_rows - active_pair_rows;
             }
             if (bucket < 2) {
-                SolveSharedCarSplitRow(
+                changed = SolveSharedCarSplitRow(
                     count, cars, (bucket == 0 ? world_rows : pair_rows)[row_idx], iter, row_idx,
-                    bucket == 0 ? "world" : "pair", car_splits, env_idx);
+                    bucket == 0 ? "world" : "pair", car_splits, env_idx) || changed;
             } else {
-                SolveUnifiedBallSplitRow(count, ball_rows[row_idx], ball_split, car_splits);
+                changed = SolveUnifiedBallSplitRow(count, ball_rows[row_idx], ball_split, car_splits) || changed;
             }
+        }
+        if (!changed) {
+            break;
         }
     }
 
@@ -4319,7 +4346,8 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
     int substep = 0,
     const ::rocketgpu::Vec3* bt_ball_linear_velocity_override = nullptr,
     EnvStridedArray<const BulletManifoldEntry> sorted_manifolds = nullptr,
-    int sorted_manifold_count = 0) {
+    int sorted_manifold_count = 0,
+    bool register_iterations = false) {
     if (count < 0 || count > 8 || (count > 0 && (!cars || !car_configs))) {
         return;
     }
@@ -4537,7 +4565,7 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
 
         const auto solve_ball_normal_row = [&](int iter, int row_idx) {
             BallVelocityContactRow& row = ball_normal_rows[row_idx];
-            SolveBallVelocityNormalRowWithAccumulators(
+            return SolveBallVelocityNormalRowWithAccumulators(
                 count,
                 row,
                 row_idx,
@@ -4705,7 +4733,7 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
 
         const auto solve_ball_friction_row = [&](int iter, int row_idx) {
             BallFrictionContactRow& row = ball_friction_rows[row_idx];
-            SolveBallVelocityFrictionRowWithAccumulators(
+            return SolveBallVelocityFrictionRowWithAccumulators(
                 count,
                 ball_normal_rows,
                 ball_normal_row_count,
@@ -4748,15 +4776,251 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
         }
     }
     const int iterations = BallVelocityContactIterations();
-    for (int iter = 0; iter < iterations; ++iter) {
+
+    // With register_iterations (the staged rows kernel up to a batch size; see UseRegisterIterations), world rows
+    // only (no ball or pair rows, at most kRegRows normal and friction rows, at most two cars): the iterations run from
+    // registers. Each row is loaded once in solve order, the two cars' accumulators stay in registers, and the applied
+    // impulses are stored after the last iteration. The operations and their order are
+    // those of SolveSharedCarVelocityNormalRow / SolveSharedCarVelocityFrictionRow for a row without body b.
+    constexpr int kRegRows = 3;
+    bool solved_in_registers = false;
+    if (register_iterations && ball_normal_row_count <= 0 && ball_friction_row_count <= 0 &&
+        pair_normal_row_count <= 0 && pair_friction_row_count <= 0 && unified_normal_count <= kRegRows &&
+        unified_friction_count <= kRegRows &&
+        unified_normal_count == world_normal_row_count && unified_friction_count == world_friction_row_count) {
+        struct RegRow {
+            ::rocketgpu::Vec3 dir;
+            ::rocketgpu::Vec3 linear;
+            ::rocketgpu::Vec3 rel_cross;
+            ::rocketgpu::Vec3 angular;
+            float rhs;
+            float jac;
+            float applied;
+            float friction;
+            int normal_slot;  // friction: its normal row is normal[normal_slot]
+            bool active;
+            bool has_rhs_bt;
+            bool second_car;
+        };
+        RegRow normal[kRegRows];
+        RegRow fric[kRegRows];
+        int body0 = -1;
+        int body1 = -1;
+        bool fits = true;
+        // Assigns the row's car to accumulator 0 or 1; false for a third car.
+        const auto take_car = [&](int body, bool& second) {
+            if (body0 < 0 || body0 == body) {
+                body0 = body;
+                second = false;
+                return true;
+            }
+            if (body1 < 0 || body1 == body) {
+                body1 = body;
+                second = true;
+                return true;
+            }
+            return false;
+        };
+#pragma unroll
+        for (int o = 0; o < kRegRows; ++o) {
+            RegRow& s = normal[o];
+            s.active = false;
+            s.applied = 0.0f;
+            if (o >= unified_normal_count) {
+                continue;
+            }
+            const CarSharedVelocityContactRow& row = world_normal_rows[unified_normal_row[o]];
+            s.applied = row.applied_impulse;
+            if (!row.valid || row.body_a_local_idx < 0 || row.body_a_local_idx >= count) {
+                continue;
+            }
+            fits = fits && !(row.body_b_local_idx >= 0 && row.body_b_local_idx < count) &&
+                   take_car(row.body_a_local_idx, s.second_car);
+            s.active = true;
+            s.dir = row.normal_a;
+            s.linear = row.normal_a * row.inv_mass_a;
+            s.rel_cross = row.rel_a_cross_normal;
+            s.angular = row.angular_component_a;
+            s.has_rhs_bt = row.has_rhs_bt != 0;
+            s.rhs = s.has_rhs_bt ? row.rhs_bt : row.rhs;
+            s.jac = row.jac_diag_ab_inv;
+        }
+#pragma unroll
+        for (int o = 0; o < kRegRows; ++o) {
+            RegRow& s = fric[o];
+            s.active = false;
+            if (o >= unified_friction_count) {
+                continue;
+            }
+            const CarSharedFrictionContactRow& row = world_friction_rows[unified_friction_row[o]];
+            if (!row.valid || row.normal_row_idx < 0 || row.normal_row_idx >= world_normal_row_count ||
+                row.body_a_local_idx < 0 || row.body_a_local_idx >= count) {
+                continue;
+            }
+            // The normal row's slot by constant-index compares (a slot loop with a dynamic index goes to local memory).
+            bool normal_found = false;
+            s.normal_slot = 0;
+#pragma unroll
+            for (int k = 0; k < kRegRows; ++k) {
+                if (!normal_found && k < unified_normal_count && unified_normal_row[k] == row.normal_row_idx) {
+                    s.normal_slot = k;
+                    normal_found = true;
+                }
+            }
+            fits = fits && normal_found && !(row.body_b_local_idx >= 0 && row.body_b_local_idx < count) &&
+                   take_car(row.body_a_local_idx, s.second_car);
+            s.active = true;
+            s.dir = row.tangent_a;
+            s.linear = row.tangent_a * row.inv_mass_a;
+            s.rel_cross = row.rel_a_cross_tangent;
+            s.angular = row.angular_component_a;
+            s.rhs = row.has_rhs_bt ? row.rhs_bt : row.rhs * kUnifiedRowConversionBtPerUu;
+            s.jac = row.jac_diag_ab_inv;
+            s.applied = row.applied_impulse;
+            s.friction = row.friction;
+        }
+        if (fits) {
+            const bool use_fma = mutator.solver_use_fma != 0;
+            BallVelocityAccumulator acc0 = body0 >= 0 ? car_accs[body0] : BallVelocityAccumulator{};
+            BallVelocityAccumulator acc1 = body1 >= 0 ? car_accs[body1] : BallVelocityAccumulator{};
+            for (int iter = 0; iter < iterations; ++iter) {
+                // The iterations are a function of the impulses and accumulators only: one that changes neither
+                // leaves the state as it found it, and every later one would repeat it exactly.
+                bool changed = false;
+#pragma unroll
+                for (int o = 0; o < kRegRows; ++o) {
+                    RegRow& s = normal[o];
+                    if (!s.active) {
+                        continue;
+                    }
+                    const float applied_before = s.applied;
+                    BallVelocityAccumulator acc = s.second_car ? acc1 : acc0;
+                    const float delta_impulse_vel_a_bt =
+                        SolverRowDot(s.dir, acc.delta_linear, use_fma) +
+                        SolverRowDot(s.rel_cross, acc.delta_angular, use_fma);
+                    const float delta_impulse_vel_b_bt = 0.0f;
+                    float delta_impulse;
+                    if (s.has_rhs_bt) {
+                        float delta_impulse_bt = s.rhs;
+                        delta_impulse_bt = SolverRowSubtract(delta_impulse_bt, delta_impulse_vel_a_bt, s.jac, use_fma);
+                        delta_impulse_bt = SolverRowSubtract(delta_impulse_bt, delta_impulse_vel_b_bt, s.jac, use_fma);
+                        const float sum_bt = s.applied + delta_impulse_bt;
+                        if (sum_bt < 0.0f) {
+                            delta_impulse = -s.applied;
+                            s.applied = 0.0f;
+                        } else {
+                            delta_impulse = delta_impulse_bt;
+                            s.applied = sum_bt;
+                        }
+                    } else {
+                        const float delta_impulse_vel_a_uu = delta_impulse_vel_a_bt * kUnifiedRowConversionUuPerBt;
+                        const float delta_impulse_vel_b_uu = delta_impulse_vel_b_bt * kUnifiedRowConversionUuPerBt;
+                        const float applied_uu = s.applied * kUnifiedRowConversionUuPerBt;
+                        delta_impulse = s.rhs;
+                        delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_a_uu, s.jac, use_fma);
+                        delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_b_uu, s.jac, use_fma);
+                        const float sum = applied_uu + delta_impulse;
+                        if (sum < 0.0f) {
+                            delta_impulse = -applied_uu;
+                            s.applied = 0.0f;
+                        } else {
+                            s.applied = sum * kUnifiedRowConversionBtPerUu;
+                        }
+                        delta_impulse *= kUnifiedRowConversionBtPerUu;
+                    }
+                    changed = changed || GlibcFloatBits(applied_before) != GlibcFloatBits(s.applied);
+                    if (delta_impulse == 0.0f) {
+                        continue;
+                    }
+                    changed = true;
+                    ApplyBallVelocityAccumulatorImpulse(acc, s.linear, s.angular, delta_impulse, use_fma);
+                    if (s.second_car) {
+                        acc1 = acc;
+                    } else {
+                        acc0 = acc;
+                    }
+                }
+#pragma unroll
+                for (int o = 0; o < kRegRows; ++o) {
+                    RegRow& s = fric[o];
+                    if (!s.active) {
+                        continue;
+                    }
+                    float total_impulse = normal[0].applied;
+#pragma unroll
+                    for (int k = 1; k < kRegRows; ++k) {
+                        if (s.normal_slot == k) {
+                            total_impulse = normal[k].applied;
+                        }
+                    }
+                    if (total_impulse <= 0.0f) {
+                        continue;
+                    }
+                    const float max_impulse = s.friction * total_impulse;
+                    float delta_impulse = s.rhs;
+                    BallVelocityAccumulator acc = s.second_car ? acc1 : acc0;
+                    const float delta_impulse_vel_a_bt =
+                        SolverRowDot(s.dir, acc.delta_linear, use_fma) +
+                        SolverRowDot(s.rel_cross, acc.delta_angular, use_fma);
+                    delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_a_bt, s.jac, use_fma);
+                    const float applied_before = s.applied;
+                    const float sum = s.applied + delta_impulse;
+                    if (sum < -max_impulse) {
+                        delta_impulse = -max_impulse - s.applied;
+                        s.applied = -max_impulse;
+                    } else if (sum > max_impulse) {
+                        delta_impulse = max_impulse - s.applied;
+                        s.applied = max_impulse;
+                    } else {
+                        s.applied = sum;
+                    }
+                    changed = changed || GlibcFloatBits(applied_before) != GlibcFloatBits(s.applied);
+                    if (delta_impulse == 0.0f) {
+                        continue;
+                    }
+                    changed = true;
+                    ApplyBallVelocityAccumulatorImpulse(acc, s.linear, s.angular, delta_impulse, use_fma);
+                    if (s.second_car) {
+                        acc1 = acc;
+                    } else {
+                        acc0 = acc;
+                    }
+                }
+                if (!changed) {
+                    break;
+                }
+            }
+#pragma unroll
+            for (int o = 0; o < kRegRows; ++o) {
+                if (normal[o].active) {
+                    world_normal_rows[unified_normal_row[o]].applied_impulse = normal[o].applied;
+                }
+                if (fric[o].active) {
+                    world_friction_rows[unified_friction_row[o]].applied_impulse = fric[o].applied;
+                }
+            }
+            if (body0 >= 0) {
+                car_accs[body0] = acc0;
+            }
+            if (body1 >= 0) {
+                car_accs[body1] = acc1;
+            }
+            solved_in_registers = true;
+        }
+    }
+
+    for (int iter = 0; iter < (solved_in_registers ? 0 : iterations); ++iter) {
+        // An iteration that changes no impulse and no accumulator leaves the state as it found it: later ones would
+        // repeat it exactly.
+        bool changed = false;
         for (int order_idx = 0; order_idx < unified_normal_count; ++order_idx) {
             const int row_idx = unified_normal_row[order_idx];
             const int bucket = unified_normal_bucket[order_idx];
             if (bucket == kUnifiedRowBucketBall) {
-                solve_ball_normal_row(iter, row_idx);
+                changed = solve_ball_normal_row(iter, row_idx) || changed;
             } else {
                 const bool world = bucket == kUnifiedRowBucketWorld;
-                SolveSharedCarVelocityNormalRow(
+                changed = SolveSharedCarVelocityNormalRow(
                     count,
                     cars,
                     car_configs,
@@ -4766,17 +5030,17 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
                     iter,
                     row_idx,
                     world ? "world" : "pair",
-                    env_idx, mutator.solver_use_fma != 0);
+                    env_idx, mutator.solver_use_fma != 0) || changed;
             }
         }
         for (int order_idx = 0; order_idx < unified_friction_count; ++order_idx) {
             const int row_idx = unified_friction_row[order_idx];
             const int bucket = unified_friction_bucket[order_idx];
             if (bucket == kUnifiedRowBucketBall) {
-                solve_ball_friction_row(iter, row_idx);
+                changed = solve_ball_friction_row(iter, row_idx) || changed;
             } else {
                 const bool world = bucket == kUnifiedRowBucketWorld;
-                SolveSharedCarVelocityFrictionRow(
+                changed = SolveSharedCarVelocityFrictionRow(
                     count,
                     cars,
                     car_configs,
@@ -4788,8 +5052,11 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
                     iter,
                     row_idx,
                     world ? "world" : "pair",
-                    env_idx, mutator.solver_use_fma != 0);
+                    env_idx, mutator.solver_use_fma != 0) || changed;
             }
+        }
+        if (!changed) {
+            break;
         }
     }
 

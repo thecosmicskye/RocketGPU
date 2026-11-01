@@ -22,6 +22,10 @@ namespace rocketgpu {
 namespace detail {
 __device__ CarWorldMeshCandidateStage* g_rocketgpu_car_world_stage = nullptr;
 __device__ int g_rocketgpu_car_world_stage_stride = 0;
+__device__ BallWorldStage* g_rocketgpu_ball_world_stage = nullptr;
+#if defined(ROCKETGPU_BALL_STAGE_CHECK)
+__device__ unsigned long long g_rocketgpu_ball_stage_counts[9] = {};
+#endif
 namespace bullet_port {
 __device__ EPA* g_rocketgpu_epa_pool = nullptr;
 __device__ unsigned int* g_rocketgpu_epa_busy = nullptr;
@@ -398,31 +402,54 @@ ROCKETGPU_GLOBAL void StepKernel(
     }
 }
 
-// Each env's VehicleUpdatesIndependent, a thread per env, after the staged wheel rays: StagedCarPreKernel and the
-// contacts kernels read it, so the envs whose updates are not independent can step apart from StagedCarPreKernel.
-ROCKETGPU_GLOBAL void StagedVehicleIndependenceKernel(
-    const __grid_constant__ SimConfig cfg, const int32_t* env_car_count, WorldSolverScratch* solver_scratch) {
+// The pose-only part of each env's ball-world contacts for World<3> (StageBallWorldContacts), on a side stream after
+// PreTick.
+ROCKETGPU_GLOBAL void StagedBallWorldKernel(
+    const __grid_constant__ SimConfig cfg, const BallState* balls, const EnvState* env_states, BallWorldStage* stages) {
+    // Every env tests the same mesh AABBs: read the mesh infos into shared memory once per block.
+    __shared__ alignas(ArenaMeshBvhMeshInfo) unsigned char mesh_storage[kBallWorldStageMaxMeshes * sizeof(ArenaMeshBvhMeshInfo)];
+    ArenaMeshBvhMeshInfo* meshes = reinterpret_cast<ArenaMeshBvhMeshInfo*>(mesh_storage);
+    const int mesh_count = cfg.arena_mesh_bvh_meshes != nullptr ? cfg.arena_mesh_bvh_mesh_count : 0;
+    if (mesh_count <= kBallWorldStageMaxMeshes) {
+        for (int m = static_cast<int>(threadIdx.x); m < mesh_count; m += static_cast<int>(blockDim.x)) {
+            memcpy(&meshes[m], &cfg.arena_mesh_bvh_meshes[m], sizeof(ArenaMeshBvhMeshInfo));
+        }
+    } else {
+        meshes = nullptr;
+    }
+    __syncthreads();
     int env_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (env_idx >= cfg.env_count) {
         return;
     }
     MapStepEnv(cfg, env_idx);
-    WorldSolverScratch& scratch = solver_scratch[env_idx];
-    const int count = env_car_count[env_idx];
-    if (cfg.mutator.physics_events.HasNonGoalEvents() || count > kWheelRayStageSlots / 4) {
-        scratch.vehicle_updates_independent = 0;
-        return;
-    }
-    // VehicleUpdatesIndependent with every ray's flags loaded at once (one word each: ground_kind, is_in_contact,
-    // is_in_contact_with_world, valid) instead of a load per test.
-    static_assert(offsetof(WheelRayStage, valid) == offsetof(WheelRayStage, ground_kind) + 3 &&
-                  offsetof(WheelRayStage, ground_kind) % 4 == 0 && sizeof(WheelRayStage) % 4 == 0, "ray flags word");
-    uint32_t flags[kWheelRayStageSlots];
+    StageBallWorldContacts(balls[env_idx], cfg.mutator, static_cast<uint64_t>(env_states[env_idx].tick),
+                           cfg.arena_mesh_tris, cfg.arena_mesh_tri_count, cfg.arena_mesh_bvh_quantization,
+                           cfg.arena_mesh_bvh_quantization_count, cfg.arena_mesh_bvh_meshes,
+                           cfg.arena_mesh_bvh_mesh_count, cfg.arena_mesh_bvh_nodes, cfg.arena_mesh_bvh_node_count,
+                           stages[env_idx], meshes);
+}
+
+// The env's staged ray flags, one word per ray (ground_kind, is_in_contact, is_in_contact_with_world, valid), loaded
+// at once; rays past the env's cars read as valid and not in contact.
+static_assert(offsetof(WheelRayStage, valid) == offsetof(WheelRayStage, ground_kind) + 3 &&
+              offsetof(WheelRayStage, ground_kind) % 4 == 0 && sizeof(WheelRayStage) % 4 == 0, "ray flags word");
+__device__ __forceinline__ void LoadStagedRayFlags(const WorldSolverScratch& scratch, int count,
+                                                   uint32_t (&flags)[kWheelRayStageSlots]) {
 #pragma unroll
     for (int lane = 0; lane < kWheelRayStageSlots; ++lane) {
         flags[lane] = lane < 4 * count
             ? *reinterpret_cast<const uint32_t*>(&scratch.wheel_ray_stage[lane].ground_kind) : 0x01000000u;
     }
+}
+// VehicleUpdatesIndependent from the staged rays (read-only after the wheel rays), where each kernel that needs it
+// tests it: StagedCarPreKernel and the contacts kernels split the envs by it.
+__device__ __forceinline__ bool StagedVehiclesIndependent(const SimConfig& cfg, const WorldSolverScratch& scratch, int count) {
+    if (cfg.mutator.physics_events.HasNonGoalEvents() || count > kWheelRayStageSlots / 4) {
+        return false;
+    }
+    uint32_t flags[kWheelRayStageSlots];
+    LoadStagedRayFlags(scratch, count, flags);
     uint32_t fails = 0u;
 #pragma unroll
     for (int lane = 0; lane < kWheelRayStageSlots; ++lane) {
@@ -432,8 +459,52 @@ ROCKETGPU_GLOBAL void StagedVehicleIndependenceKernel(
         const uint32_t with_world = ((w >> 16) & 0xFFu) != 0u ? 1u : 0u;
         fails |= invalid | (in_contact & (with_world ^ 1u));
     }
-    const bool independent = fails == 0u;
-    scratch.vehicle_updates_independent = independent ? 1 : 0;
+    return fails == 0u;
+}
+// The cars of a not-independent env that update apart: a car whose wheel rests on another car pushes that car, so
+// both keep their turn in visit order; every other car reads and writes only itself. A wheel on the ball or an
+// unstaged ray keeps the whole env in order.
+__device__ __forceinline__ uint8_t StagedVehicleApartMask(const SimConfig& cfg, const WorldSolverScratch& scratch, int count) {
+    if (cfg.mutator.physics_events.HasNonGoalEvents() || count > kWheelRayStageSlots / 4) {
+        return 0u;
+    }
+    uint32_t flags[kWheelRayStageSlots];
+    LoadStagedRayFlags(scratch, count, flags);
+    uint32_t ordered = 0u;
+    bool all_ordered = false;
+#pragma unroll
+    for (int lane = 0; lane < kWheelRayStageSlots; ++lane) {
+        const uint32_t w = flags[lane];
+        if ((w >> 24) != 1u) {
+            all_ordered = all_ordered || lane < 4 * count;
+        } else if (((w >> 8) & 0xFFu) != 0u && ((w >> 16) & 0xFFu) == 0u) {
+            const int target = scratch.wheel_ray_stage[lane].ground_car_idx;
+            if ((w & 0xFFu) != ROCKETGPU_ARENA_RAY_HIT_CAR || target < 0 || target >= count) {
+                all_ordered = true;
+            } else {
+                ordered |= (1u << (lane / 4)) | (1u << target);
+            }
+        }
+    }
+    return static_cast<uint8_t>(all_ordered ? 0u : (((1u << count) - 1u) & ~ordered));
+}
+// Larger batches test them once per env here instead (rays_inline false): the consumers' repeated flag loads (every
+// car thread of StagedCarPreKernel, every lane of World<1>) then cost more than the kernel (see kRaysInlineMaxEnvs).
+ROCKETGPU_GLOBAL void StagedVehicleIndependenceKernel(
+    const __grid_constant__ SimConfig cfg, const int32_t* env_car_count, WorldSolverScratch* solver_scratch) {
+    int env_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (env_idx >= cfg.env_count) {
+        return;
+    }
+    MapStepEnv(cfg, env_idx);
+    WorldSolverScratch& scratch = solver_scratch[env_idx];
+    const int count = env_car_count[env_idx];
+    scratch.vehicle_updates_independent = StagedVehiclesIndependent(cfg, scratch, count) ? 1 : 0;
+    scratch.vehicle_apart_mask = StagedVehicleApartMask(cfg, scratch, count);
+}
+__device__ __forceinline__ bool EnvVehiclesIndependent(const SimConfig& cfg, const WorldSolverScratch& scratch, int count,
+                                                       bool rays_inline) {
+    return rays_inline ? StagedVehiclesIndependent(cfg, scratch, count) : scratch.vehicle_updates_independent != 0;
 }
 
 // The staged step: StepKernel's lanes as kernels, each over all envs. A thread per car slot runs the independent
@@ -450,7 +521,7 @@ __device__ __forceinline__ void PrefetchLinesL2(const T* p) {
 ROCKETGPU_GLOBAL void StagedCarPreKernel(
     const __grid_constant__ SimConfig cfg, int32_t* __restrict__ env_car_count, CarState* __restrict__ cars,
     WheelRuntimeState* __restrict__ wheel_runtime_states, WorldSolverScratch* __restrict__ solver_scratch,
-    CarControls* __restrict__ controls, CarConfig* __restrict__ car_configs, BallState* __restrict__ balls) {
+    CarControls* __restrict__ controls, CarConfig* __restrict__ car_configs, BallState* __restrict__ balls, bool rays_inline) {
     const int stride = cfg.max_cars_per_env;
     const long long tid = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     int env_idx = static_cast<int>(tid / stride);
@@ -460,8 +531,7 @@ ROCKETGPU_GLOBAL void StagedCarPreKernel(
     }
     MapStepEnv(cfg, env_idx);
     const int count = env_car_count[env_idx];
-    const bool independent = solver_scratch[env_idx].vehicle_updates_independent != 0;
-    if (slot >= count || !independent) {
+    if (slot >= count || !EnvVehiclesIndependent(cfg, solver_scratch[env_idx], count, rays_inline)) {
         return;
     }
     uint32_t pushed_cars_mask = 0u;
@@ -481,11 +551,10 @@ ROCKETGPU_GLOBAL void StagedCarPreKernel(
 }
 
 // The tick's per-car end after the env's world step (StepEnvPostCar), a thread per car slot.
-ROCKETGPU_GLOBAL void StagedCarPostKernel(
-    const __grid_constant__ SimConfig cfg, int32_t* env_car_count, CarState* cars, WheelRuntimeState* wheel_runtime_states,
+__device__ __forceinline__ void StagedCarPostOne(
+    const SimConfig& cfg, long long tid, int32_t* env_car_count, CarState* cars, WheelRuntimeState* wheel_runtime_states,
     WorldSolverScratch* solver_scratch, CarControls* controls, CarConfig* car_configs) {
     const int stride = cfg.max_cars_per_env;
-    const long long tid = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     int env_idx = static_cast<int>(tid / stride);
     const int slot = static_cast<int>(tid - static_cast<long long>(env_idx) * stride);
     if (env_idx >= cfg.env_count) {
@@ -497,6 +566,12 @@ ROCKETGPU_GLOBAL void StagedCarPostKernel(
     }
     StepEnvPostCar(env_idx, slot, cfg, cars, wheel_runtime_states, solver_scratch, car_configs,
                    controls[env_idx * stride + slot], true);
+}
+ROCKETGPU_GLOBAL void StagedCarPostKernel(
+    const __grid_constant__ SimConfig cfg, int32_t* env_car_count, CarState* cars, WheelRuntimeState* wheel_runtime_states,
+    WorldSolverScratch* solver_scratch, CarControls* controls, CarConfig* car_configs) {
+    StagedCarPostOne(cfg, static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x, env_car_count, cars,
+                     wheel_runtime_states, solver_scratch, controls, car_configs);
 }
 
 // The pads' tick start (PreTickBoostPad), a thread per pad, after PreTickKernel's env commands (a kickoff resets the
@@ -520,10 +595,9 @@ ROCKETGPU_GLOBAL void StagedPadPreKernel(const __grid_constant__ SimConfig cfg, 
 // sees the cars' writes in the same order); the rest on the env's first lane, and with pads_apart the pads' ends
 // follow a thread per pad. More cars than lanes: the env's first lane runs StepEnvTail whole.
 constexpr int kEnvTailLanes = 8;
-ROCKETGPU_GLOBAL void StagedEnvTailKernel(
-    const __grid_constant__ SimConfig cfg, int32_t* env_car_count, CarState* cars, BallState* balls, EnvState* env_states, BoostPadState* pads,
-    bool pads_apart) {
-    const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+__device__ __forceinline__ void StagedEnvTailOne(
+    const SimConfig& cfg, int tid, int32_t* env_car_count, CarState* cars, BallState* balls, EnvState* env_states,
+    BoostPadState* pads, bool pads_apart) {
     int env_idx = tid / kEnvTailLanes;
     const int lane = tid - env_idx * kEnvTailLanes;
     if (env_idx >= cfg.env_count) {
@@ -560,6 +634,12 @@ ROCKETGPU_GLOBAL void StagedEnvTailKernel(
     }
     StepEnvTail(env_idx, count, cfg, cars, balls[env_idx], env_states[env_idx], pads, !pads_apart, !lanes_apart);
 }
+ROCKETGPU_GLOBAL void StagedEnvTailKernel(
+    const __grid_constant__ SimConfig cfg, int32_t* env_car_count, CarState* cars, BallState* balls, EnvState* env_states, BoostPadState* pads,
+    bool pads_apart) {
+    StagedEnvTailOne(cfg, static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x), env_car_count, cars, balls, env_states,
+                     pads, pads_apart);
+}
 
 // Whether no car can be in two pads' pickup cylinders at once (the standard layout's pads are 1283+ uu apart), so a
 // pad's pickup never meets another's on the same car and the pads' ends run in any order.
@@ -581,9 +661,9 @@ inline bool BoostPadsApart(const SimConfig& cfg) {
 }
 
 // The pads' ends (PostTickBoostPad), a thread per pad, when BoostPadsApart.
-ROCKETGPU_GLOBAL void StagedPadPostKernel(const __grid_constant__ SimConfig cfg, int32_t* env_car_count, CarState* cars, BoostPadState* pads) {
+__device__ __forceinline__ void StagedPadPostOne(const SimConfig& cfg, long long tid, int32_t* env_car_count, CarState* cars,
+                                                 BoostPadState* pads) {
     const int pad_count = BoostPadCount(cfg);
-    const long long tid = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     int env_idx = static_cast<int>(tid / pad_count);
     if (env_idx >= cfg.env_count) {
         return;
@@ -594,14 +674,52 @@ ROCKETGPU_GLOBAL void StagedPadPostKernel(const __grid_constant__ SimConfig cfg,
         PostTickBoostPad(env_idx, cfg, cars, pads, p);
     }
 }
+ROCKETGPU_GLOBAL void StagedPadPostKernel(const __grid_constant__ SimConfig cfg, int32_t* env_car_count, CarState* cars, BoostPadState* pads) {
+    StagedPadPostOne(cfg, static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x, env_car_count, cars, pads);
+}
+
+// StagedCarPostKernel, StagedEnvTailKernel and StagedPadPostKernel in one launch: a block takes envs_per_block whole envs
+// through the three in turn, a __syncthreads apart (each reads only its own envs' writes from the one before), so a
+// block that finishes one starts the next without the launch edge or the slowest block of the other envs.
+ROCKETGPU_GLOBAL void StagedPostFusedKernel(
+    const __grid_constant__ SimConfig cfg, int32_t* env_car_count, CarState* cars, WheelRuntimeState* wheel_runtime_states,
+    WorldSolverScratch* solver_scratch, CarControls* controls, CarConfig* car_configs, BallState* balls,
+    EnvState* env_states, BoostPadState* pads, bool pads_apart, int envs_per_block) {
+    const long long e0 = static_cast<long long>(blockIdx.x) * envs_per_block;
+    const int stride = cfg.max_cars_per_env;
+    for (int t = threadIdx.x; t < envs_per_block * stride; t += blockDim.x) {
+        StagedCarPostOne(cfg, e0 * stride + t, env_car_count, cars, wheel_runtime_states, solver_scratch, controls,
+                         car_configs);
+    }
+    __syncthreads();
+    // blockDim.x is a multiple of 32, so each env's kEnvTailLanes lanes stay one aligned group of a warp.
+    for (int t = threadIdx.x; t < envs_per_block * kEnvTailLanes; t += blockDim.x) {
+        StagedEnvTailOne(cfg, static_cast<int>(e0 * kEnvTailLanes + t), env_car_count, cars, balls, env_states, pads,
+                         pads_apart);
+    }
+    if (pads_apart) {
+        __syncthreads();
+        const int pad_count = BoostPadCount(cfg);
+        for (int t = threadIdx.x; t < envs_per_block * pad_count; t += blockDim.x) {
+            StagedPadPostOne(cfg, e0 * pad_count + t, env_car_count, cars, pads);
+        }
+    }
+}
 
 // A kernel per world part (a compile-time constant), so each holds only its part's code and registers.
-template <int kWorldPart>
+// Lanes per env of the dependent-env contacts kernel (StagedWorldKernel<kWorldStepContacts, kWorld1Lanes>), used up
+// to kWorld1LanesMaxEnvs envs in the batch (all groups): with more, the idle lanes of the independent envs cost more
+// than the dependent envs' shorter chains win.
+constexpr int kWorld1Lanes = 4;
+template <int kWorldPart, int kLanes = 1, bool kRegisterIterations = false>
 ROCKETGPU_GLOBAL void StagedWorldKernel(
     const __grid_constant__ SimConfig cfg, Team* teams, int32_t* env_car_count, CarState* cars, WheelRuntimeState* wheel_runtime_states,
     WorldSolverScratch* solver_scratch, WorldSolverScratchRowPool row_pool, CarControls* controls,
-    CarConfig* car_configs, BallState* balls, EnvState* env_states, BoostPadState* pads, uint64_t seed) {
-    int env_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    CarConfig* car_configs, BallState* balls, EnvState* env_states, BoostPadState* pads, uint64_t seed,
+    bool rays_inline = false) {
+    const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    int env_idx = tid / kLanes;
+    const int lane = tid - env_idx * kLanes;
     if (env_idx >= cfg.env_count) {
         return;
     }
@@ -609,8 +727,66 @@ ROCKETGPU_GLOBAL void StagedWorldKernel(
     if (WorldPartIsContacts(kWorldPart)) {
         // Envs whose vehicle updates are independent ran them (and the prestep) a thread per car: CarsApart.
         // The rest run them here in visit order, then the prestep.
-        const bool independent = solver_scratch[env_idx].vehicle_updates_independent != 0;
+        const bool independent = EnvVehiclesIndependent(cfg, solver_scratch[env_idx], env_car_count[env_idx], rays_inline);
         if (independent != (kWorldPart == kWorldStepContactsCarsApart)) {
+            return;
+        }
+    }
+    uint8_t apart_mask = 0;
+    uint8_t updated_mask = 0;
+    if constexpr (kLanes > 1) {
+        // The vehicle updates in rounds, every lane at one call site so the warp runs them together: lane 0 takes the
+        // cars that push or are pushed, in visit order; lanes 1.. take the apart cars (StagedVehicleApartMask), which then
+        // prestep there too. Lane 0 runs the world step after both, skipping those presteps.
+        const int stride = cfg.max_cars_per_env;
+        const int count = env_car_count[env_idx];
+        WorldSolverScratch& scratch = solver_scratch[env_idx];
+        apart_mask = rays_inline ? StagedVehicleApartMask(cfg, scratch, count) : scratch.vehicle_apart_mask;
+        updated_mask = static_cast<uint8_t>((1u << count) - 1u);
+        const unsigned env_lanes = ((1u << kLanes) - 1u) << (threadIdx.x & 31u & ~static_cast<unsigned>(kLanes - 1));
+        uint32_t mine = 0u;
+        if (lane != 0) {
+            int nth = 0;
+            for (uint32_t m = apart_mask; m != 0u; m &= m - 1u, ++nth) {
+                if (nth % (kLanes - 1) == lane - 1) {
+                    mine |= m & (0u - m);
+                }
+            }
+        }
+        const int n_apart = __popc(static_cast<unsigned>(apart_mask));
+        const int rounds = max(count - n_apart, (n_apart + kLanes - 2) / (kLanes - 1));
+        uint32_t pushed_cars_mask = 0u;
+        int k = 0;
+        uint32_t left = mine;
+        for (int r = 0; r < rounds; ++r) {
+            int slot = -1;
+            if (lane == 0) {
+                while (k < count) {
+                    const int i = CarVisitSlot(env_states[env_idx], k++, count);
+                    if (!((apart_mask >> i) & 1u)) {
+                        slot = i;
+                        break;
+                    }
+                }
+            } else if (left != 0u) {
+                slot = __ffs(static_cast<int>(left)) - 1;
+                left &= left - 1u;
+            }
+            if (slot >= 0) {
+                StepEnvVehicleUpdateCar(env_idx, slot, count, cfg, cars, wheel_runtime_states, car_configs, balls,
+                                        controls[env_idx * stride + slot], scratch.wheel_ray_stage, pushed_cars_mask);
+            }
+        }
+        for (uint32_t m = mine; m != 0u; m &= m - 1u) {
+            const int slot = __ffs(static_cast<int>(m)) - 1;
+            const int car_idx = env_idx * stride + slot;
+            WorldStepPrestepCar(cars[car_idx], car_configs[car_idx],
+                                wheel_runtime_states ? &wheel_runtime_states[car_idx] : nullptr, cfg.mutator,
+                                cfg.tick_dt / static_cast<float>(DebugWorldSubsteps()), scratch.pre_contact_cars[slot],
+                                scratch.deferred_linear_deltas[slot], scratch.deferred_angular_deltas[slot]);
+        }
+        __syncwarp(env_lanes);
+        if (lane != 0) {
             return;
         }
     }
@@ -618,10 +794,11 @@ ROCKETGPU_GLOBAL void StagedWorldKernel(
     accessor.controls = controls;
     accessor.base = env_idx * cfg.max_cars_per_env;
     // kWorldStepContacts runs only envs whose vehicle updates were not independent: kStepEnvPhasePost runs them
-    // without testing that again.
+    // without testing that again (their updates ran above).
     StepEnvGeneric(env_idx, cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls,
                    accessor, NoopEnvCommandAccessor{}, car_configs, balls, env_states, pads, nullptr, seed, 1, nullptr,
-                   kWorldPart == kWorldStepContacts ? kStepEnvPhasePost : kStepEnvPhasePostVehiclesDone, 0, kWorldPart);
+                   kWorldPart == kWorldStepContacts ? kStepEnvPhasePost : kStepEnvPhasePostVehiclesDone, 0, kWorldPart,
+                   apart_mask, updated_mask, kRegisterIterations);
 }
 
 // Grid-stride over car slots: each thread holds one GJK/EPA scratch from the pool.
@@ -1052,12 +1229,16 @@ inline void EnsureCudaStepStackLimit(bool step_kernel) {
         reinterpret_cast<const void*>(&StageCarWorldMeshCandidatesKernel),
         reinterpret_cast<const void*>(&CarWorldTriangleHitsKernel),
         reinterpret_cast<const void*>(&StagedCarPreKernel),
+        reinterpret_cast<const void*>(&StagedVehicleIndependenceKernel),
         reinterpret_cast<const void*>(&StagedWorldKernel<kWorldStepContacts>),
+        reinterpret_cast<const void*>(&StagedWorldKernel<kWorldStepContacts, kWorld1Lanes>),
         reinterpret_cast<const void*>(&StagedWorldKernel<kWorldStepContactsCarsApart>),
         reinterpret_cast<const void*>(&StagedWorldKernel<kWorldStepRowsCarsApart>),
+        reinterpret_cast<const void*>(&StagedWorldKernel<kWorldStepRowsCarsApart, 1, true>),
         reinterpret_cast<const void*>(&StagedCarPostKernel),
         reinterpret_cast<const void*>(&StagedEnvTailKernel),
         reinterpret_cast<const void*>(&StagedPadPostKernel),
+        reinterpret_cast<const void*>(&StagedPostFusedKernel),
         reinterpret_cast<const void*>(&StagedPadPreKernel),
         reinterpret_cast<const void*>(&StagedCarWorldRowsKernel),
         reinterpret_cast<const void*>(&StagedCarWorldRowsSplitKernel),
@@ -1305,6 +1486,70 @@ inline bool EnsureCarWorldStageArmed(const SimConfig& cfg, cudaStream_t stream) 
     }
     return true;
 }
+// ROCKETGPU_BALL_STAGE=0 turns World<3>'s ball-world stage off.
+inline bool UseBallWorldStage() {
+    static const bool on = [] {
+        const char* v = std::getenv("ROCKETGPU_BALL_STAGE");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+#if defined(ROCKETGPU_BALL_STAGE_CHECK)
+inline void BallStageCheckDump() {
+    unsigned long long c[9] = {};
+    cudaDeviceSynchronize();
+    cudaMemcpyFromSymbol(c, g_rocketgpu_ball_stage_counts, sizeof(c));
+    std::fprintf(stderr,
+                 "BALLSTAGE calls %llu unpublished %llu none %llu overflow %llu events %llu tick %llu pose %llu "
+                 "ready %llu content_mismatch %llu\n",
+                 c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8]);
+}
+#endif
+// The ball-world stage buffer (one BallWorldStage per env), published to the device; null when staging is off or
+// the buffer can't grow during a capture.
+inline BallWorldStage* EnsureBallWorldStageArmed(const SimConfig& cfg, cudaStream_t stream) {
+    struct Buffer {
+        BallWorldStage* data = nullptr;
+        size_t capacity = 0;
+        BallWorldStage* published = nullptr;
+    };
+    static Buffer b;
+    const size_t count = static_cast<size_t>(cfg.env_count);
+    if (!UseBallWorldStage() || count == 0) {
+        return nullptr;
+    }
+    const bool capturing = StreamIsCapturing(stream);
+    if (b.capacity < count) {
+        if (capturing) {
+            return nullptr;
+        }
+        CheckCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize(ball-world stage grow)");
+        if (b.data != nullptr) {
+            cudaFree(b.data);
+            b.data = nullptr;
+        }
+        CheckCuda(cudaMalloc(&b.data, count * sizeof(BallWorldStage)), "cudaMalloc(ball-world stage)");
+        CheckCuda(cudaMemset(b.data, 0, count * sizeof(BallWorldStage)), "cudaMemset(ball-world stage)");
+        b.capacity = count;
+        ++StepResourceEpoch();
+    }
+    if (b.published != b.data) {
+        if (capturing) {
+            return nullptr;
+        }
+        CheckCuda(cudaMemcpyToSymbolAsync(g_rocketgpu_ball_world_stage, &b.data, sizeof(b.data), 0,
+                                          cudaMemcpyHostToDevice, stream),
+                  "cudaMemcpyToSymbolAsync(g_rocketgpu_ball_world_stage)");
+        CheckCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize(ball-world stage publish)");
+        b.published = b.data;
+        ++StepResourceEpoch();
+#if defined(ROCKETGPU_BALL_STAGE_CHECK)
+        static const bool registered = (std::atexit(BallStageCheckDump), true);
+        (void)registered;
+#endif
+    }
+    return b.data;
+}
 // EPA slots leased by btEpaLease (bullet_gjk_epa2_port.hpp). A lease lasts one EPA run, so the slots only need to
 // cover the threads in EPA at the same moment; a thread that finds them all busy waits for one to free.
 constexpr unsigned int kEpaScratchSlots = 8192;
@@ -1517,6 +1762,40 @@ inline void LaunchStageWheelRays(
 }
 
 constexpr int kStagedBlockSize = 64;
+// RTX 5090, lanes on vs off: 1k 3v3 +2.8/+3.2%, 2k 3v3 +1.3/+2.5%, 4k 2v2 +0.5/+2.0%, 8k 3v3 +0.3/-0.1%, 16k 3v3
+// +0.9/-2.0%; training mix 1k +2.1%, 4k +0.2/+0.3%, 8k +0.3/+0.3%, 16k +0.5/+0.7%, 32k -0.4%; 65k 1v1 -0.4%.
+constexpr int kWorld1LanesMaxEnvs = 16384;
+inline bool UseWorld1Lanes(const SimConfig& cfg) {
+    static const int forced = [] {
+        const char* v = std::getenv("ROCKETGPU_WORLD1_LANES");
+        return v == nullptr ? -1 : (std::atoi(v) != 0 ? 1 : 0);
+    }();
+    return forced >= 0 ? forced != 0 : cfg.env_count <= kWorld1LanesMaxEnvs;
+}
+// Whether StagedCarPreKernel and the contacts kernels test the envs' staged ray flags themselves (rays_inline) instead
+// of StagedVehicleIndependenceKernel, up to kRaysInlineMaxEnvs envs in the batch (ROCKETGPU_RAYS_INLINE=0/1 forces it).
+// RTX 5090, inline vs the kernel: 1k 1v1 +0.5/+1.3%, 1k 3v3 +0.3/+0.4%, training mix 1k +0.3/+0.6%, 4k 2v2 +1.4/+0.9%;
+// 8k 3v3 -1.3/-1.4%.
+constexpr int kRaysInlineMaxEnvs = 4096;
+inline bool UseRaysInline(const SimConfig& cfg) {
+    static const int forced = [] {
+        const char* v = std::getenv("ROCKETGPU_RAYS_INLINE");
+        return v == nullptr ? -1 : (std::atoi(v) != 0 ? 1 : 0);
+    }();
+    return forced >= 0 ? forced != 0 : cfg.env_count <= kRaysInlineMaxEnvs;
+}
+// Whether StagedWorldKernel<kWorldStepRowsCarsApart> solves world-only rows from registers
+// (SolveUnifiedVelocityContactRows), up to kRegisterIterationsMaxEnvs envs in the batch (ROCKETGPU_REG_ITER=0/1 forces
+// it). Both forms give the same bits. RTX 5090, registers vs not (kRegRows 3): 1k 1v1 +1.5/+1.3/+1.2%, 1k 3v3 -0.2/0.0%,
+// training mix 1k +2.2% (median of 5), 4k 2v2 -0.2/-0.1%; 8k 3v3 -0.9/-1.0%, mix 8k -0.4%.
+constexpr int kRegisterIterationsMaxEnvs = 4096;
+inline bool UseRegisterIterations(const SimConfig& cfg) {
+    static const int forced = [] {
+        const char* v = std::getenv("ROCKETGPU_REG_ITER");
+        return v == nullptr ? -1 : (std::atoi(v) != 0 ? 1 : 0);
+    }();
+    return forced >= 0 ? forced != 0 : cfg.env_count <= kRegisterIterationsMaxEnvs;
+}
 inline bool UseStagedConcurrency() {
     static const bool concurrent = [] {
         const char* v = std::getenv("ROCKETGPU_STAGED_CONCURRENT");
@@ -1524,11 +1803,23 @@ inline bool UseStagedConcurrency() {
     }();
     return concurrent;
 }
+// Whether the step ends with StagedPostFusedKernel instead of the three post kernels, up to kPostFusedMaxEnvs envs in
+// the batch (ROCKETGPU_POST_FUSED=0/1 forces it). RTX 5090, fused vs not: 1k 1v1 +0.3/+1.4%, 1k 3v3 +1.0/+0.3%,
+// training mix 1k +0.4/-0.2%; 8k 3v3 -1.3/-0.9% (a block of 8 whole envs leaves CarPost's threads idle).
+constexpr int kPostFusedMaxEnvs = 2048;
+inline bool UsePostFused(const SimConfig& cfg) {
+    static const int forced = [] {
+        const char* v = std::getenv("ROCKETGPU_POST_FUSED");
+        return v == nullptr ? -1 : (std::atoi(v) != 0 ? 1 : 0);
+    }();
+    return forced >= 0 ? forced != 0 : cfg.env_count <= kPostFusedMaxEnvs;
+}
 // Side streams and fork/join events of the staged step's concurrent branches (created once, kept for the process,
 // used under StepResourcesGuard).
 struct StagedStreams {
     cudaStream_t stage = nullptr;
     cudaStream_t dependent = nullptr;
+    cudaStream_t ball = nullptr;
     cudaEvent_t pre_done = nullptr;
     cudaEvent_t prefilter_done = nullptr;
     cudaEvent_t stage_done = nullptr;
@@ -1536,13 +1827,15 @@ struct StagedStreams {
     cudaEvent_t dependent_done = nullptr;
     cudaEvent_t rows_split_done = nullptr;
     cudaEvent_t rows_light_done = nullptr;
+    cudaEvent_t ball_done = nullptr;
 };
 inline StagedStreams MakeStagedStreams() {
     StagedStreams s;
     CheckCuda(cudaStreamCreateWithFlags(&s.stage, cudaStreamNonBlocking), "cudaStreamCreate(staged stage)");
     CheckCuda(cudaStreamCreateWithFlags(&s.dependent, cudaStreamNonBlocking), "cudaStreamCreate(staged dependent)");
+    CheckCuda(cudaStreamCreateWithFlags(&s.ball, cudaStreamNonBlocking), "cudaStreamCreate(staged ball)");
     for (cudaEvent_t* e : {&s.pre_done, &s.prefilter_done, &s.stage_done, &s.independence_done, &s.dependent_done,
-                          &s.rows_split_done, &s.rows_light_done}) {
+                          &s.rows_split_done, &s.rows_light_done, &s.ball_done}) {
         CheckCuda(cudaEventCreateWithFlags(e, cudaEventDisableTiming), "cudaEventCreate(staged)");
     }
     return s;
@@ -1566,18 +1859,15 @@ inline bool UseCarWorldRowsSplit() {
     return split;
 }
 // The staged step (kernels per phase, car-world staging and the contacts on concurrent branches) unless
-// ROCKETGPU_STAGED_STEP says otherwise. The one-kernel step wins only with many envs of at most two cars (RTX 5090,
-// M arena-ticks/s, staged vs one-kernel: 1v1 16.3 vs 15.8 at 65k envs, 17.1 vs 17.6 at 82k, 17.1 vs 17.5 at 98k,
-// 17.1 vs 17.7 at 131k; 1v1 in six-car slots 14.5 vs 14.3 at 32k, 13.9 vs 13.6 at 65k; 3v3 6.8 vs 6.0 at 32k,
-// 6.8 vs 5.3 at 49k, 6.8 vs 5.7 at 65k, 6.8 vs 5.7 at 98k; training mix of 1v1/2v2/3v3 in six-car slots 7.3 vs 4.9 at 8k, 9.9 vs 9.0 at 32k,
-// 10.3 vs 9.9 at 65k).
-constexpr int kStagedStepMaxTwoCarEnvs = 65536;
-inline bool UseStagedStep(const SimConfig& cfg) {
-    static const int forced = [] {
+// ROCKETGPU_STAGED_STEP=0 asks for the one-kernel step, which loses at every measured size since the env groups run in
+// waves (RTX 5090, M arena-ticks/s, staged vs one-kernel, 1v1: 31.1 vs 18.1 at 65k envs, 31.1 vs 18.9 at 98k,
+// 31.0 vs 19.4 at 131k).
+inline bool UseStagedStep(const SimConfig&) {
+    static const bool staged = [] {
         const char* v = std::getenv("ROCKETGPU_STAGED_STEP");
-        return v == nullptr ? -1 : (std::atoi(v) != 0 ? 1 : 0);
+        return v == nullptr || std::atoi(v) != 0;
     }();
-    return forced >= 0 ? forced != 0 : (cfg.max_cars_per_env > 2 || cfg.env_count <= kStagedStepMaxTwoCarEnvs);
+    return staged;
 }
 
 // Env groups: the staged step splits the envs into G contiguous groups that run
@@ -1586,6 +1876,7 @@ inline bool UseStagedStep(const SimConfig& cfg) {
 // through SimConfig::env_step_order (its slice of the config's order, or of an identity order) and takes a share of
 // the staging lists, counters and GJK/EPA scratch. Created once, kept for the process, used under StepResourcesGuard.
 constexpr int kLiveEnvsMax = 32768;  // envs of the env groups running at once (see the group waves)
+constexpr long long kInterleaveFullCarsMax = 65536;  // full batches up to this many cars interleave their env groups
 struct StagedEnvGroups {
     int groups = 0;
     int capacity = 0;            // envs the identity order covers
@@ -1643,8 +1934,14 @@ inline int StagedEnvGroupCount(const SimConfig& cfg, cudaStream_t stream) {
         const long long slots = static_cast<long long>(cfg.env_count) * cfg.max_cars_per_env;
         const long long cars = cfg.env_car_total > 0 ? cfg.env_car_total : slots;
         const long long per = cars < slots ? cfg.env_count / 1024 : cars / 8192;
+        // At most 8 groups, or groups of 8,192+ envs: past 65k envs the groups run in waves (see kLiveEnvsMax), and
+        // waves of 8,192-env groups win (1v1 at 98k envs, 12 groups vs 8: 31.1 vs 28.2; 131k, 16 vs 8: 31.0 vs 28.3).
+        int cap = 8;
+        while (cap * 8192ll < cfg.env_count) {
+            cap *= 2;
+        }
         wanted = 1;
-        while (wanted < 8 && wanted * 2 <= per) {
+        while (wanted < cap && wanted * 2 <= per) {
             wanted *= 2;
         }
     }
@@ -1756,6 +2053,8 @@ inline void LaunchStepTicksDirect(
     bullet_port::btGjkEpaScratch* const staged_gjk_pool =
         (UseStagedStep(cfg) && !cfg.mutator.physics_events.HasNonGoalEvents()) ? EnsureGjkScratchPool(CarWorldStagingThreads(), stream) : nullptr;
     if (staged_gjk_pool != nullptr) {
+      // World<3>'s ball-world stage (on its own side branch, so only with concurrency).
+      BallWorldStage* const ball_stages = UseStagedConcurrency() ? EnsureBallWorldStageArmed(cfg, stream) : nullptr;
       // Spread kernels size their blocks by the busy threads of all env groups, which share the GPU: every env, and
       // the cars BatchSim counted (else every car slot).
       const int spread_env_bs = SpreadBlockSize(cfg.env_count);
@@ -1765,8 +2064,20 @@ inline void LaunchStepTicksDirect(
       const long long all_cars =
           cfg.env_car_total > 0 ? cfg.env_car_total : static_cast<long long>(cfg.env_count) * cfg.max_cars_per_env;
       const int spread_car_bs = SpreadBlockSize(all_cars);
-      // The full rows list holds the cars with a mesh in reach, about one in five.
-      const int spread_rows_full_bs = SpreadBlockSize(all_cars / 4);
+      // StagedWorldKernel<kWorldStepContactsCarsApart>: a warp runs the union of its envs' contact paths, which grow
+      // with the cars per env, so envs averaging 4+ cars keep blocks of at most 16. RTX 5090, M arena-ticks/s by block
+      // size 8/16/32/64: 3k 3v3 5.75/5.74/5.55/5.47, 4k 3v3 6.81/6.76/6.55/6.50, 6k 3v3 8.36/8.46/8.23/8.21, 8k 3v3
+      // 9.25/9.40/9.23/9.21, 4k 2v2 8.60/8.76/8.58/8.49; 1v1 keeps the spread rule (4k 12.11/12.62/12.76/12.74).
+      const int world3_bs = all_cars >= 4ll * cfg.env_count ? std::min(spread_env_bs, 16) : spread_env_bs;
+      // The full rows list holds the cars with a mesh in reach, about one in five. It is tail-bound (its slowest warp,
+      // whose touching cars serialize their contact paths), so it spreads over twice the SMs that count would take:
+      // RTX 5090, M arena-ticks/s by block size, 8/16/32/64: 1k 3v3 2.86/2.85/2.83/2.81, 2k 3v3 4.54/4.56/4.55/4.54,
+      // 4k 2v2 8.61/8.66/8.62/8.58, 8k 3v3 9.33/9.32/9.34/9.32; 1k 1v1 8 4.43, 16 4.40.
+      const int spread_rows_full_bs = SpreadBlockSize(all_cars / 8);
+      const int world1_lanes = UseWorld1Lanes(cfg) ? kWorld1Lanes : 1;
+      const bool post_fused = UsePostFused(cfg);
+      const bool rays_inline = UseRaysInline(cfg);
+      const bool register_iterations = UseRegisterIterations(cfg);
       // The tick loop of an env group (all envs, or a share of them on its own streams; see StagedEnvGroupCount).
       const auto run_group = [&](const SimConfig& cfg, StagedStreams& side, cudaStream_t stream,
                                  const CarWorldStageSlice* slice) {
@@ -1780,10 +2091,10 @@ inline void LaunchStepTicksDirect(
         };
         const Shape car_pre = shape(kBlockCarPre, car_slots, spread_car_bs);
         const Shape car_post = shape(kBlockCarPost, car_slots, spread_car_bs);
-        const Shape world1 = shape(kBlockWorld1, cfg.env_count, spread_env_bs);
-        const Shape world3 = shape(kBlockWorld3, cfg.env_count, spread_env_bs);
-        const Shape world4 = shape(kBlockWorld4, cfg.env_count, world4_bs);
         const Shape env_k = shape(kBlockEnv, cfg.env_count, spread_env_bs);
+        const Shape world1 = shape(kBlockWorld1, static_cast<long long>(cfg.env_count) * world1_lanes, spread_env_bs * world1_lanes);
+        const Shape world3 = shape(kBlockWorld3, cfg.env_count, world3_bs);
+        const Shape world4 = shape(kBlockWorld4, cfg.env_count, world4_bs);
         const Shape env_tail = shape(kBlockEnv, static_cast<long long>(cfg.env_count) * kEnvTailLanes, spread_tail_bs);
         const Shape rows_split = shape(kBlockRowsSplit, car_slots);
         const Shape rows_light = shape(kBlockRowsLight, car_slots);
@@ -1826,6 +2137,12 @@ inline void LaunchStepTicksDirect(
                 StagedPadPreKernel<<<pad_pre.blocks, pad_pre.threads, 0, stage_stream>>>(cfg, env_car_count, pads);
                 CheckCuda(cudaGetLastError(), "StagedPadPreKernel launch");
             }
+            if (concurrent && ball_stages != nullptr) {
+                CheckCuda(cudaStreamWaitEvent(side.ball, side.pre_done, 0), "cudaStreamWaitEvent(ball stage)");
+                StagedBallWorldKernel<<<env_k.blocks, env_k.threads, 0, side.ball>>>(cfg, balls, env_states, ball_stages);
+                CheckCuda(cudaGetLastError(), "StagedBallWorldKernel launch");
+                CheckCuda(cudaEventRecord(side.ball_done, side.ball), "cudaEventRecord(ball stage)");
+            }
             if (concurrent) {
                 LaunchStageCarWorldMeshCandidates(cfg, cars, car_configs, env_car_count, stage_stream, side.prefilter_done, slice);
                 CheckCuda(cudaEventRecord(side.stage_done, stage_stream), "cudaEventRecord(stage)");
@@ -1835,27 +2152,38 @@ inline void LaunchStepTicksDirect(
             if (!concurrent) {
                 LaunchStageCarWorldMeshCandidates(cfg, cars, car_configs, env_car_count, stream, nullptr, slice);
             }
-            StagedVehicleIndependenceKernel<<<env_k.blocks, env_k.threads, 0, stream>>>(cfg, env_car_count, solver_scratch);
-            CheckCuda(cudaGetLastError(), "StagedVehicleIndependenceKernel launch");
+            if (!rays_inline) {
+                StagedVehicleIndependenceKernel<<<env_k.blocks, env_k.threads, 0, stream>>>(cfg, env_car_count, solver_scratch);
+                CheckCuda(cudaGetLastError(), "StagedVehicleIndependenceKernel launch");
+            }
             if (concurrent) {
                 CheckCuda(cudaEventRecord(side.independence_done, stream), "cudaEventRecord(independence)");
                 CheckCuda(cudaStreamWaitEvent(dep_stream, side.independence_done, 0), "cudaStreamWaitEvent(dependent)");
                 CheckCuda(cudaStreamWaitEvent(dep_stream, side.prefilter_done, 0), "cudaStreamWaitEvent(dependent prefilter)");
             }
             StagedCarPreKernel<<<car_pre.blocks, car_pre.threads, 0, stream>>>(
-                cfg, env_car_count, cars, wheel_runtime_states, solver_scratch, controls, car_configs, balls);
+                cfg, env_car_count, cars, wheel_runtime_states, solver_scratch, controls, car_configs, balls, rays_inline);
             CheckCuda(cudaGetLastError(), "StagedCarPreKernel launch");
-            StagedWorldKernel<kWorldStepContacts><<<world1.blocks, world1.threads, 0, dep_stream>>>(
-                cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls, car_configs,
-                balls, env_states, pads, seed);
+            if (world1_lanes > 1) {
+                StagedWorldKernel<kWorldStepContacts, kWorld1Lanes><<<world1.blocks, world1.threads, 0, dep_stream>>>(
+                    cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls, car_configs,
+                    balls, env_states, pads, seed, rays_inline);
+            } else {
+                StagedWorldKernel<kWorldStepContacts><<<world1.blocks, world1.threads, 0, dep_stream>>>(
+                    cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls, car_configs,
+                    balls, env_states, pads, seed, rays_inline);
+            }
             CheckCuda(cudaGetLastError(), "StagedWorldKernel contacts launch");
             if (concurrent) {
                 CheckCuda(cudaEventRecord(side.dependent_done, dep_stream), "cudaEventRecord(dependent)");
                 CheckCuda(cudaStreamWaitEvent(stream, side.prefilter_done, 0), "cudaStreamWaitEvent(prefilter)");
+                if (ball_stages != nullptr) {
+                    CheckCuda(cudaStreamWaitEvent(stream, side.ball_done, 0), "cudaStreamWaitEvent(ball stage)");
+                }
             }
             StagedWorldKernel<kWorldStepContactsCarsApart><<<world3.blocks, world3.threads, 0, stream>>>(
                 cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls, car_configs,
-                balls, env_states, pads, seed);
+                balls, env_states, pads, seed, rays_inline);
             CheckCuda(cudaGetLastError(), "StagedWorldKernel contacts (cars apart) launch");
             if (concurrent) {
                 CheckCuda(cudaStreamWaitEvent(stream, side.dependent_done, 0), "cudaStreamWaitEvent(join dependent)");
@@ -1890,10 +2218,24 @@ inline void LaunchStepTicksDirect(
                     cfg, env_car_count, cars, car_configs, solver_scratch, row_pool, rows_gjk_pool);
                 CheckCuda(cudaGetLastError(), "StagedCarWorldRowsKernel launch");
             }
-            StagedWorldKernel<kWorldStepRowsCarsApart><<<world4.blocks, world4.threads, 0, stream>>>(
-                cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls, car_configs,
-                balls, env_states, pads, seed);
+            if (register_iterations) {
+                StagedWorldKernel<kWorldStepRowsCarsApart, 1, true><<<world4.blocks, world4.threads, 0, stream>>>(
+                    cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls,
+                    car_configs, balls, env_states, pads, seed);
+            } else {
+                StagedWorldKernel<kWorldStepRowsCarsApart><<<world4.blocks, world4.threads, 0, stream>>>(
+                    cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls,
+                    car_configs, balls, env_states, pads, seed);
+            }
             CheckCuda(cudaGetLastError(), "StagedWorldKernel rows launch");
+            if (post_fused) {
+                // The env tail's shape: kEnvTailLanes threads per env, blocks a multiple of them.
+                StagedPostFusedKernel<<<env_tail.blocks, env_tail.threads, 0, stream>>>(
+                    cfg, env_car_count, cars, wheel_runtime_states, solver_scratch, controls, car_configs, balls,
+                    env_states, pads, pads_apart, static_cast<int>(env_tail.threads) / kEnvTailLanes);
+                CheckCuda(cudaGetLastError(), "StagedPostFusedKernel launch");
+                continue;
+            }
             StagedCarPostKernel<<<car_post.blocks, car_post.threads, 0, stream>>>(
                 cfg, env_car_count, cars, wheel_runtime_states, solver_scratch, controls, car_configs);
             CheckCuda(cudaGetLastError(), "StagedCarPostKernel launch");
@@ -1919,7 +2261,9 @@ inline void LaunchStepTicksDirect(
         // In a mixed-size batch (envs sorted by car count) of 2+ groups, each group takes every groups-th env of the
         // step order, so every group carries the same mix of sizes; contiguous slices give one group all the largest
         // envs (README training mix, us/tick contiguous vs interleaved: 8k G=2 818 vs 805, G=4 782 vs 772, G=8 834 vs
-        // 760). ROCKETGPU_GROUP_INTERLEAVE=0/1 forces it.
+        // 760). Full batches of up to 65,536 cars interleave too: the groups' tick costs even out, so they reach the
+        // step's join together (M arena-ticks/s contiguous vs interleaved: 8k 3v3 9.42 vs 9.66, 16k 2v2 15.7 vs 16.5);
+        // past that the spread-out working sets lose L2 (32k 3v3 10.5 vs 9.8). ROCKETGPU_GROUP_INTERLEAVE=0/1 forces it.
         static const int forced_interleave = [] {
             const char* v = std::getenv("ROCKETGPU_GROUP_INTERLEAVE");
             return v == nullptr ? -1 : (std::atoi(v) != 0 ? 1 : 0);
@@ -1927,7 +2271,8 @@ inline void LaunchStepTicksDirect(
         const bool interleave =
             forced_interleave >= 0 ? forced_interleave != 0
                                    : groups >= 2 && cfg.env_car_total > 0 &&
-                                         cfg.env_car_total < static_cast<long long>(cfg.env_count) * cfg.max_cars_per_env;
+                                         (cfg.env_car_total < static_cast<long long>(cfg.env_count) * cfg.max_cars_per_env ||
+                                          cfg.env_car_total <= kInterleaveFullCarsMax);
         if (interleave) {
             InterleaveGroupsKernel<<<(cfg.env_count + 255) / 256, 256, 0, stream>>>(cfg.env_step_order, eg.split,
                                                                                     cfg.env_count, groups);
@@ -1943,7 +2288,11 @@ inline void LaunchStepTicksDirect(
             const char* v = std::getenv("ROCKETGPU_GROUP_CONCURRENT");
             return v == nullptr ? -1 : std::max(0, std::atoi(v));
         }();
-        const int live = forced_live >= 0 ? forced_live : std::max(1, kLiveEnvsMax / per_group);
+        // Waves of equal size: as few as fit kLiveEnvsMax, then their groups spread evenly (49k 1v1, 8 groups: 4 + 4
+        // live 30.6, 5 + 3 30.0, all 29.1).
+        const int fit = std::max(1, kLiveEnvsMax / per_group);
+        const int waves = (groups + fit - 1) / fit;
+        const int live = forced_live >= 0 ? forced_live : (groups + waves - 1) / waves;
         CheckCuda(cudaEventRecord(eg.fork, stream), "cudaEventRecord(env groups fork)");
         int interleaved_first = 0;
         for (int g = 0; g < groups; ++g) {

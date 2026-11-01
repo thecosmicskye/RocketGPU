@@ -467,8 +467,15 @@ ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
     const Vec3 rel_contact = row_rel_contact_bt * kBTToUU;
     if (split_rows && split_row_count < kMaxCarWorldSplitContactRows) {
         CarWorldSplitContactRow& split_row = split_rows[split_row_count];
-        const Vec3 split_angular_bt_native = CarWorldContactAngularComponentBtNative(
-            car, cfg, mutator.car_mass, row_rel_contact_bt, inward_normal);
+        // InitializeCarWorldSplitContactRow reads its angular inputs only past its own penetration/dt guard, which
+        // nearly every row fails: compute them only then.
+        Vec3 split_angular_bt_native(0.0f, 0.0f, 0.0f);
+        Vec3 split_angular(0.0f, 0.0f, 0.0f);
+        if (!(penetration <= 0.0f || dt <= 0.0f)) {
+            split_angular_bt_native = CarWorldContactAngularComponentBtNative(
+                car, cfg, mutator.car_mass, row_rel_contact_bt, inward_normal);
+            split_angular = ApplyInverseBodyInertiaWorld(car, cfg, mutator.car_mass, Cross(rel_contact, inward_normal));
+        }
 
         const float plane_split_pen_bt = -emit_distance_bt[emit_idx];
         InitializeCarWorldSplitContactRow(
@@ -477,7 +484,7 @@ ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
             inward_normal,
             1.0f / mutator.car_mass,
             rel_contact,
-            ApplyInverseBodyInertiaWorld(car, cfg, mutator.car_mass, Cross(rel_contact, inward_normal)),
+            split_angular,
             dt,
             &row_rel_contact_bt,
             &split_angular_bt_native,
@@ -1304,8 +1311,15 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
 
             if (split_rows && split_row_count < kMaxCarWorldSplitContactRows) {
                 CarWorldSplitContactRow& split_row = split_rows[split_row_count];
-                const Vec3 mesh_split_angular_bt_native = CarWorldContactAngularComponentBtNative(
-                    car, cfg, mutator.car_mass, candidate.rel_contact_bt, candidate.normal);
+                // As for plane rows: the angular inputs are read only past the callee's penetration/dt guard.
+                Vec3 mesh_split_angular_bt_native(0.0f, 0.0f, 0.0f);
+                Vec3 mesh_split_angular(0.0f, 0.0f, 0.0f);
+                if (!(penetration_uu <= 0.0f || dt <= 0.0f)) {
+                    mesh_split_angular_bt_native = CarWorldContactAngularComponentBtNative(
+                        car, cfg, mutator.car_mass, candidate.rel_contact_bt, candidate.normal);
+                    mesh_split_angular = ApplyInverseBodyInertiaWorld(
+                        car, cfg, mutator.car_mass, Cross(candidate.rel_contact, candidate.normal));
+                }
                 const float mesh_split_pen_bt = -candidate.distance_bt;
                 InitializeCarWorldSplitContactRow(
                     split_row,
@@ -1313,7 +1327,7 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
                     candidate.normal,
                     1.0f / mutator.car_mass,
                     candidate.rel_contact,
-                    ApplyInverseBodyInertiaWorld(car, cfg, mutator.car_mass, Cross(candidate.rel_contact, candidate.normal)),
+                    mesh_split_angular,
                     dt,
                     &candidate.rel_contact_bt,
                     &mesh_split_angular_bt_native,

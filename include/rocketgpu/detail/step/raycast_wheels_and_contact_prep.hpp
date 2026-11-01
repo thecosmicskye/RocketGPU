@@ -661,13 +661,13 @@ ROCKETGPU_HD void ApplyAutoRollReference(
     const Vec3 autoroll_force_bt = ground_down_dir * 100.0f * UnitsUUToBT() * mutator.car_mass;
     const Vec3 autoroll_torque = torque * 80.0f;
     if (wheel_runtime_state) {
-        QueueCentralForce(wheel_runtime_state, autoroll_force_bt);
+        QueueCentralForce(wheel_runtime_state, autoroll_force_bt, frame);
         QueueAngularAccelWorld(wheel_runtime_state, car, cfg, mutator.car_mass, autoroll_torque, frame);
 
         Vec3 ar_i0, ar_i1, ar_i2;
         BuildInertiaTensorWorldBtInverse(frame, car, cfg, mutator.car_mass, ar_i0, ar_i1, ar_i2);
         const Vec3 official_torque_bt = Mul3x3Vec(ar_i0, ar_i1, ar_i2, torque) * 80.0f;
-        QueueOfficialTorqueBt(wheel_runtime_state, official_torque_bt);
+        QueueOfficialTorqueBt(wheel_runtime_state, official_torque_bt, frame);
     } else {
         const Vec3 autoroll_force = autoroll_force_bt * UnitsBTToUU();
         ApplyCentralForce(car, mutator.car_mass, autoroll_force, dt);
@@ -1642,7 +1642,7 @@ ROCKETGPU_HD int PreTickVehicleDynamics(
             }
             const Vec3 sticky_force_bt =
                 upwards_dir * sticky_force_scale * (-Abs(mutator.gravity_z) * UnitsUUToBT()) * mutator.car_mass;
-            QueueCentralForce(wheel_runtime_state, sticky_force_bt);
+            QueueCentralForce(wheel_runtime_state, sticky_force_bt, frame);
         }
     } else {
     bool sticky_block = wheels_have_world_contact || sticky_prev_contact;
@@ -1670,7 +1670,7 @@ ROCKETGPU_HD int PreTickVehicleDynamics(
             upwards_dir * sticky_force_scale * (mutator.gravity_z * UnitsUUToBT()) * mutator.car_mass;
         if (!apply_sticky) {
         } else if (wheel_runtime_state) {
-            QueueCentralForce(wheel_runtime_state, sticky_force_bt);
+            QueueCentralForce(wheel_runtime_state, sticky_force_bt, frame);
         } else {
             const Vec3 sticky_force = sticky_force_bt * UnitsBTToUU();
             ApplyCentralForce(car, mutator.car_mass, sticky_force, dt);
@@ -1780,7 +1780,7 @@ ROCKETGPU_HD void ApplyAirControl(
             Vec3 ac_i0, ac_i1, ac_i2;
             BuildInertiaTensorWorldBtInverse(frame, car, cfg, mutator.car_mass, ac_i0, ac_i1, ac_i2);
             QueueOfficialTorqueBt(wheel_runtime_state,
-                Mul3x3Vec(ac_i0, ac_i1, ac_i2, torque_world - damping_world) * CarTorqueScale());
+                Mul3x3Vec(ac_i0, ac_i1, ac_i2, torque_world - damping_world) * CarTorqueScale(), frame);
         } else {
             ApplyAngularAccelWorld(car, air_control_torque, dt);
         }
@@ -1797,7 +1797,7 @@ ROCKETGPU_HD void ApplyAirControl(
         const Vec3 air_throttle_force_bt =
             throttle_fwd * air_throttle_input * mutator.car_air_throttle_accel * UnitsUUToBT() * mutator.car_mass;
         if (wheel_runtime_state) {
-            QueueCentralForce(wheel_runtime_state, air_throttle_force_bt);
+            QueueCentralForce(wheel_runtime_state, air_throttle_force_bt, frame);
         } else {
             const Vec3 air_throttle_force = air_throttle_force_bt * UnitsBTToUU();
             ApplyCentralForce(car, mutator.car_mass, air_throttle_force, dt);
@@ -1831,7 +1831,7 @@ ROCKETGPU_HD void ApplyBoost(
             const float accel = mutator.boost_accel_ground;
             const Vec3 boost_force_bt = accel * UnitsUUToBT() * boost_fwd * mutator.car_mass;
             if (wheel_runtime_state) {
-                QueueCentralForce(wheel_runtime_state, boost_force_bt);
+                QueueCentralForce(wheel_runtime_state, boost_force_bt, frame);
             } else {
                 ApplyCentralForce(car, mutator.car_mass, boost_force_bt * UnitsBTToUU(), dt);
             }
@@ -1872,7 +1872,7 @@ ROCKETGPU_HD void ApplyBoost(
         const float boost_accel_bt = accel * UnitsUUToBT();
         const Vec3 boost_force_bt = boost_accel_bt * forward * mutator.car_mass;
         if (wheel_runtime_state) {
-            QueueCentralForce(wheel_runtime_state, boost_force_bt);
+            QueueCentralForce(wheel_runtime_state, boost_force_bt, frame);
         } else {
             const Vec3 boost_force = boost_force_bt * UnitsBTToUU();
             ApplyCentralForce(car, mutator.car_mass, boost_force, dt);
@@ -1954,7 +1954,7 @@ ROCKETGPU_HD void ContinueJump(
             (total_jump_force.z * UnitsUUToBT()) * mutator.car_mass);
 
         if (wheel_runtime_state) {
-            QueueCentralForce(wheel_runtime_state, jump_force_bt);
+            QueueCentralForce(wheel_runtime_state, jump_force_bt, frame);
         } else {
             const Vec3 jump_force = jump_force_bt * UnitsBTToUU();
             ApplyCentralForce(car, mutator.car_mass, jump_force, dt);
@@ -2009,7 +2009,7 @@ ROCKETGPU_HD void ApplyFlipTorque(
         const Vec3 basis_row2(dg_f.z, dg_r.z, dg_u.z);
         Vec3 dg_m0, dg_m1, dg_m2;
         MatMul3x3BulletStyle(dg_i0, dg_i1, dg_i2, basis_row0, basis_row1, basis_row2, dg_m0, dg_m1, dg_m2);
-        QueueOfficialTorqueBt(wheel_runtime_state, Mul3x3Vec(dg_m0, dg_m1, dg_m2, dodge_torque_local));
+        QueueOfficialTorqueBt(wheel_runtime_state, Mul3x3Vec(dg_m0, dg_m1, dg_m2, dodge_torque_local), frame);
     } else {
         ApplyAngularAccelWorld(car, dodge_torque_world, dt);
     }

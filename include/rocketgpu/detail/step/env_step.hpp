@@ -156,19 +156,10 @@ ROCKETGPU_HD bool CarCarCentersBeyondBoundingSpheres(const Vec3& pos_a, const Ve
 }
 
 // ResolveCarCarCollision with a retained manifold returns at the ccm gate, after only clearing the pair's cached
-// contact, for a live pair whose retained manifold is empty and whose centers are the bounding-sphere sum apart.
-ROCKETGPU_HD bool CarCarPairRejectedByCcmGate(
-    const CarState& a, const CarState& b, const CarConfig& cfg_a, const CarConfig& cfg_b,
-    const CarCarRetainedManifold& retained) {
-    if (a.is_demoed || b.is_demoed || a.just_respawned || b.just_respawned || retained.count > 0) {
-        return false;
-    }
-    return CarCarCentersBeyondBoundingSpheres(a.pos, b.pos, BoundingSphereRadius(cfg_a), BoundingSphereRadius(cfg_b));
-}
-
-// CarCarPairRejectedByCcmGate for every pair of the first 8 cars at once, as bit CarCarRetainedSlot(lo, hi)
-// (a = hi, b = lo, as the pair loop calls it). All loads are independent, so they overlap instead of costing a memory
-// round trip per pair; valid until a pair's ResolveCarCarCollision runs.
+// contact, for a live pair whose retained manifold is empty and whose centers are the bounding-sphere sum apart. This
+// is that gate for every pair of the first 8 cars at once, as bit CarCarRetainedSlot(lo, hi) (a = hi, b = lo, as the
+// pair loop calls it). All loads are independent, so they overlap instead of costing a memory round trip per pair;
+// valid until a pair's ResolveCarCarCollision runs.
 ROCKETGPU_HD void CarCarCcmGateMasks(
     int count, const CarState* cars, const CarConfig* car_configs, const CarCarRetainedManifold* retained,
     uint32_t& reject_slots) {
@@ -1524,9 +1515,7 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
         const Vec3 basis_right = car.basis_right;
         const Vec3 basis_up = car.basis_up;
         const auto basis_authoritative = car.basis_authoritative;
-        wheel_runtime_state->accumulated_force = Vec3(0.0f, 0.0f, 0.0f);
-        wheel_runtime_state->accumulated_ang_accel = Vec3(0.0f, 0.0f, 0.0f);
-        wheel_runtime_state->accumulated_torque_bt = Vec3(0.0f, 0.0f, 0.0f);
+        car_frame.queue_forces = true;
         wheel_runtime_state->pre_solve_rot = rot;
         wheel_runtime_state->pre_solve_basis_forward = basis_forward;
         wheel_runtime_state->pre_solve_basis_right = basis_right;
@@ -1788,6 +1777,9 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     }
     ApplyBoost(car, controls, mutator, dt, wheel_runtime_state, frame);
     if (wheel_runtime_state) {
+        wheel_runtime_state->accumulated_force = car_frame.queued_force;
+        wheel_runtime_state->accumulated_ang_accel = car_frame.queued_ang_accel;
+        wheel_runtime_state->accumulated_torque_bt = car_frame.queued_torque_bt;
         wheel_runtime_state->solver_time_step = dt;
         if (env_idx >= 0 && self_car_idx >= 0) {
             int selected = -1;
@@ -2115,7 +2107,14 @@ ROCKETGPU_HD void WorldStepFinishCar(
     IntegrateCarTransformOnly(car, sub_dt, mutator.game_mode == static_cast<uint8_t>(Mode::Soccar), NativeSseMath(mutator));
 }
 
-ROCKETGPU_HD void WorldStepSoccar(
+// Inlined into each staged world kernel on the device: its world_part is then a constant there (the other parts compile
+// out), and the call's callee-saved register save/restore (local memory) goes away.
+#if defined(__CUDA_ARCH__)
+#define ROCKETGPU_WORLD_STEP_INLINE __attribute__((always_inline))
+#else
+#define ROCKETGPU_WORLD_STEP_INLINE
+#endif
+ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
     int env_idx,
     int base,
     int count,
@@ -2142,7 +2141,9 @@ ROCKETGPU_HD void WorldStepSoccar(
     const ArenaMeshBvhSubtreeInfo* mesh_bvh_subtrees = nullptr,
     int32_t mesh_bvh_subtree_count = 0,
     const ArenaBroadphaseGrid& broadphase_grid = ArenaBroadphaseGrid{},
-    int world_part = kWorldStepWhole) {
+    int world_part = kWorldStepWhole,
+    uint8_t cars_apart_mask = 0,
+    bool register_iterations = false) {
     const int solver_passes = WorldSolverPasses();
     const int world_substeps = DebugWorldSubsteps();
     const float sub_dt = dt / static_cast<float>(world_substeps);
@@ -2230,6 +2231,9 @@ ROCKETGPU_HD void WorldStepSoccar(
                 }
             }
             for (int i = 0; world_part != kWorldStepContactsCarsApart && i < count; ++i) {
+                if ((cars_apart_mask >> i) & 1u) {
+                    continue;  // prestepped after its update, on another lane
+                }
                 WorldStepPrestepCar(cars[base + i], car_configs[base + i],
                                     wheel_runtime_states ? &wheel_runtime_states[base + i] : nullptr, mutator, sub_dt,
                                     pre_contact_cars[i], deferred_linear_deltas[i], deferred_angular_deltas[i]);
@@ -2336,25 +2340,21 @@ ROCKETGPU_HD void WorldStepSoccar(
                         }
                     }
                 }
-                bool ccm_masks_current = true;
+                // Pairs a ResolveCarCarCollision ran on this tick: only their cached-contact slots can be valid (the
+                // tick-start clear left the others clear).
+                uint32_t resolved_slots = 0;
                 for (int pass = 0; pass < car_car_passes; ++pass) {
                     for (int po = 0; po < pair_order_count; ++po) {
                         const int i = pair_order_i[po];
                         const int j = pair_order_j[po];
                         const uint32_t slot_bit = 1u << CarCarRetainedSlot(i, j);
-                        if (ccm_masks_current
-                                ? (ccm_reject_slots & slot_bit) != 0
-                                : CarCarPairRejectedByCcmGate(
-                                      cars[base + j], cars[base + i], car_configs[base + j], car_configs[base + i],
-                                      rows.car_car_retained_manifolds[CarCarRetainedSlot(i, j)])) {
-                            // The tick-start clear left these cars' pair slots invalid; only ResolveCarCarCollision sets
-                            // one, so while the masks are current the slot is already clear.
-                            if (pair_contact_cache && pair_contact_cache.index(j, i) >= 0 && !ccm_masks_current) {
+                        if ((ccm_reject_slots & slot_bit) != 0) {
+                            if (pair_contact_cache && pair_contact_cache.index(j, i) >= 0 && (resolved_slots & slot_bit) != 0) {
                                 ClearCarCarPairCachedContact(pair_contact_cache.slots[pair_contact_cache.index(j, i)]);
                             }
                             continue;
                         }
-                        ccm_masks_current = false;
+                        resolved_slots |= slot_bit;
                         {
                             const int pair_velocity_rows_before = pair_velocity_row_count;
                             const int pair_friction_rows_before = pair_friction_row_count;
@@ -2404,6 +2404,10 @@ ROCKETGPU_HD void WorldStepSoccar(
                                     j * 100000 + 2000 + i);
                             }
                         }
+                        // The resolve may have moved or demoed cars i and j and refreshed their pair's retained manifold;
+                        // the masks are rebuilt at once rather than gating each later pair by its own round trips.
+                        CarCarCcmGateMasks(
+                            count, cars + base, car_configs + base, rows.car_car_retained_manifolds, ccm_reject_slots);
                     }
                 }
             }
@@ -2578,6 +2582,19 @@ ROCKETGPU_HD void WorldStepSoccar(
             }
 
             if (ball_awake_after_contact_rows && !ball_settled_skip && mutator.arena_collision) {
+                // World<3> may take the ball-world stage (StagedBallWorldKernel); World<1> runs beside the stage.
+                const BallWorldStage* const ball_stage =
+                    world_part == kWorldStepContactsCarsApart && solver_scratch != nullptr
+                        ? ConsumableBallWorldStage(env_idx, ball, mutator, current_tick, mesh_triangles, mesh_bvh_meshes,
+                                                   mesh_bvh_mesh_count)
+                        : nullptr;
+#if defined(ROCKETGPU_BALL_STAGE_CHECK) && defined(__CUDA_ARCH__)
+                if (world_part == kWorldStepContactsCarsApart && solver_scratch != nullptr) {
+                    CheckBallWorldStage(env_idx, ball, mutator, current_tick, mesh_triangles, mesh_triangle_count,
+                                        mesh_bvh_quantization, mesh_bvh_quantization_count, mesh_bvh_meshes,
+                                        mesh_bvh_mesh_count, mesh_bvh_nodes, mesh_bvh_node_count);
+                }
+#endif
                 AppendBallWorldSpecialContactRows(
                     ball,
                     mutator,
@@ -2601,7 +2618,7 @@ ROCKETGPU_HD void WorldStepSoccar(
                     mesh_bvh_node_count,
                     mesh_bvh_subtrees,
                     mesh_bvh_subtree_count,
-                    &ball_solver_linear_velocity_bt, env_idx);
+                    &ball_solver_linear_velocity_bt, env_idx, ball_stage);
                 if (mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker) && solver_scratch) {
                     for (int hs_idx = 0; hs_idx < solver_scratch->hs_world_normal_count; ++hs_idx) {
                         if (HeatseekerOnWorldContact(ball, solver_scratch->hs_world_normals[hs_idx])) {
@@ -2712,7 +2729,8 @@ ROCKETGPU_HD void WorldStepSoccar(
             substep,
             &ball_solver_linear_velocity_bt,
             rows.bullet_manifolds,
-            sorted_manifold_count);
+            sorted_manifold_count,
+            register_iterations);
         if (should_stop_after_stage(4)) {
             return;
         }
@@ -3078,7 +3096,9 @@ ROCKETGPU_HD void RocketSim_Arena_WorldStepSoccar(
     const ArenaMeshBvhSubtreeInfo* mesh_bvh_subtrees = nullptr,
     int32_t mesh_bvh_subtree_count = 0,
     const ArenaBroadphaseGrid& broadphase_grid = ArenaBroadphaseGrid{},
-    int world_part = kWorldStepWhole) {
+    int world_part = kWorldStepWhole,
+    uint8_t cars_apart_mask = 0,
+    bool register_iterations = false) {
     WorldStepSoccar(
         env_idx,
         base,
@@ -3106,7 +3126,9 @@ ROCKETGPU_HD void RocketSim_Arena_WorldStepSoccar(
         mesh_bvh_subtrees,
         mesh_bvh_subtree_count,
         broadphase_grid,
-        world_part);
+        world_part,
+        cars_apart_mask,
+        register_iterations);
 }
 
 // mesh_lanes: the ray's arena mesh walk and cars loop split over cooperating lanes (see ArenaRayMeshOneLane); only
@@ -3519,7 +3541,10 @@ ROCKETGPU_HD void StepEnvGeneric(
 
     int phase = kStepEnvPhaseFull,
     int tick_offset = 0,
-    int world_part = kWorldStepWhole) {
+    int world_part = kWorldStepWhole,
+    uint8_t cars_apart_mask = 0,
+    uint8_t cars_updated_mask = 0,
+    bool register_iterations = false) {
     const int base = env_idx * cfg.max_cars_per_env;
     const WheelRayStage* const staged_rays_for_env =
         ((phase == kStepEnvPhasePost || phase == kStepEnvPhasePostVehiclesDone) && solver_scratch != nullptr)
@@ -3549,6 +3574,9 @@ ROCKETGPU_HD void StepEnvGeneric(
             (phase == kStepEnvPhasePostVehiclesDone && VehicleUpdatesIndependent(cfg, staged_rays_for_env, count));
         for (int k = 0; !vehicle_updates_done && k < count; ++k) {
             const int i = CarVisitSlot(env_states[env_idx], k, count);
+            if ((cars_updated_mask >> i) & 1u) {
+                continue;  // updated on the contacts kernel's lanes (StagedWorldKernel<kWorldStepContacts>)
+            }
             StepEnvVehicleUpdateCar(env_idx, i, count, cfg, cars, wheel_runtime_states, car_configs, balls,
                                     controls_accessor.get(i, tick_idx), staged_rays_for_env, cal_pushed_cars_mask);
         }
@@ -3584,7 +3612,9 @@ ROCKETGPU_HD void StepEnvGeneric(
             cfg.arena_mesh_bvh_subtrees,
             cfg.arena_mesh_bvh_subtree_count,
             MakeArenaBroadphaseGrid(cfg),
-            world_part);
+            world_part,
+            cars_apart_mask,
+            register_iterations);
         if (WorldPartIsContacts(world_part) || world_part == kWorldStepRowsCarsApart) {
             continue;
         }
