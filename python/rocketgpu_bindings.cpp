@@ -1,5 +1,6 @@
 #include <array>
 #include <cstdint>
+#include <map>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -110,6 +111,7 @@ PYBIND11_MODULE(rocketgpu_py, m) {
     py::class_<rocketgpu::CarConfig>(m, "CarConfig")
         .def(py::init<>())
         .def_readwrite("hitbox_size", &rocketgpu::CarConfig::hitbox_size)
+        .def_readwrite("hitbox_published", &rocketgpu::CarConfig::hitbox_published)
         .def_readwrite("hitbox_offset", &rocketgpu::CarConfig::hitbox_offset)
         .def_readwrite("front_wheels_offset", &rocketgpu::CarConfig::front_wheels_offset)
         .def_readwrite("back_wheels_offset", &rocketgpu::CarConfig::back_wheels_offset)
@@ -1054,6 +1056,22 @@ PYBIND11_MODULE(rocketgpu_py, m) {
                      for (const auto& f : rc::Arena::DevLayouts()) d[py::str(f.name)] = py::make_tuple(f.offset, f.size);
                      return d;
                  }, "Dev only: field offsets and sizes of the raw arrays")
+            .def("get_full_state", [](const rc::Arena& a, const std::vector<std::string>& arrays) {
+                     py::dict d;
+                     for (const auto& [k, v] : a.GetFullState(arrays)) {
+                         d[py::str(k)] = py::bytes(reinterpret_cast<const char*>(v.data()), v.size());
+                     }
+                     return d;
+                 }, py::arg("arrays") = std::vector<std::string>{},
+                 "The full simulation state: {\"array.field\": bytes}, optionally of some arrays only; see Arena::GetFullState")
+            .def("set_full_state", [](rc::Arena& a, const py::dict& d) {
+                     std::map<std::string, std::vector<uint8_t>> state;
+                     for (const auto& [k, v] : d) {
+                         const std::string s = py::cast<py::bytes>(v);
+                         state[py::cast<std::string>(k)] = std::vector<uint8_t>(s.begin(), s.end());
+                     }
+                     a.SetFullState(state);
+                 }, py::arg("state"), "Write the named fields of a get_full_state dict; the others keep their values")
             .def("serialize", [](const rc::Arena& a) { std::vector<uint8_t> out; a.Serialize(out); return py::bytes(reinterpret_cast<const char*>(out.data()), out.size()); },
                  "RocketSim Arena::Serialize byte format (loads in RocketSim's DeserializeNew)")
             .def_static("deserialize_new", [](py::bytes data) { const std::string s = data; return rc::Arena::DeserializeNew(std::vector<uint8_t>(s.begin(), s.end())); },

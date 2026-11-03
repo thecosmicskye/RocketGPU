@@ -68,6 +68,9 @@ For RocketSim v3's own conventions, use `get_state_v3` / `set_state_v3` (C++ `Ca
 
 `jump_hold_broken` is stored, but RocketGPU's jump does not read it.
 
+`Arena.get_full_state()` returns the whole simulation state, including contact manifolds and timers, as
+`{"array.field": bytes}`. `set_full_state` writes the fields it is given and keeps the rest.
+
 ## Speed
 
 For CPU builds, `ROCKETGPU_CPU_THREADS` sets the worker count; set it before creating a batch. Unset or 0 uses the

@@ -2529,7 +2529,7 @@ inline void LaunchStepTicksDirect(
       const long long all_cars =
           cfg.env_car_total > 0 ? cfg.env_car_total : static_cast<long long>(cfg.env_count) * cfg.max_cars_per_env;
       const int spread_car_bs = SpreadBlockSize(all_cars);
-      const int world3_bs = all_cars >= 4ll * cfg.env_count ? std::min(spread_env_bs, 16) : spread_env_bs;
+      const int world3_bs = 8;
       const int spread_rows_full_bs = SpreadBlockSize(all_cars / 8);
       const int world1_lanes = UseWorld1Lanes(cfg) ? kWorld1Lanes : 1;
       const bool post_fused = UsePostFused(cfg);

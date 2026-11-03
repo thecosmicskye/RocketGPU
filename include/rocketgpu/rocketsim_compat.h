@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <unordered_map>
@@ -302,6 +303,14 @@ public:
         size_t size;
     };
     static std::vector<DevField> DevLayouts();
+
+    // The arena's full simulation state by field name: "array.field.path" (arrays and fields as DevGetRaw and
+    // DevLayouts name them; a field holding manifold points is split into the points' fields) -> that field's bytes
+    // for each element in turn. SetFullState writes the fields it is given and keeps the others; a field this build
+    // lacks, or one whose size differs, throws. Cars, boost pads and mutators are set through their own calls first.
+    // arrays: only those arrays' fields (all when empty).
+    std::map<std::string, std::vector<uint8_t>> GetFullState(const std::vector<std::string>& arrays = {}) const;
+    void SetFullState(const std::map<std::string, std::vector<uint8_t>>& state);
 
 private:
     friend class Car;

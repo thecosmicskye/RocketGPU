@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #define ROCKETGPU_STEP_TYPES_ONLY 1
@@ -239,6 +240,143 @@ std::vector<Arena::DevField> Arena::DevLayouts() {
 
 #undef RG_DEV_F
 #undef RG_DEV_S
+
+namespace {
+
+constexpr std::pair<const char*, const char*> kFullStateArrays[] = {
+    {"car_states", "CarState"}, {"ball_states", "BallState"}, {"env_states", "EnvState"},
+    {"wheel_runtime", "WheelRuntimeState"}, {"solver_scratch", "WorldSolverScratch"},
+    {"car_world_plane", "CarWorldPlaneRetainedManifold"}, {"car_world_mesh", "CarWorldMeshRetainedManifold"},
+    {"car_car", "CarCarRetainedManifold"}, {"ball_car", "BallCarRetainedManifold"}};
+
+// Fields that hold an array of another listed struct: written field by field, so the inner layout can change too.
+constexpr std::pair<const char*, const char*> kNestedFields[] = {
+    {"WorldSolverScratch.ball_world_mesh_manifolds", "BallMeshPersistentManifold"},
+    {"WorldSolverScratch.ball_world_plane_manifolds", "BallMeshPersistentManifold"},
+    {"BallMeshPersistentManifold.points", "BallMeshManifoldPoint"},
+    {"CarWorldPlaneRetainedManifold.points", "CarWorldPlaneRetainedPoint"},
+    {"CarWorldMeshRetainedManifold.points", "CarWorldMeshRetainedPoint"},
+    {"CarCarRetainedManifold.points", "CarCarRetainedPoint"},
+    {"BallCarRetainedManifold.points", "BallCarRetainedPoint"}};
+
+struct FieldSlice {
+    std::string key;
+    std::vector<size_t> starts;   // byte offset of the field in each element, in order
+    size_t size;
+};
+
+// Every leaf field of struct `type` in the elements starting at `starts`, named prefix + field path.
+void FullStateFields(const std::string& type, const std::vector<size_t>& starts, const std::string& prefix,
+                     std::vector<FieldSlice>& out) {
+    const std::vector<Arena::DevField>& layouts = Arena::DevLayouts();
+    const std::string head = type + ".";
+    for (const Arena::DevField& f : layouts) {
+        if (f.name.compare(0, head.size(), head) != 0) continue;
+        const std::string path = f.name.substr(head.size());
+        const char* nested = nullptr;
+        for (const auto& [field, elem] : kNestedFields) {
+            if (f.name == field) nested = elem;
+        }
+        size_t elem_size = 0;
+        for (const Arena::DevField& g : layouts) {
+            if (nested != nullptr && g.name == nested) elem_size = g.size;
+        }
+        if (elem_size == 0) {
+            std::vector<size_t> at;
+            at.reserve(starts.size());
+            for (size_t s : starts) at.push_back(s + f.offset);
+            out.push_back({prefix + path, std::move(at), f.size});
+            continue;
+        }
+        std::vector<size_t> inner;
+        for (size_t s : starts) {
+            for (size_t k = 0; k < f.size / elem_size; ++k) inner.push_back(s + f.offset + k * elem_size);
+        }
+        FullStateFields(nested, inner, prefix + path + ".", out);
+    }
+}
+
+std::vector<FieldSlice> ArrayFields(const char* array, const char* type, size_t bytes) {
+    size_t size = 0;
+    for (const Arena::DevField& g : Arena::DevLayouts()) {
+        if (g.name == type) size = g.size;
+    }
+    std::vector<size_t> starts;
+    for (size_t s = 0; size != 0 && s + size <= bytes; s += size) starts.push_back(s);
+    std::vector<FieldSlice> out;
+    FullStateFields(type, starts, std::string(array) + ".", out);
+    return out;
+}
+
+}
+
+std::map<std::string, std::vector<uint8_t>> Arena::GetFullState(const std::vector<std::string>& arrays) const {
+    std::map<std::string, std::vector<uint8_t>> out;
+    for (const std::string& a : arrays) {
+        bool known = false;
+        for (const auto& [array, type] : kFullStateArrays) known = known || a == array;
+        if (!known) throw std::invalid_argument("GetFullState: unknown array " + a);
+    }
+    for (const auto& [array, type] : kFullStateArrays) {
+        bool want = arrays.empty();
+        for (const std::string& a : arrays) want = want || a == array;
+        if (!want) continue;
+        const std::vector<uint8_t> raw = DevGetRaw(array);
+        for (const FieldSlice& f : ArrayFields(array, type, raw.size())) {
+            std::vector<uint8_t>& v = out[f.key];
+            v.reserve(f.starts.size() * f.size);
+            for (size_t s : f.starts) v.insert(v.end(), raw.begin() + s, raw.begin() + s + f.size);
+        }
+    }
+    return out;
+}
+
+void Arena::SetFullState(const std::map<std::string, std::vector<uint8_t>>& state) {
+    struct Pending {
+        const char* array;
+        std::vector<uint8_t> raw;
+        std::vector<std::pair<const FieldSlice*, const std::vector<uint8_t>*>> writes;
+        std::vector<FieldSlice> fields;
+    };
+    std::vector<Pending> arrays;
+    std::map<std::string, bool> seen;
+    for (const auto& [array, type] : kFullStateArrays) {
+        const std::string head = std::string(array) + ".";
+        const auto first = state.lower_bound(head);
+        if (first == state.end() || first->first.compare(0, head.size(), head) != 0) continue;
+        Pending p{array, DevGetRaw(array), {}, {}};
+        p.fields = ArrayFields(array, type, p.raw.size());
+        arrays.push_back(std::move(p));
+    }
+    size_t used = 0;
+    for (Pending& p : arrays) {
+        for (const FieldSlice& f : p.fields) {
+            const auto it = state.find(f.key);
+            if (it == state.end()) continue;
+            if (it->second.size() != f.starts.size() * f.size) {
+                throw std::invalid_argument("SetFullState " + f.key + ": expected " +
+                                            std::to_string(f.starts.size() * f.size) + " bytes, got " +
+                                            std::to_string(it->second.size()));
+            }
+            p.writes.push_back({&f, &it->second});
+            seen[f.key] = true;
+            ++used;
+        }
+    }
+    if (used != state.size()) {
+        for (const auto& kv : state) {
+            if (!seen.count(kv.first)) throw std::invalid_argument("SetFullState: unknown field " + kv.first);
+        }
+    }
+    for (Pending& p : arrays) {
+        for (const auto& [f, v] : p.writes) {
+            for (size_t k = 0; k < f->starts.size(); ++k) {
+                std::memcpy(p.raw.data() + f->starts[k], v->data() + k * f->size, f->size);
+            }
+        }
+        DevSetRaw(p.array, p.raw);
+    }
+}
 
 }
 }
