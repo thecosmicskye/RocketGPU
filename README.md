@@ -88,9 +88,9 @@ Arena-ticks/s. RocketGPU on an RTX 5090; RocketSim v3 0.3.5 on a Ryzen 7 9800X3D
 
 ## Accuracy
 
-121 real-game recordings: 1v1 to 3v3 matches, every car body, and scripted scenarios. Each 120-tick segment starts
-from the game's state and replays the game's inputs; 22,557 segments, 12,038,088 body-ticks. v3 takes no hidden
-state, so it starts from the public state.
+[121 real-game recordings](https://github.com/thecosmicskye/RocketGPU-fullstate-suite): 1v1 to 3v3 matches, every
+car body, and scripted scenarios. Each 120-tick segment starts from the game's state and replays the game's inputs;
+22,557 segments, 12,038,088 body-ticks. v3 takes no hidden state, so it starts from the public state.
 
 | | RocketGPU | v3 0.3.5 |
 |---|---|---|
