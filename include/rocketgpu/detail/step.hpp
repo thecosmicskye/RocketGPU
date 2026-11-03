@@ -32,6 +32,7 @@ namespace detail {
 #include "rocketgpu/detail/step/heatseeker.hpp"
 #include "rocketgpu/detail/step/snowday.hpp"
 #include "rocketgpu/detail/step/arena_geometry.hpp"
+#if !defined(ROCKETGPU_STEP_TYPES_ONLY)
 #include "rocketgpu/detail/step/car_world_contacts.hpp"
 #include "rocketgpu/detail/step/puck_world.hpp"
 #include "rocketgpu/detail/step/arena_ball.hpp"
@@ -39,5 +40,6 @@ namespace detail {
 #include "rocketgpu/detail/step/raycast_wheels_and_contact_prep.hpp"
 #include "rocketgpu/detail/step/triangle_and_carcar.hpp"
 #include "rocketgpu/detail/step/env_step.hpp"
+#endif
 }
 }

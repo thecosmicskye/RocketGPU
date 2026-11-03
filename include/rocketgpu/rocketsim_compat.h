@@ -235,11 +235,20 @@ public:
     Car* AddCar(Team team, const CarConfig& config = CarConfig{});
     void Step(int ticks_to_simulate = 1);
     void ResetToRandomKickoff(int seed = -1);
+    // The bodies' side of a goal reset alone (EnvCommand::new_round_bodies), e.g. replaying a recorded goal.
+    void StartNewRoundBodies();
 
     void SetRespawnRngSeed(uint64_t seed);
+    // The respawn slot (0-3) the car's next demo respawn takes instead of the RNG's pick; -1 clears it.
+    void SetRespawnSlotOverride(uint32_t car_id, int slot);
+    // The car's next spawn (a demoed car's, when its demo_respawn_timer runs out) is a kickoff re-creation at kickoff
+    // spot `spot` (0-4, the blue-side SoccarKickoffSpawn index; orange mirrored) at its CarConfig.spawn_z; -1 clears it.
+    void SetKickoffSpawnOverride(uint32_t car_id, int spot);
 
     void SetCarVisitOrderMode(uint8_t mode);
-    void SetCarVisitOrder(const std::vector<uint32_t>& compat_ids_in_visit_order);
+    // game_order: keep the order as the game's vehicle order (mode 3) across demolitions, respawns and round resets.
+    // List the cars in the world first; the unlisted slots follow.
+    void SetCarVisitOrder(const std::vector<uint32_t>& compat_ids_in_visit_order, bool game_order = false);
     uint8_t GetCarVisitOrderMode() const;
     void SetGoalScoreCallback(GoalScoreEventFn callback_fn, void* user_info = nullptr);
 
@@ -281,12 +290,27 @@ public:
 
     BatchSim& sim() { return *sim_; }
 
+    // Dev only (full-state restore, src/rocketsim_compat_dev.cpp): env 0's state arrays as raw bytes. what:
+    // "car_states", "ball_states", "env_states", "wheel_runtime", "solver_scratch", and the retained manifolds
+    // "car_world_plane", "car_world_mesh", "car_car", "ball_car". DevSetRaw uploads without canonicalizing.
+    std::vector<uint8_t> DevGetRaw(const std::string& what) const;
+    void DevSetRaw(const std::string& what, const std::vector<uint8_t>& bytes);
+    // Field layouts for those arrays: "Struct.field.path" -> (offset, size); "Struct" -> (0, sizeof).
+    struct DevField {
+        std::string name;
+        size_t offset;
+        size_t size;
+    };
+    static std::vector<DevField> DevLayouts();
+
 private:
     friend class Car;
     friend class Ball;
     Arena() = default;
     void PullStates() const;
-    void PushStates();
+    void NormalizeCarVisitOrder();
+    void PushCarState(int slot);
+    void PushBallState();
 
     std::unique_ptr<BatchSim> sim_;
     float tick_rate_ = 120.0f;
@@ -315,8 +339,10 @@ private:
     std::vector<uint32_t> slot_to_id_;
     uint32_t next_car_id_ = 1;
     uint32_t CompatIdFromDeviceId(uint32_t device_id) const;
+    uint32_t DeviceIdFromCompatId(uint32_t compat_id) const;
     friend struct ArenaSerializer;
     friend struct BallPredTracker;
+    friend class DevBatch;
 };
 }
 }

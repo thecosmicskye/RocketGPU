@@ -12,7 +12,6 @@ ROCKETGPU_HD constexpr float CornerCenterY() { return 4096.0f; }
 ROCKETGPU_HD constexpr float CornerRadius() { return 1024.0f; }
 ROCKETGPU_HD constexpr float FloorRampRadius() { return 256.0f; }
 ROCKETGPU_HD constexpr float CarSpawnRestZ() { return 17.0f; }
-ROCKETGPU_HD constexpr float CarRespawnZ() { return 36.0f; }
 ROCKETGPU_HD constexpr float BallRestZ() { return 93.15f; }
 ROCKETGPU_HD constexpr int BoostPadCountSoccar() { return 34; }
 
@@ -65,8 +64,8 @@ ROCKETGPU_HD constexpr Vec3 BoostPadLocSoccar(int index) {
     case 5: return Vec3(0.0f, -2816.0f, 70.0f);
     case 6: return Vec3(-3584.0f, -2484.0f, 70.0f);
     case 7: return Vec3(3584.0f, -2484.0f, 70.0f);
-    case 8: return Vec3(-1788.0f, -2300.0f, 70.0f);
-    case 9: return Vec3(1788.0f, -2300.0f, 70.0f);
+    case 8: return Vec3(-1788.0f, -2302.0f, 70.0f);
+    case 9: return Vec3(1788.0f, -2302.0f, 70.0f);
     case 10: return Vec3(-2048.0f, -1036.0f, 70.0f);
     case 11: return Vec3(0.0f, -1024.0f, 70.0f);
     case 12: return Vec3(2048.0f, -1036.0f, 70.0f);
@@ -75,8 +74,8 @@ ROCKETGPU_HD constexpr Vec3 BoostPadLocSoccar(int index) {
     case 15: return Vec3(-2048.0f, 1036.0f, 70.0f);
     case 16: return Vec3(0.0f, 1024.0f, 70.0f);
     case 17: return Vec3(2048.0f, 1036.0f, 70.0f);
-    case 18: return Vec3(-1788.0f, 2300.0f, 70.0f);
-    case 19: return Vec3(1788.0f, 2300.0f, 70.0f);
+    case 18: return Vec3(-1788.0f, 2302.0f, 70.0f);
+    case 19: return Vec3(1788.0f, 2302.0f, 70.0f);
     case 20: return Vec3(-3584.0f, 2484.0f, 70.0f);
     case 21: return Vec3(3584.0f, 2484.0f, 70.0f);
     case 22: return Vec3(0.0f, 2816.0f, 70.0f);
@@ -98,49 +97,57 @@ ROCKETGPU_HD constexpr uint8_t BoostPadIsBigSoccar(int index) {
     return index >= 28 ? 1 : 0;
 }
 
+ROCKETGPU_HD constexpr float SteerDegToRad() { return 0.01745329238474369f; }
+
+template <int N>
+ROCKETGPU_HD float EvalInterpCurveLinear(const float (&in)[N], const float (&out)[N], float x) {
+    if (N < 2 || in[0] >= x) return out[0];
+    if (x >= in[N - 1]) return out[N - 1];
+#pragma unroll
+    for (int i = 1; i < N; ++i) {
+        if (in[i] > x) return (out[i] - out[i - 1]) * ((x - in[i - 1]) / (in[i] - in[i - 1])) + out[i - 1];
+    }
+    return out[N - 1];
+}
+
 ROCKETGPU_HD float EvalSteerAngleFromSpeed(const float (&c)[6], float speed_abs) {
-    const float s = Abs(speed_abs);
-    if (s <= 500.0f) return Lerp(c[0], c[1], s / 500.0f);
-    if (s <= 1000.0f) return Lerp(c[1], c[2], (s - 500.0f) / 500.0f);
-    if (s <= 1500.0f) return Lerp(c[2], c[3], (s - 1000.0f) / 500.0f);
-    if (s <= 1750.0f) return Lerp(c[3], c[4], (s - 1500.0f) / 250.0f);
-    if (s <= 3000.0f) return Lerp(c[4], c[5], (s - 1750.0f) / 1250.0f);
-    return c[5];
+    const float in[6] = {0.0f, 500.0f, 1000.0f, 1500.0f, 1750.0f, 3000.0f};
+    return EvalInterpCurveLinear(in, c, Abs(speed_abs));
 }
 
 ROCKETGPU_HD float EvalPowerslideSteerAngleFromSpeed(const float (&c)[2], float speed_abs) {
-    const float s = Abs(speed_abs);
-    if (s <= 2500.0f) return Lerp(c[0], c[1], s / 2500.0f);
-    return c[1];
+    const float in[2] = {0.0f, 2500.0f};
+    return EvalInterpCurveLinear(in, c, Abs(speed_abs));
 }
 
 ROCKETGPU_HD float EvalSteerAngleFromSpeedThreeWheel(float speed_abs) {
-    const float s = Abs(speed_abs);
-    if (s <= 2300.0f) return Lerp(0.342473f, 0.034837f, s / 2300.0f);
-    return 0.034837f;
+    const float in[2] = {0.0f, 2300.0f};
+    const float out[2] = {19.622270584106445f, 1.9959354400634766f};
+    return EvalInterpCurveLinear(in, out, Abs(speed_abs));
 }
 
-ROCKETGPU_HD float EvalDriveTorqueFactor(float speed_abs) {
-    const float s = Abs(speed_abs);
-    if (s <= 1400.0f) return Lerp(1.0f, 0.1f, s / 1400.0f);
-    if (s <= 1410.0f) return Lerp(0.1f, 0.0f, (s - 1400.0f) / 10.0f);
-    return 0.0f;
+ROCKETGPU_HD float EvalDriveTorqueFactor(float forward_speed) {
+    const float in[5] = {-1410.0f, -1400.0f, 0.0f, 1400.0f, 1410.0f};
+    const float out[5] = {0.0f, 0.1f, 1.0f, 0.1f, 0.0f};
+    return EvalInterpCurveLinear(in, out, forward_speed);
 }
 
-// Knee at 0.707, not 0.7075: RLPR wheel long friction while coasting (the bare factor) lies on (0, 0.1)-(0.707, 0.5)
-// -(1, 1) to 1e-6 across ~5800 sloped wheel-ticks of Nexto, PartyCannon and Wisp.
 ROCKETGPU_HD float EvalNonStickyFrictionFactor(float contact_normal_z) {
-    const float s = Clamp(contact_normal_z, 0.0f, 1.0f);
-    if (s <= 0.707f) return Lerp(0.1f, 0.5f, s / 0.707f);
-    return Lerp(0.5f, 1.0f, (s - 0.707f) / (1.0f - 0.707f));
+    const float in[3] = {0.0f, 0.707f, 1.0f};
+    const float out[3] = {0.1f, 0.5f, 1.0f};
+    return EvalInterpCurveLinear(in, out, contact_normal_z);
 }
 
 ROCKETGPU_HD float EvalLatFriction(float input) {
-    return Lerp(1.0f, 0.2f, Clamp(input, 0.0f, 1.0f));
+    const float in[2] = {0.0f, 1.0f};
+    const float out[2] = {1.0f, 0.2f};
+    return EvalInterpCurveLinear(in, out, input);
 }
 
 ROCKETGPU_HD float EvalLatFrictionThreeWheel(float input) {
-    return Lerp(0.30f, 0.25f, Clamp(input, 0.0f, 1.0f));
+    const float in[2] = {0.0f, 1.0f};
+    const float out[2] = {0.30f, 0.25f};
+    return EvalInterpCurveLinear(in, out, input);
 }
 
 ROCKETGPU_HD float EvalLongFriction(float          ) {
@@ -152,15 +159,15 @@ ROCKETGPU_HD float EvalHandbrakeLatFrictionFactor(float          ) {
 }
 
 ROCKETGPU_HD float EvalHandbrakeLongFrictionFactor(float input) {
-    return Lerp(0.5f, 0.9f, Clamp(input, 0.0f, 1.0f));
+    const float in[2] = {0.0f, 1.0f};
+    const float out[2] = {0.5f, 0.9f};
+    return EvalInterpCurveLinear(in, out, input);
 }
 
 ROCKETGPU_HD float EvalBallCarExtraImpulseFactor(float speed_abs) {
-    const float s = Abs(speed_abs);
-    if (s <= 500.0f) return 0.65f;
-    if (s <= 2300.0f) return Lerp(0.65f, 0.55f, (s - 500.0f) / 1800.0f);
-    if (s <= 4600.0f) return Lerp(0.55f, 0.30f, (s - 2300.0f) / 2300.0f);
-    return 0.30f;
+    const float in[5] = {0.0f, 500.0f, 1400.0f, 2300.0f, 4600.0f};
+    const float out[5] = {0.65f, 0.65f, 0.6f, 0.55f, 0.30f};
+    return EvalInterpCurveLinear(in, out, Abs(speed_abs));
 }
 
 ROCKETGPU_HD float EvalLinearPieceCurve3(
@@ -202,7 +209,7 @@ ROCKETGPU_HD float EvalGameBumpVelAir(float speed) {
 }
 
 ROCKETGPU_HD float EvalGameBumpUpwardVel(float speed) {
-    return EvalLinearPieceCurve3(0.0f, 0.3f / 0.9f, 1400.0f, 250.0f / 0.9f, 2200.0f, 375.0f / 0.9f, speed);
+    return EvalLinearPieceCurve3(0.0f, 0.25f / 0.9f, 1400.0f, 250.0f / 0.9f, 2200.0f, 375.0f / 0.9f, speed);
 }
 }
 }

@@ -1,30 +1,15 @@
-
-
 struct ArenaMeshTriangle;
 
-struct ArenaTriangleInternalEdgeDebug {
-    int best_edge = -1;
-    int active_edge = -1;
-    int num_concave_edge_hits = 0;
-    float best_edge_distance = 0.0f;
-    float best_edge_angle = 0.0f;
-    float active_edge_distance = 0.0f;
-    float active_edge_angle = 0.0f;
-    uint8_t active_edge_convex = 0;
-    uint8_t back_facing = 0;
-    uint8_t clamped = 0;
-    uint8_t accepted_clamp = 0;
-    Vec3 point_on_b_in = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 point_on_b_out = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 normal_in = Vec3(0.0f, 0.0f, 1.0f);
-    Vec3 normal_out = Vec3(0.0f, 0.0f, 1.0f);
-    Vec3 tri_normal = Vec3(0.0f, 0.0f, 1.0f);
-    Vec3 nA = Vec3(0.0f, 0.0f, 1.0f);
-    Vec3 nB = Vec3(0.0f, 0.0f, 1.0f);
-    Vec3 clamped_local_normal = Vec3(0.0f, 0.0f, 1.0f);
-};
-
 constexpr bool EnableArenaTriangleInternalEdgeAdjust();
+
+ROCKETGPU_HD void BuildInvInertiaTensorWorldBt(
+    const CarState& car,
+    const CarConfig& cfg,
+    float mass,
+    Vec3& out_row0,
+    Vec3& out_row1,
+    Vec3& out_row2);
+ROCKETGPU_HD Vec3 Mul3x3Vec(const Vec3& row0, const Vec3& row1, const Vec3& row2, const Vec3& v);
 
 ROCKETGPU_HD Vec3 ArenaTriangleFaceNormal(const ArenaMeshTriangle& tri);
 ROCKETGPU_HD bool MaybeAdjustArenaTriangleInternalEdgeContact(
@@ -33,37 +18,14 @@ ROCKETGPU_HD bool MaybeAdjustArenaTriangleInternalEdgeContact(
     float distance_bt,
     Vec3& io_point_on_b_bt,
     Vec3& io_normal,
-    ArenaTriangleInternalEdgeDebug* debug = nullptr,
-    bool soccar_platform_math = false,
     const uint32_t* native_table = nullptr, int native_shift = 0,
     const ArenaMeshTriangle* cal_game_tri = nullptr);
 
-struct CarWorldPlaneContactGeometryBt {
-    Vec3 support_dir_local_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 support_local_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 child_origin_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 child_world_origin_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 position_world_on_a_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 local_point_a_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 rel_pos1_bt = Vec3(0.0f, 0.0f, 0.0f);
-    float distance_bt = 0.0f;
-
-    float add_distance_bt = 0.0f;
-    Vec3 local_point_b_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 support_world_bt = Vec3(0.0f, 0.0f, 0.0f);  // the support vertex the plane test checks, world space
-};
-
-// RL's btConvexPlaneCollisionAlgorithm::processCollision bounds each plane: a contact needs the support
-// vertex within threshold + half-extent of the plane origin on both in-plane axes.
-// Stadium_P's arena planes are Plane32768 (+-16384 uu) times each actor's Scale3D: floor and ceiling 4358.144 (x) by
-// 6225.92 (y) uu; side walls, centred at z = 992, 1245.184 (z) by 6225.92 (y). Soccar only.
-ROCKETGPU_HD bool SoccarPlaneExtentContainsBt(const Vec3& inward_normal, const Vec3& point_world_bt, float threshold_bt) {
+ROCKETGPU_HD bool SoccarPlaneExtentContainsInPlaneBt(const Vec3& inward_normal, const Vec3& in_plane_bt, float threshold_bt) {
     const bool horizontal = Abs(inward_normal.z) > 0.5f;
-    const float u = horizontal ? point_world_bt.x : point_world_bt.z - 992.0f / 50.0f;
-    const float lim_u = threshold_bt + (horizontal ? 4358.144f / 50.0f : 1245.184f / 50.0f);
-    const float v = point_world_bt.y;
-    const float lim_v = threshold_bt + 6225.92f / 50.0f;
-    return !(u < -lim_u || v < -lim_v || lim_u < u || lim_v < v);
+    const float lim_x = threshold_bt + (horizontal ? 4358.144f / 50.0f : 1245.184f / 50.0f);
+    const float lim_y = threshold_bt + 6225.92f / 50.0f;
+    return !(in_plane_bt.x < -lim_x || in_plane_bt.y < -lim_y || lim_x < in_plane_bt.x || lim_y < in_plane_bt.y);
 }
 
 ROCKETGPU_HD float BulletStyleDot3Bt(const Vec3& a, const Vec3& b) {
@@ -104,7 +66,7 @@ ROCKETGPU_HD Vec3 BulletStaticPlaneOriginBt(const Vec3& inward_normal) {
         return Vec3(0.0f, 0.0f, ArenaHeight() * kUUToBT);
     }
     if (inward_normal.x > 0.5f) {
-        return Vec3(-ArenaExtentX() * kUUToBT, 0.0f, 992.0f * kUUToBT);  // Stadium_P side-wall planes sit at z = 992
+        return Vec3(-ArenaExtentX() * kUUToBT, 0.0f, 992.0f * kUUToBT);
     }
     if (inward_normal.x < -0.5f) {
         return Vec3(ArenaExtentX() * kUUToBT, 0.0f, 992.0f * kUUToBT);
@@ -112,95 +74,70 @@ ROCKETGPU_HD Vec3 BulletStaticPlaneOriginBt(const Vec3& inward_normal) {
     return Vec3(0.0f, 0.0f, 0.0f);
 }
 
-ROCKETGPU_HD CarWorldPlaneContactGeometryBt ComputeBulletStyleCarWorldPlaneContactGeometryBt(
-    const CarState& car,
-    const CarConfig& cfg,
-    const Vec3& inward_normal,
-    float boundary) {
-    constexpr float kUUToBT = 1.0f / 50.0f;
-    (void)boundary;
-    CarWorldPlaneContactGeometryBt out;
+struct GamePlaneXfBt {
+    Vec3 r0 = Vec3(1.0f, 0.0f, 0.0f);
+    Vec3 r1 = Vec3(0.0f, 1.0f, 0.0f);
+    Vec3 r2 = Vec3(0.0f, 0.0f, 1.0f);
+    Vec3 o = Vec3(0.0f, 0.0f, 0.0f);
+};
 
-    Vec3 basis_forward(1.0f, 0.0f, 0.0f);
-    Vec3 basis_right(0.0f, 1.0f, 0.0f);
-    Vec3 basis_up(0.0f, 0.0f, 1.0f);
-    CarBasisColumns(car, basis_forward, basis_right, basis_up);
-
-    const Vec3 body_origin_bt = car.pos_bt;
-    const Vec3 body_row0(basis_forward.x, basis_right.x, basis_up.x);
-    const Vec3 body_row1(basis_forward.y, basis_right.y, basis_up.y);
-    const Vec3 body_row2(basis_forward.z, basis_right.z, basis_up.z);
-    const Vec3 child_origin_bt = cfg.hitbox_offset * kUUToBT;
-    const Vec3 child_world_origin_bt = BulletStyleTransformPointBt(
-        body_row0,
-        body_row1,
-        body_row2,
-        body_origin_bt,
-        child_origin_bt);
-    const Vec3 support_dir(
-        BulletStyleDot3Bt(-inward_normal, basis_forward),
-        BulletStyleDot3Bt(-inward_normal, basis_right),
-        BulletStyleDot3Bt(-inward_normal, basis_up));
-    const Vec3 plane_origin_bt = BulletStaticPlaneOriginBt(inward_normal);
-    const Vec3 convex_origin_in_plane_bt = child_world_origin_bt - plane_origin_bt;
-
-    const Vec3 half_extent_bt = BulletBoxHalfExtentWithMarginBt(cfg);
-    const Vec3 vtx(
-        support_dir.x >= 0.0f ? half_extent_bt.x : -half_extent_bt.x,
-        support_dir.y >= 0.0f ? half_extent_bt.y : -half_extent_bt.y,
-        support_dir.z >= 0.0f ? half_extent_bt.z : -half_extent_bt.z);
-    const Vec3 vtx_in_plane = BulletStyleTransformPointBt(
-        body_row0,
-        body_row1,
-        body_row2,
-        convex_origin_in_plane_bt,
-        vtx);
-    const float distance =
-        BulletStyleDot3Bt(inward_normal, vtx_in_plane);
-    const Vec3 vtx_in_plane_projected = vtx_in_plane - inward_normal * distance;
-    const Vec3 point_on_b = vtx_in_plane_projected + plane_origin_bt;
-    const Vec3 point_on_a = point_on_b + inward_normal * distance;
-    const Vec3 local_a = BulletStyleInvTransformPointBt(
-        basis_forward,
-        basis_right,
-        basis_up,
-        body_origin_bt,
-        point_on_a);
-
-    const Vec3 position_world_on_a = BulletStyleTransformPointBt(
-        body_row0,
-        body_row1,
-        body_row2,
-        body_origin_bt,
-        local_a);
-    const Vec3 local_b = point_on_b - plane_origin_bt;
-    const Vec3 position_world_on_b = local_b + plane_origin_bt;
-    const float distance_refreshed =
-        BulletStyleDot3Bt(position_world_on_a - position_world_on_b, inward_normal);
-    const Vec3 rel_pos1 = position_world_on_a - body_origin_bt;
-
-    out.support_dir_local_bt = support_dir;
-    out.support_local_bt = vtx;
-    out.child_origin_bt = child_origin_bt;
-    out.child_world_origin_bt = child_world_origin_bt;
-    out.position_world_on_a_bt = position_world_on_a;
-    out.local_point_a_bt = local_a;
-    out.rel_pos1_bt = rel_pos1;
-    out.distance_bt = distance_refreshed;
-    out.add_distance_bt = distance;
-    out.local_point_b_bt = local_b;
-    out.support_world_bt = vtx_in_plane + plane_origin_bt;
-    return out;
+ROCKETGPU_HD GamePlaneXfBt GameSoccarPlaneXfBt(const Vec3& axis_normal, const Vec3& origin_bt) {
+    GamePlaneXfBt xf;
+    xf.o = origin_bt;
+    if (axis_normal.z < -0.5f) {
+        xf.r0 = Vec3(-1.0f, -0x1.777a5cp-24f, -0x1.135bd8p-47f);
+        xf.r1 = Vec3(-0x1.777a5cp-24f, 1.0f, 0x1.777a5cp-24f);
+        xf.r2 = Vec3(-0x1p-71f, 0x1.777a5cp-24f, -1.0f);
+    } else if (axis_normal.x > 0.5f) {
+        xf.r0 = Vec3(0.0f, 0.0f, 1.0f);
+        xf.r1 = Vec3(0.0f, 1.0f, 0.0f);
+        xf.r2 = Vec3(-1.0f, 0.0f, 0.0f);
+    } else if (axis_normal.x < -0.5f) {
+        xf.r0 = Vec3(0x1.8p-23f, -0x1.8p-70f, -0x1.fffffep-1f);
+        xf.r1 = Vec3(0x1.135bd8p-47f, 1.0f, 0.0f);
+        xf.r2 = Vec3(0x1.fffffep-1f, -0x1.135bd6p-47f, 0x1.8p-23f);
+    }
+    return xf;
 }
 
-// Retained car-world plane contacts true.
-// v3 keeps one Bullet persistent manifold per (car, static body) pair across ticks:
-// collision_dispatcher.rs near_callback_with_bounds refreshes the cached points with
-// the current body transform, then merges the fresh convex-plane point
-// (persistent_manifold.rs refresh_contact_points / merge_contact_points /
-// sort_cached_points). Plane points keep local_point_a in the car body frame and
-// local_point_b relative to the plane body origin (BulletStaticPlaneOriginBt) in
-// point_on_b_bt.
+ROCKETGPU_HD Vec3 GamePlaneNormalBt(const GamePlaneXfBt& xf) {
+    return Vec3(
+        (xf.r0.y * 0.0f + xf.r0.x * 0.0f) + xf.r0.z,
+        (xf.r1.y * 0.0f + xf.r1.x * 0.0f) + xf.r1.z,
+        (xf.r2.y * 0.0f + xf.r2.x * 0.0f) + xf.r2.z);
+}
+
+ROCKETGPU_HD Vec3 GamePlanePointWorldBt(const GamePlaneXfBt& xf, const Vec3& offset_bt) {
+    const Vec3 local_b(
+        BulletStyleDot3Bt(Vec3(xf.r0.x, xf.r1.x, xf.r2.x), offset_bt),
+        BulletStyleDot3Bt(Vec3(xf.r0.y, xf.r1.y, xf.r2.y), offset_bt),
+        BulletStyleDot3Bt(Vec3(xf.r0.z, xf.r1.z, xf.r2.z), offset_bt));
+    return BulletStyleTransformPointBt(xf.r0, xf.r1, xf.r2, xf.o, local_b);
+}
+
+ROCKETGPU_HD Vec3 GamePlaneVertexInPlaneBt(
+    const GamePlaneXfBt& xf, const Vec3& c0, const Vec3& c1, const Vec3& c2, const Vec3& co, const Vec3& vtx) {
+    const Vec3 neg_origin(-xf.o.x, -xf.o.y, -xf.o.z);
+    const auto in_plane = [&](const Vec3& col) {
+        const float m0 = BulletStyleDot3Bt(col, c0);
+        const float m1 = BulletStyleDot3Bt(col, c1);
+        const float m2 = BulletStyleDot3Bt(col, c2);
+        const float mo = BulletStyleDot3Bt(col, co) + BulletStyleDot3Bt(col, neg_origin);
+        return ((m0 * vtx.x + m1 * vtx.y) + m2 * vtx.z) + mo;
+    };
+    return Vec3(
+        in_plane(Vec3(xf.r0.x, xf.r1.x, xf.r2.x)),
+        in_plane(Vec3(xf.r0.y, xf.r1.y, xf.r2.y)),
+        in_plane(Vec3(xf.r0.z, xf.r1.z, xf.r2.z)));
+}
+
+ROCKETGPU_HD Vec3 GamePlaneProjectedWorldBt(const GamePlaneXfBt& xf, const Vec3& in_plane) {
+    return Vec3(
+        ((xf.r0.x * in_plane.x + xf.r0.y * in_plane.y) + xf.r0.z * 0.0f) + xf.o.x,
+        ((xf.r1.x * in_plane.x + xf.r1.y * in_plane.y) + xf.r1.z * 0.0f) + xf.o.y,
+        ((xf.r2.x * in_plane.x + xf.r2.y * in_plane.y) + xf.r2.z * 0.0f) + xf.o.z);
+}
+
 ROCKETGPU_HD void CarWorldRetainedPlanePointWorld(
     const CarWorldPlaneRetainedPoint& pt,
     const Vec3& normal,
@@ -211,14 +148,13 @@ ROCKETGPU_HD void CarWorldRetainedPlanePointWorld(
     const Vec3& plane_origin_bt,
     Vec3& out_pwa_bt,
     Vec3& out_pwb_bt,
-    float& out_distance_bt) {
+    float& out_distance_bt,
+    const GamePlaneXfBt* xf = nullptr) {
     out_pwa_bt = BulletStyleTransformPointBt(body_row0, body_row1, body_row2, body_origin_bt, pt.local_point_a_bt);
-    out_pwb_bt = pt.point_on_b_bt + plane_origin_bt;
+    out_pwb_bt = xf != nullptr ? GamePlanePointWorldBt(*xf, pt.point_on_b_bt) : pt.point_on_b_bt + plane_origin_bt;
     out_distance_bt = BulletStyleDot3Bt(out_pwa_bt - out_pwb_bt, normal);
 }
 
-// btPersistentManifold::removeContactPoint: the last point moves into the freed slot (with its cached world
-// anchor). The vacated slot is past count and never read again.
 ROCKETGPU_HD void CarWorldRetainedRemovePoint(CarWorldPlaneRetainedManifold& manifold, Vec3 world_a_bt[4], int idx) {
     const int last = static_cast<int>(manifold.count) - 1;
     if (idx != last) {
@@ -228,8 +164,6 @@ ROCKETGPU_HD void CarWorldRetainedRemovePoint(CarWorldPlaneRetainedManifold& man
     manifold.count = static_cast<uint8_t>(last);
 }
 
-// refresh_contact_points: one world transform per point. The cull pass reuses the anchors of the distance pass
-// (same inputs, same operations), and world_a_bt[i] keeps the world anchor of the point left in slot i.
 ROCKETGPU_HD void RefreshCarWorldRetainedPlaneManifold(
     CarWorldPlaneRetainedManifold& manifold,
     const Vec3& normal,
@@ -239,14 +173,14 @@ ROCKETGPU_HD void RefreshCarWorldRetainedPlaneManifold(
     const Vec3& body_origin_bt,
     const Vec3& plane_origin_bt,
     float threshold_bt,
-    Vec3 world_a_bt[4]) {
+    Vec3 world_a_bt[4],
+    const GamePlaneXfBt* xf = nullptr) {
     Vec3 world_b_bt[4];
     for (int i = 0; i < manifold.count; ++i) {
         CarWorldRetainedPlanePointWorld(
             manifold.points[i], normal, body_row0, body_row1, body_row2, body_origin_bt, plane_origin_bt,
-            world_a_bt[i], world_b_bt[i], manifold.points[i].distance_bt);
+            world_a_bt[i], world_b_bt[i], manifold.points[i].distance_bt, xf);
     }
-    // Descending: a removal only moves an already-visited point into slot i, so slot i below is still point i.
     for (int i = static_cast<int>(manifold.count) - 1; i >= 0; --i) {
         const float distance_bt = manifold.points[i].distance_bt;
         if (distance_bt > threshold_bt) {
@@ -296,7 +230,6 @@ ROCKETGPU_HD int CarWorldRetainedSortCachedPoints(const Manifold& manifold, cons
     return biggest_area;
 }
 
-// Returns the slot the point was written to.
 template <typename Manifold, typename Point>
 ROCKETGPU_HD int MergeCarWorldRetainedPlanePoint(Manifold& manifold, const Point& pt, float threshold_bt) {
     if (manifold.count == 0) {
@@ -329,7 +262,9 @@ ROCKETGPU_HD int MergeCarWorldRetainedPlanePoint(Manifold& manifold, const Point
     return slot;
 }
 
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) && defined(_MSC_VER)
+#define ROCKETGPU_CAR_WORLD_ALWAYS_INLINE __forceinline__
+#elif defined(__CUDA_ARCH__)
 #define ROCKETGPU_CAR_WORLD_ALWAYS_INLINE __attribute__((always_inline))
 #else
 #define ROCKETGPU_CAR_WORLD_ALWAYS_INLINE
@@ -338,7 +273,7 @@ ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
     const CarState& car,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
-    const Vec3& inward_normal,
+    const Vec3& axis_normal,
     float boundary,
     const Vec3& external_linear_delta,
     const Vec3& external_angular_delta,
@@ -355,64 +290,103 @@ ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
     int* local_world_order_group_count = nullptr,
     int car_idx = -1,
     CarWorldPlaneRetainedManifold* retained_manifold = nullptr,
-    bool defer_floor_ceiling_group = false) {  // record the floor/ceiling group as valid 2: the caller decides it
+    bool defer_floor_ceiling_group = false,
+    int goal_floor = -1,
+    const float* threshold_bt_override = nullptr) {
     constexpr float kUUToBT = 1.0f / 50.0f;
     constexpr float kBTToUU = 50.0f;
+    const bool game_plane_xf = has_bt_plane && mutator.game_mode == static_cast<uint8_t>(Mode::Soccar);
+    const GamePlaneXfBt plane_xf = GameSoccarPlaneXfBt(
+        axis_normal, goal_floor >= 0 ? GoalFloorOriginBt(goal_floor) : BulletStaticPlaneOriginBt(axis_normal));
+    const GamePlaneXfBt* const xf = game_plane_xf ? &plane_xf : nullptr;
+    const Vec3 inward_normal = game_plane_xf ? GamePlaneNormalBt(plane_xf) : axis_normal;
     Vec3 basis_forward(1.0f, 0.0f, 0.0f);
     Vec3 basis_right(0.0f, 1.0f, 0.0f);
     Vec3 basis_up(0.0f, 0.0f, 1.0f);
     CarBasisColumns(car, basis_forward, basis_right, basis_up);
 
-    const Vec3 support_dir_world = -inward_normal;
-    const Vec3 support_dir_local(
-        Dot(support_dir_world, basis_forward),
-        Dot(support_dir_world, basis_right),
-        Dot(support_dir_world, basis_up));
     const Vec3 half_extent_bt = BulletBoxHalfExtentWithMarginBt(cfg);
-    const Vec3 support_local_bt =
-        cfg.hitbox_offset * kUUToBT +
-        Vec3(
-            support_dir_local.x >= 0.0f ? half_extent_bt.x : -half_extent_bt.x,
-            support_dir_local.y >= 0.0f ? half_extent_bt.y : -half_extent_bt.y,
-            support_dir_local.z >= 0.0f ? half_extent_bt.z : -half_extent_bt.z);
-    const Vec3 rel_contact_bt =
-        basis_forward * support_local_bt.x +
-        basis_right * support_local_bt.y +
-        basis_up * support_local_bt.z;
-    const Vec3 support_world_bt = car.pos_bt + rel_contact_bt;
-    const CarWorldPlaneContactGeometryBt bullet_plane_geom =
-        has_bt_plane
-            ? ComputeBulletStyleCarWorldPlaneContactGeometryBt(car, cfg, inward_normal, boundary)
-            : CarWorldPlaneContactGeometryBt{};
-    const Vec3 row_rel_contact_bt =
-        has_bt_plane ? bullet_plane_geom.rel_pos1_bt : rel_contact_bt;
-    const int source_tag = CarWorldPlaneSourceTag(inward_normal, boundary);
-    const float margin_bt =
-        has_bt_plane ? bullet_plane_geom.distance_bt : Dot(support_world_bt, inward_normal) - boundary * kUUToBT;
-
-    const float threshold_bt = has_bt_plane ? CarContactBreakingThresholdUU(cfg) * kUUToBT : 0.0f;
-
-    const float add_margin_bt = has_bt_plane ? bullet_plane_geom.add_distance_bt : margin_bt;
-    CarWorldPlaneRetainedManifold* const retained =
-        (has_bt_plane) ? retained_manifold : nullptr;
+    const Vec3 retained_plane_origin_bt =
+        goal_floor >= 0 ? GoalFloorOriginBt(goal_floor) : BulletStaticPlaneOriginBt(inward_normal);
     const Vec3 retained_body_row0(basis_forward.x, basis_right.x, basis_up.x);
     const Vec3 retained_body_row1(basis_forward.y, basis_right.y, basis_up.y);
     const Vec3 retained_body_row2(basis_forward.z, basis_right.z, basis_up.z);
-    const Vec3 retained_plane_origin_bt = BulletStaticPlaneOriginBt(inward_normal);
-    // World anchors of the retained points after the refresh (slot-aligned), reused for the emitted rows.
+
+    Vec3 rel_contact_bt(0.0f, 0.0f, 0.0f);
+    float non_bt_margin_bt = 0.0f;
+    Vec3 bt_vtx_in_plane_frame(0.0f, 0.0f, 0.0f);
+    float bt_add_distance = 0.0f;
+    if (has_bt_plane) {
+        const Vec3 child_origin_bt = cfg.hitbox_offset * kUUToBT;
+        const Vec3 child_world_origin_bt = BulletStyleTransformPointBt(
+            retained_body_row0,
+            retained_body_row1,
+            retained_body_row2,
+            car.pos_bt,
+            child_origin_bt);
+        const Vec3 support_dir(
+            BulletStyleDot3Bt(-inward_normal, basis_forward),
+            BulletStyleDot3Bt(-inward_normal, basis_right),
+            BulletStyleDot3Bt(-inward_normal, basis_up));
+        const Vec3 vtx(
+            support_dir.x >= 0.0f ? half_extent_bt.x : -half_extent_bt.x,
+            support_dir.y >= 0.0f ? half_extent_bt.y : -half_extent_bt.y,
+            support_dir.z >= 0.0f ? half_extent_bt.z : -half_extent_bt.z);
+        if (xf != nullptr) {
+            bt_vtx_in_plane_frame =
+                GamePlaneVertexInPlaneBt(*xf, basis_forward, basis_right, basis_up, child_world_origin_bt, vtx);
+            bt_add_distance = bt_vtx_in_plane_frame.z;
+        } else {
+            const Vec3 convex_origin_in_plane_bt = child_world_origin_bt - retained_plane_origin_bt;
+            bt_vtx_in_plane_frame = BulletStyleTransformPointBt(
+                retained_body_row0,
+                retained_body_row1,
+                retained_body_row2,
+                convex_origin_in_plane_bt,
+                vtx);
+            bt_add_distance = BulletStyleDot3Bt(inward_normal, bt_vtx_in_plane_frame);
+        }
+    } else {
+        const Vec3 support_dir_world = -inward_normal;
+        const Vec3 support_dir_local(
+            Dot(support_dir_world, basis_forward),
+            Dot(support_dir_world, basis_right),
+            Dot(support_dir_world, basis_up));
+        const Vec3 support_local_bt =
+            cfg.hitbox_offset * kUUToBT +
+            Vec3(
+                support_dir_local.x >= 0.0f ? half_extent_bt.x : -half_extent_bt.x,
+                support_dir_local.y >= 0.0f ? half_extent_bt.y : -half_extent_bt.y,
+                support_dir_local.z >= 0.0f ? half_extent_bt.z : -half_extent_bt.z);
+        rel_contact_bt =
+            basis_forward * support_local_bt.x +
+            basis_right * support_local_bt.y +
+            basis_up * support_local_bt.z;
+        const Vec3 support_world_bt = car.pos_bt + rel_contact_bt;
+        non_bt_margin_bt = Dot(support_world_bt, inward_normal) - boundary * kUUToBT;
+    }
+
+    const int source_tag =
+        goal_floor >= 0 ? kGoalFloorSourceTag + goal_floor : CarWorldPlaneSourceTag(inward_normal, boundary);
+    const float threshold_bt = has_bt_plane
+        ? (threshold_bt_override ? *threshold_bt_override : CarContactBreakingThresholdBt(cfg))
+        : 0.0f;
+    const float add_margin_bt = has_bt_plane ? bt_add_distance : non_bt_margin_bt;
+    CarWorldPlaneRetainedManifold* const retained =
+        (has_bt_plane) ? retained_manifold : nullptr;
     Vec3 retained_world_a_bt[4];
     if (retained && retained->count > 0) {
         RefreshCarWorldRetainedPlaneManifold(
             *retained, inward_normal, retained_body_row0, retained_body_row1, retained_body_row2,
-            car.pos_bt, retained_plane_origin_bt, threshold_bt, retained_world_a_bt);
+            car.pos_bt, retained_plane_origin_bt, threshold_bt, retained_world_a_bt, xf);
     }
-    const bool within_extent = !has_bt_plane || mutator.game_mode != static_cast<uint8_t>(Mode::Soccar) ||
-                               SoccarPlaneExtentContainsBt(inward_normal, bullet_plane_geom.support_world_bt, threshold_bt);
-    // Off the plane's rectangle the game adds no point but keeps refreshing the manifold it has.
+    const bool within_extent =
+        !has_bt_plane || mutator.game_mode != static_cast<uint8_t>(Mode::Soccar) ||
+        (goal_floor >= 0 ? GoalFloorExtentContainsBt(bt_vtx_in_plane_frame, threshold_bt)
+                         : SoccarPlaneExtentContainsInPlaneBt(inward_normal, bt_vtx_in_plane_frame,
+                                                              threshold_bt));
     if (add_margin_bt >= threshold_bt || (!within_extent && (!retained || retained->count == 0))) {
         if (retained) {
-            // No fresh point: every retained point is a box vertex no closer than the
-            // support vertex, so the refresh above culls it (distance > threshold).
             retained->count = 0;
         }
 
@@ -438,6 +412,38 @@ ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
         return;
     }
 
+    Vec3 bt_position_world_on_a(0.0f, 0.0f, 0.0f);
+    Vec3 bt_local_point_a(0.0f, 0.0f, 0.0f);
+    Vec3 bt_local_point_b(0.0f, 0.0f, 0.0f);
+    Vec3 bt_rel_pos1(0.0f, 0.0f, 0.0f);
+    float bt_distance_refreshed = 0.0f;
+    if (has_bt_plane) {
+        const Vec3 point_on_b = xf != nullptr
+            ? GamePlaneProjectedWorldBt(*xf, bt_vtx_in_plane_frame)
+            : (bt_vtx_in_plane_frame - inward_normal * bt_add_distance) + retained_plane_origin_bt;
+        const Vec3 point_on_a = point_on_b + inward_normal * bt_add_distance;
+        bt_local_point_a = BulletStyleInvTransformPointBt(
+            basis_forward,
+            basis_right,
+            basis_up,
+            car.pos_bt,
+            point_on_a);
+        bt_position_world_on_a = BulletStyleTransformPointBt(
+            retained_body_row0,
+            retained_body_row1,
+            retained_body_row2,
+            car.pos_bt,
+            bt_local_point_a);
+        bt_local_point_b = point_on_b - retained_plane_origin_bt;
+        const Vec3 position_world_on_b =
+            xf != nullptr ? GamePlanePointWorldBt(*xf, bt_local_point_b) : bt_local_point_b + retained_plane_origin_bt;
+        bt_distance_refreshed =
+            BulletStyleDot3Bt(bt_position_world_on_a - position_world_on_b, inward_normal);
+        bt_rel_pos1 = bt_position_world_on_a - car.pos_bt;
+    }
+
+    const Vec3 row_rel_contact_bt_init = has_bt_plane ? bt_rel_pos1 : rel_contact_bt;
+    const float margin_bt = has_bt_plane ? bt_distance_refreshed : non_bt_margin_bt;
     const float penetration = -margin_bt * kBTToUU;
 
     acc.add(inward_normal, Max(penetration, 0.001f));
@@ -453,46 +459,59 @@ ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
         int fresh_slot = -1;
         if (!(margin_bt > threshold_bt) && within_extent) {
             CarWorldPlaneRetainedPoint fresh_point;
-            fresh_point.local_point_a_bt = bullet_plane_geom.local_point_a_bt;
-            fresh_point.point_on_b_bt = bullet_plane_geom.local_point_b_bt;
-            fresh_point.distance_bt = bullet_plane_geom.distance_bt;
+            fresh_point.local_point_a_bt = bt_local_point_a;
+            fresh_point.point_on_b_bt = bt_local_point_b;
+            fresh_point.distance_bt = bt_distance_refreshed;
             fresh_slot = MergeCarWorldRetainedPlanePoint(*retained, fresh_point, threshold_bt);
         }
-        // Refreshed points already hold this transform's anchor and distance; only the merged point is new.
         for (int i = 0; i < retained->count; ++i) {
-            Vec3 pwa;
             if (i == fresh_slot) {
-                Vec3 pwb;
-                CarWorldRetainedPlanePointWorld(
-                    retained->points[i], inward_normal, retained_body_row0, retained_body_row1, retained_body_row2,
-                    car.pos_bt, retained_plane_origin_bt, pwa, pwb, emit_distance_bt[i]);
+                emit_distance_bt[i] = bt_distance_refreshed;
+                emit_rel_contact_bt[i] = bt_rel_pos1;
             } else {
-                pwa = retained_world_a_bt[i];
                 emit_distance_bt[i] = retained->points[i].distance_bt;
+                emit_rel_contact_bt[i] = retained_world_a_bt[i] - car.pos_bt;
             }
-            emit_rel_contact_bt[i] = pwa - car.pos_bt;
         }
         emit_count = retained->count;
     } else {
-        emit_rel_contact_bt[0] = row_rel_contact_bt;
-        emit_distance_bt[0] = has_bt_plane ? bullet_plane_geom.distance_bt : margin_bt;
+        emit_rel_contact_bt[0] = row_rel_contact_bt_init;
+        emit_distance_bt[0] = margin_bt;
         emit_count = 1;
     }
     const int group_normal_row_start = normal_row_count;
     const int group_friction_row_start = friction_row_count;
+    Vec3 inv_r0, inv_r1, inv_r2;
+    BuildInvInertiaTensorWorldBt(car, cfg, mutator.car_mass, inv_r0, inv_r1, inv_r2);
+    const float inv_car_mass = 1.0f / mutator.car_mass;
+    const bool bt_authoritative = car.ext_force_impulse_bt_valid && car.basis_authoritative;
+    const Vec3 vel_plus_ext_bt = car.vel_bt + car.ext_force_impulse_bt;
+    const Vec3 ang_vel_plus_ext = car.ang_vel + car.ext_torque_impulse;
+    CarWorldVelocityTraceInputs velocity_trace_inputs{
+        car.vel,
+        car.ang_vel,
+        external_linear_delta,
+        external_angular_delta,
+        car.pos,
+    };
+    velocity_trace_inputs.has_rel_contact_bt = 1;
+    velocity_trace_inputs.linear_velocity_bt = car.vel_bt;
+    velocity_trace_inputs.car_pos_bt = car.pos_bt;
+    velocity_trace_inputs.external_force_impulse_bt = car.ext_force_impulse_bt;
+    velocity_trace_inputs.has_bt_inputs = car.ext_force_impulse_bt_valid;
+    velocity_trace_inputs.external_torque_impulse = car.ext_torque_impulse;
+    velocity_trace_inputs.restitution_no_velocity_threshold = true;
     for (int emit_idx = 0; emit_idx < emit_count; ++emit_idx) {
     const Vec3 row_rel_contact_bt = emit_rel_contact_bt[emit_idx];
     const float penetration = retained ? -emit_distance_bt[emit_idx] * kBTToUU : -margin_bt * kBTToUU;
     const Vec3 rel_contact = row_rel_contact_bt * kBTToUU;
+    const Vec3 angular_component_bt_native = Mul3x3Vec(inv_r0, inv_r1, inv_r2, Cross(row_rel_contact_bt, inward_normal));
     if (split_rows && split_row_count < kMaxCarWorldSplitContactRows) {
         CarWorldSplitContactRow& split_row = split_rows[split_row_count];
-        // InitializeCarWorldSplitContactRow reads its angular inputs only past its own penetration/dt guard, which
-        // nearly every row fails: compute them only then.
         Vec3 split_angular_bt_native(0.0f, 0.0f, 0.0f);
         Vec3 split_angular(0.0f, 0.0f, 0.0f);
         if (!(penetration <= 0.0f || dt <= 0.0f)) {
-            split_angular_bt_native = CarWorldContactAngularComponentBtNative(
-                car, cfg, mutator.car_mass, row_rel_contact_bt, inward_normal);
+            split_angular_bt_native = angular_component_bt_native;
             split_angular = ApplyInverseBodyInertiaWorld(car, cfg, mutator.car_mass, Cross(rel_contact, inward_normal));
         }
 
@@ -501,7 +520,7 @@ ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
             split_row,
             penetration,
             inward_normal,
-            1.0f / mutator.car_mass,
+            inv_car_mass,
             rel_contact,
             split_angular,
             dt,
@@ -514,44 +533,15 @@ ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
         }
     }
 
-    const Vec3 normal_restitution_rel_vel = VelocityAtPoint(car, rel_contact);
-    const Vec3 normal_base_rel_vel = VelocityAtPoint(car, rel_contact, external_linear_delta, external_angular_delta);
-    const Vec3 tangent_basis_rel_vel = VelocityAtPoint(car, rel_contact, external_linear_delta, external_angular_delta);
-    const Vec3 friction_base_rel_vel = VelocityAtPoint(car, rel_contact, external_linear_delta, Vec3(0.0f, 0.0f, 0.0f));
-    CarWorldVelocityTraceInputs velocity_trace_inputs{
-        car.vel,
-        car.ang_vel,
-        external_linear_delta,
-        external_angular_delta,
-        car.pos,
-    };
     velocity_trace_inputs.rel_contact_bt = row_rel_contact_bt;
-    velocity_trace_inputs.has_rel_contact_bt = 1;
-    velocity_trace_inputs.linear_velocity_bt = car.vel_bt;
-    velocity_trace_inputs.car_pos_bt = car.pos_bt;
-    velocity_trace_inputs.external_force_impulse_bt = car.ext_force_impulse_bt;
-    velocity_trace_inputs.has_bt_inputs = car.ext_force_impulse_bt_valid;
-    velocity_trace_inputs.external_torque_impulse = car.ext_torque_impulse;
-    velocity_trace_inputs.restitution_no_velocity_threshold = true;
-#if !defined(__CUDA_ARCH__)
-    PopulateCarWorldVelocityTraceInertia(
-        velocity_trace_inputs,
-        car,
-        cfg,
-        mutator.car_mass,
-        rel_contact,
-        inward_normal);
-#endif
-    const Vec3 angular_component_bt_native = CarWorldContactAngularComponentBtNative(
-        car,
-        cfg,
-        mutator.car_mass,
-        row_rel_contact_bt,
-        inward_normal);
     const Vec3 angular_component = angular_component_bt_native * (1.0f / 50.0f);
+    Vec3 normal_restitution_rel_vel(0.0f, 0.0f, 0.0f);
+    Vec3 normal_base_rel_vel(0.0f, 0.0f, 0.0f);
+    Vec3 tangent_basis_rel_vel(0.0f, 0.0f, 0.0f);
+    Vec3 friction_base_rel_vel(0.0f, 0.0f, 0.0f);
     Vec3 tangent(0.0f, 0.0f, 0.0f);
-    if (car.ext_force_impulse_bt_valid && car.basis_authoritative) {
-        const Vec3 vel_nd_bt = car.vel_bt + car.ext_force_impulse_bt + Cross(car.ang_vel + car.ext_torque_impulse, row_rel_contact_bt);
+    if (bt_authoritative) {
+        const Vec3 vel_nd_bt = vel_plus_ext_bt + Cross(ang_vel_plus_ext, row_rel_contact_bt);
         const float rel_vel_n_bt = Dot(inward_normal, vel_nd_bt);
         const Vec3 lateral_bt = vel_nd_bt - inward_normal * rel_vel_n_bt;
         const float lat_rel_vel = LengthSq(lateral_bt);
@@ -560,16 +550,15 @@ ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
             ? lateral_bt * (1.0f / SqrtScalar(lat_rel_vel))
             : BulletPlaneSpace1First(inward_normal);
     } else {
+        normal_restitution_rel_vel = VelocityAtPoint(car, rel_contact);
+        normal_base_rel_vel = VelocityAtPoint(car, rel_contact, external_linear_delta, external_angular_delta);
+        tangent_basis_rel_vel = normal_base_rel_vel;
+        friction_base_rel_vel = VelocityAtPoint(car, rel_contact, external_linear_delta, Vec3(0.0f, 0.0f, 0.0f));
         tangent = tangent_basis_rel_vel - inward_normal * Dot(tangent_basis_rel_vel, inward_normal);
         const float tangent_len = Length(tangent);
         tangent = tangent_len > 1e-6f ? (tangent / tangent_len) : OrthonormalTangent(inward_normal);
     }
-    const Vec3 tangent_angular_component_bt_native = CarWorldContactAngularComponentBtNative(
-        car,
-        cfg,
-        mutator.car_mass,
-        row_rel_contact_bt,
-        tangent);
+    const Vec3 tangent_angular_component_bt_native = Mul3x3Vec(inv_r0, inv_r1, inv_r2, Cross(row_rel_contact_bt, tangent));
     const Vec3 tangent_angular_component = tangent_angular_component_bt_native * (1.0f / 50.0f);
     const int normal_row_start = normal_row_count;
     const int friction_row_start = friction_row_count;
@@ -581,7 +570,7 @@ ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
         inward_normal,
         mutator.arena_restitution,
         mutator.arena_friction,
-        1.0f / mutator.car_mass,
+        inv_car_mass,
         rel_contact,
         angular_component,
         tangent_angular_component,
@@ -657,7 +646,6 @@ ROCKETGPU_HD bool CarWorldTriangleAgainstAabbBullet(
     return true;
 }
 
-// A car-triangle GJK/EPA contact with the internal-edge adjust applied; raw_* are the values before it.
 struct CarWorldTriangleHit {
     Vec3 normal;
     Vec3 raw_normal;
@@ -674,7 +662,6 @@ ROCKETGPU_HD CarWorldTriangleHit ComputeCarWorldTriangleHit(
     const MutatorConfig& mutator,
     const ArenaMeshTriangle* mesh_triangles,
     int32_t tri_idx,
-    float contact_threshold_bt,
     bullet_port::btGjkEpaScratch* gjk_epa_scratch) {
     const ArenaMeshTriangle& tri = mesh_triangles[tri_idx];
     CarWorldTriangleHit out;
@@ -688,8 +675,8 @@ ROCKETGPU_HD CarWorldTriangleHit ComputeCarWorldTriangleHit(
     const ArenaMeshTriangle& gjk_tri = cal_frame_gjk ? mutator.cal_arena_local_tris[tri_idx] : tri;
     const float gjk_tri_origin_y_bt =
         cal_frame_gjk ? static_cast<float>(gjk_tri.cal_origin_sign) * kGoalMeshOriginYBt : 0.0f;
-    if (!ComputeCarArenaTriangleContact(car, cfg, gjk_tri, contact_threshold_bt, contact_normal, distance_bt,
-                                        &point_on_a_bt, &point_on_b_bt, gjk_epa_scratch, nullptr, nullptr, 0,
+    if (!ComputeCarArenaTriangleContact(car, cfg, gjk_tri, contact_normal, distance_bt,
+                                        &point_on_a_bt, &point_on_b_bt, gjk_epa_scratch, nullptr,
                                         gjk_tri_origin_y_bt)) {
         return out;
     }
@@ -699,8 +686,7 @@ ROCKETGPU_HD CarWorldTriangleHit ComputeCarWorldTriangleHit(
     const Vec3 cp_point_on_a_bt = point_on_b_bt + contact_normal * distance_bt;
     if (EnableArenaTriangleInternalEdgeAdjust()) {
         out.internal_edge_adjusted = MaybeAdjustArenaTriangleInternalEdgeContact(
-            tri, cp_point_on_a_bt, distance_bt, point_on_b_bt, contact_normal, nullptr,
-            mutator.game_mode == static_cast<uint8_t>(Mode::Soccar),
+            tri, cp_point_on_a_bt, distance_bt, point_on_b_bt, contact_normal,
             mutator.native_sphere_rsqrt_table, mutator.native_sphere_rsqrt_shift,
             cal_frame_gjk ? &mutator.cal_arena_local_tris[tri_idx] : nullptr) ? 1 : 0;
     }
@@ -711,16 +697,13 @@ ROCKETGPU_HD CarWorldTriangleHit ComputeCarWorldTriangleHit(
     return out;
 }
 
-// Car-triangle pairs staged for a thread each. The gather pass lists, in walk order, every triangle of a staged
-// (car, mesh) pair that passes the plane test; the contact pass computes each pair's hit; the merge pass folds the
-// hits into the pair's candidates in list order, as the inline walk does.
 struct CarWorldTrianglePairs {
     int32_t* car_idx;
     int32_t* tri_idx;
     CarWorldTriangleHit* hits;
     int32_t* count;
     int32_t capacity;
-    int32_t car_stride;  // global car index = env_idx * car_stride + slot
+    int32_t car_stride;
 };
 enum : int { kTrianglePairsNone = 0, kTrianglePairsGather = 1, kTrianglePairsMerge = 2 };
 constexpr int kCarWorldMeshGatherTriangles = 128;
@@ -749,23 +732,23 @@ struct CarWorldMeshCandidateStageMesh {
     MeshContactCandidate candidates[kCarWorldMeshStageCandidates];
     int32_t candidate_count = 0;
     int32_t broadphase_hits = 0;
-    int32_t pair_start = 0;  // CarWorldTrianglePairs entries from the gather pass; -1 count: none
+    int32_t pair_start = 0;
     int32_t pair_count = -1;
     uint8_t has_collected_normal = 0;
     Vec3 last_collected_normal = Vec3(0.0f, 0.0f, 1.0f);
+    uint8_t pairs_replayable = 0;
+    const int32_t* pair_tris = nullptr;
+    const CarWorldTriangleHit* pair_hits = nullptr;
 };
-// Meshes one car's query AABB overlaps at most for the stage to hold it (Octane recordings: never more than 2); a car
-// overlapping more is left unstaged (valid = 0) and the step walks it itself.
 constexpr int kCarWorldMeshStageSlots = 4;
 struct CarWorldMeshCandidateStage {
     float fingerprint[kCarWorldMeshStageFingerprintFloats] = {};
     int32_t valid = 0;
     int32_t mesh_count = 0;
-    uint32_t mesh_mask = 0;  // meshes with a staged entry; the others yield no candidates
-    CarWorldMeshCandidateStageMesh meshes[kCarWorldMeshStageSlots];  // the mesh_mask meshes in mesh order
+    uint32_t mesh_mask = 0;
+    CarWorldMeshCandidateStageMesh meshes[kCarWorldMeshStageSlots];
 };
 
-// Entry of a mesh in mesh_mask: the number of mask bits below it.
 ROCKETGPU_HD int CarWorldMeshStageSlot(uint32_t mesh_mask, int mesh) {
     uint32_t v = mesh_mask & ((1u << mesh) - 1u);
     v = v - ((v >> 1) & 0x55555555u);
@@ -813,7 +796,6 @@ ROCKETGPU_HD bool CarWorldMeshCandidateStageMatches(const CarWorldMeshCandidateS
                                                 const CarConfig& cfg) {
     float fp[kCarWorldMeshStageFingerprintFloats];
     FillCarWorldMeshCandidateFingerprint(car, cfg, fp);
-    // Every word compared (no early exit), so the stage loads issue together.
     uint32_t differ = 0u;
 #pragma unroll
     for (int i = 0; i < kCarWorldMeshStageFingerprintFloats; ++i) {
@@ -887,13 +869,13 @@ ROCKETGPU_HD int SelectCarWorldMeshContactReplaceIndexBulletStyle(
     return biggest_area;
 }
 
-// The car hitbox as the mesh query sees it (Bullet units): basis, box center and the rotated box's AABB with margin.
 struct CarWorldMeshQueryFrame {
     Vec3 axis_x = Vec3(1.0f, 0.0f, 0.0f);
     Vec3 axis_y = Vec3(0.0f, 1.0f, 0.0f);
     Vec3 axis_z = Vec3(0.0f, 0.0f, 1.0f);
     Vec3 box_center_bt;
     Vec3 box_half_extent_with_margin_bt;
+    Vec3 extent_bt;
     Vec3 aabb_min_bt;
     Vec3 aabb_max_bt;
 };
@@ -920,6 +902,7 @@ ROCKETGPU_HD CarWorldMeshQueryFrame ComputeCarWorldMeshQueryFrame(const CarState
         Abs(axis_x.x) * h.x + Abs(axis_y.x) * h.y + Abs(axis_z.x) * h.z,
         Abs(axis_x.y) * h.x + Abs(axis_y.y) * h.y + Abs(axis_z.y) * h.z,
         Abs(axis_x.z) * h.x + Abs(axis_y.z) * h.y + Abs(axis_z.z) * h.z);
+    f.extent_bt = extent_bt;
     f.aabb_min_bt = f.box_center_bt - extent_bt;
     f.aabb_max_bt = f.box_center_bt + extent_bt;
     return f;
@@ -936,7 +919,6 @@ ROCKETGPU_HD bool CarWorldMeshInfoUsable(
            mesh_info.node_offset + mesh_info.node_count <= mesh_bvh_node_count;
 }
 
-// A mesh whose bounds the query AABB misses yields no candidates.
 ROCKETGPU_HD bool CarWorldMeshAabbMayOverlap(
     const ArenaMeshBvhMeshInfo& mesh_info,
     const Vec3& aabb_min_bt,
@@ -950,16 +932,6 @@ ROCKETGPU_HD bool CarWorldMeshAabbMayOverlap(
            aabb_max_bt.z >= mesh_info.aabb_min.z - kMeshSkipMarginBt;
 }
 
-// Chassis early-out (car_world_early_out): conservative proofs that the car-world chassis query yields no contact
-// rows this tick, so SolveCarWorldStaticContacts can skip it with bit-identical results.
-//
-// Every point of the car box lies within reach_bt = |hitbox offset| + |half extents with margin| of the car origin.
-// The Bullet proxy AABB (current and predicted transforms, + 0.02), the compound child AABB and the mesh query AABB
-// (+ breaking threshold) therefore lie inside the box around the origin and the predicted origin pos + vel dt,
-// grown by reach_bt plus a slack that covers those expansions and a basis off unit length by rounding. A mesh whose
-// AABB misses that box has no manifold (BulletCarMeshManifoldExists), no triangle in the query AABB and no group.
-// Separation of a triangle from the car box (half extents with margin) along one box axis. GJK's distance between
-// them is at least this gap, so a gap past the breaking threshold means no candidate.
 ROCKETGPU_HD float CarWorldTriangleBoxAxisGap(
     const ArenaMeshTriangle& tri, const Vec3& axis, const Vec3& box_center_bt, float half_extent_bt) {
     const float c = Dot(axis, box_center_bt);
@@ -969,11 +941,17 @@ ROCKETGPU_HD float CarWorldTriangleBoxAxisGap(
     return Max(Min(pa, Min(pb, pc)) - (c + half_extent_bt), (c - half_extent_bt) - Max(pa, Max(pb, pc)));
 }
 
-// The mesh query's tests of one triangle before its GJK: 0 outside the query AABB, 1 in it (a broadphase hit) but
-// separated from the box along the triangle normal or a box axis, 2 a candidate (the gather pass lists it).
 ROCKETGPU_HD int CarWorldTriangleQueryTest(
-    const ArenaMeshTriangle& tri, const CarWorldMeshQueryFrame& f, float contact_threshold_bt) {
-    if (!CarWorldTriangleAgainstAabbBullet(tri, f.aabb_min_bt, f.aabb_max_bt)) {
+    const ArenaMeshTriangle& tri, const CarWorldMeshQueryFrame& f, float contact_threshold_bt,
+    const ArenaMeshTriangle* local_tri = nullptr) {
+    if (local_tri != nullptr && local_tri->cal_origin_sign != 0) {
+        const float center_y = f.box_center_bt.y - static_cast<float>(local_tri->cal_origin_sign) * kGoalMeshOriginYBt;
+        const Vec3 local_min(f.aabb_min_bt.x, center_y - f.extent_bt.y, f.aabb_min_bt.z);
+        const Vec3 local_max(f.aabb_max_bt.x, center_y + f.extent_bt.y, f.aabb_max_bt.z);
+        if (!CarWorldTriangleAgainstAabbBullet(*local_tri, local_min, local_max)) {
+            return 0;
+        }
+    } else if (!CarWorldTriangleAgainstAabbBullet(tri, f.aabb_min_bt, f.aabb_max_bt)) {
         return 0;
     }
     const Vec3 triangle_normal_world = Normalize(tri.normal, Vec3(0.0f, 0.0f, 1.0f));
@@ -989,8 +967,6 @@ ROCKETGPU_HD int CarWorldTriangleQueryTest(
         separation_against_normal > contact_threshold_bt) {
         return 1;
     }
-    // Box-axis separation: GJK would return no hit or a distance past the threshold, which adds nothing.
-    // The slack covers GJK's tolerance and rounding.
     constexpr float kBoxAxisGapSlackBt = 1.0e-3f;
     const float box_axis_reject_bt = contact_threshold_bt + kBoxAxisGapSlackBt;
     if (CarWorldTriangleBoxAxisGap(tri, f.axis_x, f.box_center_bt, f.box_half_extent_with_margin_bt.x) > box_axis_reject_bt ||
@@ -1026,10 +1002,16 @@ ROCKETGPU_HD bool CarWorldMeshInReach(const CarWorldMeshReach& reach, const Aren
            reach.hi.y >= info.aabb_min.y && reach.lo.z <= info.aabb_max.z && reach.hi.z >= info.aabb_min.z;
 }
 
-// Bit m set when mesh m (m < mesh_count <= 32) meets the reach box, as CarWorldMeshInReach. Every term is evaluated
-// and up to 16 meshes the loop is unrolled, so the mesh loads issue together instead of a round trip per mesh.
 ROCKETGPU_HD uint32_t CarWorldMeshReachMask(
     const CarWorldMeshReach& reach, const ArenaMeshBvhMeshInfo* mesh_infos, int32_t mesh_count) {
+    if (mesh_count <= 0 || mesh_infos == nullptr) {
+        return 0u;
+    }
+    const float fx = mesh_infos[0].free_half_x;
+    const float fy = mesh_infos[0].free_half_y;
+    if (reach.hi.x < fx && reach.lo.x > -fx && reach.hi.y < fy && reach.lo.y > -fy) {
+        return 0u;
+    }
     uint32_t mask = 0u;
     const auto test = [&](int m) {
         const Vec3 lo = mesh_infos[m].aabb_min;
@@ -1053,7 +1035,6 @@ ROCKETGPU_HD uint32_t CarWorldMeshReachMask(
     return mask;
 }
 
-// Bit m set when mesh m (m < mesh_count <= 32) is CarWorldMeshInfoUsable, every term evaluated as above.
 ROCKETGPU_HD uint32_t CarWorldMeshUsableMask(
     const ArenaMeshBvhMeshInfo* mesh_infos, int32_t mesh_count, int32_t mesh_bvh_quantization_count,
     int32_t mesh_bvh_node_count) {
@@ -1100,37 +1081,6 @@ ROCKETGPU_HD bool CarWorldMeshesOutOfReach(
     return true;
 }
 
-// No usable mesh within the car's broadphase reach. AppendCarWorldMeshContactRows' rows pass then skips every mesh,
-// releasing the car's retained manifold with it, and adds no row, group or normal (ReleaseCarWorldMeshManifoldsOutOfReach).
-ROCKETGPU_HD bool CarWorldUsableMeshesOutOfReach(
-    const CarState& car,
-    const CarConfig& cfg,
-    const ArenaMeshBvhQuantization* mesh_bvh_quantization,
-    int32_t mesh_bvh_quantization_count,
-    const ArenaMeshBvhMeshInfo* mesh_bvh_meshes,
-    int32_t mesh_bvh_mesh_count,
-    const ArenaMeshBvhNode* mesh_bvh_nodes,
-    int32_t mesh_bvh_node_count,
-    float dt) {
-    if (mesh_bvh_quantization == nullptr || mesh_bvh_meshes == nullptr || mesh_bvh_nodes == nullptr ||
-        mesh_bvh_mesh_count <= 0 || mesh_bvh_node_count <= 0) {
-        return false;
-    }
-    const CarWorldMeshReach reach = ComputeCarWorldMeshReach(car, cfg, dt);
-    if (mesh_bvh_mesh_count <= 32) {
-        return (CarWorldMeshReachMask(reach, mesh_bvh_meshes, mesh_bvh_mesh_count) &
-                CarWorldMeshUsableMask(mesh_bvh_meshes, mesh_bvh_mesh_count, mesh_bvh_quantization_count,
-                                       mesh_bvh_node_count)) == 0u;
-    }
-    for (int m = 0; m < mesh_bvh_mesh_count; ++m) {
-        if (CarWorldMeshInfoUsable(mesh_bvh_meshes[m], mesh_bvh_quantization_count, mesh_bvh_node_count) &&
-            CarWorldMeshInReach(reach, mesh_bvh_meshes[m])) {
-            return false;
-        }
-    }
-    return true;
-}
-
 ROCKETGPU_HD void ReleaseCarWorldMeshManifoldsOutOfReach(
     const ArenaMeshBvhMeshInfo* mesh_bvh_meshes,
     int32_t mesh_bvh_mesh_count,
@@ -1142,7 +1092,6 @@ ROCKETGPU_HD void ReleaseCarWorldMeshManifoldsOutOfReach(
     }
     static_assert(kCarWorldMeshRetainedManifoldsPerCar == 2, "the slot form below covers two slots");
     if (mesh_bvh_mesh_count <= 32) {
-        // The loop below by slot: a usable mesh's first slot holding points is released.
         const uint32_t usable =
             CarWorldMeshUsableMask(mesh_bvh_meshes, mesh_bvh_mesh_count, mesh_bvh_quantization_count, mesh_bvh_node_count);
         CarWorldMeshRetainedManifold& s0 = retained_mesh_manifolds[0];
@@ -1175,13 +1124,12 @@ ROCKETGPU_HD void ReleaseCarWorldMeshManifoldsOutOfReach(
 }
 
 constexpr float kCarWorldPlaneReachSlackBt = 1.0e-3f;
-// The four planes' support distances d (bt), with the breaking threshold and the broadphase window.
 ROCKETGPU_HD void CarWorldPlaneSupportDistances(
     const CarState& car, const CarConfig& cfg, float d[4], float& threshold_bt, float& window_bt) {
     constexpr float kUUToBT = 1.0f / 50.0f;
     constexpr float kBulletGContactBreakingThresholdBt = 0.02f;
     constexpr float kBulletStaticPlaneAabbHalfSlabBt = 0.2f;
-    threshold_bt = CarContactBreakingThresholdUU(cfg) * kUUToBT;
+    threshold_bt = CarContactBreakingThresholdBt(cfg);
     window_bt = threshold_bt + kBulletStaticPlaneAabbHalfSlabBt + 2.0f * kBulletGContactBreakingThresholdBt;
     Vec3 fwd(1.0f, 0.0f, 0.0f);
     Vec3 right(0.0f, 1.0f, 0.0f);
@@ -1190,7 +1138,6 @@ ROCKETGPU_HD void CarWorldPlaneSupportDistances(
     const Vec3 half_bt = BulletBoxHalfExtentWithMarginBt(cfg);
     const Vec3 offset_bt = cfg.hitbox_offset * kUUToBT;
     const Vec3 center_bt = car.pos_bt + fwd * offset_bt.x + right * offset_bt.y + up * offset_bt.z;
-    // Box extent along world x and z.
     const float ext_x = Abs(fwd.x) * half_bt.x + Abs(right.x) * half_bt.y + Abs(up.x) * half_bt.z;
     const float ext_z = Abs(fwd.z) * half_bt.x + Abs(right.z) * half_bt.y + Abs(up.z) * half_bt.z;
     const float wall_bt = ArenaExtentX() * kUUToBT;
@@ -1200,10 +1147,6 @@ ROCKETGPU_HD void CarWorldPlaneSupportDistances(
     d[3] = ArenaHeight() * kUUToBT - center_bt.z - ext_z;
 }
 
-// The four Bullet static planes (+X wall, -X wall, floor, ceiling, AppendCarWorldPlaneContactRows order). Returns -1
-// unless every plane's support distance clears the breaking threshold (no point) and sits clearly on one side of the
-// broadphase window (whether the plane gets an empty order group); otherwise bit i is set when plane i gets the
-// group. The bound is the support-vertex distance itself, so the slack only covers rounding.
 ROCKETGPU_HD int CarWorldPlanesOutOfReach(const CarState& car, const CarConfig& cfg) {
     constexpr float kSlackBt = kCarWorldPlaneReachSlackBt;
     float d[4];
@@ -1228,8 +1171,6 @@ ROCKETGPU_HD int CarWorldPlanesOutOfReach(const CarState& car, const CarConfig& 
     return mask;
 }
 
-// The planes that may get a point: support distance under the breaking threshold (with the slack above). The others
-// clear it, so they add no contact and no row (AppendCarWorldPlaneContactRows returns before both).
 ROCKETGPU_HD int CarWorldPlanesInReachCount(const CarState& car, const CarConfig& cfg) {
     float d[4];
     float threshold_bt;
@@ -1239,13 +1180,13 @@ ROCKETGPU_HD int CarWorldPlanesInReachCount(const CarState& car, const CarConfig
     for (int k = 0; k < 4; ++k) {
         count += d[k] < threshold_bt + kCarWorldPlaneReachSlackBt ? 1 : 0;
     }
+    if (d[2] < threshold_bt + kCarWorldPlaneReachSlackBt && Abs(car.pos_bt.x) < kGoalFloorHalfXBt + 4.0f &&
+        Abs(Abs(car.pos_bt.y) - kGoalFloorOriginYBt) < kGoalFloorHalfYBt + 4.0f) {
+        ++count;
+    }
     return count;
 }
 
-// kStagedHitsOnly: the staging kernel's build. It never runs GJK/EPA: the gather pass stops at the plane tests and
-// the merge pass takes CarWorldTriangleHitsKernel's hits (a pair without them is left to the step, see the caller).
-// Inlined into SolveCarWorldStaticContacts on the device (an ABI call there saves and restores most of the caller's
-// registers); the staging kernel goes through AppendCarWorldMeshContactRows below.
 template <bool kStagedHitsOnly = false>
 ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRowsBody(
     const CarState& car,
@@ -1285,17 +1226,18 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
     const CarWorldTrianglePairs* triangle_pairs = nullptr,
     int triangle_pairs_pass = kTrianglePairsNone,
     CarWorldMeshRetainedManifold* retained_mesh_manifolds = nullptr,
-    uint32_t mesh_reach_hint = 0u) {
+    uint32_t mesh_reach_hint = 0u,
+    const Vec3* predict_vel = nullptr,
+    const Vec3* predict_ang_vel = nullptr) {
     if (mesh_triangles == nullptr || mesh_triangle_count <= 0) {
         return;
     }
 
-    constexpr float kUUToBT = 1.0f / 50.0f;
     constexpr float kBTToUU = 50.0f;
     constexpr int kMaxMeshCandidates = 4;
     constexpr int kMaxMeshRows = 4;
 
-    const float contact_threshold_bt = CarContactBreakingThresholdUU(cfg) * kUUToBT;
+    const float contact_threshold_bt = CarContactBreakingThresholdBt(cfg);
     const bool have_bvh_traversal =
         mesh_bvh_quantization != nullptr &&
         mesh_bvh_meshes != nullptr &&
@@ -1306,29 +1248,11 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
         (stage_in->valid == 0 || !have_bvh_traversal || stage_in->mesh_count != mesh_bvh_mesh_count)) {
         stage_in = nullptr;
     }
-    // The query frame feeds only the BVH walk and the subtree overlap count; rows from a usable stage with the
-    // broadphase grid run neither.
-    const bool query_frame_used = stage_in == nullptr || broadphase_grid == nullptr;
-    const CarWorldMeshQueryFrame query_frame =
-        query_frame_used ? ComputeCarWorldMeshQueryFrame(car, cfg) : CarWorldMeshQueryFrame{};
-    const Vec3 axis_x = query_frame.axis_x;
-    const Vec3 axis_y = query_frame.axis_y;
-    const Vec3 axis_z = query_frame.axis_z;
-    const Vec3 box_center_bt = query_frame.box_center_bt;
-    const Vec3 box_half_extent_with_margin_bt = query_frame.box_half_extent_with_margin_bt;
-    const Vec3 aabb_min_bt = query_frame.aabb_min_bt;
-    const Vec3 aabb_max_bt = query_frame.aabb_max_bt;
-    // Rows pass (broadphase grid, no staging): a mesh out of reach (CarWorldMeshesOutOfReach) has no manifold, no
-    // triangle in the query AABB and no group, so it is skipped, and the proxy is built only when some mesh is in reach.
     const bool skip_out_of_reach = broadphase_grid != nullptr && stage_out == nullptr && mesh_bvh_meshes != nullptr;
-    // mesh_reach_hint (nonzero): the usable meshes in reach, as the caller computed them with this dt. The loop skips
-    // an unusable mesh before anything else, so its bit changes nothing.
     const bool reach_hinted = mesh_reach_hint != 0u && skip_out_of_reach && mesh_bvh_mesh_count <= 32;
     const CarWorldMeshReach mesh_reach =
         reach_hinted ? CarWorldMeshReach{} : ComputeCarWorldMeshReach(car, cfg, broadphase_dt);
     bool any_mesh_in_reach = !skip_out_of_reach;
-    // Rows pass: the meshes the mesh loop below visits. It skips one out of reach without a retained manifold, which
-    // does nothing there (merging and releasing a mesh's manifold never touch another mesh's).
     uint32_t mesh_visit_mask = ~0u;
     if (skip_out_of_reach && mesh_bvh_mesh_count <= 32) {
         const uint32_t in_reach =
@@ -1340,14 +1264,32 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
                 mesh_visit_mask |= 1u << retained_mesh_manifolds[k].mesh;
             }
         }
+        if (have_bvh_traversal && stage_out == nullptr && mesh_visit_mask == 0u) {
+            return;
+        }
     } else {
         for (int m = 0; !any_mesh_in_reach && m < mesh_bvh_mesh_count; ++m) {
             any_mesh_in_reach = CarWorldMeshInReach(mesh_reach, mesh_bvh_meshes[m]);
         }
     }
+    bool live_retained_mesh_walk = false;
+    for (int k = 0; stage_in != nullptr && retained_mesh_manifolds != nullptr && k < kCarWorldMeshRetainedManifoldsPerCar; ++k) {
+        const int m = retained_mesh_manifolds[k].mesh;
+        if (retained_mesh_manifolds[k].count > 0 && m < 32 && ((stage_in->mesh_mask >> m) & 1u) != 0 &&
+            stage_in->meshes[CarWorldMeshStageSlot(stage_in->mesh_mask, m)].pairs_replayable == 0) {
+            live_retained_mesh_walk = true;
+        }
+    }
+    const bool query_frame_used = stage_in == nullptr || broadphase_grid == nullptr || live_retained_mesh_walk;
+    const CarWorldMeshQueryFrame query_frame =
+        query_frame_used ? ComputeCarWorldMeshQueryFrame(car, cfg) : CarWorldMeshQueryFrame{};
+    const Vec3 box_center_bt = query_frame.box_center_bt;
+    const Vec3 aabb_min_bt = query_frame.aabb_min_bt;
+    const Vec3 aabb_max_bt = query_frame.aabb_max_bt;
     const BulletBroadphaseProxy car_broadphase_proxy =
         broadphase_grid != nullptr && any_mesh_in_reach
-            ? ComputeBulletCarProxyAabb(car, cfg, broadphase_dt, *broadphase_grid, NativeSseMath(mutator))
+            ? ComputeBulletCarProxyAabb(car, cfg, broadphase_dt, *broadphase_grid, NativeSseMath(mutator),
+                                        predict_vel, predict_ang_vel)
             : BulletBroadphaseProxy{};
 
     const Vec3 car_pos_bt = car.pos_bt;
@@ -1385,20 +1327,43 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
     auto emit_candidates = [&](
         MeshContactCandidate* candidates,
         int candidate_count) {
+        if (candidate_count <= 0) {
+            return;
+        }
+        Vec3 inv_r0, inv_r1, inv_r2;
+        BuildInvInertiaTensorWorldBt(car, cfg, mutator.car_mass, inv_r0, inv_r1, inv_r2);
+        const float inv_car_mass = 1.0f / mutator.car_mass;
+        const bool bt_authoritative = car.ext_force_impulse_bt_valid && car.basis_authoritative;
+        const Vec3 vel_plus_ext_bt = car.vel_bt + car.ext_force_impulse_bt;
+        const Vec3 ang_vel_plus_ext = car.ang_vel + car.ext_torque_impulse;
+        CarWorldVelocityTraceInputs velocity_trace_inputs{
+            car.vel,
+            car.ang_vel,
+            external_linear_delta,
+            external_angular_delta,
+            car.pos,
+        };
+        velocity_trace_inputs.has_rel_contact_bt = 1;
+        velocity_trace_inputs.linear_velocity_bt = car.vel_bt;
+        velocity_trace_inputs.car_pos_bt = car.pos_bt;
+        velocity_trace_inputs.external_force_impulse_bt = car.ext_force_impulse_bt;
+        velocity_trace_inputs.has_bt_inputs = car.ext_force_impulse_bt_valid;
+        velocity_trace_inputs.external_torque_impulse = car.ext_torque_impulse;
+        velocity_trace_inputs.restitution_no_velocity_threshold = true;
         int emitted_rows = 0;
         for (int candidate_idx = 0; candidate_idx < candidate_count && emitted_rows < kMaxMeshRows; ++candidate_idx) {
-            MeshContactCandidate candidate = candidates[candidate_idx];
+            const MeshContactCandidate& candidate = candidates[candidate_idx];
             const float penetration_uu = Max(0.0f, -candidate.distance_bt) * kBTToUU;
             acc.add(candidate.normal, Max(penetration_uu, 0.001f));
+            const Vec3 angular_component_bt_native =
+                Mul3x3Vec(inv_r0, inv_r1, inv_r2, Cross(candidate.rel_contact_bt, candidate.normal));
 
             if (split_rows && split_row_count < kMaxCarWorldSplitContactRows) {
                 CarWorldSplitContactRow& split_row = split_rows[split_row_count];
-                // As for plane rows: the angular inputs are read only past the callee's penetration/dt guard.
                 Vec3 mesh_split_angular_bt_native(0.0f, 0.0f, 0.0f);
                 Vec3 mesh_split_angular(0.0f, 0.0f, 0.0f);
                 if (!(penetration_uu <= 0.0f || dt <= 0.0f)) {
-                    mesh_split_angular_bt_native = CarWorldContactAngularComponentBtNative(
-                        car, cfg, mutator.car_mass, candidate.rel_contact_bt, candidate.normal);
+                    mesh_split_angular_bt_native = angular_component_bt_native;
                     mesh_split_angular = ApplyInverseBodyInertiaWorld(
                         car, cfg, mutator.car_mass, Cross(candidate.rel_contact, candidate.normal));
                 }
@@ -1407,7 +1372,7 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
                     split_row,
                     penetration_uu,
                     candidate.normal,
-                    1.0f / mutator.car_mass,
+                    inv_car_mass,
                     candidate.rel_contact,
                     mesh_split_angular,
                     dt,
@@ -1420,44 +1385,15 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
                 }
             }
 
-            const Vec3 normal_restitution_rel_vel = VelocityAtPoint(car, candidate.rel_contact);
-            const Vec3 normal_base_rel_vel = VelocityAtPoint(car, candidate.rel_contact, external_linear_delta, external_angular_delta);
-            const Vec3 tangent_basis_rel_vel = normal_base_rel_vel;
-            const Vec3 friction_base_rel_vel = VelocityAtPoint(car, candidate.rel_contact, external_linear_delta, Vec3(0.0f, 0.0f, 0.0f));
-            CarWorldVelocityTraceInputs velocity_trace_inputs{
-                car.vel,
-                car.ang_vel,
-                external_linear_delta,
-                external_angular_delta,
-                car.pos,
-            };
             velocity_trace_inputs.rel_contact_bt = candidate.rel_contact_bt;
-            velocity_trace_inputs.has_rel_contact_bt = 1;
-            velocity_trace_inputs.linear_velocity_bt = car.vel_bt;
-            velocity_trace_inputs.car_pos_bt = car.pos_bt;
-            velocity_trace_inputs.external_force_impulse_bt = car.ext_force_impulse_bt;
-            velocity_trace_inputs.has_bt_inputs = car.ext_force_impulse_bt_valid;
-            velocity_trace_inputs.external_torque_impulse = car.ext_torque_impulse;
-            velocity_trace_inputs.restitution_no_velocity_threshold = true;
-#if !defined(__CUDA_ARCH__)
-            PopulateCarWorldVelocityTraceInertia(
-                velocity_trace_inputs,
-                car,
-                cfg,
-                mutator.car_mass,
-                candidate.rel_contact,
-                candidate.normal);
-#endif
-            const Vec3 angular_component_bt_native = CarWorldContactAngularComponentBtNative(
-                car,
-                cfg,
-                mutator.car_mass,
-                candidate.rel_contact_bt,
-                candidate.normal);
             const Vec3 angular_component = angular_component_bt_native * (1.0f / 50.0f);
+            Vec3 normal_restitution_rel_vel(0.0f, 0.0f, 0.0f);
+            Vec3 normal_base_rel_vel(0.0f, 0.0f, 0.0f);
+            Vec3 tangent_basis_rel_vel(0.0f, 0.0f, 0.0f);
+            Vec3 friction_base_rel_vel(0.0f, 0.0f, 0.0f);
             Vec3 tangent(0.0f, 0.0f, 0.0f);
-            if (car.ext_force_impulse_bt_valid && car.basis_authoritative) {
-                const Vec3 vel_nd_bt = car.vel_bt + car.ext_force_impulse_bt + Cross(car.ang_vel + car.ext_torque_impulse, candidate.rel_contact_bt);
+            if (bt_authoritative) {
+                const Vec3 vel_nd_bt = vel_plus_ext_bt + Cross(ang_vel_plus_ext, candidate.rel_contact_bt);
                 const float rel_vel_n_bt = Dot(candidate.normal, vel_nd_bt);
                 const Vec3 lateral_bt = vel_nd_bt - candidate.normal * rel_vel_n_bt;
                 const float lat_rel_vel = LengthSq(lateral_bt);
@@ -1466,16 +1402,16 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
                     ? lateral_bt * (1.0f / SqrtScalar(lat_rel_vel))
                     : BulletPlaneSpace1First(candidate.normal);
             } else {
+                normal_restitution_rel_vel = VelocityAtPoint(car, candidate.rel_contact);
+                normal_base_rel_vel = VelocityAtPoint(car, candidate.rel_contact, external_linear_delta, external_angular_delta);
+                tangent_basis_rel_vel = normal_base_rel_vel;
+                friction_base_rel_vel = VelocityAtPoint(car, candidate.rel_contact, external_linear_delta, Vec3(0.0f, 0.0f, 0.0f));
                 tangent = tangent_basis_rel_vel - candidate.normal * Dot(tangent_basis_rel_vel, candidate.normal);
                 const float tangent_len = Length(tangent);
                 tangent = tangent_len > 1e-6f ? (tangent / tangent_len) : OrthonormalTangent(candidate.normal);
             }
-            const Vec3 tangent_angular_component_bt_native = CarWorldContactAngularComponentBtNative(
-                car,
-                cfg,
-                mutator.car_mass,
-                candidate.rel_contact_bt,
-                tangent);
+            const Vec3 tangent_angular_component_bt_native =
+                Mul3x3Vec(inv_r0, inv_r1, inv_r2, Cross(candidate.rel_contact_bt, tangent));
             const Vec3 tangent_angular_component = tangent_angular_component_bt_native * (1.0f / 50.0f);
             const int normal_row_start = normal_row_count;
             const int friction_row_start = friction_row_count;
@@ -1488,7 +1424,7 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
                 candidate.normal,
                 mutator.arena_restitution,
                 mutator.arena_friction,
-                1.0f / mutator.car_mass,
+                inv_car_mass,
                 candidate.rel_contact,
                 angular_component,
                 tangent_angular_component,
@@ -1503,11 +1439,6 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
             for (int row_idx = normal_row_start; row_idx < normal_row_count; ++row_idx) {
                 normal_rows[row_idx].source_tag = mesh_source_tag;
             }
-            const auto debug_candidate_matches_target_triangle = [&]() {
-                return false;
-            };
-            const bool debug_emit_target_triangle =
-                debug_candidate_matches_target_triangle();
             for (int row_idx = friction_row_start; row_idx < friction_row_count; ++row_idx) {
                 friction_rows[row_idx].source_tag = mesh_source_tag;
             }
@@ -1515,14 +1446,15 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
         }
     };
 
-    // Gather pass: the triangles of this (car, mesh) pair that pass the plane test, in walk order.
     int32_t gathered_tris[kCarWorldMeshGatherTriangles];
     int gathered_count = 0;
     auto consider_triangle = [&](int32_t tri_idx, MeshContactCandidate* candidates, int& candidate_count,
                                  const CarWorldTriangleHit* precomputed = nullptr) {
         const ArenaMeshTriangle& tri = mesh_triangles[tri_idx];
         if (precomputed == nullptr) {
-            const int query_test = CarWorldTriangleQueryTest(tri, query_frame, contact_threshold_bt);
+            const int query_test = CarWorldTriangleQueryTest(
+                tri, query_frame, contact_threshold_bt,
+                mutator.cal_arena_local_tris != nullptr ? &mutator.cal_arena_local_tris[tri_idx] : nullptr);
             if (query_test == 0) {
                 return;
             }
@@ -1547,9 +1479,9 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
         } else {
             hit = precomputed != nullptr
                 ? *precomputed
-                : ComputeCarWorldTriangleHit(car, cfg, mutator, mesh_triangles, tri_idx, contact_threshold_bt, gjk_epa_scratch);
+                : ComputeCarWorldTriangleHit(car, cfg, mutator, mesh_triangles, tri_idx, gjk_epa_scratch);
         }
-        if (hit.hit == 0) {
+        if (hit.hit == 0 || hit.distance_bt > contact_threshold_bt) {
             return;
         }
         const Vec3 contact_normal = hit.normal;
@@ -1567,45 +1499,18 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
         candidate.internal_edge_adjusted = internal_edge_adjusted ? 1 : 0;
         candidate.tri_normal = tri.normal;
 
-        candidate.distance_bt = distance_bt;
         candidate.add_distance_bt = distance_bt;
-        Vec3 manifold_point_a_bt =
-            point_on_b_bt_pre_adjust + contact_normal_pre_adjust * candidate.distance_bt;
+        const Vec3 manifold_point_a_bt =
+            point_on_b_bt_pre_adjust + contact_normal_pre_adjust * distance_bt;
 
         candidate.point_on_b_bt = point_on_b_bt;
         candidate.local_point_a_bt = CarBodyLocalPointBt(car, manifold_point_a_bt);
-
-        candidate.rel_contact_bt =
-            CarBodyWorldPointBt(car, candidate.local_point_a_bt) - car_pos_bt;
-        candidate.rel_contact = candidate.rel_contact_bt * kBTToUU;
         candidate.cache_local_point_a_bt = candidate.local_point_a_bt;
 
-        if (candidate.distance_bt > contact_threshold_bt) {
-            return;
-        }
-
-        const Vec3 live_add_contact_local_point_a_bt = candidate.local_point_a_bt;
-        Vec3 live_add_contact_body_forward(1.0f, 0.0f, 0.0f);
-        Vec3 live_add_contact_body_right(0.0f, 1.0f, 0.0f);
-        Vec3 live_add_contact_body_up(0.0f, 0.0f, 1.0f);
-        GetBasisVectors(
-            car.rot,
-            live_add_contact_body_forward,
-            live_add_contact_body_right,
-            live_add_contact_body_up);
-        const Vec3 live_add_contact_body_origin_bt = car.pos_bt;
-        const Vec3 live_add_contact_roundtrip_point_a_bt =
-            CarBodyWorldPointBt(car, live_add_contact_local_point_a_bt);
-        const Vec3 live_add_contact_body_row2(
-            live_add_contact_body_forward.z,
-            live_add_contact_body_right.z,
-            live_add_contact_body_up.z);
-
-        const Vec3 refreshed_point_on_a_bt = live_add_contact_roundtrip_point_a_bt;
-        const float refreshed_distance_bt =
+        const Vec3 refreshed_point_on_a_bt = CarBodyWorldPointBt(car, candidate.local_point_a_bt);
+        candidate.distance_bt =
             Dot(refreshed_point_on_a_bt - candidate.point_on_b_bt, candidate.normal);
-        candidate.distance_bt = refreshed_distance_bt;
-        candidate.rel_contact_bt = refreshed_point_on_a_bt - live_add_contact_body_origin_bt;
+        candidate.rel_contact_bt = refreshed_point_on_a_bt - car_pos_bt;
         candidate.rel_contact = candidate.rel_contact_bt * kBTToUU;
 
         int merge_idx = -1;
@@ -1650,13 +1555,6 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
         candidates[replace_idx] = candidate;
     };
 
-    // Retained car-world mesh contacts (cal_retained_world_contacts). v3 near_callback_with_bounds keeps the
-    // compound-vs-mesh persistent manifold while the pair passes the broadphase and the compound child gate
-    // (BulletCarMeshManifoldExists), and releases it otherwise. Each tick it refreshes the cached points with the
-    // current transforms (persistent_manifold.rs refresh_contact_points: recompute the anchors and distance, cull on
-    // distance or lateral drift past the breaking threshold) and merges the fresh points into them
-    // (merge_contact_points: all pushed into an empty cache, else get_cache_entry replace / add / sort_cached_points).
-    // The merged points, not just the fresh ones, are the pair's contacts. The candidates become the merged points.
     const auto find_retained_mesh_manifold = [&](int mesh_info_idx) -> CarWorldMeshRetainedManifold* {
         if (retained_mesh_manifolds == nullptr || broadphase_grid == nullptr) {
             return nullptr;
@@ -1670,7 +1568,8 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
     };
     const auto merge_retained_mesh_manifold = [&](int mesh_info_idx, const ArenaMeshBvhMeshInfo& mesh_info,
                                                   bool manifold_exists, MeshContactCandidate* candidates,
-                                                  int& candidate_count) {
+                                                  int& candidate_count,
+                                                  const CarWorldMeshRetainedPoint* seed_points = nullptr) {
         if (retained_mesh_manifolds == nullptr || broadphase_grid == nullptr) {
             return;
         }
@@ -1707,7 +1606,6 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
             for (int i = 0; i < manifold->count; ++i) {
                 manifold->points[i].distance_bt = point_distance(manifold->points[i], world_a[i], world_b[i]);
             }
-            // Descending swap-remove, as RefreshCarWorldRetainedPlaneManifold.
             for (int i = static_cast<int>(manifold->count) - 1; i >= 0; --i) {
                 const CarWorldMeshRetainedPoint& pt = manifold->points[i];
                 const Vec3 projected_difference = world_b[i] - (world_a[i] - pt.normal * pt.distance_bt);
@@ -1723,8 +1621,15 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
                 }
             }
         }
-        const bool push_all = manifold->count == 0;
+        const bool push_all = manifold->count == 0 || seed_points != nullptr;
+        if (seed_points != nullptr) {
+            manifold->count = 0;
+        }
         for (int c = 0; c < candidate_count; ++c) {
+            if (seed_points != nullptr && candidates[c].tri_idx <= -2) {
+                manifold->points[manifold->count++] = seed_points[-2 - candidates[c].tri_idx];
+                continue;
+            }
             CarWorldMeshRetainedPoint pt;
             pt.local_point_a_bt = candidates[c].local_point_a_bt;
             pt.local_point_b_bt = mesh_info.cal_origin_y != 0.0f ? candidates[c].point_on_b_bt - mesh_origin_bt
@@ -1757,10 +1662,8 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
         }
     };
 
-
     static_assert(kMaxMeshCandidates == kCarWorldMeshStageCandidates,
                   "CarWorldMeshCandidateStage holds every mesh candidate");
-    // stage_mesh >= 0 stages that one mesh and leaves the stage header to the caller.
     if (stage_out != nullptr) {
         if (stage_mesh < 0) {
             stage_out->valid = 0;
@@ -1785,21 +1688,17 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
             if (mesh_info_idx < 32 && ((mesh_visit_mask >> mesh_info_idx) & 1u) == 0u) {
                 continue;
             }
-            const ArenaMeshBvhMeshInfo mesh_info = mesh_bvh_meshes[mesh_info_idx];  // a copy: one load round trip, not one per field
+            const ArenaMeshBvhMeshInfo mesh_info = mesh_bvh_meshes[mesh_info_idx];
             if (!CarWorldMeshInfoUsable(mesh_info, mesh_bvh_quantization_count, mesh_bvh_node_count)) {
                 continue;
             }
             if (skip_out_of_reach && !(reach_hinted ? ((mesh_reach_hint >> mesh_info_idx) & 1u) != 0u
                                                     : CarWorldMeshInReach(mesh_reach, mesh_info))) {
-                // The manifold is released, as merge_retained_mesh_manifold does without one.
                 if (CarWorldMeshRetainedManifold* const retained = find_retained_mesh_manifold(mesh_info_idx)) {
                     retained->count = 0;
                 }
                 continue;
             }
-            // Not staged: the query AABB misses this mesh, so it has no candidates; only a Bullet manifold with it
-            // still gives it an (empty) order group, as below.
-            // A retained manifold with points still yields that mesh's contacts, below.
             if (stage_in != nullptr && broadphase_grid != nullptr && ((stage_in->mesh_mask >> mesh_info_idx) & 1u) == 0) {
                 CarWorldMeshRetainedManifold* const retained = find_retained_mesh_manifold(mesh_info_idx);
                 const bool exists = BulletCarMeshManifoldExists(car_broadphase_proxy, *broadphase_grid, mesh_info);
@@ -1816,12 +1715,29 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
             }
 
             int candidate_count = 0;
+            CarWorldMeshRetainedPoint seed_points[kMaxMeshCandidates];
+            bool mesh_seeded = false;
+            if (retained_mesh_manifolds != nullptr && broadphase_grid != nullptr) {
+                CarWorldMeshRetainedManifold* const retained = find_retained_mesh_manifold(mesh_info_idx);
+                if (retained != nullptr && BulletCarMeshManifoldExists(car_broadphase_proxy, *broadphase_grid, mesh_info)) {
+                    for (int k = 0; k < kMaxMeshCandidates; ++k) {
+                        candidates[k] = MeshContactCandidate{};
+                    }
+                    merge_retained_mesh_manifold(mesh_info_idx, mesh_info, true, candidates, candidate_count);
+                    for (int k = 0; k < candidate_count; ++k) {
+                        seed_points[k] = retained->points[k];
+                        candidates[k].tri_idx = -2 - k;
+                        candidates[k].add_distance_bt = candidates[k].distance_bt;
+                    }
+                    mesh_seeded = true;
+                }
+            }
             current_mesh_broadphase_hits = 0;
             gathered_count = 0;
             const ArenaMeshBvhQuantization& quantization = mesh_bvh_quantization[mesh_info.mesh_index];
             if (query_frame_used) {
-                QuantizeArenaMeshBvhPoint(quantization, aabb_min_bt, 0, quantized_query_aabb_min);
-                QuantizeArenaMeshBvhPoint(quantization, aabb_max_bt, 1, quantized_query_aabb_max);
+                QuantizeArenaMeshBvhQueryBox(quantization, box_center_bt, query_frame.extent_bt, mesh_info.cal_origin_y,
+                                             quantized_query_aabb_min, quantized_query_aabb_max);
             }
 
             int mesh_subtree_overlap_count = 0;
@@ -1834,7 +1750,6 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
                 mesh_subtrees = mesh_bvh_subtrees + mesh_info.subtree_offset;
                 mesh_subtree_count = mesh_info.subtree_count;
 
-                // The overlap count only gates the order group, which staging never emits.
                 for (int subtree_idx = 0; broadphase_grid == nullptr && stage_out == nullptr && subtree_idx < mesh_subtree_count; ++subtree_idx) {
                     const ArenaMeshBvhSubtreeInfo& subtree = mesh_subtrees[subtree_idx];
                     const bool subtree_overlap = TestQuantizedAabbAgainstQuantizedAabb(
@@ -1850,9 +1765,21 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
 
             const bool mesh_aabb_may_overlap =
                 query_frame_used && CarWorldMeshAabbMayOverlap(mesh_info, aabb_min_bt, aabb_max_bt);
-            if (stage_in != nullptr) {
-                if (((stage_in->mesh_mask >> mesh_info_idx) & 1u) == 0) {
-                    // Not staged: the query AABB misses this mesh, so it has no candidates.
+            const bool seeded_live = mesh_seeded && candidate_count > 0;
+            const CarWorldMeshCandidateStageMesh* const staged_entry =
+                stage_in != nullptr && ((stage_in->mesh_mask >> mesh_info_idx) & 1u) != 0
+                    ? &stage_in->meshes[CarWorldMeshStageSlot(stage_in->mesh_mask, mesh_info_idx)]
+                    : nullptr;
+            bool used_pairs = false;
+            if (stage_in != nullptr && seeded_live && (staged_entry == nullptr || staged_entry->pairs_replayable != 0)) {
+                if (staged_entry != nullptr) {
+                    for (int k = 0; k < staged_entry->pair_count; ++k) {
+                        consider_triangle(staged_entry->pair_tris[k], candidates, candidate_count, &staged_entry->pair_hits[k]);
+                    }
+                    current_mesh_broadphase_hits = staged_entry->broadphase_hits;
+                }
+            } else if (stage_in != nullptr && !seeded_live) {
+                if (staged_entry == nullptr) {
                 } else {
                 const CarWorldMeshCandidateStageMesh& staged =
                     stage_in->meshes[CarWorldMeshStageSlot(stage_in->mesh_mask, mesh_info_idx)];
@@ -1875,6 +1802,7 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
                                       &triangle_pairs->hits[gathered.pair_start + k]);
                 }
                 current_mesh_broadphase_hits = gathered.broadphase_hits;
+                used_pairs = true;
             } else if (mesh_aabb_may_overlap) {
             const auto visit_leaf = [&](int32_t local_triangle_index) {
                 if (local_triangle_index < 0 || local_triangle_index >= mesh_info.triangle_count) {
@@ -1901,7 +1829,7 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
             if (stage_out != nullptr && triangle_pairs_pass == kTrianglePairsGather) {
                 CarWorldMeshCandidateStageMesh& staged = stage_out->meshes[CarWorldMeshStageSlot(stage_out->mesh_mask, mesh_info_idx)];
                 staged.broadphase_hits = current_mesh_broadphase_hits;
-                staged.pair_count = -1;  // the merge pass walks this pair itself
+                staged.pair_count = -1;
 #if defined(__CUDA_ARCH__)
                 if (gathered_count <= kCarWorldMeshGatherTriangles) {
                     int start = 0;
@@ -1940,13 +1868,19 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
                 staged.broadphase_hits = current_mesh_broadphase_hits;
                 staged.has_collected_normal = has_collected_normal ? 1 : 0;
                 staged.last_collected_normal = last_collected_normal;
+                staged.pairs_replayable = used_pairs ? 1 : 0;
+                if (used_pairs) {
+                    staged.pair_tris = triangle_pairs->tri_idx + staged.pair_start;
+                    staged.pair_hits = triangle_pairs->hits + staged.pair_start;
+                }
                 continue;
             }
 
             const bool mesh_manifold_exists =
                 broadphase_grid != nullptr &&
                 BulletCarMeshManifoldExists(car_broadphase_proxy, *broadphase_grid, mesh_info);
-            merge_retained_mesh_manifold(mesh_info_idx, mesh_info, mesh_manifold_exists, candidates, candidate_count);
+            merge_retained_mesh_manifold(mesh_info_idx, mesh_info, mesh_manifold_exists, candidates, candidate_count,
+                                         mesh_seeded ? seed_points : nullptr);
 
             const int group_normal_start = normal_row_count;
             const int group_friction_start = friction_row_count;
@@ -1976,8 +1910,10 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
                 tri.mesh_index < static_cast<uint8_t>(mesh_bvh_quantization_count);
             if (have_quantized_mesh) {
                 const ArenaMeshBvhQuantization& quantization = mesh_bvh_quantization[tri.mesh_index];
-                QuantizeArenaMeshBvhPoint(quantization, aabb_min_bt, 0, quantized_query_aabb_min);
-                QuantizeArenaMeshBvhPoint(quantization, aabb_max_bt, 1, quantized_query_aabb_max);
+                const float origin_y = mutator.cal_arena_local_tris != nullptr
+                    ? static_cast<float>(mutator.cal_arena_local_tris[tri_idx].cal_origin_sign) * kGoalMeshOriginYBt : 0.0f;
+                QuantizeArenaMeshBvhQueryBox(quantization, box_center_bt, query_frame.extent_bt, origin_y,
+                                             quantized_query_aabb_min, quantized_query_aabb_max);
                 if (!TestQuantizedAabbAgainstQuantizedAabb(
                         quantized_query_aabb_min,
                         quantized_query_aabb_max,

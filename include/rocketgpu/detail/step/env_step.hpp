@@ -1,5 +1,3 @@
-
-
 ROCKETGPU_HD constexpr int CarCarVelocitySolverIterations() {
     return 10;
 }
@@ -20,7 +18,6 @@ ROCKETGPU_HD float CarCarBodyImpulseDenominatorFromRel(
 }
 
 ROCKETGPU_HD void ClearCarCarPairCachedContact(CarCarPairCachedContact& cache) {
-    // Every read is behind the slot's or a point's valid flag, and an invalid slot has no flagged points.
     if (cache.valid == 0) {
         return;
     }
@@ -39,24 +36,10 @@ ROCKETGPU_HD float GetCarCarCachedPenetrationUU(const CarCarPairCachedContact& c
     return penetration_uu;
 }
 
-// cal_car_car_manifold helpers (v3 persistent_manifold.rs, car pair orientation in CarCarRetainedPoint).
-// v3 CollisionShape::get_contact_breaking_threshold of the car compound: (bounding sphere radius of the
-// compound's local AABB + |its center|) * CONTACT_BREAKING_THRESHOLD; BoxShape::new keeps implicit_dim =
-// half - margin, margin = min(0.1 * min half extent, CONVEX_DISTANCE_MARGIN).
 ROCKETGPU_HD float CarCarBreakingThresholdBt(const CarConfig& cfg) {
-    const Vec3 half = (cfg.hitbox_size * 0.02f) * 0.5f;
-    const float margin = Min(0.1f * Min(Min(half.x, half.y), half.z), 0.04f);
-    const Vec3 margin_v(margin, margin, margin);
-    const Vec3 half_with_margin = (half - margin_v) + margin_v;
-    const Vec3 center = cfg.hitbox_offset * 0.02f;
-    const Vec3 aabb_min = center - half_with_margin;
-    const Vec3 aabb_max = center + half_with_margin;
-    const Vec3 sphere_center = (aabb_min + aabb_max) * 0.5f;
-    const float radius = Length(aabb_max - aabb_min) * 0.5f;
-    return (radius + Length(sphere_center)) * 0.02f;
+    return CarContactBreakingThresholdBt(cfg);
 }
 
-// v3 PersistentManifold::refresh_contact_points.
 ROCKETGPU_HD void RefreshCarCarRetainedManifold(
     CarCarRetainedManifold& manifold, const CarState& a, const CarState& b, float threshold_bt) {
     const int count = manifold.count;
@@ -92,8 +75,6 @@ ROCKETGPU_HD float CarCarRetainedRes(const Vec3& local, const Vec3& p1, const Ve
     return Dot(c, c);
 }
 
-// v3 PersistentManifold::add_contact_without_callback (get_cache_entry, replace, add_manifold_point,
-// sort_cached_points on v3 local_point_a = local_b_bt).
 ROCKETGPU_HD void AddCarCarRetainedPoint(
     CarCarRetainedManifold& manifold, const CarCarRetainedPoint& point, float threshold_bt) {
     const int count = manifold.count;
@@ -155,11 +136,6 @@ ROCKETGPU_HD bool CarCarCentersBeyondBoundingSpheres(const Vec3& pos_a, const Ve
     return !(LengthSq(pos_b - pos_a) < min_dist_sq);
 }
 
-// ResolveCarCarCollision with a retained manifold returns at the ccm gate, after only clearing the pair's cached
-// contact, for a live pair whose retained manifold is empty and whose centers are the bounding-sphere sum apart. This
-// is that gate for every pair of the first 8 cars at once, as bit CarCarRetainedSlot(lo, hi) (a = hi, b = lo, as the
-// pair loop calls it). All loads are independent, so they overlap instead of costing a memory round trip per pair;
-// valid until a pair's ResolveCarCarCollision runs.
 ROCKETGPU_HD void CarCarCcmGateMasks(
     int count, const CarState* cars, const CarConfig* car_configs, const CarCarRetainedManifold* retained,
     uint32_t& reject_slots) {
@@ -167,32 +143,49 @@ ROCKETGPU_HD void CarCarCcmGateMasks(
     if (count < 2) {
         return;
     }
-    // Branch-free: every load is unconditional (cars past count read car 0), so they issue together.
+#if defined(__CUDA_ARCH__)
+    if (count == 2) {
+        const CarState& lo = cars[0];
+        const CarState& hi = cars[1];
+        const uint32_t live = (lo.is_demoed == 0) & (lo.just_respawned == 0) &
+                              (hi.is_demoed == 0) & (hi.just_respawned == 0);
+        const float lo_radius = BoundingSphereRadius(car_configs[0]);
+        const float hi_radius = BoundingSphereRadius(car_configs[1]);
+        const uint32_t empty = retained[0].count == 0;
+        const uint32_t beyond = CarCarCentersBeyondBoundingSpheres(hi.pos, lo.pos, hi_radius, lo_radius);
+        reject_slots = live & empty & beyond;
+        return;
+    }
+#endif
+#if defined(__CUDA_ARCH__)
+    constexpr int gate_count = 8;
+#else
+    const int gate_count = count < 8 ? count : 8;
+#endif
     Vec3 pos[8];
     float radius[8];
     uint32_t live = 0;
 #if defined(__CUDA_ARCH__)
 #pragma unroll
 #endif
-    for (int k = 0; k < 8; ++k) {
+    for (int k = 0; k < gate_count; ++k) {
         const int kk = k < count ? k : 0;
         const CarState& car = cars[kk];
         pos[k] = car.pos;
-        radius[k] = BoundingSphereRadius(car_configs[kk]);
+        radius[k] = k < count ? BoundingSphereRadius(car_configs[kk]) : 0.0f;
         live |= static_cast<uint32_t>((k < count) & (car.is_demoed == 0) & (car.just_respawned == 0)) << k;
     }
     uint32_t reject = 0;
 #if defined(__CUDA_ARCH__)
 #pragma unroll
 #endif
-    for (int hi = 1; hi < 8; ++hi) {
+    for (int hi = 1; hi < gate_count; ++hi) {
 #if defined(__CUDA_ARCH__)
 #pragma unroll
 #endif
         for (int lo = 0; lo < hi; ++lo) {
             const int slot = CarCarRetainedSlot(lo, hi);
             const uint32_t pair_live = (live >> lo) & (live >> hi) & 1u;
-            // Pairs past count read slot 0 (allocated: count >= 2) and are masked off by pair_live.
             const uint32_t empty = retained[hi < count ? slot : 0].count == 0;
             const uint32_t beyond = CarCarCentersBeyondBoundingSpheres(pos[hi], pos[lo], radius[hi], radius[lo]);
             reject |= (pair_live & empty & beyond) << slot;
@@ -202,7 +195,6 @@ ROCKETGPU_HD void CarCarCcmGateMasks(
 }
 
 ROCKETGPU_HD void ResolveCarCarCollision(
-    int env_idx,
     CarState& a,
     uint32_t id_a,
     Team team_a,
@@ -241,7 +233,7 @@ ROCKETGPU_HD void ResolveCarCarCollision(
 
     int pair_idx = -1;
     if (respawn_slot_a >= 0 && respawn_slot_b >= 0) {
-        pair_idx = pair_contact_cache.index(respawn_slot_a, respawn_slot_b);
+        pair_idx = pair_contact_cache.index(Max(respawn_slot_a, respawn_slot_b), Min(respawn_slot_a, respawn_slot_b));
     }
     CarCarPairCachedContact* pair_cache =
         pair_contact_cache && pair_idx >= 0 ? &pair_contact_cache.slots[pair_idx] : nullptr;
@@ -258,13 +250,32 @@ ROCKETGPU_HD void ResolveCarCarCollision(
     bool force_current_contact_seed = false;
     bool force_current_from_broadphase_gap = false;
 
-    // cal_car_car_manifold: refresh the pair's retained v3 manifold on the tick-start transforms; v3 runs the
-    // OBB-OBB detector on those transforms only (no predicted contact), behind a pair AABB test.
     const bool cal_ccm = retained_manifold != nullptr;
     float ccm_threshold_bt = 0.0f;
     if (cal_ccm) {
         ccm_threshold_bt = Min(CarCarBreakingThresholdBt(cfg_a), CarCarBreakingThresholdBt(cfg_b));
         RefreshCarCarRetainedManifold(*retained_manifold, a, b, ccm_threshold_bt);
+    }
+    if (cal_ccm) {
+        const ObbData box_a = MakeCarObbBulletTransformBt(a, cfg_a);
+        const ObbData box_b = MakeCarObbBulletTransformBt(b, cfg_b);
+        bool aabbs_overlap = true;
+        for (int k = 0; k < 3; ++k) {
+            float ext_a = 0.0f, ext_b = 0.0f;
+            for (int i = 0; i < 3; ++i) {
+                ext_a += fabsf((&box_a.axis[i].x)[k]) * (&box_a.half_extent.x)[i];
+                ext_b += fabsf((&box_b.axis[i].x)[k]) * (&box_b.half_extent.x)[i];
+            }
+            const float ca = (&box_a.center.x)[k], cb = (&box_b.center.x)[k];
+            aabbs_overlap = aabbs_overlap && !(ca - ext_a > cb + ext_b || ca + ext_a < cb - ext_b);
+        }
+        if (!aabbs_overlap) {
+            retained_manifold->count = 0;
+            if (pair_cache) {
+                ClearCarCarPairCachedContact(*pair_cache);
+            }
+            return;
+        }
     }
     const bool ccm_fresh_gate = !cal_ccm || LengthSq(b.pos - a.pos) < min_dist_sq;
     if (cal_ccm && !ccm_fresh_gate && retained_manifold->count == 0) {
@@ -274,10 +285,6 @@ ROCKETGPU_HD void ResolveCarCarCollision(
         return;
     }
 
-    // Predicted states only after the retained-manifold gate, which most pairs fail. With cal_ccm nothing reads them
-    // or the OBBs built from them: the gap test and the predicted OBB test need !cal_ccm, and every cal_ccm path past
-    // the have_contact gate has force_current_contact_seed or use_cached_contact (seeds a/b, no skipped impulse, no
-    // re-anchor, current OBBs wherever an OBB is read). So they are the current states there, as with a cached contact.
     const bool predicted_unused = use_cached_contact || cal_ccm;
     const CarState predicted_a = predicted_unused
         ? a
@@ -330,17 +337,13 @@ ROCKETGPU_HD void ResolveCarCarCollision(
     const bool have_current_contact =
         !use_cached_contact &&
         ccm_fresh_gate &&
-        ComputeObbContact(
+        ComputeObbContactGameOrder(
             current_obb_a_bt,
             current_obb_b_bt,
             kFreshContactThresholdUU,
             current_normal,
             current_overlap_bt,
-            &current_feature,
-            env_idx,
-            respawn_slot_a,
-            respawn_slot_b,
-                         0);
+            &current_feature);
     current_overlap_uu = current_overlap_bt * UnitsBTToUU();
     float predicted_overlap_bt = 0.0f;
     bool have_contact = use_cached_contact;
@@ -355,13 +358,11 @@ ROCKETGPU_HD void ResolveCarCarCollision(
         contact_feature = current_feature;
         force_current_contact_seed = true;
         have_contact = true;
-    } else if (!cal_ccm && ComputeObbContact(
+    } else if (!cal_ccm && ComputeObbContactGameOrder(
                    MakeCarObbBulletTransformBt(force_current_contact_seed ? a : predicted_a, cfg_a),
                    MakeCarObbBulletTransformBt(force_current_contact_seed ? b : predicted_b, cfg_b),
                    kFreshContactThresholdUU,
-                   normal, predicted_overlap_bt, &contact_feature, env_idx,
-                   respawn_slot_a, respawn_slot_b,
-                                1)) {
+                   normal, predicted_overlap_bt, &contact_feature)) {
         contact_overlap_uu = predicted_overlap_bt * UnitsBTToUU();
     } else {
         if (extreme_speed_pair && have_current_contact) {
@@ -376,7 +377,6 @@ ROCKETGPU_HD void ResolveCarCarCollision(
     }
     const bool ccm_fresh = have_contact;
     if (cal_ccm && !have_contact && retained_manifold->count > 0) {
-        // Retained points only (v3 (Some(cached), None)): rows on the tick-start state, no car-hit callback.
         normal = retained_manifold->points[0].normal;
         contact_overlap_uu = 0.0f;
         force_current_contact_seed = true;
@@ -421,6 +421,11 @@ ROCKETGPU_HD void ResolveCarCarCollision(
     Vec3 contact_points_a_bt[kMaxApproxCarCarContactPoints];
     Vec3 contact_points_b_bt[kMaxApproxCarCarContactPoints];
 
+    Vec3 contact_game_points_a_bt[kMaxApproxCarCarContactPoints];
+    float contact_game_depths_bt[kMaxApproxCarCarContactPoints];
+    bool have_contact_game_points = false;
+    Vec3 contact_game_normal_bt(0.0f, 0.0f, 0.0f);
+
     int contact_point_count = 1;
     if (use_cached_contact) {
         contact_point_count = Min(static_cast<int>(pair_cache->contact_count), kMaxApproxCarCarContactPoints);
@@ -439,7 +444,11 @@ ROCKETGPU_HD void ResolveCarCarCollision(
             }
         }
     } else if (cal_ccm && !ccm_fresh) {
-        contact_point_count = 0;
+        contact_point_count = Min(static_cast<int>(retained_manifold->count), kMaxApproxCarCarContactPoints);
+        for (int contact_idx = 0; contact_idx < contact_point_count; ++contact_idx) {
+            contact_points_a[contact_idx] = FromBtLinearVec(retained_manifold->points[contact_idx].pos_a_bt);
+            contact_points_b[contact_idx] = FromBtLinearVec(retained_manifold->points[contact_idx].pos_b_bt);
+        }
     } else {
         contact_point_count = ComputeApproxCarCarContactAnchorPairs(
             solver_a,
@@ -456,10 +465,12 @@ ROCKETGPU_HD void ResolveCarCarCollision(
             contact_overlap_uu,
             contact_points_a_bt,
             contact_points_b_bt,
-            env_idx,
-            respawn_slot_a,
-            respawn_slot_b);
-        if (contact_point_count <= 0) {
+            cal_ccm,
+            contact_game_points_a_bt,
+            contact_game_depths_bt,
+            &have_contact_game_points,
+            &contact_game_normal_bt);
+        if (contact_point_count <= 0 && !cal_ccm) {
             contact_point_count = 1;
             ComputeApproxCarCarContactAnchors(
                 solver_a,
@@ -510,10 +521,7 @@ ROCKETGPU_HD void ResolveCarCarCollision(
             kMaxApproxCarCarContactPoints,
             contact_overlap_uu,
             contact_points_a_bt,
-            contact_points_b_bt,
-            env_idx,
-            respawn_slot_a,
-            respawn_slot_b);
+            contact_points_b_bt);
         if (contact_point_count <= 0) {
             contact_point_count = 1;
             ComputeApproxCarCarContactAnchors(
@@ -531,7 +539,8 @@ ROCKETGPU_HD void ResolveCarCarCollision(
             contact_points_b_bt[0] = ToBtLinearVec(contact_points_b[0]);
         }
     }
-    if (!use_cached_contact && have_current_contact && contact_point_count > 0) {
+    const bool ccm_touch = cal_ccm && !ccm_fresh;
+    if (!use_cached_contact && (have_current_contact || ccm_touch) && contact_point_count > 0) {
         bumper_local_x_a = -1.0e30f;
         bumper_local_x_b = -1.0e30f;
         for (int contact_idx = 0; contact_idx < contact_point_count; ++contact_idx) {
@@ -543,7 +552,7 @@ ROCKETGPU_HD void ResolveCarCarCollision(
         has_bumper_local_x_override = true;
     }
 
-    if (!use_cached_contact && have_current_contact && has_bumper_local_x_override) {
+    if (!use_cached_contact && (have_current_contact || ccm_touch) && has_bumper_local_x_override) {
         const bool a_is_lower_id = id_a > id_b;
         CarState* hitter1 = a_is_lower_id ? &a : &b;
         CarState* victim1 = a_is_lower_id ? &b : &a;
@@ -598,38 +607,30 @@ ROCKETGPU_HD void ResolveCarCarCollision(
             }
         }
     }
-    // Per-point contact normals: the pair normal unless cal_car_car_manifold supplies retained points.
     Vec3 cc_point_normals[kMaxApproxCarCarContactPoints];
     for (int contact_idx = 0; contact_idx < kMaxApproxCarCarContactPoints; ++contact_idx) {
         cc_point_normals[contact_idx] = normal;
     }
     if (cal_ccm) {
-        // v3 near_callback_with_bounds: the fresh BoxBoxDetector manifold (add_contact_point per point,
-        // refresh_contact_points) merges into the refreshed retained manifold (merge_contact_points); the
-        // solver gets every retained point, positive distances included.
         if (ccm_fresh && contact_point_count > 0) {
-            CarCarRetainedManifold fresh_manifold;
             for (int contact_idx = 0; contact_idx < contact_point_count; ++contact_idx) {
-                const Vec3 point_on_a = contact_points_a_bt[contact_idx];
-                const float depth = Dot(contact_points_b_bt[contact_idx] - point_on_a, normal);
+                const Vec3 point_on_a =
+                    have_contact_game_points ? contact_game_points_a_bt[contact_idx] : contact_points_a_bt[contact_idx];
+                const float depth = have_contact_game_points
+                                        ? contact_game_depths_bt[contact_idx]
+                                        : Dot(contact_points_b_bt[contact_idx] - point_on_a, normal);
                 if (depth > ccm_threshold_bt) {
                     continue;
                 }
+                const Vec3 point_normal = have_contact_game_points ? contact_game_normal_bt : normal;
                 CarCarRetainedPoint point;
-                point.normal = normal;
+                point.normal = point_normal;
                 point.local_a_bt = CarBodyLocalPointBt(a, point_on_a);
-                point.local_b_bt = CarBodyLocalPointBt(b, point_on_a + normal * depth);
+                point.local_b_bt = CarBodyLocalPointBt(b, point_on_a + point_normal * depth);
                 point.distance_bt = depth;
-                AddCarCarRetainedPoint(fresh_manifold, point, ccm_threshold_bt);
+                AddCarCarRetainedPoint(*retained_manifold, point, ccm_threshold_bt);
             }
-            RefreshCarCarRetainedManifold(fresh_manifold, a, b, ccm_threshold_bt);
-            if (retained_manifold->count == 0) {
-                *retained_manifold = fresh_manifold;
-            } else {
-                for (int contact_idx = 0; contact_idx < fresh_manifold.count; ++contact_idx) {
-                    AddCarCarRetainedPoint(*retained_manifold, fresh_manifold.points[contact_idx], ccm_threshold_bt);
-                }
-            }
+            RefreshCarCarRetainedManifold(*retained_manifold, a, b, ccm_threshold_bt);
         }
         contact_point_count = Min(static_cast<int>(retained_manifold->count), kMaxApproxCarCarContactPoints);
         float max_penetration_uu = 0.0f;
@@ -676,8 +677,6 @@ ROCKETGPU_HD void ResolveCarCarCollision(
     float normal_row_rhs_bt[kMaxApproxCarCarContactPoints] = {};
     uint8_t normal_row_valid[kMaxApproxCarCarContactPoints] = {};
 
-    // From here on the pair's solver states keep their seeds' rotations (impulses change only velocities), so each car's
-    // inverse-inertia rows are built once instead of at every row (same expressions, same bits).
     const CarFrame cc_frame_a = MakeCarFrame(solver_seed_a, cfg_a, mutator.car_mass);
     const CarFrame cc_frame_b = MakeCarFrame(solver_seed_b, cfg_b, mutator.car_mass);
     const CarInvInertiaRowsUu cc_inv_uu_a = MakeCarInvInertiaRowsUu(solver_seed_a, cfg_a, mutator.car_mass);
@@ -763,8 +762,6 @@ ROCKETGPU_HD void ResolveCarCarCollision(
         const Vec3 vel_a_no_ext_bt = lin_a_bt + Cross(base_a.ang_vel, rel_a_bt);
         const Vec3 vel_b_no_ext_bt = lin_b_bt + Cross(base_b.ang_vel, rel_b_bt);
         const float base_vn_no_ext_bt = Dot(normal_b_bt, vel_b_no_ext_bt - vel_a_no_ext_bt);
-        // v3 solver_constraint.rs restitution_curve has no 0.2 bt/s threshold (Wisp 27170 k25: a 0.18 bt/s closing
-        // point takes 0.1 restitution in the game).
         const float restitution_velocity_bt = Max(CarCarCollisionRestitution() * -base_vn_no_ext_bt, 0.0f);
         const float rhs_bt = (restitution_velocity_bt - base_vn_bt) * jac_diag_ab_inv;
 
@@ -1048,7 +1045,7 @@ ROCKETGPU_HD void ResolveCarCarCollision(
 
                 const float jac_diag_ab_inv = 1.0f / denom;
                 const float rhs_penetration =
-                    point_penetration * SplitImpulsePenetrationErp() * (1.0f / dt) * jac_diag_ab_inv;
+                    ((point_penetration * SplitImpulsePenetrationErp()) / dt) * jac_diag_ab_inv;
 
                 const Vec3 contact_point_a_bt = contact_points_a_bt[contact_idx];
                 const Vec3 contact_point_b_bt = contact_points_b_bt[contact_idx];
@@ -1067,7 +1064,7 @@ ROCKETGPU_HD void ResolveCarCarCollision(
                 denom_bt += inv_mass_b + Dot(normal_b, Cross(angular_component_b_bt, rel_b_bt));
                 const float jac_diag_ab_inv_bt = denom_bt > 1.0e-8f ? 1.0f / denom_bt : 0.0f;
                 const float rhs_penetration_bt =
-                    point_penetration_bt * SplitImpulsePenetrationErp() * (1.0f / dt) * jac_diag_ab_inv_bt;
+                    ((point_penetration_bt * SplitImpulsePenetrationErp()) / dt) * jac_diag_ab_inv_bt;
                 const int row_before = *shared_split_row_count;
                 AppendCarPairSharedSplitRow(
                     shared_split_rows,
@@ -1137,15 +1134,15 @@ ROCKETGPU_HD void ResolveCarCarCollision(
 
                 const float jac_diag_ab_inv = 1.0f / denom;
                 const float rhs_penetration =
-                    point_penetration * SplitImpulsePenetrationErp() * (1.0f / dt) * jac_diag_ab_inv;
+                    ((point_penetration * SplitImpulsePenetrationErp()) / dt) * jac_diag_ab_inv;
 
                 float delta_impulse = rhs_penetration;
                 delta_impulse -= (
-                    BtSimdDot3LikeBullet(normal_a, split_a.push_velocity) +
-                    BtSimdDot3LikeBullet(rel_a_cross_normal, split_a.turn_velocity)) * jac_diag_ab_inv;
-                delta_impulse -= (
                     BtSimdDot3LikeBullet(normal_b, split_b.push_velocity) +
                     BtSimdDot3LikeBullet(rel_b_cross_normal, split_b.turn_velocity)) * jac_diag_ab_inv;
+                delta_impulse -= (
+                    BtSimdDot3LikeBullet(normal_a, split_a.push_velocity) +
+                    BtSimdDot3LikeBullet(rel_a_cross_normal, split_a.turn_velocity)) * jac_diag_ab_inv;
 
                 const float sum = applied_push_impulse[contact_idx] + delta_impulse;
                 if (sum < 0.0f) {
@@ -1256,30 +1253,77 @@ ROCKETGPU_HD void UpdateCarCarPairCacheFromSharedVelocityRows(
     }
 }
 
-ROCKETGPU_HD bool BoostPadCheckCollideBt(const Vec3& pad_pos_uu, const BoostPadState& pad, const Vec3& car_bt) {
+ROCKETGPU_HD bool BoostPadSweepEnterBt(
+    const Vec3& pad_pos_uu, const BoostPadState& pad, const Vec3& from_bt, const Vec3& to_bt, float& enter) {
     constexpr float kUUToBT = 1.0f / 50.0f;
-    const Vec3 pad_bt(pad_pos_uu.x * kUUToBT, pad_pos_uu.y * kUUToBT, pad_pos_uu.z * kUUToBT);
     const float rad_bt = (pad.is_big ? 160.0f + 48.0f : 128.0f + 48.0f) * kUUToBT;
+    const float half_z_bt = (64.0f + 32.0f) * kUUToBT;
     const float pad_z_bt = (pad_pos_uu.z - (pad.is_big ? 1.0f : 5.92f)) * kUUToBT;
-    const float dx = car_bt.x - pad_bt.x;
-    const float dy = car_bt.y - pad_bt.y;
-    return (dx * dx + dy * dy) < (rad_bt * rad_bt) && Abs(car_bt.z - pad_z_bt) < ((64.0f + 32.0f) * kUUToBT);
+    float s0 = 0.0f;
+    float s1 = 1.0f;
+    const float z0 = from_bt.z - pad_z_bt;
+    const float dz = to_bt.z - from_bt.z;
+    if (Abs(dz) < 1e-7f) {
+        if (Abs(z0) >= half_z_bt) {
+            return false;
+        }
+    } else {
+        const float ta = (-half_z_bt - z0) / dz;
+        const float tb = (half_z_bt - z0) / dz;
+        s0 = Max(s0, Min(ta, tb));
+        s1 = Min(s1, Max(ta, tb));
+    }
+    const float ax = from_bt.x - pad_pos_uu.x * kUUToBT;
+    const float ay = from_bt.y - pad_pos_uu.y * kUUToBT;
+    const float dx = to_bt.x - from_bt.x;
+    const float dy = to_bt.y - from_bt.y;
+    const float a = dx * dx + dy * dy;
+    const float b = ax * dx + ay * dy;
+    const float c = ax * ax + ay * ay - rad_bt * rad_bt;
+    if (a < 1e-12f) {
+        enter = s0;
+        return c < 0.0f && s0 < s1;
+    }
+    const float disc = b * b - a * c;
+    if (disc <= 0.0f) {
+        return false;
+    }
+    const float root = sqrtf(disc);
+    enter = Max(s0, (-b - root) / a);
+    return enter < Min(s1, (-b + root) / a);
 }
 
-// One pad's tick start; pads are independent, so the CUDA pre-tick runs a thread per pad.
+ROCKETGPU_HD bool BoostPadSweepCollideBt(
+    const Vec3& pad_pos_uu, const BoostPadState& pad, const Vec3& from_bt, const Vec3& to_bt) {
+    float enter = 0.0f;
+    return BoostPadSweepEnterBt(pad_pos_uu, pad, from_bt, to_bt, enter);
+}
+
+ROCKETGPU_HD float FrameFrac(const SimConfig& cfg, int env_idx) {
+    return cfg.env_frame_frac != nullptr ? cfg.env_frame_frac[env_idx] : cfg.mutator.boost_pad_frame_frac;
+}
+
+ROCKETGPU_HD float FrameStartDt(const SimConfig& cfg, int env_idx) {
+    return cfg.env_frame_start_dt != nullptr ? cfg.env_frame_start_dt[env_idx] : cfg.mutator.frame_start_dt;
+}
+
+ROCKETGPU_HD uint16_t BoostPadFracQ(float frame_frac) {
+    return static_cast<uint16_t>(Min(Max(frame_frac, 0.0f), 1.0f) * 65535.0f + 0.5f);
+}
+
 ROCKETGPU_HD void PreTickBoostPad(BoostPadState& pad, float dt) {
-    // RL counts an inactive pad's timer down every tick, past zero, and brings the pad back on the tick after it
-    // reads -1/120: 481 / 1201 ticks after the pickup, in time for a car on the pad to take it again that tick.
     if (!pad.is_active || pad.cooldown > 0.0f) {
-        if (pad.cooldown < -0.5f * dt) {
-            pad.cooldown = 0.0f;
-            pad.is_active = 1;
-        } else {
-            pad.cooldown -= dt;
-            pad.is_active = 0;
-        }
+        pad.cooldown -= dt;
+        pad.is_active = 0;
     }
-    pad.cur_locked_car_id = 0;
+    if (pad.cur_locked_car_id != 0) {
+        pad.cur_locked_car_id = 0;
+    }
+}
+
+ROCKETGPU_HD bool BoostPadRespawnDue(const BoostPadState& pad, float dt, float frame_frac) {
+    const float left = floorf(pad.cooldown / dt + 0.5f) + 1.0f;
+    return left < 0.0f || (left == 0.0f && pad.pickup_frac_q < BoostPadFracQ(frame_frac));
 }
 
 ROCKETGPU_HD void PreTickBoostPadsForEnv(int env_idx, const SimConfig& cfg, BoostPadState* pads, float dt) {
@@ -1302,113 +1346,451 @@ ROCKETGPU_HD constexpr int BoostPadGridCellsY() { return 10; }
 ROCKETGPU_HD constexpr int BoostPadGridCellSizeX() { return 1024; }
 ROCKETGPU_HD constexpr int BoostPadGridCellSizeY() { return 1024; }
 
-ROCKETGPU_HD int BoostPadGridIndexX(float x) {
+ROCKETGPU_HD constexpr int BoostPadGridIndexX(float x) {
     return static_cast<int>(x / static_cast<float>(BoostPadGridCellSizeX())) +
            (BoostPadGridCellsX() / 2);
 }
 
-ROCKETGPU_HD int BoostPadGridIndexY(float y) {
+ROCKETGPU_HD constexpr int BoostPadGridIndexY(float y) {
     return static_cast<int>(y / static_cast<float>(BoostPadGridCellSizeY())) +
            (BoostPadGridCellsY() / 2);
 }
 
-// The pads (bit p for pad p, kMaxBoostPads <= 64) whose pickup cylinder holds the car this tick.
-ROCKETGPU_HD uint64_t BoostPadCollisionMaskForCar(
+ROCKETGPU_HD int BoostPadCtz64(uint64_t x) {
+#if defined(__CUDA_ARCH__)
+    return __ffsll(static_cast<long long>(x)) - 1;
+#elif defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctzll(x);
+#else
+    int n = 0;
+    while ((x & 1u) == 0u) {
+        x >>= 1;
+        ++n;
+    }
+    return n;
+#endif
+}
+
+ROCKETGPU_HD constexpr uint64_t SoccarBoostPadVisitMaskX(int car_cell_x) {
+    const int lo = car_cell_x - 1 > 0 ? car_cell_x - 1 : 0;
+    const int hi = car_cell_x + 1 < BoostPadGridCellsX() - 1 ? car_cell_x + 1 : BoostPadGridCellsX() - 1;
+    if (lo > hi) {
+        return 0u;
+    }
+    uint64_t mask = 0u;
+    for (int p = 0; p < BoostPadCountSoccar(); ++p) {
+        const int cx = BoostPadGridIndexX(BoostPadLocSoccar(p).x);
+        if (cx >= lo && cx <= hi) {
+            mask |= uint64_t{1} << p;
+        }
+    }
+    return mask;
+}
+
+ROCKETGPU_HD constexpr uint64_t SoccarBoostPadVisitMaskY(int car_cell_y) {
+    const int lo = car_cell_y - 1 > 0 ? car_cell_y - 1 : 0;
+    const int hi = car_cell_y + 1 < BoostPadGridCellsY() - 1 ? car_cell_y + 1 : BoostPadGridCellsY() - 1;
+    if (lo > hi) {
+        return 0u;
+    }
+    uint64_t mask = 0u;
+    for (int p = 0; p < BoostPadCountSoccar(); ++p) {
+        const int cy = BoostPadGridIndexY(BoostPadLocSoccar(p).y);
+        if (cy >= lo && cy <= hi) {
+            mask |= uint64_t{1} << p;
+        }
+    }
+    return mask;
+}
+
+ROCKETGPU_HD uint64_t SoccarBoostPadGridCandidateMask(int car_cell_x, int car_cell_y) {
+    static constexpr uint64_t kMaskX[BoostPadGridCellsX() + 2] = {
+        SoccarBoostPadVisitMaskX(-1), SoccarBoostPadVisitMaskX(0), SoccarBoostPadVisitMaskX(1),
+        SoccarBoostPadVisitMaskX(2),  SoccarBoostPadVisitMaskX(3), SoccarBoostPadVisitMaskX(4),
+        SoccarBoostPadVisitMaskX(5),  SoccarBoostPadVisitMaskX(6), SoccarBoostPadVisitMaskX(7),
+        SoccarBoostPadVisitMaskX(8),
+    };
+    static constexpr uint64_t kMaskY[BoostPadGridCellsY() + 2] = {
+        SoccarBoostPadVisitMaskY(-1), SoccarBoostPadVisitMaskY(0),  SoccarBoostPadVisitMaskY(1),
+        SoccarBoostPadVisitMaskY(2),  SoccarBoostPadVisitMaskY(3),  SoccarBoostPadVisitMaskY(4),
+        SoccarBoostPadVisitMaskY(5),  SoccarBoostPadVisitMaskY(6),  SoccarBoostPadVisitMaskY(7),
+        SoccarBoostPadVisitMaskY(8),  SoccarBoostPadVisitMaskY(9),  SoccarBoostPadVisitMaskY(10),
+    };
+    const unsigned int ix = static_cast<unsigned int>(car_cell_x + 1);
+    const unsigned int iy = static_cast<unsigned int>(car_cell_y + 1);
+    if (ix >= BoostPadGridCellsX() + 2 || iy >= BoostPadGridCellsY() + 2) {
+        return 0u;
+    }
+    return kMaskX[ix] & kMaskY[iy];
+}
+
+ROCKETGPU_HD bool BoostPadBoxOverlap(
+    const Vec3& pad_pos_uu, bool is_big, const Vec3& car_uu, const Vec3 axes[3], const CarConfig& car_cfg) {
+    const float pad_r = is_big ? 160.0f : 128.0f;
+    const float h[3] = {pad_r, pad_r, 64.0f};
+    const float e[3] = {car_cfg.hitbox_size.x * 0.5f - 1.25f, car_cfg.hitbox_size.y * 0.5f - 1.25f,
+                        car_cfg.hitbox_size.z * 0.5f - 1.25f};
+    const Vec3 centre = car_uu + axes[0] * car_cfg.hitbox_offset.x + axes[1] * car_cfg.hitbox_offset.y +
+                        axes[2] * car_cfg.hitbox_offset.z;
+    const float t[3] = {centre.x - pad_pos_uu.x, centre.y - pad_pos_uu.y,
+                        centre.z - (pad_pos_uu.z - (is_big ? 1.0f : 5.917984f))};
+    float r[3][3];
+    float ar[3][3];
+    for (int j = 0; j < 3; ++j) {
+        const float c[3] = {axes[j].x, axes[j].y, axes[j].z};
+        for (int i = 0; i < 3; ++i) {
+            r[i][j] = c[i];
+            ar[i][j] = Abs(c[i]) + 1e-6f;
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (Abs(t[i]) > h[i] + e[0] * ar[i][0] + e[1] * ar[i][1] + e[2] * ar[i][2]) {
+            return false;
+        }
+    }
+    for (int j = 0; j < 3; ++j) {
+        const float tb = t[0] * r[0][j] + t[1] * r[1][j] + t[2] * r[2][j];
+        if (Abs(tb) > h[0] * ar[0][j] + h[1] * ar[1][j] + h[2] * ar[2][j] + e[j]) {
+            return false;
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        const int i1 = (i + 1) % 3;
+        const int i2 = (i + 2) % 3;
+        for (int j = 0; j < 3; ++j) {
+            const int j1 = (j + 1) % 3;
+            const int j2 = (j + 2) % 3;
+            const float ra = h[i1] * ar[i2][j] + h[i2] * ar[i1][j];
+            const float rb = e[j1] * ar[i][j2] + e[j2] * ar[i][j1];
+            if (Abs(t[i2] * r[i1][j] - t[i1] * r[i2][j]) > ra + rb) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+ROCKETGPU_HD Vec3 BoostPadRbPosUu(const Vec3& pos_bt) {
+    const Vec3 p = pos_bt * 50.0f;
+    return Vec3(QuantRoundPosV3(p.x, 100.0f), QuantRoundPosV3(p.y, 100.0f), QuantRoundPosV3(p.z, 100.0f));
+}
+
+ROCKETGPU_HD Vec3 BoostPadFramePos(const SimConfig& cfg, int env_idx, const CarState& car) {
+    const Vec3 p0 = BoostPadRbPosUu(car.tick_start_pos_bt);
+    const Vec3 p1 = BoostPadRbPosUu(car.pos_bt);
+    return p0 + (p1 - p0) * FrameFrac(cfg, env_idx);
+}
+
+ROCKETGPU_HD void BoostPadFrameAxes(const SimConfig& cfg, int env_idx, const CarState& car, Vec3 axes[3]) {
+    CarBasisColumns(car, axes[0], axes[1], axes[2]);
+    const Vec3 spin_back = car.ang_vel * (-(1.0f - FrameFrac(cfg, env_idx)) * cfg.tick_dt);
+    for (int a = 0; a < 3; ++a) {
+        axes[a] = axes[a] + Cross(spin_back, axes[a]);
+    }
+}
+
+ROCKETGPU_HD Vec3 BoostPadSweepFromBt(const CarState& car, const Vec3& car_bt) {
+    if (car.pad_frame_pos_valid) {
+        return car.pad_frame_pos_bt;
+    }
+    const Vec3 p0 = BoostPadRbPosUu(car.tick_start_pos_bt);
+    const Vec3 p1 = BoostPadRbPosUu(car.pos_bt);
+    return car_bt - (p1 - p0) * (1.0f / 50.0f);
+}
+
+ROCKETGPU_HD void BoostPadStoreFramePos(const SimConfig& cfg, int env_idx, CarState& car) {
+    car.pad_frame_pos_bt = BoostPadFramePos(cfg, env_idx, car) * (1.0f / 50.0f);
+    car.pad_frame_pos_valid = car.is_demoed ? 0 : 1;
+}
+
+ROCKETGPU_HD uint64_t BoostPadContactsForCar(
     int env_idx,
     const SimConfig& cfg,
     const CarState& car,
-    const BoostPadState* pads) {
+    const CarConfig& car_cfg,
+    const BoostPadState* pads,
+    uint64_t& overlap,
+    Vec3* frame_pos_bt_out = nullptr) {
     static_assert(kMaxBoostPads <= 64, "pad mask");
     uint64_t hits = 0u;
-    if (!cfg.enable_boost_pads || car.is_demoed || car.boost >= cfg.mutator.boost_max) {
+    overlap = 0u;
+    const float frame_frac = FrameFrac(cfg, env_idx);
+    if (!cfg.enable_boost_pads || car.is_demoed || frame_frac < 0.0f) {
         return hits;
     }
 
     const int pad_base = env_idx * BoostPadCount(cfg);
-    // The game's pickups land on this tick or the next at random, about evenly when the car enters the pad's
-    // cylinder halfway through the tick (RLBot captures). Test the car's position halfway through the tick.
-    const Vec3 car_bt = car.pos_bt - car.vel_bt * (0.5f * cfg.tick_dt);
-    const Vec3 car_pos = car_bt * 50.0f;
+    const Vec3 car_pos = BoostPadFramePos(cfg, env_idx, car);
+    const Vec3 car_bt = car_pos * (1.0f / 50.0f);
+    if (frame_pos_bt_out != nullptr) {
+        *frame_pos_bt_out = car_bt;
+    }
+    const Vec3 prev_car_bt = BoostPadSweepFromBt(car, car_bt);
+    const Vec3 move_bt = car_bt - prev_car_bt;
+    const bool long_sweep = Dot(move_bt, move_bt) > (240.0f / 50.0f) * (240.0f / 50.0f);
+    const Vec3 lo_bt(Min(car_bt.x, prev_car_bt.x), Min(car_bt.y, prev_car_bt.y), Min(car_bt.z, prev_car_bt.z));
+    const Vec3 hi_bt(Max(car_bt.x, prev_car_bt.x), Max(car_bt.y, prev_car_bt.y), Max(car_bt.z, prev_car_bt.z));
     const int car_cell_x = BoostPadGridIndexX(car_pos.x);
     const int car_cell_y = BoostPadGridIndexY(car_pos.y);
     const bool car_in_boost_grid_z = car_pos.z <= BoostPadGridExtentZUU();
-    const int visit_min_x = Max(car_cell_x - 1, 0);
-    const int visit_max_x = Min(car_cell_x + 1, BoostPadGridCellsX() - 1);
-    const int visit_min_y = Max(car_cell_y - 1, 0);
-    const int visit_max_y = Min(car_cell_y + 1, BoostPadGridCellsY() - 1);
     constexpr float kUUToBT = 1.0f / 50.0f;
-    for (int p = 0; p < BoostPadCount(cfg); ++p) {
-        const Vec3 pad_pos = BoostPadLoc(cfg, p);
-        // Loose bounds on BoostPadCheckCollideBt for either pad size, so most pads skip loading their state.
-        const float near_dx = car_bt.x - pad_pos.x * kUUToBT;
-        const float near_dy = car_bt.y - pad_pos.y * kUUToBT;
-        if (near_dx * near_dx + near_dy * near_dy > (216.0f * kUUToBT) * (216.0f * kUUToBT) ||
-            Abs(car_bt.z - pad_pos.z * kUUToBT) > (110.0f * kUUToBT)) {
-            continue;
+    if (cfg.use_custom_boost_pads == 0) {
+        if ((car_in_boost_grid_z || long_sweep) &&
+            lo_bt.z - 135.0f * kUUToBT <= 73.0f * kUUToBT &&
+            hi_bt.z + 135.0f * kUUToBT >= 70.0f * kUUToBT) {
+            uint64_t cand = long_sweep
+                ? ((uint64_t{1} << BoostPadCountSoccar()) - 1u)
+                : SoccarBoostPadGridCandidateMask(car_cell_x, car_cell_y);
+            for (; cand != 0u; cand &= cand - 1u) {
+                const int p = BoostPadCtz64(cand);
+                const Vec3 pad_pos = BoostPadLocSoccar(p);
+                const Vec3 pad_bt = pad_pos * kUUToBT;
+                if (pad_bt.x < lo_bt.x - 240.0f * kUUToBT || pad_bt.x > hi_bt.x + 240.0f * kUUToBT ||
+                    pad_bt.y < lo_bt.y - 240.0f * kUUToBT || pad_bt.y > hi_bt.y + 240.0f * kUUToBT ||
+                    pad_bt.z < lo_bt.z - 135.0f * kUUToBT || pad_bt.z > hi_bt.z + 135.0f * kUUToBT) {
+                    continue;
+                }
+                if (BoostPadSweepCollideBt(pad_pos, pads[pad_base + p], prev_car_bt, car_bt)) {
+                    hits |= uint64_t{1} << p;
+                }
+            }
         }
-        const BoostPadState& pad = pads[pad_base + p];
-        const int pad_cell_x = BoostPadGridIndexX(pad_pos.x);
-        const int pad_cell_y = BoostPadGridIndexY(pad_pos.y);
-
-        const bool official_grid_visit =
-            cfg.use_custom_boost_pads != 0 ||
-            (car_in_boost_grid_z &&
-             pad_cell_x >= visit_min_x && pad_cell_x <= visit_max_x &&
-             pad_cell_y >= visit_min_y && pad_cell_y <= visit_max_y);
-        if (!official_grid_visit) {
-            continue;
+    } else {
+        for (int p = 0; p < BoostPadCount(cfg); ++p) {
+            const Vec3 pad_pos = BoostPadLoc(cfg, p);
+            const Vec3 pad_bt = pad_pos * kUUToBT;
+            if (pad_bt.x < lo_bt.x - 240.0f * kUUToBT || pad_bt.x > hi_bt.x + 240.0f * kUUToBT ||
+                pad_bt.y < lo_bt.y - 240.0f * kUUToBT || pad_bt.y > hi_bt.y + 240.0f * kUUToBT ||
+                pad_bt.z < lo_bt.z - 135.0f * kUUToBT || pad_bt.z > hi_bt.z + 135.0f * kUUToBT) {
+                continue;
+            }
+            const BoostPadState& pad = pads[pad_base + p];
+            if (BoostPadSweepCollideBt(pad_pos, pad, prev_car_bt, car_bt)) {
+                hits |= uint64_t{1} << p;
+            }
         }
-        if (BoostPadCheckCollideBt(pad_pos, pad, car_bt)) {
-            hits |= uint64_t{1} << p;
+    }
+    uint64_t check_overlap = hits;
+    if (car.boost_pad_touching != 0) {
+        check_overlap |= uint64_t{1} << (car.boost_pad_touching - 1);
+    }
+    if (check_overlap != 0u) {
+        Vec3 axes[3];
+        BoostPadFrameAxes(cfg, env_idx, car, axes);
+        for (; check_overlap != 0u; check_overlap &= check_overlap - 1u) {
+            const int p = BoostPadCtz64(check_overlap);
+            if (BoostPadBoxOverlap(BoostPadLoc(cfg, p), pads[pad_base + p].is_big != 0, car_pos, axes, car_cfg)) {
+                overlap |= uint64_t{1} << p;
+            }
         }
     }
     return hits;
 }
 
-ROCKETGPU_HD void CheckBoostPadCollisionForCar(
-    int env_idx,
-    const SimConfig& cfg,
-    const CarState& car,
-    uint32_t car_id,
-    BoostPadState* pads) {
-    const uint64_t hits = BoostPadCollisionMaskForCar(env_idx, cfg, car, pads);
-    const int pad_base = env_idx * BoostPadCount(cfg);
-    for (int p = 0; p < BoostPadCount(cfg); ++p) {
-        if ((hits >> p) & 1u) {
-            pads[pad_base + p].cur_locked_car_id = car_id;
+ROCKETGPU_HD bool BoostPadEligible(const SimConfig& cfg, const CarState& car) {
+    return !car.is_demoed && !car.driving_disabled && car.boost < cfg.mutator.boost_max;
+}
+
+ROCKETGPU_HD void BoostPadTouchStep(
+    BoostPadState& pad, int p, CarState& car, uint32_t car_id, bool in_cylinder, bool overlapping, bool eligible) {
+    if (!pad.is_active || pad.cur_locked_car_id != 0) {
+        return;
+    }
+    const uint8_t touching = static_cast<uint8_t>(p + 1);
+    if (car.boost_pad_touching == touching) {
+        if (!overlapping) {
+            car.boost_pad_touching = 0;
+        }
+    } else if (in_cylinder) {
+        if (eligible) {
+            car.boost_pad_touching = touching;
+            pad.cur_locked_car_id = car_id;
+        } else if (overlapping) {
+            car.boost_pad_touching = touching;
         }
     }
 }
 
-// One pad's tick end. With the standard layout no car is ever in two pads' cylinders at once (the pads are more than
-// twice the big pad's reach apart), so the CUDA step runs a thread per pad; custom layouts take the pads in order.
+ROCKETGPU_HD void BoostPadRespawnStep(
+    int env_idx, int count, const SimConfig& cfg, CarState* cars, const CarConfig* car_configs, const EnvState& env,
+    BoostPadState& pad, int p) {
+    if (pad.is_active || !BoostPadRespawnDue(pad, cfg.tick_dt, FrameFrac(cfg, env_idx))) {
+        return;
+    }
+    pad.cooldown = 0.0f;
+    pad.is_active = 1;
+    const int base = env_idx * cfg.max_cars_per_env;
+    const Vec3 pad_pos = BoostPadLoc(cfg, p);
+    for (int k = count - 1; k >= 0; --k) {
+        const int i = CarVisitSlot(env, k, count);
+        CarState& car = cars[base + i];
+        if (car.is_demoed) {
+            continue;
+        }
+        const Vec3 car_uu = BoostPadFramePos(cfg, env_idx, car);
+        Vec3 axes[3];
+        BoostPadFrameAxes(cfg, env_idx, car, axes);
+        if (BoostPadBoxOverlap(pad_pos, pad.is_big != 0, car_uu, axes, car_configs[base + i])) {
+            car.boost_pad_touching = static_cast<uint8_t>(p + 1);
+        }
+    }
+}
+
+ROCKETGPU_HD void BoostPadTouchListStep(
+    BoostPadState& pad, int p, const CarState& car, uint32_t car_id, bool eligible) {
+    if (pad.is_active && pad.cur_locked_car_id == 0 && car.boost_pad_touching == p + 1 && eligible) {
+        pad.cur_locked_car_id = car_id;
+    }
+}
+
+ROCKETGPU_HD void BoostPadGive(int env_idx, const SimConfig& cfg, CarState* cars, BoostPadState& pad, int p,
+                               uint32_t car_id) {
+    CarState& car = cars[car_id - 1u];
+    const float boost_amount = pad.is_big ? 100.0f : 12.0f;
+    const float event_boost_before = car.boost;
+    car.boost = Min(cfg.mutator.boost_max, car.boost + boost_amount);
+    pad.is_active = 0;
+    pad.cooldown = (pad.is_big ? cfg.mutator.boost_pad_cooldown_big : cfg.mutator.boost_pad_cooldown_small) -
+                   cfg.tick_dt;
+    pad.pickup_frac_q = BoostPadFracQ(FrameFrac(cfg, env_idx));
+    const int car_base = env_idx * cfg.max_cars_per_env;
+    for (int i = 0; i < cfg.max_cars_per_env; ++i) {
+        if (cars[car_base + i].boost_pad_touching == p + 1) {
+            cars[car_base + i].boost_pad_touching = 0;
+        }
+    }
+    if (cfg.mutator.physics_events.windows) {
+        PhysicsEvent event;
+        event.type = PhysicsEventType::BoostPickup;
+        event.car_id = car_id;
+        event.pad_index = p;
+        event.is_big_pad = pad.is_big;
+        event.boost_before = event_boost_before;
+        event.boost_after = car.boost;
+        cfg.mutator.physics_events.Emit(env_idx, event);
+    }
+}
+
+ROCKETGPU_HD void BoostPadSweepTouchSteps(
+    int env_idx, const SimConfig& cfg, CarState* cars, BoostPadState* pads, int car_slot, uint64_t hits,
+    uint64_t overlap) {
+    CarState& car = cars[car_slot];
+    const uint32_t car_id = static_cast<uint32_t>(car_slot + 1);
+    const Vec3 to_bt = BoostPadFramePos(cfg, env_idx, car) * (1.0f / 50.0f);
+    const Vec3 from_bt = BoostPadSweepFromBt(car, to_bt);
+    if (car.boost_pad_touching != 0 && ((hits >> (car.boost_pad_touching - 1)) & 1u) == 0u) {
+        const int p = car.boost_pad_touching - 1;
+        BoostPadTouchStep(pads[p], p, car, car_id, false, ((overlap >> p) & 1u) != 0u, false);
+    }
+    for (uint64_t left = hits; left != 0u;) {
+        int p = -1;
+        float best = 0.0f;
+        for (uint64_t m = left; m != 0u; m &= m - 1u) {
+            const int q = BoostPadCtz64(m);
+            float s = 0.0f;
+            BoostPadSweepEnterBt(BoostPadLoc(cfg, q), pads[q], from_bt, to_bt, s);
+            if (p < 0 || s < best) {
+                p = q;
+                best = s;
+            }
+        }
+        if (p < 0) {
+            break;
+        }
+        left &= ~(uint64_t{1} << p);
+        BoostPadState& pad = pads[p];
+        if (!pad.is_active || pad.cur_locked_car_id != 0) {
+            continue;
+        }
+        if (car.boost_pad_touching == p + 1) {
+            if (((overlap >> p) & 1u) == 0u) {
+                car.boost_pad_touching = 0;
+            }
+            continue;
+        }
+        if (BoostPadEligible(cfg, car)) {
+            car.boost_pad_touching = static_cast<uint8_t>(p + 1);
+            pad.cur_locked_car_id = car_id;
+            BoostPadGive(env_idx, cfg, cars, pad, p, car_id);
+        } else if (((overlap >> p) & 1u) != 0u) {
+            car.boost_pad_touching = static_cast<uint8_t>(p + 1);
+        }
+    }
+}
+
+ROCKETGPU_HD int BoostPadHitCount(uint64_t hits) {
+    int n = 0;
+    for (; hits != 0u; hits &= hits - 1u) ++n;
+    return n;
+}
+
+ROCKETGPU_HD void BoostPadTouchPassForEnv(
+    int env_idx, int count, const SimConfig& cfg, CarState* cars, const CarConfig* car_configs, const EnvState& env,
+    BoostPadState* pads) {
+    if (!cfg.enable_boost_pads || FrameFrac(cfg, env_idx) < 0.0f) {
+        return;
+    }
+    const int base = env_idx * cfg.max_cars_per_env;
+    const int pad_base = env_idx * BoostPadCount(cfg);
+    for (int k = 0; k < count; ++k) {
+        const int i = CarVisitSlot(env, k, count);
+        CarState& car = cars[base + i];
+        uint64_t overlap = 0u;
+        Vec3 frame_pos_bt;
+        const uint64_t hits = BoostPadContactsForCar(env_idx, cfg, car, car_configs[base + i], pads, overlap, &frame_pos_bt);
+        if (BoostPadHitCount(hits) > 1) {
+            BoostPadSweepTouchSteps(env_idx, cfg, cars, pads + pad_base, base + i, hits, overlap);
+            if (car.is_demoed) {
+                BoostPadStoreFramePos(cfg, env_idx, car);
+            } else {
+                car.pad_frame_pos_bt = frame_pos_bt;
+                car.pad_frame_pos_valid = 1;
+            }
+            continue;
+        }
+        const bool eligible = BoostPadEligible(cfg, car);
+        uint64_t near = hits;
+        if (car.boost_pad_touching != 0) {
+            near |= uint64_t{1} << (car.boost_pad_touching - 1);
+        }
+        for (; near != 0u; near &= near - 1u) {
+            const int p = BoostPadCtz64(near);
+            BoostPadTouchStep(pads[pad_base + p], p, car, static_cast<uint32_t>(base + i + 1), ((hits >> p) & 1u) != 0u,
+                              ((overlap >> p) & 1u) != 0u, eligible);
+        }
+        if (car.is_demoed) {
+            BoostPadStoreFramePos(cfg, env_idx, car);
+        } else {
+            car.pad_frame_pos_bt = frame_pos_bt;
+            car.pad_frame_pos_valid = 1;
+        }
+    }
+    for (int p = 0; p < BoostPadCount(cfg); ++p) {
+        BoostPadRespawnStep(env_idx, count, cfg, cars, car_configs, env, pads[pad_base + p], p);
+    }
+    for (int k = count - 1; k >= 0; --k) {
+        const int i = CarVisitSlot(env, k, count);
+        const CarState& car = cars[base + i];
+        if (car.boost_pad_touching != 0) {
+            const int p = car.boost_pad_touching - 1;
+            BoostPadTouchListStep(pads[pad_base + p], p, car, static_cast<uint32_t>(base + i + 1),
+                                  BoostPadEligible(cfg, car));
+        }
+    }
+}
+
 ROCKETGPU_HD void PostTickBoostPad(int env_idx, const SimConfig& cfg, CarState* cars, BoostPadState* pads, int p) {
     {
         BoostPadState& pad = pads[env_idx * BoostPadCount(cfg) + p];
         const uint32_t locked_car_id = pad.cur_locked_car_id;
         if (locked_car_id != 0) {
             if (pad.is_active) {
-                CarState& car = cars[locked_car_id - 1u];
-                const float boost_amount = pad.is_big ? 100.0f : 12.0f;
-                const float event_boost_before = car.boost;
-                car.boost = Min(cfg.mutator.boost_max, car.boost + boost_amount);
-                pad.is_active = 0;
-                // RLBot packets show the pickup tick's timer already counted once (4 - 1/120).
-                pad.cooldown = (pad.is_big ? cfg.mutator.boost_pad_cooldown_big : cfg.mutator.boost_pad_cooldown_small) -
-                               cfg.tick_dt;
-                if (cfg.mutator.physics_events.windows) {
-                    PhysicsEvent event;
-                    event.type = PhysicsEventType::BoostPickup;
-                    event.car_id = locked_car_id;
-                    event.pad_index = p;
-                    event.is_big_pad = pad.is_big;
-                    event.boost_before = event_boost_before;
-                    event.boost_after = car.boost;
-                    cfg.mutator.physics_events.Emit(env_idx, event);
-                }
+                BoostPadGive(env_idx, cfg, cars, pad, p, locked_car_id);
             }
         }
-        pad.prev_locked_car_id = locked_car_id;
+        if (pad.prev_locked_car_id != locked_car_id) {
+            pad.prev_locked_car_id = locked_car_id;
+        }
     }
 }
 
@@ -1429,6 +1811,181 @@ ROCKETGPU_HD void RecordArenaWorldContact(CarState& car, const ContactAccumulato
     car.world_contact.contact_normal = acc.latest_normal;
 }
 
+ROCKETGPU_HD int BodyDampingClampCar(CarState& car, const MutatorConfig& mutator, bool linear, bool angular) {
+    int clamped = 0;
+    if (linear) {
+        const Vec3 v = car.vel_bt;
+        const float max_lin = mutator.car_max_speed * 0.02f;
+        const float vsq = (v.x * v.x + v.y * v.y) + v.z * v.z;
+        if (0.0f < max_lin && max_lin * max_lin < vsq) {
+            const float s = 1.0f / sqrtf(vsq);
+            car.vel_bt = Vec3((v.x * s) * max_lin, (v.y * s) * max_lin, (v.z * s) * max_lin);
+            clamped |= 1;
+        }
+    }
+    if (angular) {
+        const Vec3 w = car.ang_vel;
+        const float max_ang = mutator.car_max_ang_speed;
+        const float lsq = (w.x * w.x + w.y * w.y) + w.z * w.z;
+        if (0.0f < max_ang && max_ang * max_ang < lsq) {
+            const float s = 1.0f / sqrtf(lsq);
+            car.ang_vel = Vec3((w.x * s) * max_ang, (w.y * s) * max_ang, (w.z * s) * max_ang);
+            clamped |= 2;
+        }
+    }
+    return clamped;
+}
+
+ROCKETGPU_HD void BodyDampingClampBall(BallState& ball, const MutatorConfig& mutator) {
+    const Vec3 v = ball.vel_bt;
+    const float max_lin = mutator.ball_max_speed * 0.02f;
+    const float vsq = (v.x * v.x + v.y * v.y) + v.z * v.z;
+    if (0.0f < max_lin && max_lin * max_lin < vsq) {
+        const float s = 1.0f / sqrtf(vsq);
+        SetBallLinearVelocityBt(ball, Vec3((v.x * s) * max_lin, (v.y * s) * max_lin, (v.z * s) * max_lin));
+    }
+    const Vec3 w = ball.ang_vel;
+    const float max_ang = mutator.ball_max_ang_speed;
+    const float lsq = (w.x * w.x + w.y * w.y) + w.z * w.z;
+    if (0.0f < max_ang && max_ang * max_ang < lsq) {
+        const float s = 1.0f / sqrtf(lsq);
+        ball.ang_vel = Vec3((w.x * s) * max_ang, (w.y * s) * max_ang, (w.z * s) * max_ang);
+    }
+}
+
+ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE CarControls PreTickCarControls(const CarState& car, CarControls controls, float& raw_pitch) {
+    ClampControls(controls);
+    raw_pitch = controls.pitch;
+    controls = QuantizeAxisControls(controls);
+    if (car.driving_disabled) {
+        const float throttle = controls.throttle;
+        controls = CarControls{};
+        controls.throttle = throttle;
+    }
+    return controls;
+}
+
+constexpr uint8_t kCalPreAirJumpStarted = 1, kCalPreFlipStarted = 2, kCalPreFlipVelChanged = 4,
+    kCalPreAirJumpUsedBefore = 8, kCalPreSetV3Tick = 16, kCalPreFlippingAtStart = 32, kCalPreWasJumping = 64;
+
+ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCarPrePhysics(
+    CarState& car,
+    CarControls controls,
+    const CarConfig& cfg,
+    const MutatorConfig& mutator,
+    float frame_frac,
+    float dt,
+    WheelRuntimeState* ROCKETGPU_RESTRICT wheel_runtime_state,
+    const CarRbSnapshot& tick_start_snapshot) {
+    car.cal_pre_flags = 0;
+    float cal_dodge_raw_pitch = 2.0f;
+    controls = PreTickCarControls(car, controls, cal_dodge_raw_pitch);
+
+    const uint8_t start_is_flipping = car.is_flipping;
+    const uint8_t start_has_flipped = car.has_flipped;
+    const uint8_t start_has_jumped = car.has_jumped;
+    const uint8_t start_has_double_jumped = car.has_double_jumped;
+    const uint8_t start_is_jumping = car.is_jumping;
+    const uint8_t start_is_on_ground = car.is_on_ground;
+    const float start_internal_flip_time = car.internal_flip_time;
+    const float start_internal_jump_time = car.internal_jump_time;
+    const bool start_last_jump = car.last_controls.jump;
+    const uint64_t start_tick_count_since_update = car.tick_count_since_update;
+    const int start_wheel_contacts =
+        static_cast<int>(car.wheels_with_contact[0] != 0) + static_cast<int>(car.wheels_with_contact[1] != 0) +
+        static_cast<int>(car.wheels_with_contact[2] != 0) + static_cast<int>(car.wheels_with_contact[3] != 0);
+    car.demo_no_contact_response = car.is_demoed ? 1 : 0;
+    if (car.is_demoed) {
+        return;
+    }
+    const CarFrame car_frame = MakeCarFrame(car, cfg, mutator.car_mass);
+    const CarFrame* const frame = &car_frame;
+    const bool cal_set_v3_tick = car.supersonic_set_v3 && start_tick_count_since_update == 0;
+    if (car.supersonic_set_v3) {
+        car.supersonic_set_v3 = 0;
+    } else {
+        UpdateSupersonicCalDemo(car, mutator, dt);
+    }
+
+    car.vel_touched_solve_stage = 0;
+    const uint8_t flipping_at_start = start_is_flipping;
+    bool flip_started = false;
+
+    const bool jump_pressed = controls.jump && !start_last_jump;
+    const uint8_t cal_has_flipped_at_start = start_has_flipped;
+    if (start_tick_count_since_update == 0 && wheel_runtime_state != nullptr && wheel_runtime_state->cal_restored) {
+        car.flip_timer_live = 1;
+    }
+    const float cal_pitchlock_restart_time =
+        (!cal_has_flipped_at_start && !start_is_flipping && (start_internal_flip_time > 0.0f || car.flip_timer_live))
+        ? start_internal_flip_time : -1.0f;
+
+    bool cal_air_jump_started = false;
+
+    const bool cal_jump = wheel_runtime_state != nullptr;
+    const bool cal_jump_g = cal_jump && start_wheel_contacts >= 3;
+    if (cal_jump) {
+        WheelRuntimeState& jw = *wheel_runtime_state;
+        if (start_tick_count_since_update == 0 && !jw.cal_restored) {
+            jw.cal_game_jumped = start_has_jumped ? 1 : 0;
+            jw.cal_game_double_jumped = (start_has_double_jumped || start_has_flipped) ? 1 : 0;
+            jw.cal_cached_ground = cal_jump_g ? 1 : 0;
+            jw.cal_jump_inactive_time = start_is_jumping ? 0.0f : start_internal_jump_time;
+            jw.cal_frame_open = 0;
+        }
+        jw.cal_restored = 0;
+        if (!jw.cal_frame_open) {
+            if (cal_jump_g && !jw.cal_cached_ground) {
+                jw.cal_game_jumped = 0;
+                jw.cal_game_double_jumped = 0;
+            }
+            jw.cal_cached_ground = cal_jump_g ? 1 : 0;
+        }
+        if (jw.cal_game_jumped && cal_jump_g && !start_is_jumping && jw.cal_jump_inactive_time >= 0.125f) {
+            jw.cal_game_jumped = 0;
+            jw.cal_game_double_jumped = 0;
+            jw.cal_cached_ground = 1;
+        }
+        jw.cal_frame_open = frame_frac < 0.0f ? 1 : 0;
+    }
+    const bool cal_jump_blocked = cal_jump && wheel_runtime_state->cal_game_jumped;
+    const uint8_t was_jumping = start_is_jumping;
+    float forward_speed_uu = SnapshotForwardSpeed(tick_start_snapshot);
+    if (jump_pressed && start_is_on_ground && !start_is_jumping && !cal_jump_blocked) {
+        StartJump(car, cfg, mutator, frame);
+        cal_air_jump_started = true;
+    }
+
+    const bool cal_air_window_closed = cal_jump &&
+        (wheel_runtime_state->cal_game_double_jumped ||
+         (wheel_runtime_state->cal_game_jumped && wheel_runtime_state->cal_jump_inactive_time > mutator.doublejump_max_delay));
+    const bool air_jump_pressed = jump_pressed && !(cal_jump && cal_jump_g) && !cal_air_window_closed;
+    const bool cal_press_as_air = cal_jump && !cal_jump_g && jump_pressed && !cal_air_window_closed;
+    const uint8_t air_jump_used_before = (car.has_double_jumped || car.has_flipped) ? 1 : 0;
+
+    bool cal_flip_before_wheels_vel_changed = false;
+    float cal_flip_before_wheels_forward_speed = 0.0f;
+    {
+        cal_flip_before_wheels_forward_speed = WheelForwardSpeed(car);
+        const Vec3 fbw_vel_bt = car.vel_bt;
+        UpdateDoubleJumpOrFlipState(car, controls, cfg, mutator, air_jump_pressed && !cal_air_jump_started,
+                                    cal_flip_before_wheels_forward_speed, dt, cal_press_as_air && !cal_air_jump_started,
+                                    cal_dodge_raw_pitch, &flip_started, frame);
+        cal_flip_before_wheels_vel_changed =
+            car.vel_bt.x != fbw_vel_bt.x || car.vel_bt.y != fbw_vel_bt.y || car.vel_bt.z != fbw_vel_bt.z;
+    }
+
+    ApplyAutoFlip(car, controls, cfg, mutator, dt, frame);
+    car.cal_pre_flags = static_cast<uint8_t>(
+        (cal_air_jump_started ? kCalPreAirJumpStarted : 0) | (flip_started ? kCalPreFlipStarted : 0) |
+        (cal_flip_before_wheels_vel_changed ? kCalPreFlipVelChanged : 0) |
+        (air_jump_used_before ? kCalPreAirJumpUsedBefore : 0) | (cal_set_v3_tick ? kCalPreSetV3Tick : 0) |
+        (flipping_at_start ? kCalPreFlippingAtStart : 0) | (was_jumping ? kCalPreWasJumping : 0));
+    car.cal_pre_forward_speed_uu = forward_speed_uu;
+    car.cal_pre_pitchlock_restart_time = cal_pitchlock_restart_time;
+}
+
+template <bool kStagedIndependent = false>
 ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     CarState& car,
     CarControls controls,
@@ -1457,45 +2014,19 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     CarState* cal_push_cars = nullptr,
     BallState* cal_push_ball = nullptr,
     uint32_t* cal_pushed_cars_mask = nullptr,
-    bool staged_rays_velocity_stale = false) {
-    ClampControls(controls);
-    // The dodge direction and dodge pitch cancel quantize the negated raw pitch (v3).
-    const float cal_dodge_raw_pitch = controls.pitch;
-    controls = QuantizeAxisControls(controls);
-
-    // The car's jump/flip state as of the tick start, loaded before the first store (the wheel runtime state stores
-    // below go through another pointer, so later loads of the car would wait for them). StartJump is the first write.
-    const uint8_t start_is_flipping = car.is_flipping;
-    const uint8_t start_has_flipped = car.has_flipped;
-    const uint8_t start_has_jumped = car.has_jumped;
-    const uint8_t start_has_double_jumped = car.has_double_jumped;
-    const uint8_t start_is_jumping = car.is_jumping;
-    const uint8_t start_is_on_ground = car.is_on_ground;
-    const float start_internal_flip_time = car.internal_flip_time;
-    const float start_internal_jump_time = car.internal_jump_time;
-    const bool start_last_jump = car.last_controls.jump;
-    const uint64_t start_tick_count_since_update = car.tick_count_since_update;
-    const int start_wheel_contacts =
-        static_cast<int>(car.wheels_with_contact[0] != 0) + static_cast<int>(car.wheels_with_contact[1] != 0) +
-        static_cast<int>(car.wheels_with_contact[2] != 0) + static_cast<int>(car.wheels_with_contact[3] != 0);
+    bool staged_rays_velocity_stale = false,
+    uint32_t wheel_ray_excluded_bodies = 0u) {
+    float cal_dodge_raw_pitch = 2.0f;
+    controls = PreTickCarControls(car, controls, cal_dodge_raw_pitch);
     car.demo_no_contact_response = car.is_demoed ? 1 : 0;
     if (car.is_demoed) {
         return;
     }
-    // The pre-tick changes no car's rotation: its basis and inverse inertia are built once here.
+    const uint8_t cal_pre = car.cal_pre_flags;
     const CarFrame car_frame = MakeCarFrame(car, cfg, mutator.car_mass);
     const CarFrame* const frame = &car_frame;
-    // supersonic_set_v3 also marks a v3-convention set state (compat SetStateV3), whose wheel contacts are per-wheel data.
-    const bool cal_set_v3_tick = car.supersonic_set_v3 && start_tick_count_since_update == 0;
-    if (car.supersonic_set_v3) {
-        car.supersonic_set_v3 = 0;
-    } else {
-        UpdateSupersonicCalDemo(car, mutator, dt);
-    }
-
+    const bool cal_set_v3_tick = (cal_pre & kCalPreSetV3Tick) != 0;
     if (wheel_runtime_state) {
-        // The car's fields loaded before any store: through generic pointers each load would wait for the store
-        // before it.
         const auto rot = car.rot;
         const Vec3 basis_forward = car.basis_forward;
         const Vec3 basis_right = car.basis_right;
@@ -1503,59 +2034,24 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
         const auto basis_authoritative = car.basis_authoritative;
         car_frame.queue_forces = true;
         wheel_runtime_state->pre_solve_rot = rot;
-        wheel_runtime_state->pre_solve_basis_forward = basis_forward;
-        wheel_runtime_state->pre_solve_basis_right = basis_right;
-        wheel_runtime_state->pre_solve_basis_up = basis_up;
-        wheel_runtime_state->pre_solve_basis_authoritative = basis_authoritative;
+        wheel_runtime_state->pre_solve_basis_forward = car.tick_start_basis_forward;
+        wheel_runtime_state->pre_solve_basis_right = car.tick_start_basis_right;
+        wheel_runtime_state->pre_solve_basis_up = car.tick_start_basis_up;
+        wheel_runtime_state->pre_solve_basis_authoritative = 1;
+        (void)basis_forward;
+        (void)basis_right;
+        (void)basis_up;
+        (void)basis_authoritative;
     }
-    car.vel_touched_solve_stage = 0;
-    const uint8_t flipping_at_start = start_is_flipping;
-    bool flip_started = false;
-
-    const bool jump_pressed = controls.jump && !start_last_jump;
-    const uint8_t cal_has_flipped_at_start = start_has_flipped;
-    // v3 update_air_torque (base.rs:507-514) locks pitch while prev_flip_time < PITCHLOCK_EXTRA_TIME, where flip_time is
-    // the restart timer once no flip is active. Tick-start value, as v3's prev_flip_time.
-    // flip_time == 0 with no flip active means "unknown" (a set state without the timer, e.g. RocketSim-convention 0): no lock.
-    const float cal_pitchlock_restart_time =
-        (!cal_has_flipped_at_start && !start_is_flipping && start_internal_flip_time > 0.0f) ? start_internal_flip_time : -1.0f;
-
-    bool cal_air_jump_started = false;
-
+    const uint8_t flipping_at_start = (cal_pre & kCalPreFlippingAtStart) ? 1 : 0;
+    const bool flip_started = (cal_pre & kCalPreFlipStarted) != 0;
+    const float cal_pitchlock_restart_time = car.cal_pre_pitchlock_restart_time;
+    const bool cal_air_jump_started = (cal_pre & kCalPreAirJumpStarted) != 0;
     const bool cal_jump = wheel_runtime_state != nullptr;
-    const bool cal_jump_g = cal_jump && start_wheel_contacts >= 3;
-    if (cal_jump) {
-        WheelRuntimeState& jw = *wheel_runtime_state;
-        if (start_tick_count_since_update == 0) {
-            jw.cal_game_jumped = start_has_jumped ? 1 : 0;
-            jw.cal_game_double_jumped = (start_has_double_jumped || start_has_flipped) ? 1 : 0;
-            jw.cal_cached_ground = cal_jump_g ? 1 : 0;
-            jw.cal_jump_inactive_time = start_is_jumping ? 0.0f : start_internal_jump_time;
-        }
-        if (cal_jump_g && !jw.cal_cached_ground) {
-            jw.cal_game_jumped = 0;
-            jw.cal_game_double_jumped = 0;
-        }
-        jw.cal_cached_ground = cal_jump_g ? 1 : 0;
-        if (jw.cal_game_jumped && cal_jump_g && !start_is_jumping && jw.cal_jump_inactive_time >= 0.125f) {
-            jw.cal_game_jumped = 0;
-            jw.cal_game_double_jumped = 0;
-        }
-    }
-    const bool cal_jump_blocked = cal_jump && wheel_runtime_state->cal_game_jumped;
-    const uint8_t was_jumping = start_is_jumping;
-    if (jump_pressed && start_is_on_ground && !start_is_jumping && !cal_jump_blocked) {
-        StartJump(car, mutator, frame);
-        cal_air_jump_started = true;
-    }
-
-    const bool cal_air_window_closed = cal_jump &&
-        (wheel_runtime_state->cal_game_double_jumped ||
-         (wheel_runtime_state->cal_game_jumped && wheel_runtime_state->cal_jump_inactive_time > mutator.doublejump_max_delay));
-    const bool air_jump_pressed = jump_pressed && !(cal_jump && cal_jump_g) && !cal_air_window_closed;
-    const bool cal_press_as_air = cal_jump && !cal_jump_g && jump_pressed && !cal_air_window_closed;
-    const uint8_t air_jump_used_before = (car.has_double_jumped || car.has_flipped) ? 1 : 0;
-
+    const uint8_t was_jumping = (cal_pre & kCalPreWasJumping) ? 1 : 0;
+    float forward_speed_uu = car.cal_pre_forward_speed_uu;
+    const uint8_t air_jump_used_before = (cal_pre & kCalPreAirJumpUsedBefore) ? 1 : 0;
+    const bool cal_flip_before_wheels_vel_changed = (cal_pre & kCalPreFlipVelChanged) != 0;
     const int prev_wheel_contacts =
         static_cast<int>(car.wheels_with_contact[0] != 0) + static_cast<int>(car.wheels_with_contact[1] != 0) +
         static_cast<int>(car.wheels_with_contact[2] != 0) + static_cast<int>(car.wheels_with_contact[3] != 0);
@@ -1566,27 +2062,8 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
         autoroll_prev_contact ? wheel_runtime_state->cal_prev_wheel_normal_sum : Vec3(0.0f, 0.0f, 0.0f);
     int autoroll_world_contacts = autoroll_prev_contact ? wheel_runtime_state->cal_prev_world_wheel_contacts : 0;
 
-    // v3 Car::pre_tick_update runs update_jump / update_double_jump_or_flip (dodge and double-jump impulses, using the
-    // tick-start forward speed and the previous tick's is_on_ground) before bullet_vehicle.update, whose raycast,
-    // suspension and friction then read the post-impulse chassis velocity. Run the flip/double-jump update here, as the
-    // jump start above already is.
-    bool cal_flip_before_wheels_done = false;
-    bool cal_flip_before_wheels_vel_changed = false;
-    float cal_flip_before_wheels_forward_speed = 0.0f;
-    {
-        cal_flip_before_wheels_forward_speed = WheelForwardSpeed(car, frame);
-        const Vec3 fbw_vel_bt = car.vel_bt;
-        UpdateDoubleJumpOrFlipState(car, controls, cfg, mutator, air_jump_pressed && !cal_air_jump_started,
-                                    cal_flip_before_wheels_forward_speed, dt, cal_press_as_air && !cal_air_jump_started,
-                                    cal_dodge_raw_pitch, &flip_started, frame);
-        cal_flip_before_wheels_done = true;
-        cal_flip_before_wheels_vel_changed =
-            car.vel_bt.x != fbw_vel_bt.x || car.vel_bt.y != fbw_vel_bt.y || car.vel_bt.z != fbw_vel_bt.z;
-    }
-
     UninitArray<WheelStepState, 4> wheels;
-    float forward_speed_uu = 0.0f;
-    const int num_wheels_in_contact = PreTickVehicleDynamics(
+    const int num_wheels_in_contact = PreTickVehicleDynamics<kStagedIndependent>(
         car,
         controls,
         cfg,
@@ -1618,7 +2095,8 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
         cal_push_cars,
         cal_push_ball,
         cal_pushed_cars_mask,
-        frame);
+        frame,
+        wheel_ray_excluded_bodies);
 
     for (int wheel = 0; wheel < 4; ++wheel)
         if (wheels[wheel].is_in_contact && wheels[wheel].is_in_contact_with_world) {
@@ -1628,43 +2106,33 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     if (car.HasFlipOrJump() && !car.flip_or_jump_last_tick)
         car.last_flip_or_jump_start = car.tick_count_since_update;
 
-    if (!cal_flip_before_wheels_done) {
-        UpdateDoubleJumpOrFlipState(car, controls, cfg, mutator, air_jump_pressed && !cal_air_jump_started, forward_speed_uu, dt,
-                                    cal_press_as_air && !cal_air_jump_started, cal_dodge_raw_pitch, &flip_started, frame);
-    }
-    // v3 Car::pre_tick_update gates the dodge torque (and the is_flipping reset) on num_wheels_in_contact read before
-    // bullet_vehicle.update, i.e. the previous tick's wheel contacts and the matching cached is_on_ground; this tick's
-    // raycasts only take effect next tick. The tick after a state set keeps the current-raycast rule (a set state
-    // carries no reliable previous wheel contacts).
-    // The dodge-press tick uses the previous contacts too: a press with < 3 contacts last tick on the tick the wheels
-    // land gets its dodge torque, and the flip ends the next tick (RLPR Wisp 1823 c4 k13 and 9059 c1 k60, recorded
-    // per-wheel contacts; RLBot c3 car1 f96764, air state InAir -> Dodging -> OnGround, w matches to 0.04 rad/s).
-    // A v3-convention set state carries v3's cached contacts, which v3 reads on the first tick too.
     const int air_gate_wheel_contacts =
         (car.tick_count_since_update != 0 || cal_set_v3_tick) ? prev_wheel_contacts :
         ((prev_wheel_contacts > num_wheels_in_contact) ? prev_wheel_contacts : num_wheels_in_contact);
 
-    // v3 gates update_air_torque on the cached contacts a set state carries
-    // (CarState::set_contact_flags, base.rs:964/997), also on the first tick after it. Only a set state that says
-    // grounded suppresses air control here (max with this tick's raycasts, like air_gate_wheel_contacts above):
-    // RocketSim-convention set states mark landings airborne from a coarse height test.
     const int landing_prev_contacts = (car.tick_count_since_update == 0 && !cal_set_v3_tick)
         ? (Max(num_wheels_in_contact, prev_wheel_contacts))
         : prev_wheel_contacts;
-    // v3 update_double_jump_or_flip returns flip_ended when the flip timer runs out this tick, and pre_tick_update
-    // skips auto-roll on that tick (the car still counts as flipping for auto-roll on its last flip tick).
     const uint8_t cal_flipping_before_air = car.is_flipping;
-    // Another car's wheel pushed this car earlier this tick (staged_rays_velocity_stale): damp its tick-start ang_vel.
-    const Vec3* air_damp_ang_vel = staged_rays_velocity_stale ? &car.cal_tick_start_ang_vel : nullptr;
+    const Vec3* air_damp_ang_vel = &car.cal_tick_start_ang_vel;
+    const bool robin_air_blocked = cfg.three_wheels && car.world_contact.has_contact;
+    if (cfg.three_wheels && !robin_air_blocked && !car.driving_disabled && landing_prev_contacts == 0 &&
+        car.is_boosting) {
+        ApplyRobinAirTorque(car, cfg, mutator.car_mass, dt, wheel_runtime_state, frame);
+    }
     if (air_gate_wheel_contacts < 3) {
-           ApplyFlipTorque(car, controls, cfg, mutator, dt, wheel_runtime_state, cal_dodge_raw_pitch, frame);
+        Vec3 dodge_torque_bt(0.0f, 0.0f, 0.0f);
+        ApplyFlipTorque(car, controls, cfg, mutator, dt, wheel_runtime_state, cal_dodge_raw_pitch, frame, &dodge_torque_bt);
 
-        ApplyAirControl(car, controls, cfg, mutator, dt, landing_prev_contacts == 0, wheel_runtime_state, landing_prev_contacts == 0, cal_pitchlock_restart_time,
+        if (!car.driving_disabled && !robin_air_blocked) ApplyAirControl(car, controls, cfg, mutator, dt, landing_prev_contacts == 0, wheel_runtime_state, landing_prev_contacts == 0, cal_pitchlock_restart_time,
                         air_damp_ang_vel, frame);
+        if (dodge_torque_bt.x != 0.0f || dodge_torque_bt.y != 0.0f || dodge_torque_bt.z != 0.0f) {
+            QueueOfficialTorqueBt(wheel_runtime_state, dodge_torque_bt, frame);
+        }
     } else {
         car.is_flipping = 0;
 
-        if (landing_prev_contacts == 0) {
+        if (landing_prev_contacts == 0 && !car.driving_disabled && !robin_air_blocked) {
             ApplyAirControl(car, controls, cfg, mutator, dt, true, wheel_runtime_state, true, cal_pitchlock_restart_time,
                             air_damp_ang_vel, frame);
         }
@@ -1672,9 +2140,8 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     const bool cal_flip_ended = air_gate_wheel_contacts < 3 &&
         cal_flipping_before_air && !car.is_flipping;
 
-    UpdateJumpState(car, controls, mutator, jump_pressed, dt, wheel_runtime_state, cal_jump_blocked, frame);
+    UpdateJumpState(car, controls, mutator, dt, wheel_runtime_state, frame);
 
-    ApplyAutoFlip(car, controls, mutator, dt, frame);
     if (cal_jump) {
         WheelRuntimeState& jw = *wheel_runtime_state;
 
@@ -1687,11 +2154,6 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
         jw.cal_jump_inactive_time = car.is_jumping ? 0.0f : jw.cal_jump_inactive_time + dt;
     }
 
-    // Report v3's jump_ticks and flip_time (car/base.rs update_jump, update_double_jump_or_flip, pre_tick_update): each
-    // reads one tick on the tick its activity changes (jump start or end; flip start, end or landing mid-flip) and
-    // otherwise advances one tick, on the ground too. v3 skips the car update on the tick a demoed car respawns.
-    // jump_time adds dt like the internal jump clocks for its first 1024 ticks (a set state then restores them bit for
-    // bit), then holds ticks * dt so it stays exact.
     const bool jump_changed = cal_air_jump_started || (was_jumping && !car.is_jumping);
     const bool flip_changed = flip_started || car.is_flipping != flipping_at_start;
     if (jump_changed || !car.just_respawned) {
@@ -1701,8 +2163,6 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     if (flip_changed || !car.just_respawned) {
         car.flip_time = flip_changed ? dt : car.flip_time + dt;
     }
-    // v3 update_jump: a released hold ends the sustain after the minimum time and a re-press never resumes it
-    // (ContinueJump reads the flag). Cleared once the jump is over, so a stale flag cannot end a restored jump.
     if (cal_air_jump_started || !car.is_jumping) {
         car.jump_hold_broken = 0;
     } else if (!controls.jump) {
@@ -1717,40 +2177,25 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     bool autoroll_gate = autoroll_cal
         ? (autoroll_contacts < 4 && (autoroll_contacts > 0 || car.world_contact.has_contact))
         : (((autoroll_contacts > 0) && (autoroll_contacts < 4)) || car.world_contact.has_contact);
-    // On the first tick after a set state, v3 Car::pre_tick_update gates auto-roll on
-    // the cached wheel contacts the set state carries (base.rs:966/1011, 0 < n < 4 or a world-contact normal), and
-    // update_auto_roll then needs the sticky gate refreshed from the set pose (base.rs:797/801) for the wheel-normal
-    // up direction. RocketGPU used this tick's raycast count for both. Only a set state with partial wheel contacts
-    // (1-3 wheels) is taken as per-wheel data: RocketSim-convention set states mark all four wheels from one coarse
-    // ground flag, and for those this tick's raycast stays the better estimate (user-suite landing fixtures).
     if (autoroll_cal && !autoroll_prev_contact &&
         prev_wheel_contacts > 0 && prev_wheel_contacts < 4) {
         const bool sticky = autoroll_world_contacts > 0;
         autoroll_gate = sticky || car.world_contact.has_contact;
         autoroll_contacts = sticky ? prev_wheel_contacts : 0;
     }
-    // A set state with the game's wheel contact normals carries the previous tick's per-wheel contacts, which the
-    // game's auto-roll reads: the ground normal is taken in the pre-physics step, before this tick's
-    // raycasts, which already reflect a jump or dodge impulse applied before them (RLPR Nexto jump-start ticks lose
-    // one or two wheels on this raycast and get no auto-roll; frame 2701 car 0: one wheel touched on the previous
-    // tick, none at the set pose, and truth has the push). The gate is the regular one above: fewer
-    // than four wheels in contact (wheel flag 2, taken as a world contact; counting wheels on the ball
-    // scores worse) and a wheel or body world contact, so four wheels down never auto-roll (v3 differs).
-    if (autoroll_cal && !autoroll_prev_contact && car.set_wheel_normals_mask) {
+    if (!kStagedIndependent && autoroll_cal && !autoroll_prev_contact && car.set_wheel_normals_mask) {
         autoroll_world_contacts = SetStateWorldWheelNormals(car, cfg, wheels, ball, ball_radius, cars_in_env,
                                                             car_cfgs_in_env, cars_in_env_count, self_car_idx,
                                                             autoroll_normal_sum, mesh_triangles, mesh_triangle_count,
                                                             mesh_bvh_quantization, mesh_bvh_quantization_count,
                                                             mesh_bvh_meshes, mesh_bvh_mesh_count, mesh_bvh_nodes,
                                                             mesh_bvh_node_count, mesh_bvh_subtrees,
-                                                            mesh_bvh_subtree_count);
+                                                            mesh_bvh_subtree_count, mutator.cal_arena_local_tris);
         autoroll_contacts = autoroll_world_contacts;
         autoroll_gate = autoroll_contacts < 4 && (autoroll_contacts > 0 || car.world_contact.has_contact);
     }
-    // The game gates auto-roll (called first in the pre-physics step) on the dodge
-    // component being inactive at tick start, so a flip that a landing cancels this tick also skips it (RLPR
-    // cw_double_jump_dash, cw_double_dash: no auto-roll impulse on the landing-cancel tick).
-    if (controls.throttle && !(car.is_flipping) && !flipping_at_start && !cal_flip_ended && autoroll_gate) {
+    if (controls.throttle && !(car.is_flipping) && !flipping_at_start && !cal_flip_ended && autoroll_gate &&
+        !cfg.three_wheels) {
         ApplyAutoRollReference(car, cfg, mutator, autoroll_contacts, wheels, dt, wheel_runtime_state,
                                autoroll_cal ? &autoroll_normal_sum : nullptr, frame);
     }
@@ -1763,6 +2208,9 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     }
     ApplyBoost(car, controls, mutator, dt, wheel_runtime_state, frame);
     if (wheel_runtime_state) {
+        if (car_frame.has_queued_jump_force) {
+            car_frame.queued_force += car_frame.queued_jump_force;
+        }
         wheel_runtime_state->accumulated_force = car_frame.queued_force;
         wheel_runtime_state->accumulated_ang_accel = car_frame.queued_ang_accel;
         wheel_runtime_state->accumulated_torque_bt = car_frame.queued_torque_bt;
@@ -1774,7 +2222,6 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
                     && (selected < 0 || wheels[wheel].contact_normal_ws.z > wheels[selected].contact_normal_ws.z))
                     selected = wheel;
             bool previous = false;
-            // The last contact's loads only feed an event, so a run that records none skips them.
             if (selected >= 0 && mutator.physics_events.windows && car.tick_count_since_update != 0) {
                 const auto normal = wheels[selected].contact_normal_ws;
                 for (int wheel = 0; wheel < 4; ++wheel) {
@@ -1802,50 +2249,43 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     }
 }
 
-// Bullet's sleeping thresholds as RL builds its bodies (0.8 bt/s, 1 rad/s) and gDeactivationTime (2 s).
 constexpr float kBallLinearSleepingThresholdBt = 0.8f;
 constexpr float kBallAngularSleepingThreshold = 1.0f;
 constexpr float kBulletDeactivationTime = 2.0f;
 
-// The ball's activation at the start of a world step. A sleeping ball takes no gravity (applyGravity skips
-// ISLAND_SLEEPING) and stays frozen until a car touches it; the game wakes it after applyGravity, so the touch step has
-// no gravity. An uploaded state (sleeping == 2) is asleep when it is exactly still and below the awake rest height: the
-// kickoff ball the game spawns asleep sits 0.4 uu inside it, which a simulated ball can't hold, while a state-set ball
-// resting at 93.15 or hanging in the air is awake. An awake ball that spent more than gDeactivationTime below the
-// sleeping thresholds falls asleep, velocity zeroed (updateActivationState), once no car shares its island,
-// i.e. no ball-car pair is in the pair cache.
+ROCKETGPU_HD uint8_t BallWakeStateAtTickStart(const BallState& ball, const MutatorConfig& mutator) {
+    if (ball.sleeping != 2) {
+        return ball.sleeping;
+    }
+    constexpr float kSoccarBallRadiusUu = 91.24999f;
+    constexpr float kAwakeRestToleranceUu = 0.2f;
+    const float rest_z = mutator.ball_radius + (BallRestZ() - kSoccarBallRadiusUu);
+    return (mutator.ball_shape == 0 && LengthSq(ball.vel) == 0.0f && LengthSq(ball.ang_vel) == 0.0f &&
+            ball.pos.z < rest_z - kAwakeRestToleranceUu) ? 1u : 0u;
+}
+
+ROCKETGPU_HD bool BallDeactivatesAtTickStart(const BallState& ball, uint8_t sleeping, const WorldSolverScratch* scratch) {
+    if (sleeping != 0 || !(ball.deactivation_time > kBulletDeactivationTime)) {
+        return false;
+    }
+    bool car_in_island = false;
+    for (int i = 0; scratch != nullptr && i < scratch->bp.bp_pair_count; ++i) {
+        car_in_island = car_in_island || BulletPairKeyKind(scratch->bp.bp_pairs[i]) == 1;
+    }
+    return !car_in_island;
+}
+
 ROCKETGPU_HD bool ResolveBallActivationAtTickStart(
     BallState& ball, const MutatorConfig& mutator, const WorldSolverScratch* scratch) {
-    if (ball.sleeping == 2) {
-        constexpr float kSoccarBallRadiusUu = 91.25f;
-        constexpr float kAwakeRestToleranceUu = 0.2f;
-        const float rest_z = mutator.ball_radius + (BallRestZ() - kSoccarBallRadiusUu);
-        ball.sleeping = (mutator.ball_shape == 0 && LengthSq(ball.vel) == 0.0f && LengthSq(ball.ang_vel) == 0.0f &&
-                         ball.pos.z < rest_z - kAwakeRestToleranceUu) ? 1u : 0u;
-    }
-    if (ball.sleeping == 0 && ball.deactivation_time > kBulletDeactivationTime) {
-        bool car_in_island = false;
-        for (int i = 0; scratch != nullptr && i < scratch->bp.bp_pair_count; ++i) {
-            car_in_island = car_in_island || BulletPairKeyKind(scratch->bp.bp_pairs[i]) == 1;
-        }
-        if (!car_in_island) {
-            ball.sleeping = 1;
-            SetBallLinearVelocityBt(ball, Vec3(0.0f, 0.0f, 0.0f));
-            ball.ang_vel = Vec3(0.0f, 0.0f, 0.0f);
-        }
+    ball.sleeping = BallWakeStateAtTickStart(ball, mutator);
+    if (BallDeactivatesAtTickStart(ball, ball.sleeping, scratch)) {
+        ball.sleeping = 1;
+        SetBallLinearVelocityBt(ball, Vec3(0.0f, 0.0f, 0.0f));
+        ball.ang_vel = Vec3(0.0f, 0.0f, 0.0f);
     }
     return ball.sleeping == 1;
 }
 
-// Settled-ball fast path (cal_ball_wake_on_set). With no ball-car rows, the rest of a world substep acts on the
-// ball only through its static-world stage S: ball-world contact rows (AppendBallWorldSpecialContactRows), their
-// velocity/split solve, gravity and integration. S reads the ball, the retained ball-mesh manifolds, the solver's
-// damped ball velocity, the ball's world (kind 0) entries in the sorted manifold list, sub_dt and the mutator,
-// and nothing that belongs to a car; car rows never read or write the ball. When S returns its input ball
-// bit-identical (a ball resting on a plane), a later substep whose S inputs are bit-identical would compute the
-// same identity, so it skips S and restores the verified ball. Car results do not change: their rows, order and
-// solver paths are the same with or without the ball's world rows (both solvers stay on the unified order
-// because the ball's world entries remain in the manifold list).
 ROCKETGPU_HD bool SettleBitsEqual(float a, float b) {
     return GlibcFloatBits(a) == GlibcFloatBits(b);
 }
@@ -1854,11 +2294,8 @@ ROCKETGPU_HD bool SettleBitsEqual(const Vec3& a, const Vec3& b) {
     return SettleBitsEqual(a.x, b.x) & SettleBitsEqual(a.y, b.y) & SettleBitsEqual(a.z, b.z);
 }
 
-// Every BallState field except tick_count_since_update, which only FinishBallTick advances (no step stage reads
-// it), and deactivation_time, which counts on while settled, so a settled ball keeps settling while they run.
 ROCKETGPU_HD bool BallSettleStateEqual(const BallState& a, const BallState& b) {
-    // Non-short-circuit (&): every field load issues at once rather than one dependent load after another.
-    static_assert(sizeof(BallState) == 208, "BallState changed: compare the new fields in BallSettleStateEqual");
+    static_assert(sizeof(BallState) == 288, "BallState changed: compare the new fields in BallSettleStateEqual");
     return SettleBitsEqual(a.pos, b.pos) &
            SettleBitsEqual(a.vel, b.vel) &
            SettleBitsEqual(a.ang_vel, b.ang_vel) &
@@ -1870,6 +2307,14 @@ ROCKETGPU_HD bool BallSettleStateEqual(const BallState& a, const BallState& b) {
            SettleBitsEqual(a.basis_right, b.basis_right) &
            SettleBitsEqual(a.basis_up, b.basis_up) &
            a.basis_authoritative == b.basis_authoritative &
+           SettleBitsEqual(a.inertia_basis_forward, b.inertia_basis_forward) &
+           SettleBitsEqual(a.inertia_basis_right, b.inertia_basis_right) &
+           SettleBitsEqual(a.inertia_basis_up, b.inertia_basis_up) &
+           a.inertia_basis_valid == b.inertia_basis_valid &
+           SettleBitsEqual(a.restored_inv_inertia_bt[0], b.restored_inv_inertia_bt[0]) &
+           SettleBitsEqual(a.restored_inv_inertia_bt[1], b.restored_inv_inertia_bt[1]) &
+           SettleBitsEqual(a.restored_inv_inertia_bt[2], b.restored_inv_inertia_bt[2]) &
+           a.restored_inv_inertia_valid == b.restored_inv_inertia_valid &
            SettleBitsEqual(a.vel_impulse_cache, b.vel_impulse_cache) &
            SettleBitsEqual(a.vel_impulse_cache_bt, b.vel_impulse_cache_bt) &
            a.tick_count_when_extra_impulse_applied == b.tick_count_when_extra_impulse_applied &
@@ -1896,12 +2341,17 @@ ROCKETGPU_HD bool BallWorldMeshManifoldsEmpty(const WorldSolverScratch& scratch)
     return true;
 }
 
-// Moves each car's world rows from its slot (CarWorldRowsOut) up behind the previous car's, and appends its order
-// groups: the shared rows and groups SolveCarWorldStaticContacts appends car by car in the WorldStepSoccar loop.
+ROCKETGPU_HD bool BallWorldManifoldsEmpty(const WorldSolverScratch& scratch) {
+    for (int i = 0; i < kBallWorldPlaneSlots; ++i) {
+        if (scratch.ball_world_plane_manifolds[i].count != 0) {
+            return false;
+        }
+    }
+    return BallWorldMeshManifoldsEmpty(scratch);
+}
+
 static_assert(kMaxApproxCarCarContactPoints <= kMaxCarPairRowsPerPair, "pair row caps assume <= 4 rows per car pair");
 
-// A row's words, all loaded before any is stored: a plain struct copy between global rows alternates load and store,
-// so each store waits on its load before the next load issues. 16-byte aligned rows move as 16-byte vectors.
 template <typename T>
 struct RowWords {
     static_assert(sizeof(T) % sizeof(uint32_t) == 0 && alignof(T) >= alignof(uint32_t), "rows copy by 32-bit words");
@@ -1949,10 +2399,6 @@ struct RowWords {
     }
 };
 
-// Moves a car's split, velocity and friction rows down to their packed slots (each dst <= src): row j of all three
-// kinds loads in one round trip before any is stored, and a store never lands on a source row still to be loaded. A
-// moved friction row's normal_row_idx drops by normal_shift; with friction rows in place it is adjusted where they
-// stand.
 ROCKETGPU_HD void MoveCarWorldRowsDown(const WorldSolverScratchRows& rows, bool move_split, int split_dst,
                                        int split_src, int split_n, bool move_velocity, int velocity_dst,
                                        int velocity_src, int velocity_n, bool move_friction, int friction_dst,
@@ -2007,8 +2453,6 @@ ROCKETGPU_HD void PackCarWorldRows(
     int& velocity_row_count,
     int& friction_row_count,
     int& group_count) {
-    // Every car's four counts load before any row move, byte-packed into registers (unrolled, constant shifts), so
-    // the loads share one trip instead of each waiting behind the previous car's moves. Cars past 8 read in place.
     static_assert(kMaxCarWorldSplitContactRows < 256 && kMaxCarWorldVelocityContactRows < 256 &&
                       kMaxCarWorldFrictionContactRows < 256 && kMaxCarWorldMeshesPerCar + 4 < 256,
                   "a car's row and group counts fit a byte");
@@ -2041,7 +2485,6 @@ ROCKETGPU_HD void PackCarWorldRows(
                              velocity_shift != 0, velocity_row_count, velocity_row_count + velocity_shift,
                              out_velocity_count, friction_shift != 0, friction_row_count,
                              friction_row_count + friction_shift, out_friction_count, velocity_shift);
-        // Group g + 1 is loaded before group g is stored, so the loads do not wait on the stores.
         SharedContactOrderGroup next_group;
         if (out_group_count > 0) {
             next_group = out.groups[0];
@@ -2065,13 +2508,15 @@ ROCKETGPU_HD void PackCarWorldRows(
     }
 }
 
-// WorldStepSoccar parts. Contacts runs up to the car-world rows and saves its locals (WorldStepCarry); a thread per
-// car then builds those rows (BuildCarWorldRowsForCar), and Rows packs them in car order and runs the rest. The
-// CarsApart variants leave each car's own start (WorldStepPrestepCar) and end (WorldStepFinishCar) to a thread per car.
 enum : int {
     kWorldStepWhole = 0, kWorldStepContacts = 1, kWorldStepRows = 2,
-    kWorldStepContactsCarsApart = 3, kWorldStepRowsCarsApart = 4
+    kWorldStepContactsCarsApart = 3, kWorldStepRowsCarsApart = 4,
+    kWorldStepContactsCarsApartPrefix = 5,
+    kWorldStepContactsCarsApartInfo = 6
 };
+ROCKETGPU_HD constexpr bool WorldPartIsPrefix(int part) {
+    return part == kWorldStepContactsCarsApartPrefix || part == kWorldStepContactsCarsApartInfo;
+}
 ROCKETGPU_HD constexpr bool WorldPartIsContacts(int part) {
     return part == kWorldStepContacts || part == kWorldStepContactsCarsApart;
 }
@@ -2079,15 +2524,10 @@ ROCKETGPU_HD constexpr bool WorldPartIsRows(int part) {
     return part == kWorldStepRows || part == kWorldStepRowsCarsApart;
 }
 
-// A car's world-step start: clamp, pre-contact snapshot, external impulses and deferred deltas.
 ROCKETGPU_HD void WorldStepPrestepCar(
     CarState& car, const CarConfig& car_config, const WheelRuntimeState* wheel_runtime_state,
     const MutatorConfig& mutator, float sub_dt, PreContactCar& pre_contact_car,
     Vec3& deferred_linear_delta, Vec3& deferred_angular_delta) {
-    // No speed cap before the world step (v3 caps at tick start and after jump/dodge impulses only): the
-    // game keeps pre-tick pushes past 2300, e.g. PartyCannon 28636 k14 car 3 ends the tick at 2508 uu/s.
-    // Everything is computed before the first store: none of it reads a field stored here, and through generic
-    // pointers each load would otherwise wait for the stores before it.
     const PreContactCar pre_contact = MakePreContactCar(car);
     const ::rocketgpu::Vec3 linear_delta =
         ComputeDeferredLinearVelocityDelta(car, wheel_runtime_state, mutator, sub_dt);
@@ -2097,10 +2537,13 @@ ROCKETGPU_HD void WorldStepPrestepCar(
         : ComputeOfficialExternalForceImpulseBt(wheel_runtime_state, mutator, sub_dt);
     ::rocketgpu::Vec3 ext_torque(0.0f, 0.0f, 0.0f);
     if (wheel_runtime_state && !inactive) {
-        ::rocketgpu::Vec3 inv_r0, inv_r1, inv_r2;
-        BuildPreSolveInvInertiaTensorWorldBt(
-            *wheel_runtime_state, car_config, mutator.car_mass, inv_r0, inv_r1, inv_r2);
-        ext_torque = VecMul3x3(wheel_runtime_state->accumulated_torque_bt, inv_r0, inv_r1, inv_r2) * sub_dt;
+        const ::rocketgpu::Vec3& t_bt = wheel_runtime_state->accumulated_torque_bt;
+        if (t_bt.x != 0.0f || t_bt.y != 0.0f || t_bt.z != 0.0f) {
+            ::rocketgpu::Vec3 inv_r0, inv_r1, inv_r2;
+            BuildPreSolveInvInertiaTensorWorldBt(
+                car, *wheel_runtime_state, car_config, mutator.car_mass, inv_r0, inv_r1, inv_r2);
+            ext_torque = VecMul3x3(t_bt, inv_r0, inv_r1, inv_r2) * sub_dt;
+        }
     }
     const ::rocketgpu::Vec3 angular_delta = ComputeDeferredAngularVelocityDelta(
         car, car_config, mutator.car_mass, wheel_runtime_state, sub_dt);
@@ -2115,7 +2558,6 @@ ROCKETGPU_HD void WorldStepPrestepCar(
     deferred_angular_delta = angular_delta;
 }
 
-// A car's world-step end, after the solve: its deferred velocity deltas, then its transform.
 ROCKETGPU_HD void WorldStepFinishCar(
     CarState& car, const CarConfig& car_config, WheelRuntimeState* wheel_runtime_state, const MutatorConfig& mutator,
     float sub_dt, const PreContactCar& pre_contact_car, const Vec3& deferred_linear_delta,
@@ -2128,12 +2570,241 @@ ROCKETGPU_HD void WorldStepFinishCar(
     if (car.just_respawned) {
         return;
     }
-    IntegrateCarTransformOnly(car, sub_dt, mutator.game_mode == static_cast<uint8_t>(Mode::Soccar), NativeSseMath(mutator));
+    IntegrateCarTransformOnly(car, sub_dt, NativeSseMath(mutator));
 }
 
-// Inlined into each staged world kernel on the device: its world_part is then a constant there (the other parts compile
-// out), and the call's callee-saved register save/restore (local memory) goes away.
-#if defined(__CUDA_ARCH__)
+template <typename MeshLanes = ArenaRayMeshOneLane>
+ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE bool PredictiveContactRayForBody(
+    int body, const BallState& ball, bool ball_sleeping, const CarState* cars, const PreContactCar* pre_contact_cars,
+    const CarConfig* car_configs, float dt, bool native_sse_math,
+    const ArenaMeshTriangle* mesh_triangles, int32_t mesh_triangle_count,
+    const ArenaMeshBvhQuantization* mesh_bvh_quantization, int32_t mesh_bvh_quantization_count,
+    const ArenaMeshBvhMeshInfo* mesh_bvh_meshes, int32_t mesh_bvh_mesh_count,
+    const ArenaMeshBvhNode* mesh_bvh_nodes, int32_t mesh_bvh_node_count,
+    const ArenaMeshBvhSubtreeInfo* mesh_bvh_subtrees, int32_t mesh_bvh_subtree_count,
+    const ArenaMeshLeafGrid* leaf_grid, Vec3& normal_out, float& distance_bt_out,
+    const MeshLanes& mesh_lanes = MeshLanes{},
+    const ArenaMeshTriangle* local_triangles = nullptr) {
+    constexpr float kCcdMotionThresholdBt = 0.02f;
+    constexpr float kRayBackoffBt = 0.04f;
+    const bool have_bvh_free_box =
+        mesh_triangles != nullptr && mesh_triangle_count > 0 &&
+        mesh_bvh_quantization != nullptr && mesh_bvh_quantization_count > 0 &&
+        mesh_bvh_nodes != nullptr && mesh_bvh_node_count > 0 && mesh_bvh_meshes != nullptr && mesh_bvh_mesh_count > 0;
+    Vec3 cur, to;
+    if (body == 0) {
+        if (ball_sleeping) {
+            return false;
+        }
+        cur = ball.pos_bt;
+        to = ball.pos_bt + ball.vel_bt * dt;
+    } else {
+        const CarState& car = cars[body - 1];
+        if (pre_contact_cars[body - 1].is_demoed) {
+            return false;
+        }
+        Vec3 ax(1.0f, 0.0f, 0.0f), ay(0.0f, 1.0f, 0.0f), az(0.0f, 0.0f, 1.0f);
+        CarBasisColumns(car, ax, ay, az);
+        const Vec3 child = car_configs[body - 1].hitbox_offset * (1.0f / 50.0f);
+        const Vec3 pred_origin = car.pos_bt + car.vel_bt * dt;
+        cur = Vec3(car.pos_bt.x + (ax.x * child.x + ay.x * child.y + az.x * child.z),
+                   car.pos_bt.y + (ax.y * child.x + ay.y * child.y + az.y * child.z),
+                   car.pos_bt.z + (ax.z * child.x + ay.z * child.y + az.z * child.z));
+        Quat rot = car.rot;
+        Vec3 fwd = car.basis_forward, right = car.basis_right, up = car.basis_up;
+        if (car.basis_authoritative && !native_sse_math) {
+            GameIntegrateOrientationBasisColumns(fwd, right, up, rot, car.ang_vel, dt);
+        } else if (car.basis_authoritative) {
+            IntegrateOrientationBasisColumns(fwd, right, up, rot, car.ang_vel, dt, native_sse_math);
+        } else {
+            IntegrateOrientation(rot, car.ang_vel, dt);
+            GetBasisVectors(rot, fwd, right, up);
+        }
+        to = Vec3(pred_origin.x + (fwd.x * child.x + right.x * child.y + up.x * child.z),
+                  pred_origin.y + (fwd.y * child.x + right.y * child.y + up.y * child.z),
+                  pred_origin.z + (fwd.z * child.x + right.z * child.y + up.z * child.z));
+    }
+    if (have_bvh_free_box) {
+        const float margin = kRayBackoffBt + 1e-3f;
+        const float fx = Min(mesh_bvh_meshes[0].free_half_x, 81.8f) - margin;
+        const float fy = Min(mesh_bvh_meshes[0].free_half_y, 199.9f) - margin;
+        if (cur.x > -fx && cur.x < fx && to.x > -fx && to.x < fx &&
+            cur.y > -fy && cur.y < fy && to.y > -fy && to.y < fy &&
+            cur.z > margin && to.z > 0.0f && cur.z < 40.75f && to.z < 40.8f) {
+            return false;
+        }
+    }
+    const Vec3 m(to.x - cur.x, to.y - cur.y, to.z - cur.z);
+    const float m2 = m.x * m.x + m.y * m.y + m.z * m.z;
+    if (!(m2 > kCcdMotionThresholdBt * kCcdMotionThresholdBt)) {
+        return false;
+    }
+    const float inv_len = 1.0f / SqrtScalar(m2);
+    const Vec3 from(cur.x - inv_len * m.x * kRayBackoffBt, cur.y - inv_len * m.y * kRayBackoffBt,
+                    cur.z - inv_len * m.z * kRayBackoffBt);
+    const Vec3 delta(to.x - from.x, to.y - from.y, to.z - from.z);
+    const ArenaRayHit hit = CastArenaRayDeltaBt(
+        ArenaRayHit{}, from, delta, Length(delta) * 50.0f, mesh_triangles, mesh_triangle_count,
+        mesh_bvh_quantization, mesh_bvh_quantization_count, mesh_bvh_meshes, mesh_bvh_mesh_count, mesh_bvh_nodes,
+        mesh_bvh_node_count, mesh_bvh_subtrees, mesh_bvh_subtree_count, nullptr, 0, mesh_lanes, leaf_grid,
+        local_triangles);
+    if (!hit.hit || !(hit.ray_fraction < 1.0f)) {
+        return false;
+    }
+    Vec3 n = hit.normal;
+    if (hit.kind == ROCKETGPU_ARENA_RAY_HIT_ARENA_MESH && hit.tri_index >= 0 && hit.tri_index < mesh_triangle_count) {
+        const ArenaMeshTriangle& tri = (local_triangles != nullptr ? local_triangles : mesh_triangles)[hit.tri_index];
+        const float origin_y = local_triangles != nullptr ? static_cast<float>(tri.cal_origin_sign) * kGoalMeshOriginYBt : 0.0f;
+        const Vec3 local_from(from.x, from.y - origin_y, from.z);
+        n = Cross(tri.b - tri.a, tri.c - tri.a);
+        const bool behind = Dot(n, local_from) - Dot(tri.a, n) <= 0.0f;
+        const float inv_len = 1.0f / SqrtScalar((n.y * n.y + n.x * n.x) + n.z * n.z);
+        n = Vec3(n.x * inv_len, n.y * inv_len, n.z * inv_len);
+        if (behind) {
+            n = -n;
+        }
+    }
+    const float f = hit.ray_fraction;
+    const Vec3 d(delta.x * f, delta.y * f, delta.z * f);
+    const float d_len = SqrtScalar(d.x * d.x + d.y * d.y + d.z * d.z);
+    const float s = d_len > kRayBackoffBt ? d_len - kRayBackoffBt : 0.0f;
+    const float inv_d = 1.0f / d_len;
+    const Vec3 d_short(inv_d * d.x * s, inv_d * d.y * s, inv_d * d.z * s);
+    normal_out = n;
+    distance_bt_out = ((delta.y - d_short.y) * n.y + (delta.x - d_short.x) * n.x) + (delta.z - d_short.z) * n.z;
+    return true;
+}
+
+ROCKETGPU_HD void ComputePredictiveContactHits(
+    const BallState& ball, bool ball_sleeping, const CarState* cars, const PreContactCar* pre_contact_cars,
+    const CarConfig* car_configs, int count, float dt, bool native_sse_math,
+    const ArenaMeshTriangle* mesh_triangles, int32_t mesh_triangle_count,
+    const ArenaMeshBvhQuantization* mesh_bvh_quantization, int32_t mesh_bvh_quantization_count,
+    const ArenaMeshBvhMeshInfo* mesh_bvh_meshes, int32_t mesh_bvh_mesh_count,
+    const ArenaMeshBvhNode* mesh_bvh_nodes, int32_t mesh_bvh_node_count,
+    const ArenaMeshBvhSubtreeInfo* mesh_bvh_subtrees, int32_t mesh_bvh_subtree_count,
+    const ArenaMeshLeafGrid* leaf_grid, WorldSolverScratch& scratch,
+    const ArenaMeshTriangle* local_triangles = nullptr) {
+    scratch.predictive_hit_mask = 0;
+    const int body_count = Min(count + 1, 9);
+    for (int body = 0; body < body_count; ++body) {
+        Vec3 n;
+        float distance_bt;
+        if (PredictiveContactRayForBody(body, ball, ball_sleeping, cars, pre_contact_cars, car_configs, dt,
+                                        native_sse_math, mesh_triangles, mesh_triangle_count, mesh_bvh_quantization,
+                                        mesh_bvh_quantization_count, mesh_bvh_meshes, mesh_bvh_mesh_count,
+                                        mesh_bvh_nodes, mesh_bvh_node_count, mesh_bvh_subtrees,
+                                        mesh_bvh_subtree_count, leaf_grid, n, distance_bt,
+                                        ArenaRayMeshOneLane{}, local_triangles)) {
+            scratch.predictive_hit_mask = static_cast<uint16_t>(scratch.predictive_hit_mask | (1u << body));
+            scratch.predictive_normal[body] = n;
+            scratch.predictive_distance_bt[body] = distance_bt;
+        }
+    }
+}
+
+ROCKETGPU_HD void AppendPredictiveContactRows(
+    const BallState& ball, const CarState* cars, const MutatorConfig& mutator, const WorldSolverScratch& scratch,
+    float dt, const Vec3* deferred_linear_deltas, const Vec3* deferred_angular_deltas,
+    const Vec3& ball_external_linear_delta, const Vec3* ball_solver_linear_velocity_bt,
+    EnvStridedArray<CarSharedSplitContactRow> world_split_rows, int& world_split_row_count,
+    EnvStridedArray<CarSharedVelocityContactRow> world_velocity_rows, int& world_velocity_row_count,
+    EnvStridedArray<CarSharedFrictionContactRow> world_friction_rows, int& world_friction_row_count,
+    EnvStridedArray<BallSplitContactRow> ball_split_rows, int& ball_split_row_count,
+    EnvStridedArray<BallVelocityContactRow> ball_normal_rows, int& ball_normal_row_count,
+    EnvStridedArray<BallFrictionContactRow> ball_friction_rows, int& ball_friction_row_count) {
+    const BulletBroadphaseHistory& bp = scratch.bp;
+    const Vec3 zero(0.0f, 0.0f, 0.0f);
+    for (int k = 0; k < bp.bp_predictive_count; ++k) {
+        const BulletManifoldEntry key = UnpackBulletPairKey(bp.bp_predictive[k]);
+        const int body = key.kind == 0 ? 0 : key.body_a + 1;
+        if (((scratch.predictive_hit_mask >> body) & 1u) == 0) {
+            continue;
+        }
+        const Vec3 n = scratch.predictive_normal[body];
+        const float distance_bt = scratch.predictive_distance_bt[body];
+        const float penetration_bt = -distance_bt;
+        if (body == 0) {
+            AppendBallStaticSplitRow(ball_split_rows, ball_split_row_count, penetration_bt * 50.0f, n, zero,
+                                     mutator, dt, &zero, &penetration_bt, &zero,
+                                     static_cast<int16_t>(kBulletPredictiveStaticId));
+            const Vec3 rhs_ball_linear = ball.vel + ball_external_linear_delta;
+            const Vec3 bt_linear = ball_solver_linear_velocity_bt ? *ball_solver_linear_velocity_bt
+                                                                  : BallStoredLinearVelocityToBt(ball.vel);
+            const Vec3 bt_tangent_basis_rel_vel = bt_linear + UuVecToBtDiv(ball_external_linear_delta);
+            const int before = ball_normal_row_count;
+            AppendBallVelocityContactRows(
+                ball_normal_rows, ball_normal_row_count, ball_friction_rows, ball_friction_row_count, n,
+                0.0f, mutator.ball_friction, 1.0f / mutator.ball_mass, zero, zero, -1, 0.0f, zero, zero, zero, zero,
+                ball.vel, ball.ang_vel, zero, zero,
+                ball_external_linear_delta, zero, zero, zero, rhs_ball_linear, rhs_ball_linear, &zero, nullptr,
+                ball_solver_linear_velocity_bt, &zero, nullptr, &zero, nullptr, &bt_tangent_basis_rel_vel, nullptr,
+                nullptr, nullptr, nullptr, true);
+            if (ball_normal_row_count > before) {
+                ball_normal_rows[before].predictive = 1;
+            }
+            continue;
+        }
+        const int i = body - 1;
+        const CarState& car = cars[i];
+        const float inv_mass = 1.0f / mutator.car_mass;
+        const int source_tag = 100 + kBulletPredictiveStaticId;
+        CarWorldSplitContactRow split_row;
+        InitializeCarWorldSplitContactRow(split_row, penetration_bt * 50.0f, n, inv_mass, zero, zero, dt, &zero, &zero,
+                                          &penetration_bt);
+        split_row.source_tag = source_tag;
+        AppendCarWorldToSharedSplitRows(world_split_rows, world_split_row_count, i, &split_row, 1);
+
+        CarWorldVelocityTraceInputs trace{car.vel, car.ang_vel, deferred_linear_deltas[i], deferred_angular_deltas[i],
+                                          car.pos};
+        trace.rel_contact_bt = zero;
+        trace.has_rel_contact_bt = 1;
+        trace.linear_velocity_bt = car.vel_bt;
+        trace.car_pos_bt = car.pos_bt;
+        trace.external_force_impulse_bt = car.ext_force_impulse_bt;
+        trace.has_bt_inputs = car.ext_force_impulse_bt_valid;
+        trace.external_torque_impulse = car.ext_torque_impulse;
+        trace.restitution_no_velocity_threshold = true;
+        const Vec3 base_rel_vel = VelocityAtPoint(car, zero, deferred_linear_deltas[i], deferred_angular_deltas[i]);
+        const Vec3 friction_base_rel_vel = VelocityAtPoint(car, zero, deferred_linear_deltas[i], zero);
+        Vec3 tangent(0.0f, 0.0f, 0.0f);
+        if (car.ext_force_impulse_bt_valid && car.basis_authoritative) {
+            const Vec3 vel_bt = car.vel_bt + car.ext_force_impulse_bt;
+            const Vec3 lateral_bt = vel_bt - n * Dot(n, vel_bt);
+            const float lat_rel_vel = LengthSq(lateral_bt);
+            tangent = lat_rel_vel > 1.1920928955078125e-7f ? lateral_bt * (1.0f / SqrtScalar(lat_rel_vel))
+                                                            : BulletPlaneSpace1First(n);
+        } else {
+            tangent = base_rel_vel - n * Dot(base_rel_vel, n);
+            const float tangent_len = Length(tangent);
+            tangent = tangent_len > 1e-6f ? (tangent / tangent_len) : OrthonormalTangent(n);
+        }
+        CarWorldVelocityContactRow normal_row[1];
+        CarWorldFrictionContactRow friction_row[1];
+        int normal_count = 0, friction_count = 0;
+        AppendCarWorldVelocityContactRows(normal_row, normal_count, friction_row, friction_count, n, 0.0f,
+                                          mutator.arena_friction, inv_mass, zero, zero, zero,
+                                          VelocityAtPoint(car, zero), base_rel_vel,
+                                          base_rel_vel, friction_base_rel_vel, &trace, &zero, &zero, &tangent);
+        normal_row[0].source_tag = source_tag;
+        friction_row[0].source_tag = source_tag;
+        AppendCarWorldToSharedVelocityRows(world_velocity_rows, world_velocity_row_count, world_friction_rows,
+                                           world_friction_row_count, i, normal_row, normal_count, friction_row,
+                                           friction_count);
+    }
+}
+
+ROCKETGPU_HD bool WorldStepPrefixRuns(const BallState& ball, const MutatorConfig& mutator, uint8_t enable_car_car_collisions,
+                                      const ArenaBroadphaseGrid& grid, const ArenaMeshBvhMeshInfo* mesh_bvh_meshes,
+                                      int32_t mesh_bvh_mesh_count) {
+    return enable_car_car_collisions && mutator.game_mode != static_cast<uint8_t>(Mode::Heatseeker) && grid.valid() &&
+           mesh_bvh_meshes != nullptr && mesh_bvh_mesh_count > 0 &&
+           (BallWakeStateAtTickStart(ball, mutator) != 0 || !(ball.deactivation_time > kBulletDeactivationTime));
+}
+
+#if defined(__CUDA_ARCH__) && defined(_MSC_VER)
+#define ROCKETGPU_WORLD_STEP_INLINE __forceinline__
+#elif defined(__CUDA_ARCH__)
 #define ROCKETGPU_WORLD_STEP_INLINE __attribute__((always_inline))
 #else
 #define ROCKETGPU_WORLD_STEP_INLINE
@@ -2192,12 +2863,77 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
     const auto should_stop_after_world_car = [&](int local_car_index) {
         return false;
     };
+    const auto record_ball_car_info = [&](const Vec3& cal_ball_start_vel) {
+        solver_scratch->hit_ball_pos = ball.pos;
+        for (int i = 0; i < count && i < kMaxBallCarRetainedManifolds; ++i) {
+            solver_scratch->hit_car_pos[i] = cars[base + i].pos;
+            solver_scratch->hit_car_rot[i] = cars[base + i].rot;
+        }
+        uint32_t ball_car_info_mask = 0;
+        for (int i = kMaxBallCarRetainedManifolds; i < count; ++i) {
+            if (BallCarCollisionInfoMayOverlap(ball, cars[base + i], car_configs[base + i], mutator, sub_dt, env_idx)) {
+                ball_car_info_mask |= 1u << i;
+            }
+        }
+        for (int i = kMaxBallCarRetainedManifolds; i < count; ++i) {
+            if (!(ball_car_info_mask & (1u << i))) {
+                continue;
+            }
+            RecordBallCarCollisionInfoIfOverlapping(
+                ball,
+                cars[base + i],
+                static_cast<uint32_t>(base + i + 1),
+                cars[base + i],
+                car_configs[base + i],
+                mutator,
+                current_tick,
+                ball,
+                &solver_scratch->ball_car_gjk_epa_scratch,
+                sub_dt,
+                env_idx,
+                static_cast<int8_t>(teams[base + i]),
+                (i < 8) ? &solver_scratch->cal_start_vel[i] : nullptr,
+                (&cal_ball_start_vel));
+        }
+    };
+    if (WorldPartIsPrefix(world_part)) {
+        if (world_part == kWorldStepContactsCarsApartInfo) {
+            if (world_substeps == 1 && solver_scratch != nullptr &&
+                WorldStepPrefixRuns(ball, mutator, enable_car_car_collisions, broadphase_grid, mesh_bvh_meshes,
+                                    mesh_bvh_mesh_count)) {
+                record_ball_car_info(solver_scratch->cal_ball_start_vel);
+                solver_scratch->w3_info_done = 1;
+            }
+            return;
+        }
+        if (world_substeps == 1 && solver_scratch != nullptr &&
+            WorldStepPrefixRuns(ball, mutator, enable_car_car_collisions, broadphase_grid, mesh_bvh_meshes,
+                                mesh_bvh_mesh_count)) {
+            int8_t prefix_body_islands[9];
+            BuildBulletManifoldList(ball, count, cars + base, pre_contact_cars, car_configs + base, mutator.ball_radius,
+                                    sub_dt, broadphase_grid, mesh_bvh_meshes, mesh_bvh_mesh_count,
+                                    rows.bullet_manifolds, kMaxBulletManifoldEntries, mutator.arena_collision != 0,
+                                    solver_scratch, NativeSseMath(mutator), prefix_body_islands, 1,
+                                    solver_scratch->w3_proxies_done != 0,
+                                    mutator.game_mode == static_cast<uint8_t>(Mode::Soccar));
+            solver_scratch->w3_prefix_done = 1;
+        }
+        if (solver_scratch != nullptr) {
+            solver_scratch->w3_proxies_done = 0;
+        }
+        return;
+    }
     for (int substep = 0; substep < world_substeps; ++substep) {
         WorldStepCarry carry;
         if (WorldPartIsRows(world_part)) {
             carry = solver_scratch->world_step_carry;
         } else {
+            carry.ball_vehicle_woke = (ball.sleeping & 4u) != 0;
+            ball.sleeping &= 3u;
             carry.ball_sleeping = ResolveBallActivationAtTickStart(ball, mutator, solver_scratch);
+            if (carry.ball_vehicle_woke) {
+                ball.deactivation_time = 0.0f;
+            }
         }
         int& pair_split_row_count = carry.pair_split_row_count;
         int world_split_row_count = 0;
@@ -2217,10 +2953,15 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
         const Vec3 sleeping_start_ball_external_linear_delta = ball_sleeping
             ? Vec3(0.0f, 0.0f, 0.0f)
             : Vec3(0.0f, 0.0f, mutator.gravity_z * sub_dt);
+        const bool w3_prefix_done = world_part == kWorldStepContactsCarsApart && solver_scratch->w3_prefix_done != 0;
+        const bool w3_info_done = world_part == kWorldStepContactsCarsApart && solver_scratch->w3_info_done != 0;
+        const bool w3_proxies_done = world_part == kWorldStepContactsCarsApart && solver_scratch->w3_proxies_done != 0;
         if (!WorldPartIsRows(world_part)) {
+            solver_scratch->w3_proxies_done = 0;
+            solver_scratch->w3_prefix_done = 0;
+            solver_scratch->w3_info_done = 0;
             solver_scratch->shared_contact_order_group_count = 0;
             if (solver_scratch->retained_reset_pending) {
-                // The cars-apart contacts run beside the car-world rows, which clear their own car-world manifolds.
                 const bool car_world = world_part != kWorldStepContactsCarsApart;
                 ClearRetainedContactManifolds(rows, car_world);
                 for (int k = 0; car_world && k < 8; ++k) {
@@ -2229,10 +2970,8 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
                 solver_scratch->retained_reset_pending = 0;
             }
 
-            // Pair slots are [j * cars + i] for local car indices, so only those of the last tick's cars can be valid.
             const int pair_cache_cars = Min(Max(count, static_cast<int>(solver_scratch->pair_cache_cars)), pair_contact_cache.cars);
             solver_scratch->pair_cache_cars = static_cast<uint8_t>(Min(count, pair_contact_cache.cars));
-            // Only slots a car-car resolve may have set valid since the last clear are read.
             uint64_t valid_pairs = 0;
             for (uint32_t maybe = pair_contact_cache ? solver_scratch->pair_cache_maybe_valid : 0; maybe != 0;
                  maybe &= maybe - 1) {
@@ -2251,7 +2990,6 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
             for (; valid_pairs != 0; valid_pairs &= valid_pairs - 1) {
                 const int bit = static_cast<int>(CountTrailingZeros64(valid_pairs));
                 CarCarPairCachedContact& slot = pair_contact_cache.slots[(bit / 8) * pair_contact_cache.cars + bit % 8];
-                // Points are only written with slot.valid set (or cleared whole), so an invalid slot is already clear.
                 slot.valid = 0;
                 slot.contact_count = 0;
                 for (int k = 0; k < kMaxCarCarCachedPoints; ++k) {
@@ -2261,7 +2999,7 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
             }
             for (int i = 0; world_part != kWorldStepContactsCarsApart && i < count; ++i) {
                 if ((cars_apart_mask >> i) & 1u) {
-                    continue;  // prestepped after its update, on another lane
+                    continue;
                 }
                 WorldStepPrestepCar(cars[base + i], car_configs[base + i],
                                     wheel_runtime_states ? &wheel_runtime_states[base + i] : nullptr, mutator, sub_dt,
@@ -2269,45 +3007,40 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
             }
 
             ball_solver_linear_velocity_bt = ball.vel_bt;
-            // v3 Ball::on_hit reads the ball's state.phys velocity, synced at tick start (captured in the tick-start block,
-            // before any car pre-tick wheel push or heatseeker pre-tick) and before the Bullet step damps it.
             const Vec3 cal_ball_start_vel = solver_scratch != nullptr ? solver_scratch->cal_ball_start_vel : ball.vel;
 
-            if (!ball_sleeping) {
-                ball_solver_linear_velocity_bt = BulletDampedLinearVelocityFromBt(ball.vel_bt, mutator, sub_dt);
-                ApplyBulletLinearDampingBall(ball, mutator, sub_dt);
-            }
-
-            uint32_t ball_car_info_mask = 0;
-            for (int i = 0; i < count; ++i) {
-                if (BallCarCollisionInfoMayOverlap(ball, cars[base + i], car_configs[base + i], mutator, sub_dt, env_idx)) {
-                    ball_car_info_mask |= 1u << i;
+            if (mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker)) {
+                BodyDampingClampBall(ball, mutator);
+                ball_solver_linear_velocity_bt = ball.vel_bt;
+                if (!ball_sleeping) {
+                    ball_solver_linear_velocity_bt = BulletDampedLinearVelocityFromBt(ball.vel_bt, mutator, sub_dt);
+                    ApplyBulletLinearDampingBall(ball, mutator, sub_dt);
+                }
+                if (solver_scratch != nullptr) {
+                    solver_scratch->ball_predict_vel_bt = ball.vel_bt;
                 }
             }
-            for (int i = 0; i < count; ++i) {
-                if (!(ball_car_info_mask & (1u << i))) {
-                    continue;
-                }
-                RecordBallCarCollisionInfoIfOverlapping(
-                    ball,
-                    cars[base + i],
-                    static_cast<uint32_t>(base + i + 1),
-                    cars[base + i],
-                    car_configs[base + i],
-                    mutator,
-                    current_tick,
-                    ball,
-                    &solver_scratch->ball_car_gjk_epa_scratch,
-                    sub_dt,
-                    env_idx,
-                    i,
-                    static_cast<int8_t>(teams[base + i]),
-                    (i < 8) ? &solver_scratch->cal_start_vel[i] : nullptr,
-                    (&cal_ball_start_vel));
+
+            if (!w3_info_done) {
+                record_ball_car_info(cal_ball_start_vel);
             }
 
+            const bool predictive_staged = solver_scratch->predictive_staged != 0;
+            solver_scratch->predictive_staged = 0;
+            if (!(broadphase_grid.valid() && mesh_bvh_meshes != nullptr && mesh_bvh_mesh_count > 0 &&
+                  mutator.arena_collision != 0)) {
+                solver_scratch->predictive_hit_mask = 0;
+            } else if (!predictive_staged) {
+                ComputePredictiveContactHits(
+                    ball, ball_sleeping && !carry.ball_vehicle_woke, cars + base, pre_contact_cars, car_configs + base,
+                    count, sub_dt,
+                    NativeSseMath(mutator), mesh_triangles, mesh_triangle_count, mesh_bvh_quantization,
+                    mesh_bvh_quantization_count, mesh_bvh_meshes, mesh_bvh_mesh_count, mesh_bvh_nodes,
+                    mesh_bvh_node_count, mesh_bvh_subtrees, mesh_bvh_subtree_count, &broadphase_grid.leaf_grid,
+                    *solver_scratch, mutator.cal_arena_local_tris);
+            }
             int prebuilt_manifold_count = -1;
-            int8_t manifold_body_islands[9];  // BuildBulletManifoldList's bodies: the ball, then up to 8 cars
+            int8_t manifold_body_islands[9];
             if (enable_car_car_collisions) {
                 const bool shared_rows_active =
                     pair_velocity_rows && pair_friction_rows;
@@ -2330,13 +3063,15 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
                         mutator.arena_collision != 0,
                         solver_scratch,
                         NativeSseMath(mutator),
-                        manifold_body_islands);
+                        manifold_body_islands,
+                        w3_prefix_done ? 2 : 0,
+                        !w3_prefix_done && w3_proxies_done,
+                        mutator.game_mode == static_cast<uint8_t>(Mode::Soccar),
+                        ball_sleeping && !carry.ball_vehicle_woke);
                 }
                 uint32_t ccm_reject_slots = 0;
                 CarCarCcmGateMasks(
                     count, cars + base, car_configs + base, rows.car_car_retained_manifolds, ccm_reject_slots);
-                // Every pair of the first 8 cars rejected (the usual case): no pair reaches ResolveCarCarCollision on any
-                // pass, so the loop would only clear the rejected pairs' cached contacts, which are already clear.
                 const int ccm_pair_cars = Min(count, 8);
                 const uint32_t ccm_all_slots =
                     ccm_pair_cars >= 2 ? (1u << (ccm_pair_cars * (ccm_pair_cars - 1) / 2)) - 1u : 0u;
@@ -2369,8 +3104,6 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
                         }
                     }
                 }
-                // Pairs a ResolveCarCarCollision ran on this tick: only their cached-contact slots can be valid (the
-                // tick-start clear left the others clear).
                 uint32_t resolved_slots = 0;
                 for (int pass = 0; pass < car_car_passes; ++pass) {
                     for (int po = 0; po < pair_order_count; ++po) {
@@ -2387,22 +3120,25 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
                         {
                             const int pair_velocity_rows_before = pair_velocity_row_count;
                             const int pair_friction_rows_before = pair_friction_row_count;
+                            const uint8_t* const body_handle = solver_scratch->bp.sweep.sap_body_handle;
+                            const bool i_is_body0 = body_handle[i + 1] <= body_handle[j + 1];
+                            const int a = i_is_body0 ? j : i;
+                            const int b = i_is_body0 ? i : j;
                             ResolveCarCarCollision(
-                                env_idx,
-                                cars[base + j], static_cast<uint32_t>(base + j + 1), teams[base + j],
-                                cars[base + i], static_cast<uint32_t>(base + i + 1), teams[base + i],
-                                car_configs[base + j], car_configs[base + i],
+                                cars[base + a], static_cast<uint32_t>(base + a + 1), teams[base + a],
+                                cars[base + b], static_cast<uint32_t>(base + b + 1), teams[base + b],
+                                car_configs[base + a], car_configs[base + b],
                                 mutator,
-                                pre_contact_cars[j],
-                                pre_contact_cars[i],
-                                deferred_linear_deltas[j],
-                                deferred_linear_deltas[i],
-                                deferred_angular_deltas[j],
-                                deferred_angular_deltas[i],
+                                pre_contact_cars[a],
+                                pre_contact_cars[b],
+                                deferred_linear_deltas[a],
+                                deferred_linear_deltas[b],
+                                deferred_angular_deltas[a],
+                                deferred_angular_deltas[b],
                                 sub_dt,
                                 enable_demos,
-                                j,
-                                i,
+                                a,
+                                b,
                                 pair_contact_cache,
                                 pair_split_rows,
                                 &pair_split_row_count,
@@ -2410,8 +3146,8 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
                                 &pair_velocity_row_count,
                                 pair_friction_rows,
                                 &pair_friction_row_count,
-                                (&solver_scratch->cal_start_vel[j]),
-                                (&solver_scratch->cal_start_vel[i]),
+                                (&solver_scratch->cal_start_vel[a]),
+                                (&solver_scratch->cal_start_vel[b]),
                                 (i < j && j < 8)
                                     ? &rows.car_car_retained_manifolds[CarCarRetainedSlot(i, j)]
                                     : nullptr);
@@ -2423,8 +3159,8 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
                                     rows.shared_contact_order_groups,
                                     solver_scratch->shared_contact_order_group_count,
                                     SharedContactOrderBucket::Pair,
-                                    j,
-                                    i,
+                                    a,
+                                    b,
                                     j * 8 + i,
                                     pair_velocity_rows_before,
                                     pair_velocity_row_count - pair_velocity_rows_before,
@@ -2433,8 +3169,6 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
                                     j * 100000 + 2000 + i);
                             }
                         }
-                        // The resolve may have moved or demoed cars i and j and refreshed their pair's retained manifold;
-                        // the masks are rebuilt at once rather than gating each later pair by its own round trips.
                         CarCarCcmGateMasks(
                             count, cars + base, car_configs + base, rows.car_car_retained_manifolds, ccm_reject_slots);
                     }
@@ -2453,16 +3187,16 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
             for (int i = 0; i < count; ++i) {
                 if (i < kMaxBallCarRetainedManifolds) {
                     if (!(ball_car_overlap_mask & (1u << i))) {
-                        rows.ball_car_retained_manifolds[i].count = 0;
+                        if (rows.ball_car_retained_manifolds[i].count != 0) {
+                            rows.ball_car_retained_manifolds[i].count = 0;
+                        }
                         continue;
                     }
                     AppendBallCarContactRowsRetained(
                         ball,
                         cars[base + i],
-                        static_cast<uint32_t>(base + i + 1),
                         car_configs[base + i],
                         mutator,
-                        current_tick,
                         sleeping_start_ball_external_linear_delta,
                         deferred_linear_deltas[i],
                         deferred_angular_deltas[i],
@@ -2478,16 +3212,24 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
                         &solver_scratch->ball_car_gjk_epa_scratch,
                         pre_contact_cars[i].is_demoed == 0,
                         &ball_solver_linear_velocity_bt,
-                        static_cast<int8_t>(teams[base + i]),
                         rows.ball_car_retained_manifolds[i]);
+                    if (!pre_contact_cars[i].is_demoed && !cars[base + i].just_respawned) {
+                        BallCarHitStart start;
+                        start.car_pos = solver_scratch->hit_car_pos[i];
+                        start.car_rot = solver_scratch->hit_car_rot[i];
+                        start.ball_pos = solver_scratch->hit_ball_pos;
+                        CommitBallCarHitFromManifold(
+                            ball, cars[base + i], static_cast<uint32_t>(base + i + 1), cars[base + i], mutator,
+                            current_tick, ball, rows.ball_car_retained_manifolds[i],
+                            static_cast<int8_t>(teams[base + i]), &solver_scratch->cal_start_vel[i],
+                            &solver_scratch->cal_ball_start_vel, &start);
+                    }
                 } else
                 AppendBallCarContactRows(
                     ball,
                     cars[base + i],
-                    static_cast<uint32_t>(base + i + 1),
                     car_configs[base + i],
                     mutator,
-                    current_tick,
                     sleeping_start_ball_external_linear_delta,
                     deferred_linear_deltas[i],
                     deferred_angular_deltas[i],
@@ -2502,8 +3244,7 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
                     env_idx,
                     &solver_scratch->ball_car_gjk_epa_scratch,
                     pre_contact_cars[i].is_demoed == 0,
-                    &ball_solver_linear_velocity_bt,
-                    static_cast<int8_t>(teams[base + i]));
+                    &ball_solver_linear_velocity_bt);
             }
             if (should_stop_after_stage(2)) {
                 return;
@@ -2526,12 +3267,13 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
                     mutator.arena_collision != 0,
                     solver_scratch,
                     NativeSseMath(mutator),
-                    manifold_body_islands);
+                    manifold_body_islands,
+                    0,
+                    false,
+                    mutator.game_mode == static_cast<uint8_t>(Mode::Soccar),
+                    ball_sleeping && !carry.ball_vehicle_woke);
                 if (built > 1) {
-                    // The entries are the packed pair keys of bp_manifolds (contiguous in the env's scratch) with their
-                    // bodies' islands (BuildBulletManifoldList): sort and rewrite them from those, not the strided list.
                     const uint32_t* const packed = solver_scratch->bp.bp_manifolds;
-                    // Bytes, not ints: entries < 96, islands < 9; both arrays live in local memory.
                     int8_t order[kMaxBulletManifoldEntries];
                     int8_t island_ids[kMaxBulletManifoldEntries];
                     for (int i = 0; i < built; ++i) {
@@ -2554,10 +3296,9 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
             solver_scratch->bullet_manifold_count = sorted_manifold_count;
 
             ball_awake_after_contact_rows =
-                !ball_sleeping || split_row_count > 0 || normal_row_count > 0 || friction_row_count > 0;
+                !ball_sleeping || carry.ball_vehicle_woke || split_row_count > 0 || normal_row_count > 0 ||
+                friction_row_count > 0;
 
-            // Settled-ball fast path (see BallSettleStateEqual). Only a still ball with no ball-car rows, empty retained
-            // mesh manifolds and 1..kBallSettledMaxWorldEntries world entries is a candidate; anything else clears it.
             if (solver_scratch != nullptr) {
                 int16_t settle_world_ids[kBallSettledMaxWorldEntries] = {};
                 int settle_world_count = 0;
@@ -2610,20 +3351,14 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
                 }
             }
 
-            if (ball_awake_after_contact_rows && !ball_settled_skip && mutator.arena_collision) {
-                // World<3> may take the ball-world stage (StagedBallWorldKernel); World<1> runs beside the stage.
+            const bool ball_world_dispatched = !ball_sleeping || carry.ball_vehicle_woke || solver_scratch == nullptr ||
+                                               !BallWorldManifoldsEmpty(*solver_scratch);
+            if (ball_awake_after_contact_rows && ball_world_dispatched && !ball_settled_skip && mutator.arena_collision) {
                 const BallWorldStage* const ball_stage =
                     world_part == kWorldStepContactsCarsApart && solver_scratch != nullptr
                         ? ConsumableBallWorldStage(env_idx, ball, mutator, current_tick, mesh_triangles, mesh_bvh_meshes,
                                                    mesh_bvh_mesh_count)
                         : nullptr;
-#if defined(ROCKETGPU_BALL_STAGE_CHECK) && defined(__CUDA_ARCH__)
-                if (world_part == kWorldStepContactsCarsApart && solver_scratch != nullptr) {
-                    CheckBallWorldStage(env_idx, ball, mutator, current_tick, mesh_triangles, mesh_triangle_count,
-                                        mesh_bvh_quantization, mesh_bvh_quantization_count, mesh_bvh_meshes,
-                                        mesh_bvh_mesh_count, mesh_bvh_nodes, mesh_bvh_node_count);
-                }
-#endif
                 AppendBallWorldSpecialContactRows(
                     ball,
                     mutator,
@@ -2664,9 +3399,6 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
                 return;
             }
         }
-        // A verified fixed point needs a ball world velocity row, so the velocity solver writes the ball back
-        // whether or not cars add rows. Without ball split rows the split solver leaves the ball untouched
-        // (zero push and turn), so its ball split rows may be absent.
         const bool ball_settled_rows_ok = normal_row_count > 0;
 
         if (WorldPartIsRows(world_part)) {
@@ -2728,7 +3460,12 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
                 (i < kMaxCarWorldMeshPersistentCars)
                     ? &rows.car_world_mesh_manifolds[i * kCarWorldMeshRetainedManifoldsPerCar]
                     : nullptr,
-                rows.car_world_local_rows ? &rows.car_world_local_rows[i] : nullptr);
+                rows.car_world_local_rows ? &rows.car_world_local_rows[i] : nullptr,
+                0u,
+                false,
+                nullptr,
+                (i < 8 && solver_scratch->car_predict_valid[i]) ? &solver_scratch->car_predict_vel[i] : nullptr,
+                (i < 8 && solver_scratch->car_predict_valid[i]) ? &solver_scratch->car_predict_ang_vel[i] : nullptr);
             RecordArenaWorldContact(cars[car_idx], acc);
             if (should_stop_after_world_car(i)) {
                 return;
@@ -2738,6 +3475,16 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
             return;
         }
 
+        if (solver_scratch->predictive_hit_mask != 0) {
+            AppendPredictiveContactRows(
+                ball, cars + base, mutator, *solver_scratch, sub_dt, deferred_linear_deltas, deferred_angular_deltas,
+                sleeping_start_ball_external_linear_delta, &ball_solver_linear_velocity_bt, world_split_rows,
+                world_split_row_count, world_velocity_rows, world_velocity_row_count, world_friction_rows,
+                world_friction_row_count, split_rows, split_row_count, normal_rows, normal_row_count, friction_rows,
+                friction_row_count);
+            ApplyPredictiveCarWorldContactNormal(cars + base, count, solver_scratch->predictive_hit_mask,
+                                                 world_velocity_rows, world_velocity_row_count);
+        }
         SolveUnifiedVelocityContactRows(
             ball,
             count,
@@ -2758,9 +3505,6 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
             pair_friction_row_count,
             rows.shared_contact_order_groups,
             solver_scratch->shared_contact_order_group_count,
-            env_idx,
-            current_tick,
-            substep,
             &ball_solver_linear_velocity_bt,
             rows.bullet_manifolds,
             sorted_manifold_count,
@@ -2772,12 +3516,14 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
             return;
         }
 
-        UpdateCarCarPairCacheFromSharedVelocityRows(
-            pair_contact_cache,
-            pair_velocity_rows,
-            pair_velocity_row_count,
-            pair_friction_rows,
-            pair_friction_row_count);
+        if (pair_velocity_row_count > 0 || pair_friction_row_count > 0) {
+            UpdateCarCarPairCacheFromSharedVelocityRows(
+                pair_contact_cache,
+                pair_velocity_rows,
+                pair_velocity_row_count,
+                pair_friction_rows,
+                pair_friction_row_count);
+        }
 
         SolveUnifiedSplitContactRows(
             ball,
@@ -2791,8 +3537,6 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
             pair_split_row_count,
             sub_dt,
             env_idx,
-            current_tick,
-            substep,
             rows.bullet_manifolds,
             sorted_manifold_count,
             mutator.ball_shape == 0 && !mutator.ball_no_rot,
@@ -2808,18 +3552,17 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
         }
 
         if (ball_settled_skip) {
-            // The skipped stage returns this ball unchanged; the car solve may have rewritten it in between.
             const uint64_t ball_ticks = ball.tick_count_since_update;
             const float ball_deactivation_time = ball.deactivation_time;
+            const uint16_t ball_constrained_2d = ball.constrained_2d;
             ball = solver_scratch->ball_settled_state;
             ball.tick_count_since_update = ball_ticks;
             ball.deactivation_time = ball_deactivation_time;
+            ball.constrained_2d = ball_constrained_2d;
         } else if (ball_awake_after_contact_rows) {
             IntegrateBallTransformOnly(ball, mutator, sub_dt);
         }
         if (ball_awake_after_contact_rows) {
-            // A touch woke a sleeping ball (activate() clears the timer); updateActivationState then counts time spent
-            // below both sleeping thresholds and restarts on any step above either.
             ball.sleeping = 0;
             const bool below = LengthSq(ball.vel_bt) < kBallLinearSleepingThresholdBt * kBallLinearSleepingThresholdBt &&
                                LengthSq(ball.ang_vel) < kBallAngularSleepingThreshold * kBallAngularSleepingThreshold;
@@ -2831,7 +3574,6 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void WorldStepSoccar(
                  BallSettleStateEqual(ball, solver_scratch->ball_settled_state)) ? 1 : 0;
         }
 
-        // Each car's deferred deltas and transform (independent of the ball's integration above).
         for (int i = 0; world_part != kWorldStepRowsCarsApart && i < count; ++i) {
             WorldStepFinishCar(cars[base + i], car_configs[base + i],
                                wheel_runtime_states ? &wheel_runtime_states[base + i] : nullptr, mutator, sub_dt,
@@ -2883,6 +3625,28 @@ struct StreamEnvCommandAccessor {
     }
 };
 
+ROCKETGPU_HD void ApplyEnvCommandBodies(
+    WorldSolverScratch& scratch, const EnvCommand& command, int car_count, const CarState* env_cars) {
+    if (command.reset_to_kickoff && command.reset_scoreboard) {
+        scratch.bp = BulletBroadphaseHistory{};
+        return;
+    }
+    if (!command.reset_to_kickoff && !command.new_round_bodies) {
+        return;
+    }
+    BulletSweepNewRound(scratch.bp, car_count, env_cars);
+    for (int manifold_idx = 0; manifold_idx < kMaxBallWorldMeshPersistentManifolds; ++manifold_idx) {
+        ResetBallMeshPersistentManifold(scratch.ball_world_mesh_manifolds[manifold_idx]);
+    }
+    for (int manifold_idx = 0; manifold_idx < kBallWorldPlaneSlots; ++manifold_idx) {
+        ResetBallMeshPersistentManifold(scratch.ball_world_plane_manifolds[manifold_idx]);
+    }
+    scratch.retained_reset_pending = 1;
+    for (int k = 0; k < 8; ++k) {
+        scratch.car_world_reset[k] = 1;
+    }
+}
+
 ROCKETGPU_HD void ApplyEnvCommand(
     int env_idx,
     const SimConfig& cfg,
@@ -2895,7 +3659,8 @@ ROCKETGPU_HD void ApplyEnvCommand(
     BoostPadState* pads,
     const EnvCommand& command,
     RespawnRngState* respawn_rng = nullptr,
-    const int* kickoff_order_override = nullptr) {
+    const int* kickoff_order_override = nullptr,
+    const CarConfig* car_configs = nullptr) {
     if (!command.reset_to_kickoff) {
         return;
     }
@@ -2914,7 +3679,15 @@ ROCKETGPU_HD void ApplyEnvCommand(
         env_states,
         command.kickoff_seed_mode,
         respawn_rng,
-        kickoff_order_override);
+        kickoff_order_override,
+        command.keep_boost_pads != 0,
+        car_configs,
+        command.kickoff_countdown_ticks != 0);
+    for (int i = 0; i < env_car_count[env_idx]; ++i) {
+        const int slot = CarVisitSlot(env_states[env_idx], i, env_car_count[env_idx]);
+        cars[env_idx * cfg.max_cars_per_env + slot].driving_disabled = command.kickoff_countdown_ticks;
+    }
+    balls[env_idx].constrained_2d = command.kickoff_countdown_ticks;
 
     EnvState& env = env_states[env_idx];
     if (command.reset_scoreboard) {
@@ -2926,9 +3699,12 @@ ROCKETGPU_HD void ApplyEnvCommand(
         env.tick = 0;
     }
     env.goal_scored_this_tick = 0;
+    env.countdown_phase = command.kickoff_countdown_ticks == kKickoffCountdownGameTimers ? 1 : 0;
+    env.countdown_fires = 0;
+    env.countdown_count = 0.0f;
 }
 
-// Always inlined, so StagedCarPreKernel (through StepEnvVehicleUpdateCarInline) runs the vehicle update without an ABI call.
+template <bool kStagedIndependent = false>
 ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void RocketSim_Car_PreTickUpdate(
     CarState& car,
     CarControls controls,
@@ -2957,8 +3733,9 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void RocketSim_Car_PreTickUpdate(
     CarState* cal_push_cars = nullptr,
     BallState* cal_push_ball = nullptr,
     uint32_t* cal_pushed_cars_mask = nullptr,
-    bool staged_rays_velocity_stale = false) {
-    PreTickCar(
+    bool staged_rays_velocity_stale = false,
+    uint32_t wheel_ray_excluded_bodies = 0u) {
+    PreTickCar<kStagedIndependent>(
         car,
         controls,
         cfg,
@@ -2986,26 +3763,23 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void RocketSim_Car_PreTickUpdate(
         cal_push_cars,
         cal_push_ball,
         cal_pushed_cars_mask,
-        staged_rays_velocity_stale);
+        staged_rays_velocity_stale,
+        wheel_ray_excluded_bodies);
 }
 
 ROCKETGPU_HD void RocketSim_Car_PostTickUpdate(
     CarState& car,
     CarControls controls,
-    const MutatorConfig& mutator,
     float dt) {
-    PostTickCar(car, controls, mutator, dt);
+    PostTickCar(car, controls, dt);
 }
 
-ROCKETGPU_HD void RocketSim_Car_FinishPhysicsTick(CarState& car, const MutatorConfig& mutator) {
-    FinishCarTick(car, mutator);
+ROCKETGPU_HD void RocketSim_Car_FinishPhysicsTick(CarState& car) {
+    FinishCarTick(car);
 }
 
-// End of tick: keep the step's values in the internal_* fields and write RLBot's values into the reported ones
-// (rocketgpu.h CarState). StepEnvPreTickCar puts the step's values back.
 ROCKETGPU_HD void ReportRLBotCarFields(CarState& car, const WheelRuntimeState* jw, const MutatorConfig& mutator, float dt) {
     if (car.is_demoed && car.tick_count_since_update == 0) {
-        // Demoed before its first tick after a set: the next tick start still reads the fields as a set state.
         car.reported_flags = 0;
         return;
     }
@@ -3019,10 +3793,6 @@ ROCKETGPU_HD void ReportRLBotCarFields(CarState& car, const WheelRuntimeState* j
 
     car.double_jump_ticks = !car.has_double_jumped ? 255 :
         (dj_started ? 0 : (car.double_jump_ticks < 255 ? car.double_jump_ticks + 1 : 255));
-    // The game's has_jumped: set by a jump, cleared on a tick in the OnGround air state once the jump started more than
-    // JUMP_MIN_TIME + JUMP_RESET_TIME_PAD ago. RocketGPU checks its own flag before the jump ends in the tick (so a car
-    // that releases the jump on the ground and leaves it next tick keeps it), and also clears it while dodging on the
-    // ground.
     const bool on_ground_state = car.is_on_ground && !car.is_jumping && !car.is_flipping;
     if (car.is_jumping) {
         car.game_has_jumped = 1;
@@ -3031,7 +3801,6 @@ ROCKETGPU_HD void ReportRLBotCarFields(CarState& car, const WheelRuntimeState* j
         car.game_has_jumped = 0;
     }
 
-    // Velocity caps, as the next tick start applies them (CalTickStartLimitAndQuantizeCar, before quantizing).
     const float max_speed_bt = mutator.car_max_speed * UnitsUUToBT();
     if (!car.is_demoed && LengthSq(car.vel_bt) > max_speed_bt * max_speed_bt) {
         const Vec3 vel_bt_normalized = mutator.native_sphere_rsqrt_table
@@ -3050,7 +3819,6 @@ ROCKETGPU_HD void ReportRLBotCarFields(CarState& car, const WheelRuntimeState* j
 
     car.air_state = car.is_jumping ? 1 : (car.is_flipping ? 3 : (car.is_on_ground ? 0 :
         (car.double_jump_ticks < 13 ? 2 : 4)));
-    // The game's jump inactive time (WheelRuntimeState::cal_jump_inactive_time) counts the release tick as one tick.
     const float jump_inactive = jw ? jw->cal_jump_inactive_time : car.air_time_since_jump;
     const bool dodge_window = !car.is_on_ground && !car.is_jumping && car.has_jumped && !car.internal_has_double_jumped &&
         !car.internal_has_flipped && jump_inactive < mutator.doublejump_max_delay - 0.5f * dt;
@@ -3068,8 +3836,6 @@ ROCKETGPU_HD void ReportRLBotCarFields(CarState& car, const WheelRuntimeState* j
         (car.is_supersonic ? CarState::kReportedIsSupersonic : 0);
 }
 
-// Tick start: the step's values back into the reported fields. After a state set (tick_count_since_update == 0) the
-// written fields are the step's values; the game's supersonic flag still holds while supersonic_time runs.
 ROCKETGPU_HD void RestoreStepCarFields(CarState& car) {
     if (car.tick_count_since_update != 0) {
         car.RestoreWorkingFields();
@@ -3083,21 +3849,12 @@ ROCKETGPU_HD void RestoreStepCarFields(CarState& car) {
     car.double_jump_ticks = 255;
 }
 
-ROCKETGPU_HD void RocketSim_Ball_FinishPhysicsTick(BallState& ball, const MutatorConfig& mutator) {
-    FinishBallTick(ball, mutator);
+ROCKETGPU_HD void RocketSim_Ball_FinishPhysicsTick(BallState& ball) {
+    FinishBallTick(ball);
 }
 
 ROCKETGPU_HD void RocketSim_BoostPad_PreTickUpdate(int env_idx, const SimConfig& cfg, BoostPadState* pads, float dt) {
     PreTickBoostPadsForEnv(env_idx, cfg, pads, dt);
-}
-
-ROCKETGPU_HD void RocketSim_BoostPad_CheckCollide(
-    int env_idx,
-    const SimConfig& cfg,
-    const CarState& car,
-    uint32_t car_id,
-    BoostPadState* pads) {
-    CheckBoostPadCollisionForCar(env_idx, cfg, car, car_id, pads);
 }
 
 ROCKETGPU_HD void RocketSim_BoostPad_PostTickUpdate(int env_idx, const SimConfig& cfg, CarState* cars, BoostPadState* pads) {
@@ -3166,8 +3923,6 @@ ROCKETGPU_HD void RocketSim_Arena_WorldStepSoccar(
         register_iterations);
 }
 
-// mesh_lanes: the ray's arena mesh walk and cars loop split over cooperating lanes (see ArenaRayMeshOneLane); only
-// the leader writes the stage.
 template <typename MeshLanes = ArenaRayMeshOneLane>
 ROCKETGPU_HD void StageWheelRaysForEnv(
     int lane,
@@ -3196,12 +3951,9 @@ ROCKETGPU_HD void StageWheelRaysForEnv(
         return;
     }
     const CarState& car = cars[base + car_slot];
-    // A car set with wheel contact normals reads the other cars' velocities in its update (SetStateWorldWheelNormals),
-    // which their updates write: leaving its rays unstaged keeps the env's updates in visit order.
     if (car.is_demoed || car.set_wheel_normals_mask != 0) {
         return;
     }
-    // One bit per car slot: a runtime-indexed byte array would live in local memory.
     int32_t no_response = 0;
     for (int j = 0; j < count; ++j) {
         no_response |= (cars[base + j].demo_no_contact_response != 0 ? 1 : 0) << j;
@@ -3228,8 +3980,6 @@ ROCKETGPU_HD void StageWheelRaysForEnv(
         &car_configs[base],
         count,
         car_slot,
-        env_idx,
-        wheel_idx,
         &balls[env_idx],
         cfg.mutator.ball_radius,
         cfg.arena_mesh_bvh_quantization,
@@ -3241,20 +3991,17 @@ ROCKETGPU_HD void StageWheelRaysForEnv(
         cfg.arena_mesh_bvh_subtrees,
         cfg.arena_mesh_bvh_subtree_count,
         cfg.mutator.arena_collision != 0, cfg.mutator.native_sphere_rsqrt_table, cfg.mutator.native_sphere_rsqrt_shift,
-        no_response, CalMinWheelHitDistSqBt(car_cfg), mesh_lanes);
+        no_response, CalMinWheelHitDistSqBt(car_cfg), mesh_lanes, cfg.mutator.cal_arena_local_tris,
+        WheelRayExcludedBodies(car, car_cfg, &scratch.bp.sweep, car_slot, count));
     if (mesh_lanes.Leader()) {
         StoreWheelRayStage(wheel, stage);
         stage.valid = 1;
     }
 }
 
-// Full runs a whole tick; Post skips the tick start (StepEnvPreTick*) and reads the staged wheel rays;
-// PostVehiclesDone is Post after VehicleUpdateKernel ran the independent vehicle updates.
 enum : int { kStepEnvPhaseFull = 0, kStepEnvPhasePost = 2, kStepEnvPhasePostVehiclesDone = 3 };
 
-// Vehicle update of car slot i at the start of the physics tick (RocketSim_Car_PreTickUpdate). A wheel resting on
-// another car or the ball pushes that body, which the cars visited after it then see.
-// Always inlined for StagedCarPreKernel; the other callers share the outlined StepEnvVehicleUpdateCar below.
+template <bool kStagedIndependent = false>
 ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void StepEnvVehicleUpdateCarInline(
     int env_idx,
     int i,
@@ -3266,9 +4013,10 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void StepEnvVehicleUpdateCarInline(
     BallState* balls,
     const CarControls& controls,
     const WheelRayStage* staged_rays_for_env,
-    uint32_t& pushed_cars_mask) {
+    uint32_t& pushed_cars_mask,
+    const BulletSweepHistory* sweep = nullptr) {
     const int base = env_idx * cfg.max_cars_per_env;
-    RocketSim_Car_PreTickUpdate(
+    RocketSim_Car_PreTickUpdate<kStagedIndependent>(
         cars[base + i],
         controls,
         car_configs[base + i],
@@ -3296,7 +4044,11 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void StepEnvVehicleUpdateCarInline(
         &cars[base],
         &balls[env_idx],
         &pushed_cars_mask,
-        i < 32 && ((pushed_cars_mask >> i) & 1u));
+        i < 32 && ((pushed_cars_mask >> i) & 1u),
+        (kStagedIndependent || cars[base + i].is_demoed ||
+         (staged_rays_for_env != nullptr && staged_rays_for_env[4 * i].valid != 0))
+            ? 0u
+            : WheelRayExcludedBodies(cars[base + i], car_configs[base + i], sweep, i, count));
 }
 
 ROCKETGPU_HD void StepEnvVehicleUpdateCar(
@@ -3310,19 +4062,12 @@ ROCKETGPU_HD void StepEnvVehicleUpdateCar(
     BallState* balls,
     const CarControls& controls,
     const WheelRayStage* staged_rays_for_env,
-    uint32_t& pushed_cars_mask) {
+    uint32_t& pushed_cars_mask,
+    const BulletSweepHistory* sweep = nullptr) {
     StepEnvVehicleUpdateCarInline(env_idx, i, count, cfg, cars, wheel_runtime_states, car_configs, balls, controls,
-                                  staged_rays_for_env, pushed_cars_mask);
+                                  staged_rays_for_env, pushed_cars_mask, sweep);
 }
 
-// Whether the cars' vehicle updates can run in any order: every wheel ray is staged (no live raycast against the
-// other cars) and none rests on a car or the ball (the only bodies an update pushes), and no physics events are
-// recorded (they are emitted in visit order). Each update then reads and writes only its own car.
-// Car slot i's turn in the WorldStepSoccar car-world loop, between kWorldStepContacts and kWorldStepRows: its rows go
-// to the env's shared world rows at the car's slot and its order groups to its CarWorldRowsOut (see PackCarWorldRows).
-// kPart 1 / 2 (the car passed CarWorldRowsSplitPlanes): one part of the split query, the mesh part into the car's
-// local rows and the planes part into plane_rows; FinishCarWorldRowsForCar then merges them (both parts done) and
-// clears the reset flag. Each part resets its own retained manifolds.
 template <bool kMeshesOutOfReach = false, int kPart = 0>
 ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void BuildCarWorldRowsForCar(
     int env_idx,
@@ -3392,7 +4137,9 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void BuildCarWorldRowsForCar(
             kPart == 2 ? plane_rows : rows.car_world_local_rows ? &rows.car_world_local_rows[i] : nullptr,
             mesh_reach_hint,
             true,
-            part);
+            part,
+            (i < 8 && scratch.car_predict_valid[i]) ? &scratch.car_predict_vel[i] : nullptr,
+            (i < 8 && scratch.car_predict_valid[i]) ? &scratch.car_predict_ang_vel[i] : nullptr);
         if (kPart != 0) {
             return;
         }
@@ -3404,7 +4151,6 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void BuildCarWorldRowsForCar(
     out.friction_row_count = friction_end - i * kMaxCarWorldFrictionContactRows;
 }
 
-// The split query's end (both BuildCarWorldRowsForCar parts done): the rest of BuildCarWorldRowsForCar.
 ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void FinishCarWorldRowsForCar(
     int env_idx,
     int i,
@@ -3449,8 +4195,29 @@ ROCKETGPU_HD bool VehicleUpdatesIndependent(const SimConfig& cfg, const WheelRay
     return true;
 }
 
-// Tick start, split so the CUDA pre-tick runs a thread per car: StepEnvPreTickEnv first, then StepEnvPreTickCar for
-// each car and StepEnvPreTickBallAndPads in any order (each touches only its own car, or the ball and pads).
+ROCKETGPU_HD void CountdownUpdateTimers(EnvState& env, CarState* env_cars, int count, BallState& ball, float frame_dt) {
+    if (env.countdown_phase == 0) {
+        return;
+    }
+    env.countdown_count += frame_dt;
+    if (env.countdown_count > 1.0f) {
+        if (env.countdown_phase == 1) {
+            env.countdown_phase = 2;
+            env.countdown_count = 0.0f;
+        } else {
+            env.countdown_count -= 1.0f;
+            if (++env.countdown_fires == 3) {
+                env.countdown_phase = 0;
+                env.countdown_fires = 0;
+                for (int i = 0; i < count; ++i) {
+                    env_cars[i].driving_disabled = 0;
+                }
+                ball.constrained_2d = 0;
+            }
+        }
+    }
+}
+
 ROCKETGPU_HD void StepEnvPreTickEnv(
     int env_idx,
     const SimConfig& cfg,
@@ -3463,7 +4230,12 @@ ROCKETGPU_HD void StepEnvPreTickEnv(
     EnvState* env_states,
     BoostPadState* pads,
     const EnvCommand& command,
-    const int* kickoff_order_override) {
+    const int* kickoff_order_override,
+    const CarConfig* car_configs = nullptr) {
+    if (solver_scratch) {
+        ApplyEnvCommandBodies(
+            solver_scratch[env_idx], command, env_car_count[env_idx], cars + env_idx * cfg.max_cars_per_env);
+    }
     ApplyEnvCommand(
         env_idx,
         cfg,
@@ -3476,8 +4248,15 @@ ROCKETGPU_HD void StepEnvPreTickEnv(
         pads,
         command,
         nullptr,
-        kickoff_order_override);
+        kickoff_order_override,
+        car_configs);
     EnvState& env = env_states[env_idx];
+    const float frame_start_dt = FrameStartDt(cfg, env_idx);
+    if (cfg.mutator.countdown_on_frame_start && frame_start_dt >= 0.0f) {
+        CountdownUpdateTimers(env, cars + env_idx * cfg.max_cars_per_env, env_car_count[env_idx], balls[env_idx],
+                              frame_start_dt);
+    }
+    UpdateGameCarVisitOrder(env, cars + env_idx * cfg.max_cars_per_env, env_car_count[env_idx]);
     if (cfg.mutator.physics_events.windows) {
         cfg.mutator.physics_events.windows[env_idx].tick = static_cast<uint64_t>(env.tick);
     }
@@ -3486,7 +4265,7 @@ ROCKETGPU_HD void StepEnvPreTickEnv(
         for (int manifold_idx = 0; manifold_idx < kMaxBallWorldMeshPersistentManifolds; ++manifold_idx) {
             ResetBallMeshPersistentManifold(solver_scratch[env_idx].ball_world_mesh_manifolds[manifold_idx]);
         }
-        for (int manifold_idx = 0; manifold_idx < 4; ++manifold_idx) {
+        for (int manifold_idx = 0; manifold_idx < kBallWorldPlaneSlots; ++manifold_idx) {
             ResetBallMeshPersistentManifold(solver_scratch[env_idx].ball_world_plane_manifolds[manifold_idx]);
         }
         solver_scratch[env_idx].retained_reset_pending = 1;
@@ -3505,7 +4284,10 @@ ROCKETGPU_HD void StepEnvPreTickCar(
     WorldSolverScratch* solver_scratch,
     const EnvState& env,
     const uint8_t* respawn_slot_overrides,
-    uint64_t seed) {
+    uint64_t seed,
+    CarControls controls,
+    const CarConfig& car_cfg,
+    WheelRuntimeState* wheel_runtime_state) {
     const int base = env_idx * cfg.max_cars_per_env;
     CarState& car = cars[base + i];
     car.ball_contact_this_tick = 0;
@@ -3516,12 +4298,16 @@ ROCKETGPU_HD void StepEnvPreTickCar(
     if (car.just_respawned) {
         car.just_respawned = 0;
     }
+    bool respawned = false;
     if (car.is_demoed) {
         car.demo_respawn_timer = Max(0.0f, car.demo_respawn_timer - cfg.tick_dt);
         if (car.demo_respawn_timer <= 0.0f) {
             const uint32_t car_id = static_cast<uint32_t>(base + i + 1);
             int respawn_slot = -1;
-            if (respawn_slot_overrides) {
+            if (car.respawn_slot_override_plus1 != 0) {
+                respawn_slot = car.respawn_slot_override_plus1 - 1;
+                car.respawn_slot_override_plus1 = 0;
+            } else if (respawn_slot_overrides) {
                 const uint8_t override_slot = respawn_slot_overrides[base + i];
                 if (override_slot != 0xFFu) {
                     respawn_slot = static_cast<int>(override_slot);
@@ -3530,24 +4316,54 @@ ROCKETGPU_HD void StepEnvPreTickCar(
             if (respawn_slot < 0) {
                 respawn_slot = PickRespawnSlot(seed, env_idx, static_cast<uint64_t>(env.tick), car_id);
             }
-            RespawnCar(car, teams[base + i], respawn_slot, cfg.mutator);
+            if (respawn_slot >= kKickoffSpawnOverridePlus1 - 1) {
+                KickoffSpawnCar(car, teams[base + i], respawn_slot - (kKickoffSpawnOverridePlus1 - 1), cfg.mutator,
+                                car_cfg.spawn_z);
+            } else {
+                RespawnCar(car, teams[base + i], respawn_slot, cfg.mutator, car_cfg.spawn_z);
+            }
+            respawned = true;
         }
     }
+    const Quat spawn_rot = car.rot;
+    car.tick_start_pos_bt = car.pos_bt;
     CalTickStartLimitAndQuantizeCar(car, cfg.mutator);
-    // v3 contact callbacks read state.phys.vel, synced after the tick-start limit/quantize and before
-    // the z-damp prepass touches the rigid body; capture the hit/bump start velocity here.
+    if (respawned) {
+        SpawnInertiaBasis(spawn_rot, car.tick_start_basis_forward, car.tick_start_basis_right, car.tick_start_basis_up);
+    }
     if (solver_scratch != nullptr && i < 8) {
         solver_scratch[env_idx].cal_start_vel[i] = car.vel;
     }
+    const CarRbSnapshot tick_start_snapshot = TickStartCarRbSnapshot(car);
     CalFlipZDampPrepass(car, cfg.mutator, cfg.tick_dt);
+    car.cal_tick_start_ang_vel = car.ang_vel;
+    const Vec3 vel_before_components = car.vel_bt;
+    PreTickCarPrePhysics(car, controls, car_cfg, cfg.mutator, FrameFrac(cfg, env_idx), cfg.tick_dt, wheel_runtime_state, tick_start_snapshot);
+    if (!car.is_demoed) {
+        const bool impulsed = car.vel_bt.x != vel_before_components.x || car.vel_bt.y != vel_before_components.y ||
+            car.vel_bt.z != vel_before_components.z;
+        if ((BodyDampingClampCar(car, cfg.mutator, true, true) & 1) && impulsed) {
+            SetCarLinearVelocityBt(car, car.vel_bt);
+        }
+    }
+    if (solver_scratch != nullptr && i < 8) {
+        solver_scratch[env_idx].car_predict_vel[i] = car.vel;
+        solver_scratch[env_idx].car_predict_ang_vel[i] = car.ang_vel;
+        solver_scratch[env_idx].car_predict_valid[i] = 1;
+    }
 }
 
 ROCKETGPU_HD void StepEnvPreTickBall(int env_idx, const SimConfig& cfg, WorldSolverScratch* solver_scratch, BallState* balls) {
     CalTickStartLimitAndQuantizeBall(balls[env_idx], cfg.mutator);
     if (solver_scratch != nullptr) {
-        // v3 Ball::on_hit reads state.phys.vel, synced here (after the tick-start limit/quantize); the car
-        // pre-tick wheel pushes onto the ball and the heatseeker pre-tick only change the rigid body.
         solver_scratch[env_idx].cal_ball_start_vel = balls[env_idx].vel;
+    }
+    if (cfg.mutator.game_mode != static_cast<uint8_t>(Mode::Heatseeker)) {
+        BodyDampingClampBall(balls[env_idx], cfg.mutator);
+        ApplyBulletLinearDampingBall(balls[env_idx], cfg.mutator, cfg.tick_dt);
+        if (solver_scratch != nullptr) {
+            solver_scratch[env_idx].ball_predict_vel_bt = balls[env_idx].vel_bt;
+        }
     }
 }
 
@@ -3564,8 +4380,6 @@ ROCKETGPU_HD void StepEnvPreTickBallAndPads(
     }
 }
 
-// A car's tick end after the world step: with finish_world (kWorldStepRowsCarsApart) its world-step end first, then
-// the demoed car's pre-contact rotation, and its post-tick update. Touches only this car.
 ROCKETGPU_HD void StepEnvPostCar(
     int env_idx, int i, const SimConfig& cfg, CarState* cars, WheelRuntimeState* wheel_runtime_states,
     WorldSolverScratch* solver_scratch, const CarConfig* car_configs, const CarControls& controls, bool finish_world) {
@@ -3583,38 +4397,62 @@ ROCKETGPU_HD void StepEnvPostCar(
             car.rot = scratch.pre_contact_cars[i].rot;
         }
     }
-    RocketSim_Car_PostTickUpdate(car, controls, cfg.mutator, cfg.tick_dt);
-    RocketSim_Car_FinishPhysicsTick(car, cfg.mutator);
-    // Reads nothing the tail's boost pads change (boost) and changes nothing they read (pos_bt, vel_bt, is_demoed).
+    RocketSim_Car_PostTickUpdate(car, controls, cfg.tick_dt);
+    RocketSim_Car_FinishPhysicsTick(car);
     ReportRLBotCarFields(car, wheel_runtime_states ? &wheel_runtime_states[car_idx] : nullptr, cfg.mutator, cfg.tick_dt);
 }
 
-// The env's tick end after every car's StepEnvPostCar: boost pads (cars in visit order; the pads' own tick end too
-// unless pads_post is false), the ball and scoring. car_pad_checks false: the cars' pad checks already ran.
-ROCKETGPU_HD void StepEnvTail(
-    int env_idx, int count, const SimConfig& cfg, CarState* cars, BallState& ball, EnvState& env, BoostPadState* pads,
-    bool pads_post, bool car_pad_checks = true) {
+ROCKETGPU_HD void ApplyBallExtraHits(int env_idx, int count, const SimConfig& cfg, CarState* cars, BallState& ball) {
     const int base = env_idx * cfg.max_cars_per_env;
-    if (car_pad_checks && cfg.enable_boost_pads) {
-        for (int k = 0; k < count; ++k) {
-            const int i = CarVisitSlot(env, k, count);
-            RocketSim_BoostPad_CheckCollide(env_idx, cfg, cars[base + i], static_cast<uint32_t>(base + i + 1), pads);
+    const float ball_inv_mass = 1.0f / cfg.mutator.ball_mass;
+    const float ball_mass_bt = 1.0f / ball_inv_mass;
+    Vec3 v = ball.vel_bt;
+    bool any = false;
+    for (int i = 0; i < count; ++i) {
+        BallHitInfo& hit = cars[base + i].ball_hit_info;
+        if (!hit.extra_pending) {
+            continue;
         }
+        const Vec3 a = hit.extra_hit_vel;
+        v = Vec3(v.x + ((a.x * 0.02f) * ball_mass_bt) * ball_inv_mass, v.y + ((a.y * 0.02f) * ball_mass_bt) * ball_inv_mass,
+                 v.z + ((a.z * 0.02f) * ball_mass_bt) * ball_inv_mass);
+        hit.extra_pending = 0;
+        any = true;
+    }
+    if (any) {
+        SetBallLinearVelocityBt(ball, v);
+    }
+}
+
+ROCKETGPU_HD void StepEnvTail(
+    int env_idx, int count, const SimConfig& cfg, CarState* cars, const CarConfig* car_configs, BallState& ball,
+    EnvState& env, BoostPadState* pads, bool pads_post, bool car_pad_checks = true) {
+    if (car_pad_checks) {
+        BoostPadTouchPassForEnv(env_idx, count, cfg, cars, car_configs, env, pads);
     }
 
     if (pads_post && cfg.enable_boost_pads && count > 0) {
         RocketSim_BoostPad_PostTickUpdate(env_idx, cfg, cars, pads);
     }
 
-    RocketSim_Ball_FinishPhysicsTick(ball, cfg.mutator);
+    for (int k = 0; k < count; ++k) {
+        const int i = CarVisitSlot(env, k, count);
+        CarState& car = cars[env_idx * cfg.max_cars_per_env + i];
+        if (!car.is_demoed && car.driving_disabled) {
+            --car.driving_disabled;
+        }
+    }
+
+    ApplyBallExtraHits(env_idx, count, cfg, cars, ball);
+    RocketSim_Ball_FinishPhysicsTick(ball);
 
     if (cfg.enable_scoring) {
         const float score_threshold = cfg.mutator.goal_base_threshold_y + cfg.mutator.ball_radius;
-        if (ball.pos.y > score_threshold) {
+        if (ball.pos.y >= score_threshold) {
             env.last_scored_team = static_cast<int32_t>(Team::Blue);
             env.goal_scored_this_tick = 1;
             env.blue_score += 1;
-        } else if (ball.pos.y < -score_threshold) {
+        } else if (ball.pos.y <= -score_threshold) {
             env.last_scored_team = static_cast<int32_t>(Team::Orange);
             env.goal_scored_this_tick = 1;
             env.orange_score += 1;
@@ -3628,6 +4466,17 @@ ROCKETGPU_HD void StepEnvTail(
         event.ball_position = ball.pos;
         event.ball_velocity = ball.vel;
         cfg.mutator.physics_events.Emit(env_idx, event);
+    }
+
+    env.frame_ticks += 1;
+    const float frame_frac = FrameFrac(cfg, env_idx);
+    if (frame_frac >= 0.0f) {
+        const float frame_dt = (static_cast<float>(env.frame_ticks) + frame_frac - env.frame_frac_prev) * cfg.tick_dt;
+        env.frame_ticks = 0;
+        env.frame_frac_prev = frame_frac;
+        if (!cfg.mutator.countdown_on_frame_start) {
+            CountdownUpdateTimers(env, cars + env_idx * cfg.max_cars_per_env, count, ball, frame_dt);
+        }
     }
     env.tick += 1;
 }
@@ -3671,11 +4520,14 @@ ROCKETGPU_HD void StepEnvGeneric(
         if (phase == kStepEnvPhaseFull) {
             const EnvCommand command = env_command_accessor.get(tick_idx);
             StepEnvPreTickEnv(env_idx, cfg, teams, env_car_count, cars, solver_scratch, controls_for_reset, balls,
-                              env_states, pads, command, kickoff_order_override);
+                              env_states, pads, command, kickoff_order_override, car_configs);
             const int pre_count = env_car_count[env_idx];
             for (int k = 0; k < pre_count; ++k) {
-                StepEnvPreTickCar(env_idx, CarVisitSlot(env_states[env_idx], k, pre_count), cfg, teams, cars,
-                                  solver_scratch, env_states[env_idx], respawn_slot_overrides, seed);
+                const int slot = CarVisitSlot(env_states[env_idx], k, pre_count);
+                StepEnvPreTickCar(env_idx, slot, cfg, teams, cars, solver_scratch, env_states[env_idx],
+                                  respawn_slot_overrides, seed, controls_accessor.get(slot, tick_idx),
+                                  car_configs[base + slot],
+                                  wheel_runtime_states ? &wheel_runtime_states[base + slot] : nullptr);
             }
             StepEnvPreTickBallAndPads(env_idx, cfg, pre_count, solver_scratch, balls, pads);
         }
@@ -3684,20 +4536,22 @@ ROCKETGPU_HD void StepEnvGeneric(
         const uint64_t current_tick = static_cast<uint64_t>(env.tick);
 
         uint32_t cal_pushed_cars_mask = 0u;
-        // kWorldStepContactsCarsApart runs only envs whose vehicle updates were independent, so ran a thread per car.
         const bool vehicle_updates_done = WorldPartIsRows(world_part) || world_part == kWorldStepContactsCarsApart ||
+            WorldPartIsPrefix(world_part) ||
             (phase == kStepEnvPhasePostVehiclesDone && VehicleUpdatesIndependent(cfg, staged_rays_for_env, count));
         for (int k = 0; !vehicle_updates_done && k < count; ++k) {
             const int i = CarVisitSlot(env_states[env_idx], k, count);
             if ((cars_updated_mask >> i) & 1u) {
-                continue;  // updated on the contacts kernel's lanes (StagedWorldKernel<kWorldStepContacts>)
+                continue;
             }
             StepEnvVehicleUpdateCar(env_idx, i, count, cfg, cars, wheel_runtime_states, car_configs, balls,
-                                    controls_accessor.get(i, tick_idx), staged_rays_for_env, cal_pushed_cars_mask);
+                                    controls_accessor.get(i, tick_idx), staged_rays_for_env, cal_pushed_cars_mask,
+                                    solver_scratch != nullptr ? &solver_scratch[env_idx].bp.sweep : nullptr);
         }
 
         BallState& ball = balls[env_idx];
-        if (!WorldPartIsRows(world_part) && cfg.mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker)) {
+        if (!WorldPartIsRows(world_part) && !WorldPartIsPrefix(world_part) &&
+            cfg.mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker)) {
             HeatseekerBallPreTick(ball, cfg.tick_dt, [](BallState& b, const Vec3& v_bt) { SetBallLinearVelocityBt(b, v_bt); });
         }
         RocketSim_Arena_WorldStepSoccar(
@@ -3730,7 +4584,7 @@ ROCKETGPU_HD void StepEnvGeneric(
             world_part,
             cars_apart_mask,
             register_iterations);
-        if (WorldPartIsContacts(world_part) || world_part == kWorldStepRowsCarsApart) {
+        if (WorldPartIsContacts(world_part) || world_part == kWorldStepRowsCarsApart || WorldPartIsPrefix(world_part)) {
             continue;
         }
 
@@ -3739,7 +4593,7 @@ ROCKETGPU_HD void StepEnvGeneric(
             StepEnvPostCar(env_idx, i, cfg, cars, wheel_runtime_states, solver_scratch, car_configs,
                            controls_accessor.get(i, tick_idx), false);
         }
-        StepEnvTail(env_idx, count, cfg, cars, ball, env, pads, true);
+        StepEnvTail(env_idx, count, cfg, cars, car_configs, ball, env, pads, true);
     }
 }
 

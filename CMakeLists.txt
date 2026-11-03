@@ -8,6 +8,16 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+find_program(ROCKETGPU_CCACHE_EXECUTABLE ccache)
+if (ROCKETGPU_CCACHE_EXECUTABLE)
+    if (NOT DEFINED CMAKE_CXX_COMPILER_LAUNCHER)
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${ROCKETGPU_CCACHE_EXECUTABLE}" CACHE STRING "CXX compiler launcher")
+    endif()
+    if (ROCKETGPU_USE_CUDA AND NOT DEFINED CMAKE_CUDA_COMPILER_LAUNCHER)
+        set(CMAKE_CUDA_COMPILER_LAUNCHER "${ROCKETGPU_CCACHE_EXECUTABLE}" CACHE STRING "CUDA compiler launcher")
+    endif()
+endif()
+
 if (ROCKETGPU_USE_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     find_program(ROCKETGPU_NVIDIA_SMI_EXECUTABLE nvidia-smi)
     if (ROCKETGPU_NVIDIA_SMI_EXECUTABLE)
@@ -35,13 +45,25 @@ target_sources(rocketgpu PRIVATE
     src/arena/mesh_loader.cpp
     src/rocketsim_compat.cpp
     src/rocketsim_compat_serialize.cpp
+    src/rocketsim_compat_dev.cpp
+    src/rocketsim_compat_devbatch.cpp
     src/rocketgpu.cpp)
 set_target_properties(rocketgpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
+find_package(Threads REQUIRED)
+target_link_libraries(rocketgpu PUBLIC Threads::Threads)
 
 target_compile_options(rocketgpu PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic -ffp-contract=off>
 )
-
+if (NOT ROCKETGPU_USE_CUDA AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"
+    AND NOT CMAKE_CXX_FLAGS MATCHES "-march=")
+    target_compile_options(rocketgpu PRIVATE -march=native)
+endif()
+if (NOT ROCKETGPU_USE_CUDA AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(rocketgpu PRIVATE -fno-semantic-interposition
+        --param=max-inline-insns-single=2000 --param=max-inline-insns-auto=300
+        --param=large-function-growth=800 --param=inline-unit-growth=400)
+endif()
 
 if (ROCKETGPU_USE_CUDA)
     target_compile_definitions(rocketgpu PUBLIC ROCKETGPU_USE_CUDA=1)

@@ -31,6 +31,7 @@ void LaunchResetToKickoff(
     uint64_t seed,
     RespawnRngState* respawn_rng,
     uint8_t kickoff_seed_mode,
+    const CarConfig* car_configs,
     cudaStream_t stream);
 
 void LaunchApplyEnvCommands(
@@ -46,6 +47,7 @@ void LaunchApplyEnvCommands(
     const EnvCommand* env_commands,
     int32_t command_count,
     RespawnRngState* respawn_rng,
+    const CarConfig* car_configs,
     cudaStream_t stream);
 
 void LaunchCanonicalizeImportedCars(

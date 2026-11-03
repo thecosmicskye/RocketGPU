@@ -1,11 +1,10 @@
-
-
 #include <rocketgpu/rocketsim_compat.h>
 
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace rocketgpu {
@@ -185,6 +184,7 @@ struct ArenaSerializer {
         Arena* a = Arena::Create(mode, arena_config, 1.0f / tick_time);
         a->tick_count_ = tick_count;
         const uint32_t car_count = i.U32();
+        std::vector<std::pair<int, uint32_t>> contact_ids;
         for (uint32_t c = 0; c < car_count; ++c) {
             const Team team = static_cast<Team>(i.U8());
             const uint32_t id = i.U32();
@@ -217,11 +217,21 @@ struct ArenaSerializer {
             Car* car = a->AddCar(team, k);
             car->id = id;
             a->slot_to_id_[static_cast<size_t>(car->slot_)] = id;
+            contact_ids.emplace_back(car->slot_, s.carContact.otherCarID);
+            s.carContact.otherCarID = 0;
 
             s.boost = a->GetMutatorConfig().boost_spawn_amount;
             car->SetState(s);
             car->SetControls(ctl);
         }
+        a->PullStates();
+        for (const auto& contact : contact_ids) {
+            a->car_states_[static_cast<size_t>(contact.first)].car_contact.other_car_id =
+                a->DeviceIdFromCompatId(contact.second);
+        }
+        a->sim_->upload_car_states(a->car_states_.data(), a->car_states_.size(), nullptr,
+                                   BatchSim::StateUploadMode::PreserveInternal);
+        a->dirty_ = true;
         a->next_car_id_ = last_car_id + 1;
         std::vector<BoostPadState> pads = a->GetBoostPadStates();
         if (!pads.empty() && mode != GameMode::THE_VOID) {
@@ -248,7 +258,7 @@ struct ArenaSerializer {
             raw.hs_info.y_target_dir = i.F(); raw.hs_info.cur_target_speed = i.F(); raw.hs_info.time_since_hit = i.F();
             raw.ds_info.charge_level = i.I32(); raw.ds_info.accumulated_hit_force = i.F(); raw.ds_info.y_target_dir = i.F();
             raw.ds_info.has_damaged = i.Bool() ? 1 : 0; raw.ds_info.last_damage_tick = i.U64();
-            a->PushStates();
+            a->PushBallState();
         }
         {
             const uint16_t arg_count = i.U16();
@@ -272,6 +282,10 @@ struct ArenaSerializer {
             m.goal_base_threshold_y = i.F();
             a->SetMutatorConfig(m);
         }
+        a->sim_->download_env_states(a->env_states_.data(), a->env_states_.size());
+        a->env_states_[0].tick = static_cast<uint32_t>(tick_count);
+        a->sim_->upload_env_states(a->env_states_.data(), a->env_states_.size());
+        a->sim_->synchronize();
         return a;
     }
 };

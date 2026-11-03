@@ -10,6 +10,7 @@
 #include <pybind11/functional.h>
 #include <pybind11/stl.h>
 #include "rocketgpu/rocketsim_compat.h"
+#include "rocketgpu/rocketsim_compat_devbatch.h"
 #include "rocketgpu/detail/constants.hpp"
 #include "rocketgpu/rocketsim_compat_events.h"
 
@@ -118,17 +119,18 @@ PYBIND11_MODULE(rocketgpu_py, m) {
         .def_readwrite("back_suspension_rest", &rocketgpu::CarConfig::back_suspension_rest)
         .def_readwrite("dodge_deadzone", &rocketgpu::CarConfig::dodge_deadzone)
         .def_readwrite("three_wheels", &rocketgpu::CarConfig::three_wheels)
-        .def_property("steer_angle_curve",
-            [](const rocketgpu::CarConfig& c) { return std::vector<float>(c.steer_angle_curve, c.steer_angle_curve + 6); },
+        .def_readwrite("spawn_z", &rocketgpu::CarConfig::spawn_z)
+        .def_property("steer_angle_curve_deg",
+            [](const rocketgpu::CarConfig& c) { return std::vector<float>(c.steer_angle_curve_deg, c.steer_angle_curve_deg + 6); },
             [](rocketgpu::CarConfig& c, const std::vector<float>& v) {
-                if (v.size() != 6) throw py::value_error("steer_angle_curve needs 6 values");
-                std::copy(v.begin(), v.end(), c.steer_angle_curve);
+                if (v.size() != 6) throw py::value_error("steer_angle_curve_deg needs 6 values");
+                std::copy(v.begin(), v.end(), c.steer_angle_curve_deg);
             })
-        .def_property("powerslide_steer_angle_curve",
-            [](const rocketgpu::CarConfig& c) { return std::vector<float>(c.powerslide_steer_angle_curve, c.powerslide_steer_angle_curve + 2); },
+        .def_property("powerslide_steer_angle_curve_deg",
+            [](const rocketgpu::CarConfig& c) { return std::vector<float>(c.powerslide_steer_angle_curve_deg, c.powerslide_steer_angle_curve_deg + 2); },
             [](rocketgpu::CarConfig& c, const std::vector<float>& v) {
-                if (v.size() != 2) throw py::value_error("powerslide_steer_angle_curve needs 2 values");
-                std::copy(v.begin(), v.end(), c.powerslide_steer_angle_curve);
+                if (v.size() != 2) throw py::value_error("powerslide_steer_angle_curve_deg needs 2 values");
+                std::copy(v.begin(), v.end(), c.powerslide_steer_angle_curve_deg);
             });
 
     py::class_<rocketgpu::BallHitInfo>(m, "BallHitInfo")
@@ -181,6 +183,9 @@ PYBIND11_MODULE(rocketgpu_py, m) {
         .def_readwrite("is_supersonic", &rocketgpu::CarState::is_supersonic)
         .def_readwrite("is_auto_flipping", &rocketgpu::CarState::is_auto_flipping)
         .def_readwrite("is_demoed", &rocketgpu::CarState::is_demoed)
+        .def_readwrite("boost_pad_touching", &rocketgpu::CarState::boost_pad_touching)
+        .def_readwrite("pad_frame_pos_bt", &rocketgpu::CarState::pad_frame_pos_bt)
+        .def_readwrite("pad_frame_pos_valid", &rocketgpu::CarState::pad_frame_pos_valid)
         .def_readwrite("just_respawned", &rocketgpu::CarState::just_respawned)
         .def_readwrite("world_contact", &rocketgpu::CarState::world_contact)
         .def_readwrite("car_contact", &rocketgpu::CarState::car_contact)
@@ -188,6 +193,7 @@ PYBIND11_MODULE(rocketgpu_py, m) {
         .def_readwrite("ball_hit_info", &rocketgpu::CarState::ball_hit_info)
         .def_readwrite("last_controls", &rocketgpu::CarState::last_controls)
         .def_readwrite("air_state", &rocketgpu::CarState::air_state)
+        .def_readwrite("driving_disabled", &rocketgpu::CarState::driving_disabled)
         .def_readwrite("dodge_timeout", &rocketgpu::CarState::dodge_timeout)
         .def_readwrite("dodge_elapsed", &rocketgpu::CarState::dodge_elapsed)
         .def_readwrite("dodge_dir_x", &rocketgpu::CarState::dodge_dir_x)
@@ -236,7 +242,8 @@ PYBIND11_MODULE(rocketgpu_py, m) {
         .def_readwrite("is_active", &rocketgpu::BoostPadState::is_active)
         .def_readwrite("is_big", &rocketgpu::BoostPadState::is_big)
         .def_readwrite("prev_locked_car_id", &rocketgpu::BoostPadState::prev_locked_car_id)
-        .def_readwrite("cur_locked_car_id", &rocketgpu::BoostPadState::cur_locked_car_id);
+        .def_readwrite("cur_locked_car_id", &rocketgpu::BoostPadState::cur_locked_car_id)
+        .def_readwrite("pickup_frac_q", &rocketgpu::BoostPadState::pickup_frac_q);
 
     py::class_<rocketgpu::EnvState>(m, "EnvState")
         .def(py::init<>())
@@ -246,7 +253,13 @@ PYBIND11_MODULE(rocketgpu_py, m) {
         .def_readwrite("last_scored_team", &rocketgpu::EnvState::last_scored_team)
         .def_readwrite("goal_scored_this_tick", &rocketgpu::EnvState::goal_scored_this_tick)
         .def_readwrite("car_visit_order_mode", &rocketgpu::EnvState::car_visit_order_mode)
-        .def_readwrite("car_visit_order_packed", &rocketgpu::EnvState::car_visit_order_packed);
+        .def_readwrite("car_visit_order_packed", &rocketgpu::EnvState::car_visit_order_packed)
+        .def_readwrite("car_visit_present_mask", &rocketgpu::EnvState::car_visit_present_mask)
+        .def_readwrite("countdown_phase", &rocketgpu::EnvState::countdown_phase)
+        .def_readwrite("countdown_fires", &rocketgpu::EnvState::countdown_fires)
+        .def_readwrite("frame_ticks", &rocketgpu::EnvState::frame_ticks)
+        .def_readwrite("countdown_count", &rocketgpu::EnvState::countdown_count)
+        .def_readwrite("frame_frac_prev", &rocketgpu::EnvState::frame_frac_prev);
 
     py::class_<rocketgpu::EnvCommand>(m, "EnvCommand")
         .def(py::init<>())
@@ -254,7 +267,10 @@ PYBIND11_MODULE(rocketgpu_py, m) {
         .def_readwrite("reset_scoreboard", &rocketgpu::EnvCommand::reset_scoreboard)
         .def_readwrite("reset_tick_count", &rocketgpu::EnvCommand::reset_tick_count)
         .def_readwrite("kickoff_seed", &rocketgpu::EnvCommand::kickoff_seed)
-        .def_readwrite("kickoff_seed_mode", &rocketgpu::EnvCommand::kickoff_seed_mode);
+        .def_readwrite("kickoff_seed_mode", &rocketgpu::EnvCommand::kickoff_seed_mode)
+        .def_readwrite("new_round_bodies", &rocketgpu::EnvCommand::new_round_bodies)
+        .def_readwrite("keep_boost_pads", &rocketgpu::EnvCommand::keep_boost_pads)
+        .def_readwrite("kickoff_countdown_ticks", &rocketgpu::EnvCommand::kickoff_countdown_ticks);
 
     py::class_<rocketgpu::MutatorConfig>(m, "MutatorConfig")
         .def(py::init<>())
@@ -318,6 +334,9 @@ PYBIND11_MODULE(rocketgpu_py, m) {
         .def_readwrite("demo_respawn_time", &rocketgpu::MutatorConfig::demo_respawn_time)
         .def_readwrite("boost_pad_cooldown_small", &rocketgpu::MutatorConfig::boost_pad_cooldown_small)
         .def_readwrite("boost_pad_cooldown_big", &rocketgpu::MutatorConfig::boost_pad_cooldown_big)
+        .def_readwrite("boost_pad_frame_frac", &rocketgpu::MutatorConfig::boost_pad_frame_frac)
+        .def_readwrite("countdown_on_frame_start", &rocketgpu::MutatorConfig::countdown_on_frame_start)
+        .def_readwrite("frame_start_dt", &rocketgpu::MutatorConfig::frame_start_dt)
         .def_readwrite("car_air_control_pitch", &rocketgpu::MutatorConfig::car_air_control_pitch)
         .def_readwrite("car_air_control_yaw", &rocketgpu::MutatorConfig::car_air_control_yaw)
         .def_readwrite("car_air_control_roll", &rocketgpu::MutatorConfig::car_air_control_roll)
@@ -497,7 +516,11 @@ PYBIND11_MODULE(rocketgpu_py, m) {
             scalar("bump_event_other_id", "<u4", offsetof(S, bump_event_other_id), f);
             scalar("bump_event_is_demo", "|u1", offsetof(S, bump_event_is_demo), f);
             scalar("bump_event_was_bumper", "|u1", offsetof(S, bump_event_was_bumper), f);
+            scalar("boost_pad_touching", "|u1", offsetof(S, boost_pad_touching), f);
+            vec3("pad_frame_pos_bt", offsetof(S, pad_frame_pos_bt), f);
+            scalar("pad_frame_pos_valid", "|u1", offsetof(S, pad_frame_pos_valid), f);
             scalar("air_state", "|u1", offsetof(S, air_state), f);
+            scalar("driving_disabled", "<u2", offsetof(S, driving_disabled), f);
             scalar("dodge_timeout", "<f4", offsetof(S, dodge_timeout), f);
             scalar("dodge_elapsed", "<f4", offsetof(S, dodge_elapsed), f);
             scalar("dodge_dir_x", "<f4", offsetof(S, dodge_dir_x), f);
@@ -534,6 +557,7 @@ PYBIND11_MODULE(rocketgpu_py, m) {
             vec3("vel_impulse_cache_bt", offsetof(S, vel_impulse_cache_bt), f);
             scalar("sleeping", "<u4", offsetof(S, sleeping), f);
             scalar("deactivation_time", "<f4", offsetof(S, deactivation_time), f);
+            scalar("constrained_2d", "<u2", offsetof(S, constrained_2d), f);
             finish("ball_states", sizeof(S), f);
         }
         {
@@ -542,6 +566,7 @@ PYBIND11_MODULE(rocketgpu_py, m) {
             scalar("cooldown", "<f4", offsetof(S, cooldown), f);
             scalar("is_active", "|u1", offsetof(S, is_active), f);
             scalar("is_big", "|u1", offsetof(S, is_big), f);
+            scalar("pickup_frac_q", "<u2", offsetof(S, pickup_frac_q), f);
             scalar("prev_locked_car_id", "<u4", offsetof(S, prev_locked_car_id), f);
             scalar("cur_locked_car_id", "<u4", offsetof(S, cur_locked_car_id), f);
             finish("boost_pad_states", sizeof(S), f);
@@ -555,7 +580,13 @@ PYBIND11_MODULE(rocketgpu_py, m) {
             scalar("last_scored_team", "<i4", offsetof(S, last_scored_team), f);
             scalar("goal_scored_this_tick", "|u1", offsetof(S, goal_scored_this_tick), f);
             scalar("car_visit_order_mode", "|u1", offsetof(S, car_visit_order_mode), f);
+            scalar("car_visit_present_mask", "|u1", offsetof(S, car_visit_present_mask), f);
             scalar("car_visit_order_packed", "<u4", offsetof(S, car_visit_order_packed), f);
+            scalar("countdown_phase", "|u1", offsetof(S, countdown_phase), f);
+            scalar("countdown_fires", "|u1", offsetof(S, countdown_fires), f);
+            scalar("frame_ticks", "<u2", offsetof(S, frame_ticks), f);
+            scalar("countdown_count", "<f4", offsetof(S, countdown_count), f);
+            scalar("frame_frac_prev", "<f4", offsetof(S, frame_frac_prev), f);
             finish("env_states", sizeof(S), f);
         }
         return out;
@@ -882,7 +913,6 @@ PYBIND11_MODULE(rocketgpu_py, m) {
             .def_property("latest_touch_normal",
                 [](const rc::CarStateCompat& st) { return st.latestTouch.normal; },
                 [](rc::CarStateCompat& st, const rocketgpu::Vec3& v) { st.latestTouch.normal = v; });
-        // RocketSim v3's CarState (rocketsim crate), field for field; None where v3 has an empty Option.
         py::class_<rc::CarStateV3>(c, "CarStateV3")
             .def(py::init<>())
             .def_readwrite("pos", &rc::CarStateV3::pos)
@@ -999,14 +1029,31 @@ PYBIND11_MODULE(rocketgpu_py, m) {
             .def_property_readonly("ball", [](rc::Arena& a) { return a.ball; }, py::return_value_policy::reference_internal)
             .def("step", &rc::Arena::Step, py::arg("ticks") = 1)
             .def("reset_to_random_kickoff", &rc::Arena::ResetToRandomKickoff, py::arg("seed") = -1)
+            .def("start_new_round_bodies", &rc::Arena::StartNewRoundBodies)
             .def("set_respawn_rng_seed", &rc::Arena::SetRespawnRngSeed, py::arg("seed"))
+            .def("set_respawn_slot_override", &rc::Arena::SetRespawnSlotOverride, py::arg("car_id"), py::arg("slot"))
+            .def("set_kickoff_spawn_override", &rc::Arena::SetKickoffSpawnOverride, py::arg("car_id"), py::arg("spot"))
             .def("set_car_visit_order_mode", &rc::Arena::SetCarVisitOrderMode, py::arg("mode"))
-            .def("set_car_visit_order", &rc::Arena::SetCarVisitOrder, py::arg("compat_ids_in_visit_order"))
+            .def("set_car_visit_order", &rc::Arena::SetCarVisitOrder, py::arg("compat_ids_in_visit_order"),
+                 py::arg("game_order") = false)
             .def("get_car_visit_order_mode", &rc::Arena::GetCarVisitOrderMode)
             .def("is_ball_scored", &rc::Arena::IsBallScored)
             .def("set_mutator_config", &rc::Arena::SetMutatorConfig, py::arg("config"),
                  "RocketSim Arena::SetMutatorConfig: replace the mutators between steps")
             .def("get_mutator_config", &rc::Arena::GetMutatorConfig, py::return_value_policy::copy)
+            .def("dev_get_raw", [](const rc::Arena& a, const std::string& what) {
+                     const std::vector<uint8_t> v = a.DevGetRaw(what);
+                     return py::bytes(reinterpret_cast<const char*>(v.data()), v.size());
+                 }, py::arg("what"), "Dev only: env 0's raw state array (see Arena::DevGetRaw)")
+            .def("dev_set_raw", [](rc::Arena& a, const std::string& what, py::bytes data) {
+                     const std::string s = data;
+                     a.DevSetRaw(what, std::vector<uint8_t>(s.begin(), s.end()));
+                 }, py::arg("what"), py::arg("data"), "Dev only: overwrite env 0's raw state array")
+            .def_static("dev_layouts", []() {
+                     py::dict d;
+                     for (const auto& f : rc::Arena::DevLayouts()) d[py::str(f.name)] = py::make_tuple(f.offset, f.size);
+                     return d;
+                 }, "Dev only: field offsets and sizes of the raw arrays")
             .def("serialize", [](const rc::Arena& a) { std::vector<uint8_t> out; a.Serialize(out); return py::bytes(reinterpret_cast<const char*>(out.data()), out.size()); },
                  "RocketSim Arena::Serialize byte format (loads in RocketSim's DeserializeNew)")
             .def_static("deserialize_new", [](py::bytes data) { const std::string s = data; return rc::Arena::DeserializeNew(std::vector<uint8_t>(s.begin(), s.end())); },
@@ -1045,6 +1092,25 @@ PYBIND11_MODULE(rocketgpu_py, m) {
                             py::cast(victim, py::return_value_policy::reference), is_demo);
                      }, nullptr);
                  });
+
+        py::class_<rc::DevBatch>(c, "DevBatch", "Dev only: restored arenas' env 0 copied into one BatchSim, stepped together")
+            .def(py::init<const rc::Arena&, int>(), py::arg("template"), py::arg("n_envs"))
+            .def("set_env", &rc::DevBatch::SetEnv, py::arg("env"), py::arg("arena"))
+            .def("commit", &rc::DevBatch::Commit)
+            .def("set_frame_frac", &rc::DevBatch::SetFrameFrac, py::arg("frac"))
+            .def("set_frame_start_dt", &rc::DevBatch::SetFrameStartDt, py::arg("dt"))
+            .def("step", &rc::DevBatch::Step, py::arg("ticks") = 1)
+            .def("get_raw", [](const rc::DevBatch& b, const std::string& what) {
+                     const std::vector<uint8_t> v = b.GetRaw(what);
+                     return py::bytes(reinterpret_cast<const char*>(v.data()), v.size());
+                 }, py::arg("what"))
+            .def("set_raw", [](rc::DevBatch& b, const std::string& what, py::bytes data) {
+                     const std::string s = data;
+                     b.SetRaw(what, std::vector<uint8_t>(s.begin(), s.end()));
+                 }, py::arg("what"), py::arg("data"))
+            .def_property_readonly("env_count", &rc::DevBatch::EnvCount)
+            .def_property_readonly("car_capacity", &rc::DevBatch::CarCapacity)
+            .def_property_readonly("pad_count", &rc::DevBatch::PadCount);
 
         py::class_<rc::GameEventTrackerConfig>(c, "GameEventTrackerConfig")
             .def(py::init<>())
@@ -1109,4 +1175,5 @@ PYBIND11_MODULE(rocketgpu_py, m) {
     m.def("MercConfig", &rocketgpu::MercConfig);
 
     m.def("PsyclopsConfig", &rocketgpu::PsyclopsConfig);
+    m.def("BatmobileConfig", &rocketgpu::BatmobileConfig);
 }

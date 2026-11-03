@@ -24,7 +24,7 @@ struct MeshVertex {
 };
 
 float GetInternalEdgeAngle(const Vec3& ref_axis0, const Vec3& ref_axis1, const Vec3& swing_axis) {
-    return GlibcAtan2f(Dot(swing_axis, ref_axis0), Dot(swing_axis, ref_axis1));
+    return RocketGpuUcrtAtan2f(Dot(swing_axis, ref_axis0), Dot(swing_axis, ref_axis1));
 }
 
 static Vec3 SseNormalizeVec3(const Vec3& v, const Vec3& fallback) {
@@ -351,12 +351,16 @@ void BuildArenaMeshBulletStyleBvh(
         QuantizeArenaMeshBvhPoint(quantization, quantization.bvh_aabb_min, 1, internal_node.quantized_aabb_max);
         for (int i = start_index; i < end_index; ++i) {
             const ArenaMeshBvhNode& leaf = leaf_nodes[static_cast<size_t>(i)];
+            uint16_t leaf_min[3];
+            uint16_t leaf_max[3];
+            QuantizeArenaMeshBvhPoint(quantization, GetArenaMeshBvhNodeAabbMin(quantization, leaf), 0, leaf_min);
+            QuantizeArenaMeshBvhPoint(quantization, GetArenaMeshBvhNodeAabbMax(quantization, leaf), 1, leaf_max);
             for (int axis = 0; axis < 3; ++axis) {
-                if (internal_node.quantized_aabb_min[axis] > leaf.quantized_aabb_min[axis]) {
-                    internal_node.quantized_aabb_min[axis] = leaf.quantized_aabb_min[axis];
+                if (internal_node.quantized_aabb_min[axis] > leaf_min[axis]) {
+                    internal_node.quantized_aabb_min[axis] = leaf_min[axis];
                 }
-                if (internal_node.quantized_aabb_max[axis] < leaf.quantized_aabb_max[axis]) {
-                    internal_node.quantized_aabb_max[axis] = leaf.quantized_aabb_max[axis];
+                if (internal_node.quantized_aabb_max[axis] < leaf_max[axis]) {
+                    internal_node.quantized_aabb_max[axis] = leaf_max[axis];
                 }
             }
         }
@@ -476,52 +480,8 @@ std::vector<ArenaMeshTriangle> LoadArenaMeshTriangles(
             triangles.push_back(tri);
         }
 
-        if (out_quantization) {
-            SetArenaMeshBvhQuantization((*out_quantization)[static_cast<size_t>(mesh_idx)], mesh_min, mesh_max, 1.0f, out_local_triangles != nullptr);
-            const ArenaMeshBvhQuantization& quantization = (*out_quantization)[static_cast<size_t>(mesh_idx)];
-            for (size_t tri_pos = mesh_base; tri_pos < triangles.size(); ++tri_pos) {
-                ArenaMeshTriangle& tri = triangles[tri_pos];
-                QuantizeArenaMeshBvhPoint(quantization, tri.min, 0, tri.quantized_aabb_min);
-                QuantizeArenaMeshBvhPoint(quantization, tri.max, 1, tri.quantized_aabb_max);
-            }
-
-            if (out_mesh_infos && out_nodes && out_subtrees) {
-                std::vector<ArenaMeshBvhNode> mesh_nodes;
-                std::vector<ArenaMeshBvhSubtreeInfo> mesh_subtrees;
-                BuildArenaMeshBulletStyleBvh(
-                    triangles,
-                    static_cast<int32_t>(mesh_base),
-                    num_tris,
-                    quantization,
-                    mesh_nodes,
-                    mesh_subtrees);
-
-                ArenaMeshBvhMeshInfo mesh_info;
-                mesh_info.aabb_min = mesh_min;
-                mesh_info.aabb_max = mesh_max;
-                mesh_info.mesh_index = mesh_idx;
-                mesh_info.triangle_start = static_cast<int32_t>(mesh_base);
-                mesh_info.triangle_count = num_tris;
-                mesh_info.node_offset = static_cast<int32_t>(out_nodes->size());
-                mesh_info.node_count = static_cast<int32_t>(mesh_nodes.size());
-                mesh_info.subtree_offset = static_cast<int32_t>(out_subtrees->size());
-                mesh_info.subtree_count = static_cast<int32_t>(mesh_subtrees.size());
-                mesh_info.dfs_subtree_offset = mesh_info.subtree_offset + mesh_info.subtree_count;
-                out_mesh_infos->push_back(mesh_info);
-
-                out_nodes->insert(out_nodes->end(), mesh_nodes.begin(), mesh_nodes.end());
-                for (ArenaMeshBvhSubtreeInfo& subtree : mesh_subtrees) {
-                    subtree.root_node_index += mesh_info.node_offset;
-                }
-                out_subtrees->insert(out_subtrees->end(), mesh_subtrees.begin(), mesh_subtrees.end());
-                // cal_bvh_dfs_order headers (ArenaMeshBvhMeshInfo::dfs_subtree_offset): node-index order.
-                std::stable_sort(mesh_subtrees.begin(), mesh_subtrees.end(),
-                                 [](const ArenaMeshBvhSubtreeInfo& a, const ArenaMeshBvhSubtreeInfo& b) {
-                                     return a.root_node_index < b.root_node_index;
-                                 });
-                out_subtrees->insert(out_subtrees->end(), mesh_subtrees.begin(), mesh_subtrees.end());
-            }
-        }
+        const float center_y = 0.5f * (mesh_min.y + mesh_max.y);
+        const int8_t origin_sign = center_y > kGoalMeshOriginYBt ? 1 : (center_y < -kGoalMeshOriginYBt ? -1 : 0);
 
         for (int32_t tri_a = 0; tri_a < num_tris; ++tri_a) {
             const ArenaMeshTriangle& tri_a_ref = triangles[mesh_base + static_cast<size_t>(tri_a)];
@@ -542,18 +502,104 @@ std::vector<ArenaMeshTriangle> LoadArenaMeshTriangles(
                     static_cast<int>(mesh_base));
             }
         }
+        for (int32_t tri_i = 0; tri_i < num_tris; ++tri_i) {
+            ArenaMeshTriangle& wt = triangles[mesh_base + static_cast<size_t>(tri_i)];
+            if (wt.edge_v0v1_angle == 2.0f * Pi()) wt.edge_v0v1_angle = 0.0f;
+            if (wt.edge_v1v2_angle == 2.0f * Pi()) wt.edge_v1v2_angle = 0.0f;
+            if (wt.edge_v2v0_angle == 2.0f * Pi()) wt.edge_v2v0_angle = 0.0f;
+        }
 
         if (out_local_triangles) {
-            // The game's goal meshes are in their own frame, placed at the goal: a mesh centered past the goal line
-            // is moved into it
-            const float center_y = 0.5f * (mesh_min.y + mesh_max.y);
-            const int8_t origin_sign = center_y > kGoalMeshOriginYBt ? 1 : (center_y < -kGoalMeshOriginYBt ? -1 : 0);
+            static constexpr float kGoalMeshLocalY[536] = {
+                -0.208231956f, -0.805375218f, -0.805375218f, -6.25633335f, -8.17787647f, -8.1780262f, -6.2563324f, -1.75011611f,
+                -3.00114131f, -3.00113893f, -1.75011122f, -3.00113893f, -1.75011122f, -0.562714756f, -0.328159034f, -0.329575032f,
+                -0.564282119f, -1.53333008f, -1.60904539f, -1.23098147f, -1.17305171f, -0.888754785f, -0.84693104f, -1.36972642f,
+                -1.41155016f, -0.937856257f, -0.91006577f, 0.0000021114231f, -0.00000032854885f, 0.00000982247184f, 0.0000122624715f, 0.0000139307685f,
+                0.00001309662f, 0.0000106566195f, 15.4826374f, 15.4826374f, 16.1931648f, 16.1931553f, 17.222374f, 17.2223835f,
+                17.5022964f, 17.5022964f, 17.2223721f, 17.2223816f, 16.7795315f, 16.7795258f, 16.1931438f, 16.1931438f,
+                15.4826164f, 15.4826069f, 14.6673088f, 14.6673069f, 13.7666206f, 13.7666235f, -1.9550879f, -1.9550879f,
+                -1.41155016f, -1.41155016f, -0.937856257f, -0.937856257f, -0.546928465f, -0.546928465f, -0.937856257f, -0.546928465f,
+                -0.251693994f, -0.251693994f, -0.0650777072f, -0.0650777072f, -0.251693994f, -0.251693994f, 0.00000333662047f, 0.00000333662047f,
+                0.00000250247194f, 0.00000661076911f, 0.00000166832331f, 0.00000166832331f, 0.000000521345953f, 0.000000521345953f, 0.00000661076911f, 0.00000988491593f,
+                0.00000166832353f, 0.00000166832331f, 0.000000521345953f, 0.00000250247194f, 0.00000250247194f, 0.00000333662047f, -15.6772575f, -0.208236843f,
+                -0.208236843f, -0.805380106f, -0.805380106f, 0.00000250247194f, 0.00000250247194f, 0.00000166832331f, 0.00000333662047f, 0.000011490768f,
+                0.00000661076911f, 0.00000577662013f, 0.0000123249156f, -1.75011361f, -0.805380106f, -0.805377662f, -3.00114131f, 0.00000250247194f,
+                0.00000166832331f, 0.00000333662047f, 0.160002083f, 0.159999639f, 14.6673088f, 15.4826069f, 4.27382517f, 13.9150963f,
+                14.4025183f, 13.3792744f, 15.1039906f, 15.3599157f, 15.8032331f, 15.5033703f, 16.0746689f, 16.3112221f,
+                16.7017288f, 16.4387417f, 17.1792393f, 17.3536339f, 17.448164f, 17.2701378f, 16.7017479f, 16.9187698f,
+                16.5064449f, 16.3112297f, 16.074688f, 15.7934761f, 15.5916014f, -1.75011122f, -3.0011363f, -4.51703453f,
+                -4.51703453f, 14.207757f, 14.335536f, 15.0061998f, 14.8227329f, -0.2082344f, -15.6778049f, 0.0000147649152f,
+                0.00000982247184f, 0.0000147649152f, 0.000011490768f, 0.0000106566195f, 0.000011490768f, 0.0000147649152f, -0.208231956f, 12.7991867f,
+                12.7993507f, 4.69311523f, 4.69306183f, -0.805375218f, 12.7994995f, 4.69316673f, 12.799634f, 4.69321012f,
+                -4.51703453f, 12.7997484f, 4.69324684f, -6.25633335f, 12.799839f, 4.69327879f, -8.17766666f, 12.7999048f,
+                4.69330072f, -15.6782637f, 0.00000494247115f, 12.7999392f, 4.69331026f, 0.00000821661979f, 12.7999458f, 4.69331551f,
+                0.00000988491593f, 13.4572926f, -0.208236843f, -0.2082344f, 13.5299826f, 13.5957832f, -4.5170393f, 13.6531219f,
+                -6.2563386f, -6.25633574f, -8.17782784f, -6.25634098f, -8.17779541f, -8.17773628f, 13.7004414f, -15.6780682f,
+                -15.6778736f, 0.00000050589864f, 0.00000898832332f, 0.000000467280472f, 13.7361736f, 0.000000417076791f, 0.000000366873167f, 13.7587566f,
+                0.00000032825497f, 0.000000312807714f, 13.7666235f, -0.000000328576505f, -0.000000335327002f, 0.00000738247172f, 13.9151726f, 14.0666571f,
+                -0.00000279510436f, -0.00000526638405f, 14.2077999f, -0.0000298991927f, -0.0000372861068f, 14.3355589f, -0.00002251554f, -0.0000151179484f,
+                14.4468966f, -0.0000101877813f, 14.5387812f, -0.00121062726f, -0.0402829498f, -0.03904761f, 14.6081686f, -0.152324021f,
+                -0.15101786f, 14.6520233f, 14.6673088f, -0.848676682f, 14.4025612f, 14.6200848f, -1.17500484f, 14.8227587f,
+                -1.5355078f, 15.0062151f, -2.94249988f, -2.93945312f, 15.1660957f, 15.2980394f, 15.3976755f, -3.08457994f,
+                -0.590502799f, 15.4606543f, -0.344362646f, 15.4826069f, -0.158473924f, 14.8293724f, 15.1040354f, -0.040973857f,
+                15.3599482f, -1.79834962f, -3.44749022f, -1.37580323f, 15.9600782f, -0.993312895f, 16.0858974f, -0.659973025f,
+                16.1654186f, -0.384875327f, 16.1931438f, -0.177118912f, 15.1815691f, 15.5033979f, -0.0457956083f, 15.8032513f,
+                -2.04443359f, -3.91926742f, -1.56406975f, 16.6538677f, -1.12924063f, 16.7470398f, -0.750285447f, 16.7795315f,
+                -0.43754375f, 15.4458504f, 15.8036432f, -0.201357171f, 16.1370106f, -0.0520602055f, 16.4387684f, -2.29052734f,
+                17.0826664f, -4.39100599f, -1.75233889f, 17.1862602f, -1.26516831f, 17.2223721f, -0.840595543f, 15.6119537f,
+                15.9926767f, -0.490212202f, 16.347393f, -0.225592971f, 16.6684875f, -0.0583272688f, 16.9483109f, 17.1792393f,
+                -2.47982407f, 17.3536339f, -4.7539258f, -1.89715815f, 17.4638672f, 17.5022964f, 15.6702356f, 16.0588779f,
+                -0.530724883f, 16.4209766f, -0.244237974f, 16.7487507f, -0.0631490126f, 17.0343952f, -2.55554676f, -4.89906216f,
+                17.5606842f, 17.5999126f, -0.546928465f, 15.6119537f, 15.9926672f, -0.251693994f, 16.347393f, -0.0650777072f,
+                16.6684875f, 0.000000521345953f, 16.9483109f, -0.00000032854885f, 17.4638672f, 17.5022964f, 4.69331789f, 4.69331551f,
+                12.7999458f, 12.7999439f, 15.4458017f, 15.8036041f, 14.6673613f, 4.48001194f, 4.48001194f, 14.6673641f,
+                16.1369743f, 16.7795315f, 16.7795315f, 16.9187603f, 17.5999088f, 17.5999126f, 17.502306f, 17.5022964f,
+                17.5999088f, 17.5022964f, 17.2223721f, 17.0826664f, 17.1862602f, 17.222374f, 15.1815319f, 0.000000521345953f,
+                -2.55554676f, -4.89906216f, 16.5064373f, 16.6538677f, -0.251693994f, 16.7470512f, -0.0650777072f, 16.7795315f,
+                0.000000521345953f, 14.8293104f, -2.55554676f, 15.5915728f, -4.89906216f, -1.9550879f, 15.7934675f, -2.55554676f,
+                -1.9550879f, 15.9600792f, 16.0858994f, -0.0650777072f, 16.1654301f, 16.1931553f, -4.89906216f, 14.6200523f,
+                -1.41155016f, -0.0650777072f, 15.1660919f, 15.2980452f, -2.55554676f, 15.3976965f, -4.89906216f, -1.9550879f,
+                15.4606743f, -1.41155016f, 15.4826374f, -0.937856257f, 14.0665998f, -0.546928465f, 14.4468927f, 14.5387926f,
+                14.6081944f, -4.89906216f, -2.55554676f, 14.6520643f, -1.9550879f, 14.6673613f, -1.41155016f, 4.31534863f,
+                -0.937856257f, 4.35403728f, -0.546928465f, 4.38905668f, 4.41957951f, 4.44476748f, 4.69331551f, 12.7999458f,
+                4.46379089f, 4.47581768f, 4.48001194f, 0.159972534f, 0.00000988491593f, 0.159965143f, -0.208236843f, 0.15997991f,
+                -0.805380106f, 0.159984857f, -1.75011849f, -1.75011849f, 0.159989789f, -3.00114608f, -3.00114608f, 0.159994707f,
+                -4.5170393f, -4.5170393f, 0.15999718f, -6.25634098f, -6.25634098f, 0.159999639f, -8.1776886f, -8.1776886f,
+                0.159999639f, -15.6773949f, -15.6773949f, 0.00000661076911f, 0.00000988491593f, -1.75011849f, -3.00114608f, 13.7666235f,
+                -4.5170393f, -6.25634098f, -8.1776886f, -15.6773853f, 16.1931438f, 16.7795258f, -0.208236843f, 0.00000988491593f,
+                -0.805380106f, -1.75011849f, 17.5022964f, -3.00114608f, 17.222374f, -4.5170393f, 16.7795315f, -6.25634098f,
+                16.1931553f, -8.1776886f, 15.4826374f, -15.6782341f, 14.6673613f, 4.48001194f, 0.00000333662047f, 0.00000661076911f,
+                0.00000661076911f, 0.159999639f, 0.00000988491593f, 0.00000661076911f, -0.208236843f, 0.159983158f, 0.160000294f, -0.805380106f,
+                0.159934267f, -1.75011849f, 0.159856081f, -3.00114608f, 0.159751073f, 0.159626514f, -6.25634098f, -4.5170393f,
+                0.159482449f, -8.177845f, 0.159318849f, -15.6779127f, 0.159147933f, -4.51703453f, 0.00000988491593f, -0.208236843f,
+                -0.805380106f, -1.75011849f, -3.00114608f, -4.5170393f, -15.6780195f, -0.127153128f, -0.291064322f, 0.0385963917f,
+                -0.0307982005f, -0.186208352f, -0.0603782274f, 0.0191579703f, -0.550788462f, -0.181618646f, 0.158671856f, -0.508102953f,
+                -0.465351552f, -0.830627322f, -0.108920865f, -1.15172362f, -0.0431151874f, -1.50644529f, 0.0142334914f, -2.89086914f,
+                -1.05371094f, -0.502910137f, -0.771093667f, -0.361774862f, -1.07286131f, -0.234020934f, -1.40623045f, -0.122680567f,
+                -2.70732427f, -0.441032618f, -0.352819741f, -0.677604914f, -1.58313477f, -0.792053223f, -0.949055135f, -0.589370072f,
+                -1.24893546f, -0.405895948f, -2.41927719f, -0.245998427f, -0.554709435f, -2.04109359f, -1.04227531f, -0.786364734f,
+            };
+            static constexpr uint16_t kGoalMeshMirrorSwap[51] = {
+                4, 8, 14, 18, 24, 28, 32, 35, 39, 43, 47, 51, 55, 57, 62, 67, 71,
+                81, 88, 92, 96, 103, 106, 111, 115, 119, 123, 127, 138, 152, 156, 158, 161, 164,
+                167, 171, 174, 185, 187, 194, 203, 220, 223, 234, 327, 341, 367, 393, 446, 478, 493,
+            };
             std::vector<MeshVertex> frame_vertices = vertices;
-            for (MeshVertex& v : frame_vertices) v.y -= static_cast<float>(origin_sign) * kGoalMeshOriginYBt;
-            local_goal_meshes += origin_sign != 0;
-            if (out_mesh_infos && !out_mesh_infos->empty() && out_mesh_infos->back().mesh_index == mesh_idx) {
-                out_mesh_infos->back().cal_origin_y = static_cast<float>(origin_sign) * kGoalMeshOriginYBt;
+            if (origin_sign != 0 && frame_vertices.size() == 536) {
+                for (size_t i = 0; i < 536; ++i) {
+                    frame_vertices[i].y = static_cast<float>(origin_sign) * kGoalMeshLocalY[i];
+                    if (frame_vertices[i].x == 0.0f && (mesh_idx == 4 || mesh_idx == 7))
+                        frame_vertices[i].x = -0.0f;
+                }
+                if ((mesh_idx & 1) != 0) {
+                    for (uint16_t s : kGoalMeshMirrorSwap) {
+                        std::swap(frame_vertices[s].y, frame_vertices[s + 1].y);
+                    }
+                }
+            } else {
+                for (MeshVertex& v : frame_vertices) v.y -= static_cast<float>(origin_sign) * kGoalMeshOriginYBt;
             }
+            local_goal_meshes += origin_sign != 0;
 
             std::vector<ArenaMeshTriangle>& local = *out_local_triangles;
             for (int32_t tri_i = 0; tri_i < num_tris; ++tri_i) {
@@ -607,6 +653,70 @@ std::vector<ArenaMeshTriangle> LoadArenaMeshTriangles(
                 if (lt.edge_v0v1_angle == 2.0f * Pi()) lt.edge_v0v1_angle = 0.0f;
                 if (lt.edge_v1v2_angle == 2.0f * Pi()) lt.edge_v1v2_angle = 0.0f;
                 if (lt.edge_v2v0_angle == 2.0f * Pi()) lt.edge_v2v0_angle = 0.0f;
+            }
+        }
+
+        if (out_quantization) {
+            const bool local_bvh = out_local_triangles != nullptr && origin_sign != 0;
+            std::vector<ArenaMeshTriangle>& bvh_tris = local_bvh ? *out_local_triangles : triangles;
+            Vec3 bvh_min = mesh_min;
+            Vec3 bvh_max = mesh_max;
+            if (local_bvh) {
+                bvh_min = bvh_tris[mesh_base].min;
+                bvh_max = bvh_tris[mesh_base].max;
+                for (int32_t tri_i = 1; tri_i < num_tris; ++tri_i) {
+                    bvh_min = MinComponents(bvh_min, bvh_tris[mesh_base + static_cast<size_t>(tri_i)].min);
+                    bvh_max = MaxComponents(bvh_max, bvh_tris[mesh_base + static_cast<size_t>(tri_i)].max);
+                }
+            }
+            SetArenaMeshBvhQuantization((*out_quantization)[static_cast<size_t>(mesh_idx)], bvh_min, bvh_max, 1.0f, out_local_triangles != nullptr);
+            const ArenaMeshBvhQuantization& quantization = (*out_quantization)[static_cast<size_t>(mesh_idx)];
+            for (size_t tri_pos = mesh_base; tri_pos < triangles.size(); ++tri_pos) {
+                ArenaMeshTriangle& tri = triangles[tri_pos];
+                const ArenaMeshTriangle& src = bvh_tris[tri_pos];
+                QuantizeArenaMeshBvhPoint(quantization, src.min, 0, tri.quantized_aabb_min);
+                QuantizeArenaMeshBvhPoint(quantization, src.max, 1, tri.quantized_aabb_max);
+                if (out_local_triangles) {
+                    std::copy_n(tri.quantized_aabb_min, 3, (*out_local_triangles)[tri_pos].quantized_aabb_min);
+                    std::copy_n(tri.quantized_aabb_max, 3, (*out_local_triangles)[tri_pos].quantized_aabb_max);
+                }
+            }
+
+            if (out_mesh_infos && out_nodes && out_subtrees) {
+                std::vector<ArenaMeshBvhNode> mesh_nodes;
+                std::vector<ArenaMeshBvhSubtreeInfo> mesh_subtrees;
+                BuildArenaMeshBulletStyleBvh(
+                    bvh_tris,
+                    static_cast<int32_t>(mesh_base),
+                    num_tris,
+                    quantization,
+                    mesh_nodes,
+                    mesh_subtrees);
+
+                ArenaMeshBvhMeshInfo mesh_info;
+                mesh_info.aabb_min = mesh_min;
+                mesh_info.aabb_max = mesh_max;
+                mesh_info.mesh_index = mesh_idx;
+                mesh_info.cal_origin_y = static_cast<float>(origin_sign) * kGoalMeshOriginYBt;
+                mesh_info.triangle_start = static_cast<int32_t>(mesh_base);
+                mesh_info.triangle_count = num_tris;
+                mesh_info.node_offset = static_cast<int32_t>(out_nodes->size());
+                mesh_info.node_count = static_cast<int32_t>(mesh_nodes.size());
+                mesh_info.subtree_offset = static_cast<int32_t>(out_subtrees->size());
+                mesh_info.subtree_count = static_cast<int32_t>(mesh_subtrees.size());
+                mesh_info.dfs_subtree_offset = mesh_info.subtree_offset + mesh_info.subtree_count;
+                out_mesh_infos->push_back(mesh_info);
+
+                out_nodes->insert(out_nodes->end(), mesh_nodes.begin(), mesh_nodes.end());
+                for (ArenaMeshBvhSubtreeInfo& subtree : mesh_subtrees) {
+                    subtree.root_node_index += mesh_info.node_offset;
+                }
+                out_subtrees->insert(out_subtrees->end(), mesh_subtrees.begin(), mesh_subtrees.end());
+                std::stable_sort(mesh_subtrees.begin(), mesh_subtrees.end(),
+                                 [](const ArenaMeshBvhSubtreeInfo& a, const ArenaMeshBvhSubtreeInfo& b) {
+                                     return a.root_node_index < b.root_node_index;
+                                 });
+                out_subtrees->insert(out_subtrees->end(), mesh_subtrees.begin(), mesh_subtrees.end());
             }
         }
     }
@@ -708,7 +818,6 @@ std::vector<uint16_t> BuildArenaBroadphaseCellMask(
 }
 
 void SetArenaMeshFreeBox(std::vector<ArenaMeshBvhMeshInfo>& mesh_infos) {
-    // A mesh's gap on an axis: how far its AABB stays from 0 on that axis (0 when it straddles 0).
     const auto gap = [](float lo, float hi) { return lo > 0.0f ? lo : (hi < 0.0f ? -hi : 0.0f); };
     constexpr float kUnbounded = 1.0e4f;
     float best_x = 0.0f, best_y = 0.0f;
@@ -720,7 +829,6 @@ void SetArenaMeshFreeBox(std::vector<ArenaMeshBvhMeshInfo>& mesh_infos) {
         if (x <= 0.0f) {
             continue;
         }
-        // Meshes whose x gap reaches x lie beyond the box in x; every other one must lie beyond it in y.
         float y = kUnbounded;
         for (const ArenaMeshBvhMeshInfo& m : mesh_infos) {
             if (gap(m.aabb_min.x, m.aabb_max.x) < x) {
@@ -738,6 +846,24 @@ void SetArenaMeshFreeBox(std::vector<ArenaMeshBvhMeshInfo>& mesh_infos) {
     }
 }
 
+void SetArenaMeshRayOrder(std::vector<ArenaMeshBvhMeshInfo>& mesh_infos, float neg_x_plane_max_x) {
+    const auto key = [&](size_t i) { return ArenaSweepQuantize(mesh_infos[i].aabb_max.x, 1); };
+    std::vector<int32_t> order(mesh_infos.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        order[i] = static_cast<int32_t>(i);
+    }
+    std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return key(a) < key(b); });
+    const uint16_t plane_key = ArenaSweepQuantize(neg_x_plane_max_x, 1);
+    int32_t plane_pos = 0;
+    for (size_t i = 0; i < mesh_infos.size(); ++i) {
+        plane_pos += key(i) <= plane_key ? 1 : 0;
+    }
+    for (size_t k = 0; k < order.size(); ++k) {
+        mesh_infos[k].ray_order = order[k];
+        mesh_infos[k].ray_neg_x_plane_pos = plane_pos;
+    }
+}
+
 void BuildArenaMeshLeafGrid(
     const std::vector<ArenaMeshBvhQuantization>& quantization,
     const std::vector<ArenaMeshBvhMeshInfo>& mesh_infos,
@@ -746,7 +872,6 @@ void BuildArenaMeshLeafGrid(
     std::vector<ArenaMeshLeafGridInfo>& out_infos,
     std::vector<int32_t>& out_cell_start,
     std::vector<ArenaMeshLeafEntry>& out_entries) {
-    // A car's mesh query AABB is at most ~3 bt wide; wider queries walk the BVH.
     constexpr float kCellBt = 4.0f;
     const auto contains = [](const uint16_t* outer_min, const uint16_t* outer_max,
                              const uint16_t* inner_min, const uint16_t* inner_max) {
@@ -768,7 +893,6 @@ void BuildArenaMeshLeafGrid(
             mesh.node_count <= 0 || begin < 0 || end > static_cast<int>(nodes.size())) {
             continue;
         }
-        // The walk visits a leaf when it and every enclosing node (and subtree header) overlap the query.
         bool nested = true;
         for (int i = begin; nested && i < end; ++i) {
             if (nodes[i].is_leaf_node()) {
@@ -780,18 +904,26 @@ void BuildArenaMeshLeafGrid(
                                   nodes[j].quantized_aabb_min, nodes[j].quantized_aabb_max);
             }
         }
-        // The walk takes the node-index-sorted headers when it has them (SelectArenaMeshBvhDfsOrderSubtrees),
-        // else the whole tree; the headers must then cover every leaf.
         const bool headers = mesh.subtree_count > 0 && mesh.subtree_offset >= 0 && mesh.dfs_subtree_offset >= 0 &&
                              mesh.dfs_subtree_offset + mesh.subtree_count <= static_cast<int>(subtrees.size());
         if (nested && headers) {
             std::vector<uint8_t> covered(static_cast<size_t>(mesh.node_count), 0);
+            int last_leaf = begin - 1;
             for (int h = 0; nested && h < mesh.subtree_count; ++h) {
                 const ArenaMeshBvhSubtreeInfo& header = subtrees[static_cast<size_t>(mesh.dfs_subtree_offset + h)];
-                const int stop = std::min(end, header.root_node_index + header.subtree_size);
-                for (int j = std::max(begin, header.root_node_index); nested && j < stop; ++j) {
-                    nested = contains(header.quantized_aabb_min, header.quantized_aabb_max,
-                                      nodes[j].quantized_aabb_min, nodes[j].quantized_aabb_max);
+                const int root = header.root_node_index;
+                if (root < begin || root >= end || header.subtree_size <= 0 || header.subtree_size > end - root) {
+                    nested = false;
+                    break;
+                }
+                const int stop = root + header.subtree_size;
+                for (int j = root; nested && j < stop; ++j) {
+                    if (nodes[j].is_leaf_node()) {
+                        nested = !covered[static_cast<size_t>(j - begin)] && j > last_leaf;
+                        last_leaf = j;
+                    }
+                    nested = nested && contains(header.quantized_aabb_min, header.quantized_aabb_max,
+                                                nodes[j].quantized_aabb_min, nodes[j].quantized_aabb_max);
                     covered[static_cast<size_t>(j - begin)] = 1;
                 }
             }

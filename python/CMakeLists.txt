@@ -1,4 +1,14 @@
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
+if (NOT DEFINED pybind11_DIR)
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}" -m pybind11 --cmakedir
+        OUTPUT_VARIABLE _rocketgpu_pybind11_cmakedir
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+    if (_rocketgpu_pybind11_cmakedir)
+        set(pybind11_DIR "${_rocketgpu_pybind11_cmakedir}" CACHE PATH "pybind11 CMake directory")
+    endif()
+endif()
 find_package(pybind11 CONFIG REQUIRED)
 
 pybind11_add_module(rocketgpu_py NO_EXTRAS rocketgpu_bindings.cpp)

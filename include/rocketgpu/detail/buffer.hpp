@@ -81,6 +81,18 @@ public:
 #endif
     }
 
+    void copy_range_from_host(const T* host_src, size_t first, size_t count, cudaStream_t stream = nullptr) {
+        if (first > size_ || count > size_ - first) {
+            throw std::out_of_range("Buffer::copy_range_from_host range exceeds buffer size");
+        }
+#if defined(ROCKETGPU_USE_CUDA)
+        CheckCuda(cudaMemcpyAsync(ptr_ + first, host_src, count * sizeof(T), cudaMemcpyHostToDevice, stream), "cudaMemcpyAsync H2D range");
+#else
+        std::copy(host_src, host_src + count, host_.begin() + static_cast<std::ptrdiff_t>(first));
+        (void)stream;
+#endif
+    }
+
     void copy_range_to_host(T* host_dst, size_t first, size_t count, cudaStream_t stream = nullptr) const {
         if (first > size_ || count > size_ - first) {
             throw std::out_of_range("Buffer::copy_range_to_host range exceeds buffer size");

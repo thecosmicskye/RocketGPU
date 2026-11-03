@@ -1,5 +1,3 @@
-
-
 ROCKETGPU_HD void DetectCarWorldFloorRampContact(
     const CarState& car,
     const CarConfig& cfg,
@@ -86,18 +84,13 @@ ROCKETGPU_HD void DetectCarWorldFloorRampContact(
     acc.add(final_normal, -margin);
 }
 
-ROCKETGPU_HD bool DebugCarWorldSolverTraceEnabledFor(int env_idx, int car_idx) {
-    (void)env_idx;
-    (void)car_idx;
-    return false;
+ROCKETGPU_HD int CarWorldRowOrderKey(int source_tag) {
+    SharedContactOrderGroup group;
+    group.bucket = SharedContactOrderBucket::World;
+    group.source_tag = source_tag;
+    return BulletContactOrderInitialKey(group);
 }
 
-// The game's car world-contact normal (read by auto-roll) is built
-// after the step: per colliding world object, the unit sum of its contact point normals,
-// then the unit sum over those objects. v3 keeps the last contact-added normal instead. RLPR records
-// the averaged normal (cw_turtle_autoroll_slope frame 17568: slope points (-0.955,0,0.297) and (-0.637,0,0.771),
-// recorded (-0.830,0,0.557)).
-// kSegs: the rows in that many segments, read in order as one list (the split RowsFull, CarWorldRowsPart).
 template <int kSegs = 1>
 ROCKETGPU_HD void ApplyGameCarWorldContactNormal(
     ContactAccumulator& acc,
@@ -106,44 +99,116 @@ ROCKETGPU_HD void ApplyGameCarWorldContactNormal(
     if (!acc.hit) {
         return;
     }
-    constexpr int kMaxObjects = 8;
-    int tags[kMaxObjects];
-    Vec3 sums[kMaxObjects];
-    int object_count = 0;
+    int min_key = 0x7fffffff;
+    int max_key = -1;
+    Vec3 single_key_sum(0.0f, 0.0f, 0.0f);
 #pragma unroll
     for (int seg = 0; seg < kSegs; ++seg) {
-    const CarWorldVelocityContactRow* const normal_rows = seg_rows[seg];
-    const int normal_row_count = normal_rows ? seg_counts[seg] : 0;
-    for (int row_idx = 0; row_idx < normal_row_count; ++row_idx) {
-        if (!normal_rows[row_idx].valid) {
-            continue;
-        }
-        const int tag = normal_rows[row_idx].source_tag;
-        int slot = 0;
-        while (slot < object_count && tags[slot] != tag) {
-            ++slot;
-        }
-        if (slot == object_count) {
-            if (object_count == kMaxObjects) {
+        const CarWorldVelocityContactRow* const normal_rows = seg_rows[seg];
+        const int normal_row_count = normal_rows ? seg_counts[seg] : 0;
+        for (int row_idx = 0; row_idx < normal_row_count; ++row_idx) {
+            if (!normal_rows[row_idx].valid) {
                 continue;
             }
-            tags[slot] = tag;
-            sums[slot] = Vec3(0.0f, 0.0f, 0.0f);
-            ++object_count;
-        }
-        sums[slot] += normal_rows[row_idx].normal;
-    }
-    }
-    Vec3 total(0.0f, 0.0f, 0.0f);
-    for (int i = 0; i < object_count; ++i) {
-        const float len_sq = Dot(sums[i], sums[i]);
-        if (len_sq >= 1e-8f) {
-            total += sums[i] * (1.0f / SqrtScalar(len_sq));
+            const int k = CarWorldRowOrderKey(normal_rows[row_idx].source_tag);
+            if (k < min_key) {
+                min_key = k;
+            }
+            if (k > max_key) {
+                max_key = k;
+            }
+            single_key_sum += normal_rows[row_idx].normal;
         }
     }
-    const float total_len_sq = Dot(total, total);
-    if (total_len_sq >= 1e-8f) {
-        acc.latest_normal = total * (1.0f / SqrtScalar(total_len_sq));
+    if (max_key < 0) {
+        return;
+    }
+    Vec3 sum = single_key_sum;
+    if (min_key != max_key) {
+        sum = Vec3(0.0f, 0.0f, 0.0f);
+        int key = min_key;
+        for (;;) {
+#pragma unroll
+            for (int seg = 0; seg < kSegs; ++seg) {
+                const CarWorldVelocityContactRow* const normal_rows = seg_rows[seg];
+                const int normal_row_count = normal_rows ? seg_counts[seg] : 0;
+                for (int row_idx = 0; row_idx < normal_row_count; ++row_idx) {
+                    if (normal_rows[row_idx].valid && CarWorldRowOrderKey(normal_rows[row_idx].source_tag) == key) {
+                        sum += normal_rows[row_idx].normal;
+                    }
+                }
+            }
+            const int prev_key = key;
+            key = 0x7fffffff;
+            bool found = false;
+#pragma unroll
+            for (int seg = 0; seg < kSegs; ++seg) {
+                const CarWorldVelocityContactRow* const normal_rows = seg_rows[seg];
+                const int normal_row_count = normal_rows ? seg_counts[seg] : 0;
+                for (int row_idx = 0; row_idx < normal_row_count; ++row_idx) {
+                    if (!normal_rows[row_idx].valid) {
+                        continue;
+                    }
+                    const int k = CarWorldRowOrderKey(normal_rows[row_idx].source_tag);
+                    if (k > prev_key && k < key) {
+                        key = k;
+                        found = true;
+                    }
+                }
+            }
+            if (!found) {
+                break;
+            }
+        }
+    }
+    const float len_sq = Dot(sum, sum);
+    if (len_sq >= 1e-8f) {
+        const Vec3 n = sum * (1.0f / SqrtScalar(len_sq));
+        acc.latest_normal = Vec3(0.0f + n.x, 0.0f + n.y, 0.0f + n.z);
+    }
+}
+ROCKETGPU_HD void ApplyPredictiveCarWorldContactNormal(
+    CarState* cars,
+    int count,
+    uint32_t predictive_hit_mask,
+    EnvStridedArray<CarSharedVelocityContactRow> rows,
+    int row_count) {
+    for (int i = 0; i < count && i < 8; ++i) {
+        CarState& car = cars[i];
+        if (((predictive_hit_mask >> (i + 1)) & 1u) == 0 || !car.world_contact.has_contact) {
+            continue;
+        }
+        Vec3 sum(0.0f, 0.0f, 0.0f);
+        bool any = false;
+        int prev_key = -1;
+        for (;;) {
+            int key = 0x7fffffff;
+            for (int r = 0; r < row_count; ++r) {
+                const CarSharedVelocityContactRow& row = rows[r];
+                if (row.valid && row.body_a_local_idx == i) {
+                    const int k = CarWorldRowOrderKey(row.source_tag);
+                    if (k > prev_key && k < key) {
+                        key = k;
+                    }
+                }
+            }
+            if (key == 0x7fffffff) {
+                break;
+            }
+            for (int r = 0; r < row_count; ++r) {
+                const CarSharedVelocityContactRow& row = rows[r];
+                if (row.valid && row.body_a_local_idx == i && CarWorldRowOrderKey(row.source_tag) == key) {
+                    sum += row.normal_a;
+                    any = true;
+                }
+            }
+            prev_key = key;
+        }
+        const float len_sq = Dot(sum, sum);
+        if (any && len_sq >= 1e-8f) {
+            const Vec3 n = sum * (1.0f / SqrtScalar(len_sq));
+            car.world_contact.contact_normal = Vec3(0.0f + n.x, 0.0f + n.y, 0.0f + n.z);
+        }
     }
 }
 ROCKETGPU_HD void ApplyGameCarWorldContactNormal(
@@ -158,13 +223,6 @@ ROCKETGPU_HD void ApplyGameCarWorldContactNormal(
     ApplyGameCarWorldContactNormal<1>(acc, seg_rows, seg_counts);
 }
 
-
-// kMeshesOutOfReach: the caller found no usable arena mesh in reach (CarWorldUsableMeshesOutOfReach), so the mesh
-// query reduces to releasing the retained mesh manifolds.
-// kPart 1 / 2: only the mesh query / only the four planes (+-X walls, floor, ceiling), each into its own local rows,
-// for FinishCarWorldSplitRows to merge in the whole query's order (part_out: the part's counts and contacts). The
-// caller makes sure neither part's rows can reach a row cap (CarWorldRowsSplitPlanes) and gives the planes part
-// fresh local rows.
 template <bool kMeshesOutOfReach = false, int kPart = 0>
 ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     CarState& car,
@@ -200,29 +258,50 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     CarWorldMeshRetainedManifold* retained_mesh_manifolds = nullptr,
     CarWorldLocalRows* local_rows = nullptr,
     uint32_t mesh_reach_hint = 0u,
-    bool defer_world_surface = false,  // true: acc.surface only; the caller applies RecordWorldSurface later
-    CarWorldRowsPart* part_out = nullptr) {
+    bool defer_world_surface = false,
+    CarWorldRowsPart* part_out = nullptr,
+    const Vec3* predict_vel = nullptr,
+    const Vec3* predict_ang_vel = nullptr) {
     ContactAccumulator acc;
     acc.history_car = defer_world_surface ? nullptr : &car;
 
-    // car_world_early_out: a car out of reach of every arena mesh and clear of the four planes gets no rows, so skip
-    // the query and leave only what it would: an empty World group for each plane inside its broadphase window, and
-    // the retained plane manifolds emptied (their refresh culls every point). Retained mesh points and physics events
-    // take the full query. Host, and the GPU's out-of-reach build (kMeshesOutOfReach), where nearly every car skips:
-    // elsewhere on the GPU the per-car test costs more than the queries it skips (a warp saves nothing unless all its
-    // cars skip), and the full query gives the same result.
 #if defined(__CUDA_ARCH__)
     constexpr bool kEarlyOut = kMeshesOutOfReach;
 #else
     constexpr bool kEarlyOut = kPart == 0;
 #endif
+    float plane_d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float plane_threshold_bt = 0.0f;
+    float plane_window_bt = 0.0f;
+    if (kPart != 1 && mutator.arena_collision) {
+        CarWorldPlaneSupportDistances(car, cfg, plane_d, plane_threshold_bt, plane_window_bt);
+    }
     if (kEarlyOut && mutator.arena_collision && !mutator.physics_events.HasNonGoalEvents() && mesh_triangles != nullptr &&
-        mesh_triangle_count > 0) {
+        mesh_triangle_count > 0 && mesh_bvh_quantization != nullptr && mesh_bvh_meshes != nullptr &&
+        mesh_bvh_nodes != nullptr && mesh_bvh_mesh_count > 0 && mesh_bvh_node_count > 0) {
         bool has_retained_mesh_points = false;
         for (int k = 0; retained_mesh_manifolds != nullptr && k < kCarWorldMeshRetainedManifoldsPerCar; ++k) {
             has_retained_mesh_points |= retained_mesh_manifolds[k].count > 0;
         }
-        const int plane_groups = has_retained_mesh_points ? -1 : CarWorldPlanesOutOfReach(car, cfg);
+        int plane_groups = has_retained_mesh_points ? -1 : 0;
+        const auto classify_plane = [&](float d, int bit) {
+            if (plane_groups < 0) {
+                return;
+            }
+            if (d < plane_threshold_bt + kCarWorldPlaneReachSlackBt ||
+                Abs(d - plane_window_bt) <= kCarWorldPlaneReachSlackBt) {
+                plane_groups = -1;
+            } else if (d < plane_window_bt) {
+                plane_groups |= bit;
+            }
+        };
+        classify_plane(plane_d[0], 1);
+        classify_plane(plane_d[1], 2);
+        classify_plane(plane_d[2], 4);
+        classify_plane(plane_d[3], 8);
+        if (plane_groups >= 0 && (plane_groups & 4) != 0 && mutator.game_mode == static_cast<uint8_t>(Mode::Soccar)) {
+            plane_groups = -1;
+        }
         if (plane_groups >= 0 && CarWorldMeshesOutOfReach(car, cfg, mesh_bvh_meshes, mesh_bvh_mesh_count, dt)) {
             if (retained_plane_manifolds != nullptr) {
                 for (int plane_idx = 0; plane_idx < kCarWorldPlaneRetainedManifoldsPerCar; ++plane_idx) {
@@ -241,7 +320,6 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
                         car_idx, -1, source_tag, -1, 0, -1, 0, car_idx * 100000 + 1000 + group_idx);
                     ++group_idx;
                 };
-                // +X wall, -X wall, floor, ceiling (CarWorldPlaneSourceTag).
                 append_plane_group(1, 2);
                 append_plane_group(2, 1);
                 append_plane_group(4, 6);
@@ -290,18 +368,9 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
         mesh_triangles != nullptr && mesh_triangle_count > 0;
 
     const Vec3 center = car.pos + RotateCarBasis(car, cfg.hitbox_offset);
-    // Planes part: a plane whose support distance clears the breaking threshold and sits clearly on one side of the
-    // broadphase window gets only what AppendCarWorldPlaneContactRows leaves for it there (CarWorldPlanesOutOfReach):
-    // its retained manifold emptied and, inside the window, an empty group.
-    float plane_d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float plane_threshold_bt = 0.0f;
-    float plane_window_bt = 0.0f;
-    if (kPart == 2) {
-        CarWorldPlaneSupportDistances(car, cfg, plane_d, plane_threshold_bt, plane_window_bt);
-    }
     const auto plane_out_of_reach = [&](int k, const Vec3& inward_normal, float boundary,
                                         CarWorldPlaneRetainedManifold* retained) {
-        if (kPart != 2) {
+        if (kPart == 1) {
             return false;
         }
         const float d = plane_d[k];
@@ -312,7 +381,7 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
         if (retained != nullptr) {
             retained->count = 0;
         }
-        if (d < plane_window_bt) {
+        if (d < plane_window_bt && car_idx >= 0 && local_world_order_groups) {
             AppendSharedContactOrderGroup(
                 local_world_order_groups, local_world_order_group_count, SharedContactOrderBucket::World, car_idx, -1,
                 CarWorldPlaneSourceTag(inward_normal, boundary), normal_row_count, 0, friction_row_count, 0,
@@ -404,7 +473,8 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
                 local_world_order_groups,
                 &local_world_order_group_count,
                 car_idx,
-                retained_plane_manifolds ? &retained_plane_manifolds[2] : nullptr);
+                retained_plane_manifolds ? &retained_plane_manifolds[2] : nullptr,
+                false, -1, &plane_threshold_bt);
         }
         if (!plane_out_of_reach(1, Vec3(-1.0f, 0.0f, 0.0f), -ArenaExtentX(),
                                 retained_plane_manifolds ? &retained_plane_manifolds[3] : nullptr)) {
@@ -428,12 +498,11 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
                 local_world_order_groups,
                 &local_world_order_group_count,
                 car_idx,
-                retained_plane_manifolds ? &retained_plane_manifolds[3] : nullptr);
+                retained_plane_manifolds ? &retained_plane_manifolds[3] : nullptr,
+                false, -1, &plane_threshold_bt);
         }
     }
     if (kPart == 2) {
-        // The walls' share; the floor and ceiling start a fresh accumulator (only hit, surface and the latest normal
-        // are read past the query: by ApplyGameCarWorldContactNormal and the caller).
         part_out->split[0] = split_row_count;
         part_out->normal[0] = normal_row_count;
         part_out->friction[0] = friction_row_count;
@@ -486,11 +555,13 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
             nullptr,
             mesh_candidate_stage_in,
             -1,
-            nullptr,
+            broadphase_grid != nullptr ? &broadphase_grid->leaf_grid : nullptr,
             nullptr,
             kTrianglePairsNone,
             retained_mesh_manifolds,
-            mesh_reach_hint);
+            mesh_reach_hint,
+            predict_vel,
+            predict_ang_vel);
     }
 
     if (kPart != 1) {
@@ -517,7 +588,42 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
                 &local_world_order_group_count,
                 car_idx,
                 retained_plane_manifolds ? &retained_plane_manifolds[0] : nullptr,
-                kPart == 2);
+                kPart == 2, -1, &plane_threshold_bt);
+        }
+        for (int gf = 0; mutator.game_mode == static_cast<uint8_t>(Mode::Soccar) && gf < 2; ++gf) {
+            CarWorldPlaneRetainedManifold* const gf_retained =
+                retained_plane_manifolds ? &retained_plane_manifolds[4 + gf] : nullptr;
+            const bool gf_points = gf_retained != nullptr && gf_retained->count > 0;
+            const float reach_bt = support_radius * (1.0f / 50.0f) + 0.1f;
+            const Vec3 center_bt = center * (1.0f / 50.0f);
+            if (!gf_points && (Abs(center_bt.x) > kGoalFloorHalfXBt + reach_bt ||
+                               Abs(center_bt.y - GoalFloorOriginBt(gf).y) > kGoalFloorHalfYBt + reach_bt)) {
+                continue;
+            }
+            AppendCarWorldPlaneContactRows(
+                car,
+                cfg,
+                mutator,
+                Vec3(0.0f, 0.0f, 1.0f),
+                0.0f,
+                external_linear_delta,
+                external_angular_delta,
+                acc,
+                split_rows,
+                split_row_count,
+                normal_rows,
+                normal_row_count,
+                friction_rows,
+                friction_row_count,
+                dt,
+                true,
+                local_world_order_groups,
+                &local_world_order_group_count,
+                car_idx,
+                gf_retained,
+                false,
+                gf,
+                &plane_threshold_bt);
         }
         if (!plane_out_of_reach(3, Vec3(0.0f, 0.0f, -1.0f), -ArenaHeight(),
                                 retained_plane_manifolds ? &retained_plane_manifolds[1] : nullptr)) {
@@ -542,7 +648,7 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
                 &local_world_order_group_count,
                 car_idx,
                 retained_plane_manifolds ? &retained_plane_manifolds[1] : nullptr,
-                kPart == 2);
+                kPart == 2, -1, &plane_threshold_bt);
         }
     }
 
@@ -632,7 +738,7 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     if (shared_split_rows && shared_split_row_count && split_row_count > 0) {
         AppendCarWorldToSharedSplitRows(shared_split_rows, *shared_split_row_count, car_idx, split_rows, split_row_count);
     } else if (split_row_count > 0) {
-        SolveCarWorldSplitContactRows(car, split_rows, split_row_count, dt, env_idx, car_idx, NativeSseMath(mutator));
+        SolveCarWorldSplitContactRows(car, split_rows, split_row_count, dt, NativeSseMath(mutator));
     }
 
     if (shared_velocity_rows && shared_velocity_row_count && shared_friction_rows && shared_friction_row_count) {
@@ -686,11 +792,6 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     return acc;
 }
 
-// The finish of SolveCarWorldStaticContacts for its two parts (kPart 1: mesh, rows mesh; kPart 2: planes, rows
-// planes): the rows and groups go out as the whole query's, whose local lists are the +-X walls', the meshes', then
-// the floor's and ceiling's. A floor or ceiling group with rows (valid 2) is dropped when the group before it in that
-// list is mesh 1's, as AppendCarWorldPlaneContactRows does. Neither part reached a row cap, so the whole query's rows
-// are the parts' rows in that order.
 ROCKETGPU_HD ContactAccumulator FinishCarWorldSplitRows(
     int car_idx,
     CarWorldLocalRows& mesh,
@@ -861,7 +962,6 @@ ROCKETGPU_HD void RemoveBallMeshManifoldPoint(
         return;
     }
     if (swap_remove) {
-        // btPersistentManifold::removeContactPoint: the last point moves into the freed slot.
         cache[remove_index] = cache[count - 1];
         cache[count - 1] = BallMeshManifoldPoint{};
         --count;
@@ -883,7 +983,8 @@ ROCKETGPU_HD void RefreshBallMeshPersistentManifold(
     const BallState& ball,
     float contact_breaking_threshold_bt,
     float cal_origin_y = 0.0f,
-    bool swap_remove = false) {
+    bool swap_remove = false,
+    const GamePlaneXfBt* plane_xf = nullptr) {
     constexpr float kBTToUU = 50.0f;
     Vec3 ball_basis_x;
     Vec3 ball_basis_y;
@@ -905,7 +1006,9 @@ ROCKETGPU_HD void RefreshBallMeshPersistentManifold(
                 ball_basis_z.z * manifold_point.local_point_a_bt.z);
         const Vec3 position_world_on_a = rotated_local_a + ball_center_bt;
 
-        const Vec3 position_world_on_b = cal_origin_y != 0.0f
+        const Vec3 position_world_on_b = plane_xf != nullptr
+            ? GamePlanePointWorldBt(*plane_xf, manifold_point.local_point_b_bt - plane_xf->o)
+            : cal_origin_y != 0.0f
             ? Vec3(manifold_point.local_point_b_bt.x, manifold_point.local_point_b_bt.y + cal_origin_y, manifold_point.local_point_b_bt.z)
             : manifold_point.local_point_b_bt;
         const float distance_bt = Dot(
@@ -932,11 +1035,11 @@ ROCKETGPU_HD void RefreshBallMeshPersistentManifold(
     }
 }
 
-// convex_plane_collision_alg for the ball against an arena plane: the contact's relative position (its length is
-// returned) and, when asked, the distance, the ball-local point and the plane point (Bullet units).
 ROCKETGPU_HD float BallPlaneRelLen(const BallState& ball, float ball_radius_bt, const Vec3& inward_normal,
                                    const Vec3& plane_pos_uu, Vec3* out_rel_bt, float* out_distance_bt,
-                                   Vec3* out_local_a_bt, Vec3* out_point_b_bt) {
+                                   Vec3* out_local_a_bt, Vec3* out_point_b_bt,
+                                   const GamePlaneXfBt* xf = nullptr, Vec3* out_in_plane_bt = nullptr,
+                                   float* out_depth_bt = nullptr) {
     constexpr float kUUToBT_local = 1.0f / 50.0f;
     const Vec3 plane_pos_bt(
         plane_pos_uu.x * kUUToBT_local,
@@ -958,17 +1061,40 @@ ROCKETGPU_HD float BallPlaneRelLen(const BallState& ball, float ball_radius_bt, 
         dir_unit = Vec3(dir_local.x * inv_dir_len, dir_local.y * inv_dir_len, dir_local.z * inv_dir_len);
     }
     const Vec3 vtx_local = dir_unit * ball_radius_bt;
-    const Vec3 trans_origin(
-        ball.pos_bt.x - plane_pos_bt.x,
-        ball.pos_bt.y - plane_pos_bt.y,
-        ball.pos_bt.z - plane_pos_bt.z);
-    const Vec3 vtx_in_plane(
-        (bx.x * vtx_local.x + by.x * vtx_local.y + bz.x * vtx_local.z) + trans_origin.x,
-        (bx.y * vtx_local.x + by.y * vtx_local.y + bz.y * vtx_local.z) + trans_origin.y,
-        (bx.z * vtx_local.x + by.z * vtx_local.y + bz.z * vtx_local.z) + trans_origin.z);
-    const float distance = Dot(inward_normal, vtx_in_plane);
-    const Vec3 projected = vtx_in_plane - inward_normal * distance;
-    const Vec3 world = projected + plane_pos_bt;
+    float distance = 0.0f;
+    Vec3 world(0.0f, 0.0f, 0.0f);
+    if (xf != nullptr) {
+        const Vec3 in_plane = GamePlaneVertexInPlaneBt(*xf, bx, by, bz, ball.pos_bt, vtx_local);
+        distance = in_plane.z;
+        world = GamePlaneProjectedWorldBt(*xf, in_plane);
+        if (out_in_plane_bt) {
+            const Vec3 trans_origin(
+                ball.pos_bt.x - plane_pos_bt.x,
+                ball.pos_bt.y - plane_pos_bt.y,
+                ball.pos_bt.z - plane_pos_bt.z);
+            *out_in_plane_bt = Vec3(
+                (bx.x * vtx_local.x + by.x * vtx_local.y + bz.x * vtx_local.z) + trans_origin.x,
+                (bx.y * vtx_local.x + by.y * vtx_local.y + bz.y * vtx_local.z) + trans_origin.y,
+                (bx.z * vtx_local.x + by.z * vtx_local.y + bz.z * vtx_local.z) + trans_origin.z);
+        }
+    } else {
+        const Vec3 trans_origin(
+            ball.pos_bt.x - plane_pos_bt.x,
+            ball.pos_bt.y - plane_pos_bt.y,
+            ball.pos_bt.z - plane_pos_bt.z);
+        const Vec3 vtx_in_plane(
+            (bx.x * vtx_local.x + by.x * vtx_local.y + bz.x * vtx_local.z) + trans_origin.x,
+            (bx.y * vtx_local.x + by.y * vtx_local.y + bz.y * vtx_local.z) + trans_origin.y,
+            (bx.z * vtx_local.x + by.z * vtx_local.y + bz.z * vtx_local.z) + trans_origin.z);
+        distance = Dot(inward_normal, vtx_in_plane);
+        world = (vtx_in_plane - inward_normal * distance) + plane_pos_bt;
+        if (out_in_plane_bt) {
+            *out_in_plane_bt = vtx_in_plane;
+        }
+    }
+    if (out_depth_bt) {
+        *out_depth_bt = distance;
+    }
     const Vec3 point_a = world + inward_normal * distance;
 
     const Vec3 raw_rel(
@@ -988,7 +1114,8 @@ ROCKETGPU_HD float BallPlaneRelLen(const BallState& ball, float ball_radius_bt, 
         *out_rel_bt = rel;
     }
     if (out_distance_bt) {
-        *out_distance_bt = Dot(world_a - world, inward_normal);
+        const Vec3 world_b = xf != nullptr ? GamePlanePointWorldBt(*xf, world - xf->o) : world;
+        *out_distance_bt = Dot(world_a - world_b, inward_normal);
     }
     if (out_local_a_bt) {
         *out_local_a_bt = local_a;
@@ -999,8 +1126,6 @@ ROCKETGPU_HD float BallPlaneRelLen(const BallState& ball, float ball_radius_bt, 
     return sqrtf(rel.x * rel.x + rel.y * rel.y + rel.z * rel.z);
 }
 
-// One triangle of the ball's mesh walk (sphere_triangle_detector plus the internal-edge adjust): true with the new
-// manifold point and the raw contact normal when the ball touches it.
 ROCKETGPU_HD bool BallMeshTriangleHit(const MutatorConfig& mutator, const BallState& ball, const Vec3& ball_center_bt,
                                       float radius_bt, float contact_breaking_threshold_bt, float cal_origin_y,
                                       const ArenaMeshTriangle& tri, int32_t global_tri_idx, BallMeshManifoldPoint& new_pt,
@@ -1055,8 +1180,7 @@ ROCKETGPU_HD bool BallMeshTriangleHit(const MutatorConfig& mutator, const BallSt
                 point_world_on_a_bt,
                 distance_bt,
                 contact_on_tri_bt,
-                contact_normal, nullptr,
-                mutator.game_mode == static_cast<uint8_t>(Mode::Soccar),
+                contact_normal,
                 mutator.native_sphere_rsqrt_table, mutator.native_sphere_rsqrt_shift,
                 cal_game_tri);
         }
@@ -1076,19 +1200,34 @@ ROCKETGPU_HD bool BallMeshTriangleHit(const MutatorConfig& mutator, const BallSt
     return false;
 }
 
-// Arena plane `slot` of the ball-world contacts: floor, ceiling, then the two side walls.
+ROCKETGPU_HD int16_t BallWorldPlaneStaticId(int slot) {
+    constexpr int16_t kIds[kBallWorldPlaneSlots] = {100, 101, 103, 102, 104, 105};
+    return kIds[slot];
+}
+
+ROCKETGPU_HD int BallWorldPlaneSlotCount(const MutatorConfig& mutator) {
+    return mutator.game_mode == static_cast<uint8_t>(Mode::Soccar) ? kBallWorldPlaneSlots : 4;
+}
+
+ROCKETGPU_HD bool BallNearGoalFloor(const BallState& ball, int slot) {
+    const float dy = ball.pos_bt.y - GoalFloorOriginBt(slot - 4).y;
+    return Abs(ball.pos_bt.x) <= kGoalFloorHalfXBt + 0.1f && Abs(dy) <= kGoalFloorHalfYBt + 0.1f;
+}
+
 ROCKETGPU_HD void BallWorldPlane(int slot, float arena_margin, Vec3& inward_normal, float& boundary, Vec3& plane_pos_uu) {
     inward_normal = Vec3(0.0f, 0.0f, 1.0f);
     boundary = arena_margin;
     plane_pos_uu = Vec3(0.0f, 0.0f, 0.0f);
-    if (slot == 1) {
+    if (slot >= 4) {
+        plane_pos_uu = Vec3(0.0f, slot == 4 ? -5584.0f : 5584.0f, 0.0f);
+    } else if (slot == 1) {
         inward_normal = Vec3(0.0f, 0.0f, -1.0f);
         boundary = -(ArenaHeight() - arena_margin);
         plane_pos_uu = Vec3(0.0f, 0.0f, ArenaHeight());
     } else if (slot == 2) {
         inward_normal = Vec3(-1.0f, 0.0f, 0.0f);
         boundary = -(ArenaExtentX() - arena_margin);
-        plane_pos_uu = Vec3(ArenaExtentX(), 0.0f, 992.0f);  // Stadium_P side-wall planes sit at z = 992
+        plane_pos_uu = Vec3(ArenaExtentX(), 0.0f, 992.0f);
     } else if (slot == 3) {
         inward_normal = Vec3(1.0f, 0.0f, 0.0f);
         boundary = -(ArenaExtentX() - arena_margin);
@@ -1096,10 +1235,6 @@ ROCKETGPU_HD void BallWorldPlane(int slot, float arena_margin, Vec3& inward_norm
     }
 }
 
-// Ball-world staging: the part of AppendBallWorldSpecialContactRows that depends only on the ball's pose and the
-// arena (each plane's contact geometry, which meshes the ball's box reaches, every walked triangle's contact in walk
-// order), computed on a side stream after PreTick. World<3> takes it when the stage's key equals the ball's key at the
-// call; anything else (a moved ball, another tick or arena, too many hits, physics events) runs inline.
 constexpr int kBallWorldStageHits = 12;
 constexpr int kBallWorldStageMaxMeshes = 32;
 struct BallWorldStageKey {
@@ -1127,6 +1262,8 @@ struct BallWorldStagePlane {
     Vec3 local_a_bt;
     Vec3 point_b_bt;
     float rel_len = 0.0f;
+    Vec3 in_plane_bt;
+    float depth_bt = 0.0f;
 };
 struct BallWorldStageHit {
     BallMeshManifoldPoint pt;
@@ -1141,10 +1278,10 @@ enum BallWorldStageState : uint32_t {
 struct BallWorldStage {
     BallWorldStageKey key;
     uint32_t state = kBallWorldStageNone;
-    uint32_t plane_mask = 0;  // planes within detection reach, whose geometry is in planes[]
-    uint32_t walk_mask = 0;   // meshes whose AABB the ball's query box reaches
+    uint32_t plane_mask = 0;
+    uint32_t walk_mask = 0;
     int32_t hit_count = 0;
-    BallWorldStagePlane planes[4];
+    BallWorldStagePlane planes[kBallWorldPlaneSlots];
     BallWorldStageHit hits[kBallWorldStageHits];
 };
 
@@ -1174,7 +1311,6 @@ ROCKETGPU_HD BallWorldStageKey MakeBallWorldStageKey(const BallState& ball, cons
     return k;
 }
 
-// Bitwise key equality (a -0 or NaN difference is a mismatch).
 ROCKETGPU_HD bool BallWorldStageKeyEqual(const BallWorldStageKey& a, const BallWorldStageKey& b) {
     const uint32_t* wa = reinterpret_cast<const uint32_t*>(&a);
     const uint32_t* wb = reinterpret_cast<const uint32_t*>(&b);
@@ -1189,6 +1325,10 @@ ROCKETGPU_HD bool BallWorldStageKeyEqual(const BallWorldStageKey& a, const BallW
 ROCKETGPU_HD int BallStageLowBit(uint32_t m) {
 #if defined(__CUDA_ARCH__)
     return __ffs(static_cast<int>(m)) - 1;
+#elif defined(_MSC_VER)
+    unsigned long i;
+    _BitScanForward(&i, m);
+    return static_cast<int>(i);
 #else
     return __builtin_ctz(m);
 #endif
@@ -1208,7 +1348,6 @@ ROCKETGPU_HD void StageBallWorldContacts(
     int32_t mesh_bvh_node_count,
     BallWorldStage& out,
     const ArenaMeshBvhMeshInfo* mesh_infos = nullptr) {
-    // mesh_infos: a copy of mesh_bvh_meshes (e.g. in shared memory) to read; the key keeps mesh_bvh_meshes.
     if (mesh_infos == nullptr) {
         mesh_infos = mesh_bvh_meshes;
     }
@@ -1241,31 +1380,38 @@ ROCKETGPU_HD void StageBallWorldContacts(
     const Vec3 aabb_max_bt = ball_center_bt + Vec3(radiusWithThreshold, radiusWithThreshold, radiusWithThreshold);
     constexpr float kBallMeshWalkSkipMarginBt = 0.01f;
 
-    // Reach first, the inline path's tests: planes within detection range, meshes whose AABB the ball's query box
-    // reaches. A ball that reaches neither stages nothing and stops here.
     uint32_t plane_mask = 0u;
-#pragma unroll
-    for (int plane_slot = 0; plane_slot < 4; ++plane_slot) {
+    const int plane_slot_count = BallWorldPlaneSlotCount(mutator);
+    for (int plane_slot = 0; plane_slot < plane_slot_count; ++plane_slot) {
         Vec3 inward_normal;
         float boundary;
         Vec3 plane_pos_uu;
         BallWorldPlane(plane_slot, arena_margin, inward_normal, boundary, plane_pos_uu);
         const float margin = Dot(ball.pos, inward_normal) - boundary;
-        if (margin < collision_r + plane_detection_r) {
+        if (margin < collision_r + plane_detection_r && (plane_slot < 4 || BallNearGoalFloor(ball, plane_slot))) {
             plane_mask |= 1u << plane_slot;
         }
     }
     uint32_t walk_mask = 0u;
     if (meshes_valid) {
-        for (int mesh_info_idx = 0; mesh_info_idx < mesh_bvh_mesh_count; ++mesh_info_idx) {
-            const ArenaMeshBvhMeshInfo& mesh_info = mesh_infos[mesh_info_idx];
-            const bool walk_mesh = !(mesh_info.aabb_max.x < aabb_min_bt.x - kBallMeshWalkSkipMarginBt ||
-                                     mesh_info.aabb_min.x > aabb_max_bt.x + kBallMeshWalkSkipMarginBt ||
-                                     mesh_info.aabb_max.y < aabb_min_bt.y - kBallMeshWalkSkipMarginBt ||
-                                     mesh_info.aabb_min.y > aabb_max_bt.y + kBallMeshWalkSkipMarginBt ||
-                                     mesh_info.aabb_max.z < aabb_min_bt.z - kBallMeshWalkSkipMarginBt ||
-                                     mesh_info.aabb_min.z > aabb_max_bt.z + kBallMeshWalkSkipMarginBt);
-            walk_mask |= walk_mesh ? 1u << mesh_info_idx : 0u;
+        const float fx = mesh_infos[0].free_half_x;
+        const float fy = mesh_infos[0].free_half_y;
+        const bool in_free_interior =
+            aabb_max_bt.x + kBallMeshWalkSkipMarginBt < fx &&
+            aabb_min_bt.x - kBallMeshWalkSkipMarginBt > -fx &&
+            aabb_max_bt.y + kBallMeshWalkSkipMarginBt < fy &&
+            aabb_min_bt.y - kBallMeshWalkSkipMarginBt > -fy;
+        if (!in_free_interior) {
+            for (int mesh_info_idx = 0; mesh_info_idx < mesh_bvh_mesh_count; ++mesh_info_idx) {
+                const ArenaMeshBvhMeshInfo& mesh_info = mesh_infos[mesh_info_idx];
+                const bool walk_mesh = !(mesh_info.aabb_max.x < aabb_min_bt.x - kBallMeshWalkSkipMarginBt ||
+                                         mesh_info.aabb_min.x > aabb_max_bt.x + kBallMeshWalkSkipMarginBt ||
+                                         mesh_info.aabb_max.y < aabb_min_bt.y - kBallMeshWalkSkipMarginBt ||
+                                         mesh_info.aabb_min.y > aabb_max_bt.y + kBallMeshWalkSkipMarginBt ||
+                                         mesh_info.aabb_max.z < aabb_min_bt.z - kBallMeshWalkSkipMarginBt ||
+                                         mesh_info.aabb_min.z > aabb_max_bt.z + kBallMeshWalkSkipMarginBt);
+                walk_mask |= walk_mesh ? 1u << mesh_info_idx : 0u;
+            }
         }
     }
     out.plane_mask = plane_mask;
@@ -1281,9 +1427,12 @@ ROCKETGPU_HD void StageBallWorldContacts(
         float boundary;
         Vec3 plane_pos_uu;
         BallWorldPlane(plane_slot, arena_margin, inward_normal, boundary, plane_pos_uu);
+        const bool soccar = mutator.game_mode == static_cast<uint8_t>(Mode::Soccar);
+        const GamePlaneXfBt xf = GameSoccarPlaneXfBt(inward_normal, plane_pos_uu * kUUToBT_local);
         BallWorldStagePlane& sp = out.planes[plane_slot];
-        sp.rel_len = BallPlaneRelLen(ball, ball_radius_bt, inward_normal, plane_pos_uu, &sp.rel_bt, &sp.distance_bt,
-                                     &sp.local_a_bt, &sp.point_b_bt);
+        sp.rel_len = BallPlaneRelLen(ball, ball_radius_bt, soccar ? GamePlaneNormalBt(xf) : inward_normal, plane_pos_uu,
+                                     &sp.rel_bt, &sp.distance_bt, &sp.local_a_bt, &sp.point_b_bt,
+                                     soccar ? &xf : nullptr, &sp.in_plane_bt, &sp.depth_bt);
     }
     uint32_t state = kBallWorldStageReady;
     int hit_count = 0;
@@ -1298,8 +1447,8 @@ ROCKETGPU_HD void StageBallWorldContacts(
         uint16_t quantized_query_aabb_min[3] = {0, 0, 0};
         uint16_t quantized_query_aabb_max[3] = {0, 0, 0};
         const ArenaMeshBvhQuantization& quantization = mesh_bvh_quantization[mesh_info.mesh_index];
-        QuantizeArenaMeshBvhPoint(quantization, aabb_min_bt, 0, quantized_query_aabb_min);
-        QuantizeArenaMeshBvhPoint(quantization, aabb_max_bt, 1, quantized_query_aabb_max);
+        QuantizeArenaMeshBvhQueryBox(quantization, ball_center_bt, Vec3(radiusWithThreshold, radiusWithThreshold, radiusWithThreshold),
+                                     mesh_info.cal_origin_y, quantized_query_aabb_min, quantized_query_aabb_max);
         const float cal_origin_y = mesh_info.cal_origin_y;
         const int32_t triangle_count = mesh_info.triangle_count;
         const int32_t triangle_start = mesh_info.triangle_start;
@@ -1340,14 +1489,8 @@ ROCKETGPU_HD void StageBallWorldContacts(
 
 #if defined(__CUDACC__)
 extern __device__ BallWorldStage* g_rocketgpu_ball_world_stage;
-#if defined(ROCKETGPU_BALL_STAGE_CHECK)
-// calls, unpublished, none, overflow, events, other tick, other pose or arena, ready, ready but different from inline
-extern __device__ unsigned long long g_rocketgpu_ball_stage_counts[9];
-#endif
 #endif
 
-// The ball-world stage World<3> takes for this env: published, ready and keyed to the ball and arena as they are at
-// the call. Null: run inline.
 ROCKETGPU_HD const BallWorldStage* ConsumableBallWorldStage(
     int env_idx, const BallState& ball, const MutatorConfig& mutator, uint64_t tick,
     const ArenaMeshTriangle* mesh_triangles, const ArenaMeshBvhMeshInfo* mesh_bvh_meshes, int32_t mesh_bvh_mesh_count) {
@@ -1369,61 +1512,6 @@ ROCKETGPU_HD const BallWorldStage* ConsumableBallWorldStage(
     return nullptr;
 #endif
 }
-
-#if defined(ROCKETGPU_BALL_STAGE_CHECK) && defined(__CUDA_ARCH__)
-// Check build: counts why a World<3> ball-world call would or would not take its stage, and compares a ready stage
-// with one staged again here from the ball at the call.
-__device__ inline bool BallStageWordsEqual(const void* a, const void* b, int bytes) {
-    const uint32_t* wa = static_cast<const uint32_t*>(a);
-    const uint32_t* wb = static_cast<const uint32_t*>(b);
-    uint32_t diff = 0u;
-    for (int i = 0; i < bytes / 4; ++i) {
-        diff |= wa[i] ^ wb[i];
-    }
-    return diff == 0u;
-}
-__device__ inline void CheckBallWorldStage(
-    int env_idx, const BallState& ball, const MutatorConfig& mutator, uint64_t tick,
-    const ArenaMeshTriangle* mesh_triangles, int32_t mesh_triangle_count,
-    const ArenaMeshBvhQuantization* mesh_bvh_quantization, int32_t mesh_bvh_quantization_count,
-    const ArenaMeshBvhMeshInfo* mesh_bvh_meshes, int32_t mesh_bvh_mesh_count,
-    const ArenaMeshBvhNode* mesh_bvh_nodes, int32_t mesh_bvh_node_count) {
-    atomicAdd(&g_rocketgpu_ball_stage_counts[0], 1ull);
-    const BallWorldStage* base = g_rocketgpu_ball_world_stage;
-    if (base == nullptr || env_idx < 0) {
-        atomicAdd(&g_rocketgpu_ball_stage_counts[1], 1ull);
-        return;
-    }
-    const BallWorldStage& st = base[env_idx];
-    if (st.state != kBallWorldStageReady) {
-        atomicAdd(&g_rocketgpu_ball_stage_counts[st.state == kBallWorldStageOverflow ? 3 : st.state == kBallWorldStageEvents ? 4 : 2], 1ull);
-        return;
-    }
-    const BallWorldStageKey key =
-        MakeBallWorldStageKey(ball, mutator, tick, mesh_triangles, mesh_bvh_meshes, mesh_bvh_mesh_count);
-    if (!BallWorldStageKeyEqual(st.key, key)) {
-        atomicAdd(&g_rocketgpu_ball_stage_counts[st.key.tick != key.tick ? 5 : 6], 1ull);
-        return;
-    }
-    atomicAdd(&g_rocketgpu_ball_stage_counts[7], 1ull);
-    BallWorldStage fresh;
-    StageBallWorldContacts(ball, mutator, tick, mesh_triangles, mesh_triangle_count, mesh_bvh_quantization,
-                           mesh_bvh_quantization_count, mesh_bvh_meshes, mesh_bvh_mesh_count, mesh_bvh_nodes,
-                           mesh_bvh_node_count, fresh);
-    bool same = fresh.state == st.state && fresh.plane_mask == st.plane_mask && fresh.walk_mask == st.walk_mask &&
-                fresh.hit_count == st.hit_count;
-    for (int k = 0; same && k < 4; ++k) {
-        same = ((st.plane_mask >> k) & 1u) == 0u ||
-               BallStageWordsEqual(&fresh.planes[k], &st.planes[k], static_cast<int>(sizeof(BallWorldStagePlane)));
-    }
-    for (int h = 0; same && h < st.hit_count; ++h) {
-        same = BallStageWordsEqual(&fresh.hits[h], &st.hits[h], static_cast<int>(sizeof(BallWorldStageHit)));
-    }
-    if (!same) {
-        atomicAdd(&g_rocketgpu_ball_stage_counts[8], 1ull);
-    }
-}
-#endif
 
 ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
     const BallState& ball,
@@ -1451,8 +1539,6 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
     const Vec3* bt_ball_linear_velocity_override = nullptr,
     int event_env_idx = -1,
     const BallWorldStage* stage = nullptr) {
-    // Heatseeker world normals: counted in a register and the count stored once below, so appending a point is not a
-    // load-increment-store chain through the scratch.
     int hs_world_normal_count = 0;
 
     BallWorldContactAggregate aggregate;
@@ -1469,8 +1555,6 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
         float penetration_bt = 0.0f;
     };
     constexpr int kMaxBallWorldSpecialCps = 16;
-    // Not default-constructed (local memory): only slots below special_cp_count are read, each assigned whole first
-    // (rel_pos1_bt and penetration_bt only read when has_bt).
     UninitArray<BallWorldSpecialCp, kMaxBallWorldSpecialCps> special_cp_slots;
     BallWorldSpecialCp* const special_cps = special_cp_slots;
     int special_cp_count = 0;
@@ -1514,61 +1598,63 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
         }
     };
 
-    const auto official_plane_rel_len = [&](const Vec3& inward_normal, const Vec3& plane_pos_uu, Vec3* out_rel_bt = nullptr, float* out_distance_bt = nullptr, Vec3* out_local_a_bt = nullptr, Vec3* out_point_b_bt = nullptr) -> float {
+    const auto official_plane_rel_len = [&](const Vec3& inward_normal, const Vec3& plane_pos_uu, Vec3* out_rel_bt = nullptr, float* out_distance_bt = nullptr, Vec3* out_local_a_bt = nullptr, Vec3* out_point_b_bt = nullptr, const GamePlaneXfBt* xf = nullptr, Vec3* out_in_plane_bt = nullptr, float* out_depth_bt = nullptr) -> float {
         return BallPlaneRelLen(ball, ball_radius_bt, inward_normal, plane_pos_uu, out_rel_bt, out_distance_bt,
-                               out_local_a_bt, out_point_b_bt);
-    };
-    const auto bullet_plane_rank = [](const Vec3& inward_normal) -> int16_t {
-        if (inward_normal.z > 0.5f) return 100 + 0;
-        if (inward_normal.z < -0.5f) return 100 + 1;
-        if (inward_normal.x > 0.5f) return 100 + 2;
-        if (inward_normal.x < -0.5f) return 100 + 3;
-        return -1;
+                               out_local_a_bt, out_point_b_bt, xf, out_in_plane_bt, out_depth_bt);
     };
     const float plane_breaking_threshold_bt = (ball_radius_bt + 0.08f) * 0.02f;
     const bool retain_plane_points = solver_scratch != nullptr;
-    // Each plane's call changes only its own manifold, so the four counts load together up front, a byte each.
-    uint32_t plane_manifold_counts = 0;
+    const int plane_slot_count = BallWorldPlaneSlotCount(mutator);
+    uint64_t plane_manifold_counts = 0;
     if (retain_plane_points) {
 #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            plane_manifold_counts |= static_cast<uint32_t>(solver_scratch->ball_world_plane_manifolds[k].count) << (8 * k);
+        for (int k = 0; k < kBallWorldPlaneSlots; ++k) {
+            plane_manifold_counts |= static_cast<uint64_t>(solver_scratch->ball_world_plane_manifolds[k].count) << (8 * k);
         }
     }
-    const auto append_plane_cp = [&](const Vec3& inward_normal, float boundary, const Vec3& plane_pos_uu, int plane_slot) {
-        const float margin = Dot(ball.pos, inward_normal) - boundary;
+    const auto append_plane_cp = [&](const Vec3& axis_normal, float boundary, const Vec3& plane_pos_uu, int plane_slot) {
+        const float margin = Dot(ball.pos, axis_normal) - boundary;
+        const bool in_reach =
+            margin < collision_r + plane_detection_r && (plane_slot < 4 || BallNearGoalFloor(ball, plane_slot));
+        int count = retain_plane_points ? static_cast<int>((plane_manifold_counts >> (8 * plane_slot)) & 0xFFu) : 0;
+        if (!in_reach && count == 0) {
+            return;
+        }
+        const bool soccar = mutator.game_mode == static_cast<uint8_t>(Mode::Soccar);
+        const GamePlaneXfBt plane_xf = GameSoccarPlaneXfBt(axis_normal, plane_pos_uu * (1.0f / 50.0f));
+        const GamePlaneXfBt* const xf = soccar ? &plane_xf : nullptr;
+        const Vec3 inward_normal = soccar ? GamePlaneNormalBt(plane_xf) : axis_normal;
         if (retain_plane_points) {
-            // v3 collision_dispatcher near_callback_with_bounds: refresh the cached ball-plane manifold, then merge the
-            // fresh convex_plane_collision_alg point (get_cache_entry on the ball-local point); every retained point
-            // stays a special sample (persistent_manifold.rs refresh_contact_points / merge_contact_points).
             BallMeshPersistentManifold& m = solver_scratch->ball_world_plane_manifolds[plane_slot];
-            int count = static_cast<int>((plane_manifold_counts >> (8 * plane_slot)) & 0xFFu);
-            if (count > 0) {
-                RefreshBallMeshPersistentManifold(m.points, count, ball.pos_bt, ball, plane_breaking_threshold_bt, 0.0f, true);
-            }
-            if (margin < collision_r + plane_detection_r) {
+            if (in_reach) {
                 Vec3 rel_bt(0.0f, 0.0f, 0.0f);
                 float distance_bt = 0.0f;
                 Vec3 local_a_bt(0.0f, 0.0f, 0.0f);
                 Vec3 point_b_bt(0.0f, 0.0f, 0.0f);
+                Vec3 in_plane_bt(0.0f, 0.0f, 0.0f);
                 float rel_len;
+                float fresh_depth_bt = 0.0f;
                 if (stage != nullptr && ((stage->plane_mask >> plane_slot) & 1u) != 0u) {
                     const BallWorldStagePlane& sp = stage->planes[plane_slot];
                     rel_bt = sp.rel_bt;
                     distance_bt = sp.distance_bt;
                     local_a_bt = sp.local_a_bt;
                     point_b_bt = sp.point_b_bt;
+                    in_plane_bt = sp.in_plane_bt;
+                    fresh_depth_bt = sp.depth_bt;
                     rel_len = sp.rel_len;
                 } else {
-                    rel_len = official_plane_rel_len(inward_normal, plane_pos_uu, &rel_bt, &distance_bt, &local_a_bt, &point_b_bt);
+                    rel_len = official_plane_rel_len(inward_normal, plane_pos_uu, &rel_bt, &distance_bt, &local_a_bt,
+                                                     &point_b_bt, xf, &in_plane_bt, &fresh_depth_bt);
                 }
                 const bool within_extent =
-                    mutator.game_mode != static_cast<uint8_t>(Mode::Soccar) ||
-                    SoccarPlaneExtentContainsBt(inward_normal, point_b_bt, plane_breaking_threshold_bt);
-                if (distance_bt < plane_breaking_threshold_bt && within_extent) {
+                    !soccar || (plane_slot >= 4 ? GoalFloorExtentContainsBt(in_plane_bt, plane_breaking_threshold_bt)
+                                                : SoccarPlaneExtentContainsInPlaneBt(inward_normal, in_plane_bt,
+                                                                                     plane_breaking_threshold_bt));
+                if (fresh_depth_bt < plane_breaking_threshold_bt && within_extent) {
                     BallMeshManifoldPoint new_pt;
                     new_pt.normal = inward_normal;
-                    new_pt.pen_uu = -distance_bt * 50.0f;
+                    new_pt.pen_uu = -fresh_depth_bt * 50.0f;
                     new_pt.local_point_a_bt = local_a_bt;
                     new_pt.local_point_b_bt = point_b_bt;
                     new_pt.triangle_index = -1;
@@ -1583,6 +1669,10 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                     }
                 }
             }
+            if (count > 0) {
+                RefreshBallMeshPersistentManifold(m.points, count, ball.pos_bt, ball, plane_breaking_threshold_bt, 0.0f, true,
+                                                  xf);
+            }
             m.count = static_cast<uint8_t>(count);
             for (int i = 0; i < count; ++i) {
                 const BallMeshManifoldPoint& q = m.points[i];
@@ -1591,32 +1681,31 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                     inward_normal,
                     q.pen_uu,
                     q.rel_pos1_length_bt,
-                    bullet_plane_rank(inward_normal),
+                    BallWorldPlaneStaticId(plane_slot),
                     &q.rel_pos1_bt,
                     &pen_bt);
             }
             return;
         }
-        if (margin >= collision_r + plane_detection_r) {
+        if (margin >= collision_r + plane_detection_r || (plane_slot >= 4 && !BallNearGoalFloor(ball, plane_slot))) {
             return;
         }
         Vec3 plane_rel_bt(0.0f, 0.0f, 0.0f);
         float plane_distance_bt = 0.0f;
-        const float plane_rel_len = official_plane_rel_len(inward_normal, plane_pos_uu, &plane_rel_bt, &plane_distance_bt);
+        const float plane_rel_len =
+            official_plane_rel_len(inward_normal, plane_pos_uu, &plane_rel_bt, &plane_distance_bt, nullptr, nullptr, xf);
         const float plane_pen_bt = -plane_distance_bt;
         append_special_cp_with_len(
             inward_normal,
             collision_r - margin,
             plane_rel_len,
-            bullet_plane_rank(inward_normal),
+            BallWorldPlaneStaticId(plane_slot),
             &plane_rel_bt,
             &plane_pen_bt);
     };
 
-    // One rolled loop, so the four planes share one copy of the plane code (the call is rare and runs from a cold
-    // instruction cache).
 #pragma unroll 1
-    for (int plane_slot = 0; plane_slot < 4; ++plane_slot) {
+    for (int plane_slot = 0; plane_slot < plane_slot_count; ++plane_slot) {
         Vec3 inward_normal;
         float boundary;
         Vec3 plane_pos_uu;
@@ -1641,9 +1730,6 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
         uint16_t quantized_query_aabb_min[3] = {0, 0, 0};
         uint16_t quantized_query_aabb_max[3] = {0, 0, 0};
 
-        // A contact point lies on its triangle within radiusWithThreshold of the ball's center, so a mesh whose
-        // AABB (the union of its triangles' AABBs) misses the query box by more than float rounding has no
-        // triangle that adds a point: its walk is skipped.
         constexpr float kBallMeshWalkSkipMarginBt = 0.01f;
         const auto mesh_walk_needed = [&](const ArenaMeshBvhMeshInfo& info) {
             return !(info.aabb_max.x < aabb_min_bt.x - kBallMeshWalkSkipMarginBt ||
@@ -1653,16 +1739,24 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                      info.aabb_max.z < aabb_min_bt.z - kBallMeshWalkSkipMarginBt ||
                      info.aabb_min.z > aabb_max_bt.z + kBallMeshWalkSkipMarginBt);
         };
-        // A mesh with no walk and an empty retained manifold changes nothing (its refresh has no points and its
-        // count stays 0). Those meshes are found first, in one pass whose loads overlap, and skipped below.
-        // The retained counts it loads (3 bits per mesh) are reused below: each mesh's pass changes only its own. Only
-        // meshes in ball_mesh_maybe_retained can hold points; the others' counts are 0 without a load.
+        const float fx = mesh_bvh_meshes[0].free_half_x;
+        const float fy = mesh_bvh_meshes[0].free_half_y;
+        const bool ball_in_free_interior =
+            stage != nullptr
+                ? stage->walk_mask == 0u
+                : (aabb_max_bt.x + kBallMeshWalkSkipMarginBt < fx &&
+                   aabb_min_bt.x - kBallMeshWalkSkipMarginBt > -fx &&
+                   aabb_max_bt.y + kBallMeshWalkSkipMarginBt < fy &&
+                   aabb_min_bt.y - kBallMeshWalkSkipMarginBt > -fy);
         uint32_t idle_meshes = 0u;
         uint64_t retained_counts = 0u;
         const bool track_retained = mutator.cal_ball_world != 0 && solver_scratch != nullptr;
         const uint32_t maybe_retained = track_retained ? solver_scratch->ball_mesh_maybe_retained : 0u;
         uint32_t next_maybe_retained = maybe_retained;
-        if (track_retained) {
+        if (ball_in_free_interior && track_retained && maybe_retained == 0u &&
+            mesh_bvh_mesh_count <= kMaxBallWorldMeshPersistentManifolds) {
+            idle_meshes = ~0u;
+        } else if (track_retained) {
 #pragma unroll
             for (int mesh_info_idx = 0; mesh_info_idx < kMaxBallWorldMeshPersistentManifolds; ++mesh_info_idx) {
                 const uint64_t retained = ((maybe_retained >> mesh_info_idx) & 1u) != 0u
@@ -1670,15 +1764,18 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                     : 0u;
                 retained_counts |= retained << (3 * mesh_info_idx);
                 if (mesh_info_idx < mesh_bvh_mesh_count && retained == 0 &&
-                    !(stage != nullptr ? ((stage->walk_mask >> mesh_info_idx) & 1u) != 0u
-                                       : mesh_walk_needed(mesh_bvh_meshes[mesh_info_idx]))) {
+                    (ball_in_free_interior ||
+                     !(stage != nullptr ? ((stage->walk_mask >> mesh_info_idx) & 1u) != 0u
+                                        : mesh_walk_needed(mesh_bvh_meshes[mesh_info_idx])))) {
                     idle_meshes |= 1u << mesh_info_idx;
                 }
             }
         }
 
         int stage_hit = 0;
-        for (int mesh_info_idx = 0; mesh_info_idx < mesh_bvh_mesh_count; ++mesh_info_idx) {
+        const int active_mesh_count =
+            (idle_meshes == ~0u && mesh_bvh_mesh_count <= kMaxBallWorldMeshPersistentManifolds) ? 0 : mesh_bvh_mesh_count;
+        for (int mesh_info_idx = 0; mesh_info_idx < active_mesh_count; ++mesh_info_idx) {
             if (mesh_info_idx < kMaxBallWorldMeshPersistentManifolds && ((idle_meshes >> mesh_info_idx) & 1u) != 0u) {
                 next_maybe_retained &= ~(1u << mesh_info_idx);
                 continue;
@@ -1690,7 +1787,6 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                 continue;
             }
 
-            // The transient manifold is never retained, so it is always reset below before use.
             UninitArray<BallMeshPersistentManifold, 1> transient_storage;
             BallMeshPersistentManifold* const transient_manifold = transient_storage.data();
             BallMeshPersistentManifold* persistent_manifold = transient_manifold;
@@ -1700,11 +1796,6 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
                 persistent_manifold = &solver_scratch->ball_world_mesh_manifolds[mesh_info_idx];
             }
 
-            // cal_retained_ball_world_contacts: Bullet keeps the ball-mesh persistent manifold across ticks
-            // (btConvexConcaveCollisionAlgorithm never clears it); new points merge into the retained cache and
-            // refreshContactPoints drops the separated ones (v3 sphere_concave_collision_alg::process_collision_into).
-            // Retention needs the cal_ball_world merge threshold below; without it (Snowday forces cal_ball_world=0)
-            // every tick's points would pile up as duplicates of the retained ones.
             const bool retain_ball_mesh_points =
                 mutator.cal_ball_world != 0 &&
                 persistent_manifold != transient_manifold;
@@ -1714,13 +1805,12 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
             int persistent_count =
                 retain_ball_mesh_points ? static_cast<int>((retained_counts >> (3 * mesh_info_idx)) & 7u) : 0;
 
-            // A skipped walk is an empty node range; the mesh's retained points are still refreshed below.
-            // With a stage the mesh's triangle hits come from it (below) instead of a walk.
             const bool walk_mesh = stage == nullptr && mesh_walk_needed(mesh_info);
             if (walk_mesh) {
                 const ArenaMeshBvhQuantization& quantization = mesh_bvh_quantization[mesh_info.mesh_index];
-                QuantizeArenaMeshBvhPoint(quantization, aabb_min_bt, 0, quantized_query_aabb_min);
-                QuantizeArenaMeshBvhPoint(quantization, aabb_max_bt, 1, quantized_query_aabb_max);
+                QuantizeArenaMeshBvhQueryBox(quantization, ball_center_bt,
+                                             Vec3(radiusWithThreshold, radiusWithThreshold, radiusWithThreshold),
+                                             mesh_info.cal_origin_y, quantized_query_aabb_min, quantized_query_aabb_max);
             }
 
             const float cal_origin_y = mesh_info.cal_origin_y;
@@ -1737,9 +1827,6 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
             WalkArenaMeshBvhStacklessQuantizedTreeCacheFriendly(
                 mesh_bvh_nodes,
                 mesh_subtrees,
-                // cal_bvh_dfs_order: stock btQuantizedBvh walks TRAVERSAL_STACKLESS (whole-tree DFS); no subtree headers.
-                // The ball query is large enough that the whole-tree walk beats scanning the node-ordered headers
-                // (SelectArenaMeshBvhDfsOrderSubtrees, same leaves in the same order) on the GPU; car queries use those.
                 true ? 0 : mesh_subtree_count,
                 quantized_query_aabb_min,
                 quantized_query_aabb_max,
@@ -1877,10 +1964,8 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
     Vec3 normal = aggregate.normal_sum * inv_count;
     float synthetic_distance_bt = aggregate.rel_pos1_length_sum_bt / static_cast<float>(aggregate.count);
     float synthetic_friction = mutator.ball_friction;
-    float synthetic_restitution = mutator.ball_restitution;
+    float synthetic_restitution = ball.constrained_2d ? 0.0f : mutator.ball_restitution;
     if (mutator.cal_ball_world) {
-        // The game's per-body average (solveGroupCacheFriendlySetup): one sample is used as is; more are scaled by
-        // 1/count (friction, restitution, lever) and the normal sum is normalized directly.
         normal = aggregate.normal_sum;
         synthetic_distance_bt = aggregate.rel_pos1_length_sum_bt;
         if (aggregate.count > 1) {
@@ -1904,13 +1989,10 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
     {
     }
 
-    const Vec3 normal_restitution_rel_vel = BallVelocityAtPoint(ball, rel_ball_contact);
-    const Vec3 normal_base_rel_vel = BallVelocityAtPoint(ball, rel_ball_contact, external_linear_delta);
-    const Vec3 tangent_basis_rel_vel = normal_base_rel_vel;
-    const Vec3 friction_base_rel_vel = normal_base_rel_vel;
+    const Vec3 tangent_basis_rel_vel(0.0f, 0.0f, 0.0f);
+    const Vec3 friction_base_rel_vel(0.0f, 0.0f, 0.0f);
 
     const Vec3 restitution_ball_linear = ball.vel;
-    const Vec3 rhs_ball_linear = ball.vel + external_linear_delta;
     const Vec3 ball_angular_world = ball.ang_vel;
     const float ball_inv_mass = 1.0f / mutator.ball_mass;
     const Vec3 ball_normal_component = ApplyInverseBallInertiaWorld(
@@ -1962,10 +2044,6 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
         ball_angular_world,
         Vec3(0.0f, 0.0f, 0.0f),
         Vec3(0.0f, 0.0f, 0.0f),
-        rhs_ball_linear,
-        ball_angular_world,
-        Vec3(0.0f, 0.0f, 0.0f),
-        Vec3(0.0f, 0.0f, 0.0f),
         external_linear_delta,
         Vec3(0.0f, 0.0f, 0.0f),
         Vec3(0.0f, 0.0f, 0.0f),
@@ -1982,8 +2060,6 @@ ROCKETGPU_HD void AppendBallWorldSpecialContactRows(
         &bt_tangent_basis_rel_vel,
         nullptr, nullptr, nullptr, nullptr,
         true);
-    (void)normal_restitution_rel_vel;
-    (void)normal_base_rel_vel;
 }
 
 ROCKETGPU_HD void ClampControls(CarControls& c) {
@@ -1998,6 +2074,7 @@ ROCKETGPU_HD void ClampControls(CarControls& c) {
 }
 
 ROCKETGPU_HD void ResetCarCommonState(CarState& car, const MutatorConfig& mutator, float spawn_boost) {
+    car.restored_inv_inertia_valid = 0;
     SetCarLinearVelocityBt(car, Vec3(0.0f, 0.0f, 0.0f));
     car.ang_vel = Vec3(0.0f, 0.0f, 0.0f);
     car.world_contact = {};
@@ -2007,6 +2084,7 @@ ROCKETGPU_HD void ResetCarCommonState(CarState& car, const MutatorConfig& mutato
     car.flip_time = 0.0f;
     car.internal_jump_time = 0.0f;
     car.internal_flip_time = 0.0f;
+    car.flip_timer_live = 1;
     car.air_time = 0.0f;
     car.air_time_since_jump = 0.0f;
     car.boosting_time = 0.0f;
@@ -2044,6 +2122,10 @@ ROCKETGPU_HD void ResetCarCommonState(CarState& car, const MutatorConfig& mutato
     car.vel_impulse_cache = Vec3(0.0f, 0.0f, 0.0f);
     car.ball_hit_info = BallHitInfo{};
     car.last_controls = CarControls{};
+    car.boost_pad_touching = 0;
+    car.driving_disabled = 0;
+    car.respawn_slot_override_plus1 = 0;
+    car.pad_frame_pos_valid = 0;
     (void)mutator;
 }
 
@@ -2058,16 +2140,14 @@ ROCKETGPU_HD void PlaceCarAtKickoffSpawn(
     float y = spawn.y;
     float yaw = spawn.yaw;
 
-    float yaw_official = spawn.yaw;
     if (team == Team::Orange) {
         x = -x;
         y = -y;
         yaw += Pi();
-        yaw_official = static_cast<float>(static_cast<double>(spawn.yaw) + 3.14159265358979323846);
     }
     SetCarOriginUu(car, Vec3(x, y, z));
     car.rot = FromYaw(WrapAngle(yaw));
-    SeedCarBasisFromSetEulerYPR(car, yaw_official);
+    SeedCarBasisFromSpawnRotator(car, SpawnYawRotatorUnits(spawn.yaw), team == Team::Orange);
     ResetCarCommonState(car, mutator, boost_amount);
 }
 
@@ -2082,12 +2162,9 @@ ROCKETGPU_HD void PlaceCarAtRespawnSpawn(
     const float y = (team == Team::Blue) ? spawn.y : -spawn.y;
     const float yaw = spawn.yaw + (team == Team::Blue ? 0.0f : Pi());
 
-    const float yaw_official = (team == Team::Blue)
-        ? spawn.yaw
-        : static_cast<float>(static_cast<double>(spawn.yaw) + 3.14159265358979323846);
     SetCarOriginUu(car, Vec3(x, y, z));
     car.rot = FromYaw(WrapAngle(yaw));
-    SeedCarBasisFromSetEulerYPR(car, yaw_official);
+    SeedCarBasisFromSpawnRotator(car, SpawnYawRotatorUnits(spawn.yaw), team == Team::Orange);
     ResetCarCommonState(car, mutator, boost_amount);
 }
 
@@ -2124,7 +2201,7 @@ ROCKETGPU_HD void BuildKickoffOrder(uint64_t seed, int env_idx, int* order) {
     }
 }
 
-ROCKETGPU_HD void PlaceNthTeamCarAtKickoff(
+ROCKETGPU_HD int PlaceNthTeamCarAtKickoff(
     int base,
     int count,
     Team team,
@@ -2133,7 +2210,8 @@ ROCKETGPU_HD void PlaceNthTeamCarAtKickoff(
     CarState* cars,
     const SpawnPos& spawn,
     const MutatorConfig& mutator,
-    const EnvState& env_state) {
+    const EnvState& env_state,
+    const CarConfig* car_configs) {
     int seen = 0;
     for (int k = 0; k < count; ++k) {
         const int i = CarVisitSlot(env_state, k, count);
@@ -2142,11 +2220,19 @@ ROCKETGPU_HD void PlaceNthTeamCarAtKickoff(
             continue;
         }
         if (seen == nth) {
-            PlaceCarAtKickoffSpawn(cars[idx], team, spawn, CarSpawnRestZ(), mutator, mutator.boost_spawn_amount);
-            return;
+            const float z = car_configs != nullptr ? car_configs[idx].spawn_z : CarSpawnRestZ();
+            PlaceCarAtKickoffSpawn(cars[idx], team, spawn, z, mutator, mutator.boost_spawn_amount);
+            return idx;
         }
         ++seen;
     }
+    return -1;
+}
+
+ROCKETGPU_HD void PendKickoffSpawn(CarState& car, int spot, float tick_dt) {
+    car.is_demoed = 1;
+    car.demo_respawn_timer = 1.5f * tick_dt;
+    car.respawn_slot_override_plus1 = static_cast<uint8_t>(kKickoffSpawnOverridePlus1 + spot);
 }
 
 ROCKETGPU_HD void ResetBall(BallState& ball) {
@@ -2167,13 +2253,14 @@ ROCKETGPU_HD void ResetBall(BallState& ball) {
     ball.ds_info = BallState::DropshotInfo{};
     ball.sleeping = 0;
     ball.deactivation_time = 0.0f;
+    ball.constrained_2d = 0;
 }
 
-ROCKETGPU_HD void ResetBall(BallState& ball, uint8_t game_mode) {
+ROCKETGPU_HD void ResetBall(BallState& ball, uint8_t game_mode, bool game_spawn = false) {
     ResetBall(ball);
-    if (game_mode == static_cast<uint8_t>(Mode::Soccar)) {
-        // The game spawns the kickoff ball asleep at z 92.75 (every recorded kickoff: exactly still, 0.4 uu inside the
-        // ball's 93.15 rest height, which a simulated ball can't hold), so it takes no gravity until a car touches it.
+    if (game_mode == static_cast<uint8_t>(Mode::Soccar) && game_spawn) {
+        SetBallOriginBt(ball, Vec3(0.0f, 0.0f, 2.0097436904907227f));
+    } else if (game_mode == static_cast<uint8_t>(Mode::Soccar)) {
         constexpr float kUuToBt = 1.0f / 50.0f;
         SetBallOriginBt(ball, Vec3(0.0f, 0.0f, 92.75f) * kUuToBt);
         ball.sleeping = 1;
@@ -2192,6 +2279,7 @@ ROCKETGPU_HD void ResetBoostPads(const SimConfig& cfg, BoostPadState* pads, int 
         pads[base + p].is_big = BoostPadIsBig(cfg, p);
         pads[base + p].prev_locked_car_id = 0;
         pads[base + p].cur_locked_car_id = 0;
+        pads[base + p].pickup_frac_q = 32768;
     }
 }
 
@@ -2216,7 +2304,10 @@ ROCKETGPU_HD void ResetEnvToKickoff(
     EnvState* env_states,
     uint8_t kickoff_seed_mode = 0,
     RespawnRngState* respawn_rng = nullptr,
-    const int* kickoff_order_override = nullptr) {
+    const int* kickoff_order_override = nullptr,
+    bool keep_boost_pads = false,
+    const CarConfig* car_configs = nullptr,
+    bool game_spawn = false) {
     constexpr float kCarSpawnExtraOffsetY = 250.0f;
 
     EnvState saved = env_states[env_idx];
@@ -2224,6 +2315,12 @@ ROCKETGPU_HD void ResetEnvToKickoff(
 
     env_states[env_idx].car_visit_order_mode = saved.car_visit_order_mode;
     env_states[env_idx].car_visit_order_packed = saved.car_visit_order_packed;
+    if (saved.car_visit_order_mode == 3) {
+        env_states[env_idx].car_visit_order_packed = 0x76543210u;
+        env_states[env_idx].car_visit_present_mask = 0xFFu;
+    }
+    env_states[env_idx].frame_ticks = saved.frame_ticks;
+    env_states[env_idx].frame_frac_prev = saved.frame_frac_prev;
     if (preserve_score) {
         env_states[env_idx].blue_score = saved.blue_score;
         env_states[env_idx].orange_score = saved.orange_score;
@@ -2231,7 +2328,7 @@ ROCKETGPU_HD void ResetEnvToKickoff(
         env_states[env_idx].last_scored_team = saved.last_scored_team;
     }
 
-    ResetBall(balls[env_idx], cfg.mutator.game_mode);
+    ResetBall(balls[env_idx], cfg.mutator.game_mode, game_spawn);
     if (cfg.mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker)) {
         const uint32_t draw = AdvanceDeterministicRng(MixSeed(seed ^ 0x9e3779b97f4a7c15ull, env_idx, 0x48534b4f));
         const float y_scale = (draw % 2u) ? 1.0f : -1.0f;
@@ -2242,14 +2339,16 @@ ROCKETGPU_HD void ResetEnvToKickoff(
         hs_ball.vel_bt = hs_ball.vel * (1.0f / 50.0f);
         hs_ball.hs_info = {};
     }
-    ResetBoostPads(cfg, pads, env_idx);
+    if (!keep_boost_pads) {
+        ResetBoostPads(cfg, pads, env_idx);
+    }
 
     const int base = env_idx * cfg.max_cars_per_env;
     const int count = env_car_count[env_idx];
     int blue_count = 0;
     int orange_count = 0;
     for (int i = 0; i < count; ++i) {
-        const Team team = teams[base + i];
+        const Team team = teams[base + CarVisitSlot(env_states[env_idx], i, count)];
         if (team == Team::Blue) {
             ++blue_count;
         } else {
@@ -2296,11 +2395,12 @@ ROCKETGPU_HD void ResetEnvToKickoff(
             ++respawn_counts[respawn_idx];
         }
 
-        if (slot < blue_count) {
-            PlaceNthTeamCarAtKickoff(base, count, Team::Blue, slot, teams, cars, spawn, cfg.mutator, env_states[env_idx]);
-        }
-        if (slot < orange_count) {
-            PlaceNthTeamCarAtKickoff(base, count, Team::Orange, slot, teams, cars, spawn, cfg.mutator, env_states[env_idx]);
+        for (int t = 0; t < 2; ++t) {
+            const Team team = t == 0 ? Team::Blue : Team::Orange;
+            if (slot >= (t == 0 ? blue_count : orange_count)) continue;
+            const int idx = PlaceNthTeamCarAtKickoff(base, count, team, slot, teams, cars, spawn, cfg.mutator,
+                                                     env_states[env_idx], car_configs);
+            if (game_spawn && idx >= 0 && slot < 5) PendKickoffSpawn(cars[idx], kickoff_order[slot], cfg.tick_dt);
         }
     }
 }
@@ -2316,11 +2416,19 @@ ROCKETGPU_HD int PickRespawnSlot(uint64_t seed, int env_idx, uint64_t current_ti
     return static_cast<int>(state % 4u);
 }
 
-ROCKETGPU_HD void RespawnCar(CarState& car, Team team, int slot, const MutatorConfig& mutator) {
+ROCKETGPU_HD void RespawnCar(CarState& car, Team team, int slot, const MutatorConfig& mutator, float spawn_z) {
     const SpawnPos spawn = SoccarRespawnSpawn(slot % 4);
-    PlaceCarAtRespawnSpawn(car, team, spawn, CarRespawnZ(), mutator, mutator.boost_spawn_amount);
+    PlaceCarAtRespawnSpawn(car, team, spawn, spawn_z, mutator, mutator.boost_spawn_amount);
     car.vel_impulse_cache = Vec3(0.0f, 0.0f, 0.0f);
-    car.just_respawned = 1;
+}
+
+ROCKETGPU_HD void KickoffSpawnCar(CarState& car, Team team, int spot, const MutatorConfig& mutator, float spawn_z) {
+    const SpawnPos spawn = mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker) ? HeatseekerKickoffSpawn(spot)
+                                                                                         : SoccarKickoffSpawn(spot);
+    const uint16_t driving_disabled = car.driving_disabled;
+    PlaceCarAtKickoffSpawn(car, team, spawn, spawn_z, mutator, mutator.boost_spawn_amount);
+    car.driving_disabled = driving_disabled;
+    car.vel_impulse_cache = Vec3(0.0f, 0.0f, 0.0f);
 }
 
 ROCKETGPU_HD void UpdateSupersonicCalDemo(CarState& car, const MutatorConfig& mutator, float dt) {
@@ -2383,274 +2491,3 @@ ROCKETGPU_HD void MaybeUpdateBestHitFraction(
     uint8_t kind = ROCKETGPU_ARENA_RAY_HIT_UNKNOWN,
     int32_t mesh_index = -1,
     int32_t tri_index = -1);
-
-inline thread_local const int32_t* g_host_validation_respawn_order_cache = nullptr;
-inline thread_local int32_t g_host_validation_respawn_order_env_count = 0;
-inline thread_local int32_t g_host_validation_respawn_order_stride = 0;
-
-inline bool TryGetHostValidationRespawnOrder(
-    int env_idx,
-    const int32_t*& order) {
-    return false;
-}
-
-#if defined(ROCKETGPU_CAN_COMPILE_OFFICIAL_HOST_HELPERS)
-struct ArenaMeshTriangleHost {
-    Vec3 a = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 b = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 c = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 normal = Vec3(0.0f, 0.0f, 1.0f);
-    Vec3 min = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 max = Vec3(0.0f, 0.0f, 0.0f);
-    float edge_v0v1_angle = 2.0f * Pi();
-    float edge_v1v2_angle = 2.0f * Pi();
-    float edge_v2v0_angle = 2.0f * Pi();
-    uint8_t edge_flags = 0;
-    int32_t mesh_index = -1;
-    int32_t tri_index = -1;
-    uint16_t quantized_aabb_min[3] = {0, 0, 0};
-    uint16_t quantized_aabb_max[3] = {0, 0, 0};
-};
-
-ROCKETGPU_HD bool ComputeCarArenaTriangleContactHost(
-    const CarState& car,
-    const CarConfig& cfg,
-    const ArenaMeshTriangleHost& tri,
-    float contact_threshold_bt,
-    Vec3& out_normal,
-    float& out_distance_bt);
-
-ROCKETGPU_HD const std::vector<ArenaMeshTriangleHost>& ArenaMeshTrianglesHost() {
-    static std::once_flag once;
-    static std::vector<ArenaMeshTriangleHost> triangles;
-    std::call_once(once, []() {
-        struct TriangleIndex {
-            int32_t vertex_index[3];
-        };
-        struct MeshVertex {
-            float x;
-            float y;
-            float z;
-        };
-        auto get_internal_edge_angle = [](const Vec3& ref_axis0, const Vec3& ref_axis1, const Vec3& swing_axis) {
-            return SafeAtan2(Dot(swing_axis, ref_axis0), Dot(swing_axis, ref_axis1));
-        };
-        auto populate_triangle_internal_edge_info = [&](const std::vector<TriangleIndex>& tri_indices,
-                                                        std::vector<ArenaMeshTriangleHost>& out_triangles,
-                                                        int tri_a_idx,
-                                                        int tri_b_idx) {
-            (void)tri_indices;
-
-            constexpr float kEqualVertexThresholdSq = 1.0e-4f * 1.0e-4f;
-            const ArenaMeshTriangleHost& tri_a_ref = out_triangles[static_cast<size_t>(tri_a_idx)];
-            const ArenaMeshTriangleHost& tri_b_ref = out_triangles[static_cast<size_t>(tri_b_idx)];
-            const Vec3 verts_a[3] = {tri_a_ref.a, tri_a_ref.b, tri_a_ref.c};
-            const Vec3 verts_b[3] = {tri_b_ref.a, tri_b_ref.b, tri_b_ref.c};
-            int shared_verts_a[2] = {-1, -1};
-            int shared_verts_b[2] = {-1, -1};
-            int shared_count = 0;
-            for (int i = 0; i < 3; ++i) {
-                for (int j = 0; j < 3; ++j) {
-                    const Vec3 delta = verts_a[i] - verts_b[j];
-                    if (LengthSq(delta) < kEqualVertexThresholdSq) {
-                        shared_verts_a[shared_count] = i;
-                        shared_verts_b[shared_count] = j;
-                        ++shared_count;
-                        if (shared_count >= 3) {
-                            return;
-                        }
-                        break;
-                    }
-                }
-                if (shared_count >= 3) {
-                    return;
-                }
-            }
-            if (shared_count != 2) {
-                return;
-            }
-
-            if (shared_verts_a[0] == 0 && shared_verts_a[1] == 2) {
-                std::swap(shared_verts_a[0], shared_verts_a[1]);
-                std::swap(shared_verts_b[0], shared_verts_b[1]);
-            }
-
-            ArenaMeshTriangleHost& tri_a = out_triangles[static_cast<size_t>(tri_a_idx)];
-            const ArenaMeshTriangleHost& tri_b = out_triangles[static_cast<size_t>(tri_b_idx)];
-            const Vec3 tri_a_vertices[3] = {tri_a.a, tri_a.b, tri_a.c};
-            const Vec3 tri_b_vertices[3] = {tri_b.a, tri_b.b, tri_b.c};
-
-            const int sum_verts_a = shared_verts_a[0] + shared_verts_a[1];
-            const int other_index_a = 3 - sum_verts_a;
-            const int other_index_b = 3 - (shared_verts_b[0] + shared_verts_b[1]);
-
-            Vec3 edge = tri_a_vertices[shared_verts_a[1]] - tri_a_vertices[shared_verts_a[0]];
-            if (LengthSq(edge) <= 1.0e-12f) {
-                return;
-            }
-            edge = Normalize(edge, Vec3(1.0f, 0.0f, 0.0f));
-
-            const Vec3 normal_a = Normalize(tri_a.normal, Vec3(0.0f, 0.0f, 1.0f));
-            const Vec3 tri_b0 = tri_b_vertices[shared_verts_b[1]];
-            const Vec3 tri_b1 = tri_b_vertices[shared_verts_b[0]];
-            const Vec3 tri_b2 = tri_b_vertices[other_index_b];
-            Vec3 normal_b = Normalize(Cross(tri_b1 - tri_b0, tri_b2 - tri_b0), Normalize(tri_b.normal, Vec3(0.0f, 0.0f, 1.0f)));
-
-            Vec3 edge_cross_a = Normalize(Cross(edge, normal_a), normal_a);
-            if (Dot(edge_cross_a, tri_a_vertices[other_index_a] - tri_a_vertices[shared_verts_a[0]]) < 0.0f) {
-                edge_cross_a = -edge_cross_a;
-            }
-
-            Vec3 edge_cross_b = Normalize(Cross(edge, normal_b), normal_b);
-            if (Dot(edge_cross_b, tri_b_vertices[other_index_b] - tri_b_vertices[shared_verts_b[0]]) < 0.0f) {
-                edge_cross_b = -edge_cross_b;
-            }
-
-            float corrected_angle = 0.0f;
-            bool is_convex = false;
-            const Vec3 calculated_edge = Cross(edge_cross_a, edge_cross_b);
-            if (LengthSq(calculated_edge) >= 0.0001f) {
-                const Vec3 calculated_edge_unit = Normalize(calculated_edge, edge);
-                const Vec3 calculated_normal_a = Normalize(Cross(calculated_edge_unit, edge_cross_a), normal_a);
-                const float angle2 = get_internal_edge_angle(calculated_normal_a, edge_cross_a, edge_cross_b);
-                const float ang4 = Pi() - angle2;
-                is_convex = Dot(normal_a, edge_cross_b) < 0.0f;
-                corrected_angle = is_convex ? ang4 : -ang4;
-            }
-
-            auto set_edge_info = [&](float& edge_angle, uint8_t convex_flag, uint8_t swap_flag, const Vec3& edge_axis) {
-                Vec3 computed_normal_b = Rotate(
-                    AxisAngle(Normalize(edge_axis, Vec3(1.0f, 0.0f, 0.0f)), -corrected_angle),
-                    normal_a);
-                if (Dot(computed_normal_b, normal_b) < 0.0f) {
-                    computed_normal_b = -computed_normal_b;
-                    tri_a.edge_flags = static_cast<uint8_t>(tri_a.edge_flags | swap_flag);
-                }
-                edge_angle = -corrected_angle;
-                if (is_convex) {
-                    tri_a.edge_flags = static_cast<uint8_t>(tri_a.edge_flags | convex_flag);
-                }
-            };
-
-            switch (sum_verts_a) {
-                case 1:
-                    set_edge_info(
-                        tri_a.edge_v0v1_angle,
-                        ROCKETGPU_TRI_INFO_V0V1_CONVEX,
-                        ROCKETGPU_TRI_INFO_V0V1_SWAP_NORMALB,
-                        tri_a_vertices[0] - tri_a_vertices[1]);
-                    break;
-                case 2:
-                    set_edge_info(
-                        tri_a.edge_v2v0_angle,
-                        ROCKETGPU_TRI_INFO_V2V0_CONVEX,
-                        ROCKETGPU_TRI_INFO_V2V0_SWAP_NORMALB,
-                        tri_a_vertices[2] - tri_a_vertices[0]);
-                    break;
-                case 3:
-                    set_edge_info(
-                        tri_a.edge_v1v2_angle,
-                        ROCKETGPU_TRI_INFO_V1V2_CONVEX,
-                        ROCKETGPU_TRI_INFO_V1V2_SWAP_NORMALB,
-                        tri_a_vertices[1] - tri_a_vertices[2]);
-                    break;
-                default:
-                    break;
-            }
-        };
-
-        std::filesystem::path root(OfficialCollisionMeshRoot());
-        const std::filesystem::path soccar_dir = root / "soccar";
-        if (!std::filesystem::exists(soccar_dir)) {
-            throw std::runtime_error("official RocketSim collision meshes not found");
-        }
-
-        for (int idx = 0; idx < 16; ++idx) {
-            const std::filesystem::path mesh_path = soccar_dir / ("mesh_" + std::to_string(idx) + ".cmf");
-            std::ifstream input(mesh_path, std::ios::binary);
-            if (!input) {
-                throw std::runtime_error("failed to open collision mesh: " + mesh_path.string());
-            }
-
-            int32_t num_tris = 0;
-            int32_t num_vertices = 0;
-            input.read(reinterpret_cast<char*>(&num_tris), sizeof(num_tris));
-            input.read(reinterpret_cast<char*>(&num_vertices), sizeof(num_vertices));
-            if (!input || num_tris <= 0 || num_vertices <= 0) {
-                throw std::runtime_error("invalid collision mesh header: " + mesh_path.string());
-            }
-
-            std::vector<TriangleIndex> tri_indices(static_cast<size_t>(num_tris));
-            std::vector<MeshVertex> vertices(static_cast<size_t>(num_vertices));
-            input.read(reinterpret_cast<char*>(tri_indices.data()), static_cast<std::streamsize>(tri_indices.size() * sizeof(TriangleIndex)));
-            input.read(reinterpret_cast<char*>(vertices.data()), static_cast<std::streamsize>(vertices.size() * sizeof(MeshVertex)));
-            if (!input) {
-                throw std::runtime_error("failed to read collision mesh: " + mesh_path.string());
-            }
-
-            Vec3 mesh_min(std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity());
-            Vec3 mesh_max(-std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity());
-            for (int32_t tri_i = 0; tri_i < num_tris; ++tri_i) {
-                const TriangleIndex& tri_idx = tri_indices[static_cast<size_t>(tri_i)];
-                if (tri_idx.vertex_index[0] < 0 || tri_idx.vertex_index[0] >= num_vertices ||
-                    tri_idx.vertex_index[1] < 0 || tri_idx.vertex_index[1] >= num_vertices ||
-                    tri_idx.vertex_index[2] < 0 || tri_idx.vertex_index[2] >= num_vertices) {
-                    throw std::runtime_error("collision mesh triangle index out of range: " + mesh_path.string());
-                }
-
-                const MeshVertex& va = vertices[static_cast<size_t>(tri_idx.vertex_index[0])];
-                const MeshVertex& vb = vertices[static_cast<size_t>(tri_idx.vertex_index[1])];
-                const MeshVertex& vc = vertices[static_cast<size_t>(tri_idx.vertex_index[2])];
-
-                ArenaMeshTriangleHost tri;
-                tri.a = Vec3(va.x, va.y, va.z);
-                tri.b = Vec3(vb.x, vb.y, vb.z);
-                tri.c = Vec3(vc.x, vc.y, vc.z);
-                tri.normal = Normalize(Cross(tri.b - tri.a, tri.c - tri.a), Vec3(0.0f, 0.0f, 1.0f));
-                tri.min = Vec3(
-                    Min(tri.a.x, Min(tri.b.x, tri.c.x)),
-                    Min(tri.a.y, Min(tri.b.y, tri.c.y)),
-                    Min(tri.a.z, Min(tri.b.z, tri.c.z)));
-                tri.max = Vec3(
-                    Max(tri.a.x, Max(tri.b.x, tri.c.x)),
-                    Max(tri.a.y, Max(tri.b.y, tri.c.y)),
-                    Max(tri.a.z, Max(tri.b.z, tri.c.z)));
-                tri.mesh_index = idx;
-                tri.tri_index = tri_i;
-                mesh_min = MinComponents(mesh_min, tri.min);
-                mesh_max = MaxComponents(mesh_max, tri.max);
-                triangles.push_back(tri);
-            }
-
-            ArenaMeshBvhQuantization quantization;
-            SetArenaMeshBvhQuantization(quantization, mesh_min, mesh_max);
-            for (size_t tri_pos = triangles.size() - static_cast<size_t>(num_tris); tri_pos < triangles.size(); ++tri_pos) {
-                ArenaMeshTriangleHost& tri = triangles[tri_pos];
-                QuantizeArenaMeshBvhPoint(quantization, tri.min, 0, tri.quantized_aabb_min);
-                QuantizeArenaMeshBvhPoint(quantization, tri.max, 1, tri.quantized_aabb_max);
-            }
-
-            const size_t mesh_base = triangles.size() - static_cast<size_t>(num_tris);
-            for (int32_t tri_a = 0; tri_a < num_tris; ++tri_a) {
-                const ArenaMeshTriangleHost& tri_a_ref = triangles[mesh_base + static_cast<size_t>(tri_a)];
-                for (int32_t tri_b = 0; tri_b < num_tris; ++tri_b) {
-                    if (tri_a == tri_b) continue;
-                    const ArenaMeshTriangleHost& tri_b_ref = triangles[mesh_base + static_cast<size_t>(tri_b)];
-                    if (tri_a_ref.max.x < tri_b_ref.min.x || tri_a_ref.min.x > tri_b_ref.max.x ||
-                        tri_a_ref.max.y < tri_b_ref.min.y || tri_a_ref.min.y > tri_b_ref.max.y ||
-                        tri_a_ref.max.z < tri_b_ref.min.z || tri_a_ref.min.z > tri_b_ref.max.z) {
-                        continue;
-                    }
-                    populate_triangle_internal_edge_info(
-                        tri_indices,
-                        triangles,
-                        static_cast<int>(mesh_base + static_cast<size_t>(tri_a)),
-                        static_cast<int>(mesh_base + static_cast<size_t>(tri_b)));
-                }
-            }
-        }
-    });
-    return triangles;
-}
-
-#endif

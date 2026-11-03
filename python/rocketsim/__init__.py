@@ -29,6 +29,7 @@ _PRESETS = {
     "CAR_CONFIG_HYBRID": "HybridConfig",
     "CAR_CONFIG_MERC": "MercConfig",
     "CAR_CONFIG_PSYCLOPS": "PsyclopsConfig",
+    "CAR_CONFIG_BATMOBILE": "BatmobileConfig",
 }
 for _name, _fn in _PRESETS.items():
     if hasattr(_rs, _fn):

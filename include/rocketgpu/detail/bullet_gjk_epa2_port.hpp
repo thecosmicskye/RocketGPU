@@ -1,12 +1,3 @@
-/*
-Bullet Continuous Collision Detection and Physics Library
-Copyright (c) 2003-2008 Erwin Coumans  https://bulletphysics.org
-
-This file is a device-safe local port of Bullet's btGjkEpa2.h/.cpp, adapted
-to use rocketgpu math/types while keeping the control flow and structure
-as close as practical to the original source.
-*/
-
 #pragma once
 
 #include <cstdlib>
@@ -337,9 +328,6 @@ enum btShapeKind : uint8_t {
     BT_SHAPE_CONVEX_HULL = 3,
 };
 
-// Out of line: only the Snowday puck is a hull, and inlined into every support call the unrolled loop is about 7k
-// SASS of EPA::Evaluate alone, between the box/triangle paths that run. Arguments by value (see SPEED_TRIED:
-// no address of a local into a noinline call).
 ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE int btHullSupportIndex(const btVector3* points, int count, btVector3 vec) {
     btScalar max_dot = -3.402823466e+38f;
     int max_index = -1;
@@ -515,56 +503,6 @@ struct btConvexHullShape : public btConvexShape {
 
 struct btGjkEpaScratch;
 
-struct btGjkEpaDebugStop {
-    int32_t requested_phase = 0;
-    int32_t hit_phase = 0;
-    int32_t stage = 0;
-    int32_t status = 0;
-    int32_t rank = 0;
-    btScalar detail0 = 0.0f;
-    btScalar detail1 = 0.0f;
-    btVector3 detail_vec0 = btVector3(0.0f, 0.0f, 0.0f);
-    btVector3 detail_vec1 = btVector3(0.0f, 0.0f, 0.0f);
-
-    ROCKETGPU_HD bool Stop(int32_t phase, int32_t stage_value, int32_t status_value, int32_t rank_value, btScalar detail0_value, btScalar detail1_value) {
-        return StopRequested(requested_phase, phase, stage_value, status_value, rank_value, detail0_value, detail1_value);
-    }
-
-    ROCKETGPU_HD bool StopRequested(int32_t requested, int32_t phase, int32_t stage_value, int32_t status_value, int32_t rank_value, btScalar detail0_value, btScalar detail1_value) {
-        if (requested != phase) {
-            return false;
-        }
-        requested_phase = requested;
-        hit_phase = phase;
-        stage = stage_value;
-        status = status_value;
-        rank = rank_value;
-        detail0 = detail0_value;
-        detail1 = detail1_value;
-        detail_vec0 = btVector3(0.0f, 0.0f, 0.0f);
-        detail_vec1 = btVector3(0.0f, 0.0f, 0.0f);
-        return true;
-    }
-
-    ROCKETGPU_HD bool StopVec(
-        int32_t requested,
-        int32_t phase,
-        int32_t stage_value,
-        int32_t status_value,
-        int32_t rank_value,
-        btScalar detail0_value,
-        btScalar detail1_value,
-        const btVector3& detail_vec0_value,
-        const btVector3& detail_vec1_value) {
-        if (!StopRequested(requested, phase, stage_value, status_value, rank_value, detail0_value, detail1_value)) {
-            return false;
-        }
-        detail_vec0 = detail_vec0_value;
-        detail_vec1 = detail_vec1_value;
-        return true;
-    }
-};
-
 struct btGjkEpaSolver2
 {
     struct sResults
@@ -605,8 +543,7 @@ struct btGjkEpaSolver2
                                        const btVector3& guess,
                                        sResults& results,
                                        btGjkEpaScratch& scratch,
-                                       bool usemargins = true,
-                                       btGjkEpaDebugStop* debug_stop = nullptr);
+                                       bool usemargins = true);
 
     static btScalar SignedDistance(const btVector3& position,
                                    btScalar margin,
@@ -630,7 +567,6 @@ namespace gjkepa2_impl
 #define GJK_SIMPLEX3_EPS ((btScalar)0.0)
 #define GJK_SIMPLEX4_EPS ((btScalar)0.0)
 
-// The game links Bullet 2.82's 64-vertex EPA store (EPA::Evaluate stops at 64 vertices; 128 faces).
 #define EPA_MAX_VERTICES 64
 #define EPA_MAX_ITERATIONS 255
 #define EPA_ACCURACY ((btScalar)0.0001)
@@ -686,26 +622,6 @@ struct MinkowskiDiff
 
 typedef MinkowskiDiff tShape;
 
-inline void TraceDebugEpaWitnessReconstruct(
-    const btVector3 support0_dir_norm[4],
-    const btVector3 support0_without_margin[4],
-    const btVector3 support0[4],
-    const btVector3& w0,
-    const btTransform& wtrs0,
-    const btVector3& normal,
-    btScalar depth) {
-#if defined(ROCKETGPU_CAN_COMPILE_OFFICIAL_HOST_HELPERS)
-#else
-    (void)support0_dir_norm;
-    (void)support0_without_margin;
-    (void)support0;
-    (void)w0;
-    (void)wtrs0;
-    (void)normal;
-    (void)depth;
-#endif
-}
-
 struct GJK
 {
     struct sSV
@@ -738,13 +654,6 @@ struct GJK
     U m_current;
     sSimplex* m_simplex;
     eStatus::_ m_status;
-    btVector3 m_debug_seed_query_dir;
-    btVector3 m_debug_seed_support_d;
-    btVector3 m_debug_seed_support_w;
-    btVector3 m_debug_seed_support0;
-    btVector3 m_debug_seed_support1_dir_local;
-    btVector3 m_debug_seed_support1_local;
-    btVector3 m_debug_seed_support1;
 
     ROCKETGPU_HD GJK()
     {
@@ -758,21 +667,11 @@ struct GJK
         m_status = eStatus::Failed;
         m_current = 0;
         m_distance = 0;
-#if defined(ROCKETGPU_GJK_EPA_DEBUG)
-        m_debug_seed_query_dir = btVector3(0, 0, 0);
-        m_debug_seed_support_d = btVector3(0, 0, 0);
-        m_debug_seed_support_w = btVector3(0, 0, 0);
-        m_debug_seed_support0 = btVector3(0, 0, 0);
-        m_debug_seed_support1_dir_local = btVector3(0, 0, 0);
-        m_debug_seed_support1_local = btVector3(0, 0, 0);
-        m_debug_seed_support1 = btVector3(0, 0, 0);
-#endif
     }
 
     ROCKETGPU_HD eStatus::_ Evaluate(
         const tShape& shapearg,
-        const btVector3& guess,
-        const btGjkEpaDebugStop* debug_stop = nullptr)
+        const btVector3& guess)
     {
         U iterations = 0;
         btScalar sqdist = 0;
@@ -794,31 +693,6 @@ struct GJK
         const btVector3 seed_query_dir = sqrl > 0 ? -m_ray : btVector3(1, 0, 0);
         appendvertice(m_simplices[0], seed_query_dir);
         m_simplices[0].p[0] = 1;
-#if defined(ROCKETGPU_GJK_EPA_DEBUG)
-        m_debug_seed_query_dir = seed_query_dir;
-        m_debug_seed_support_d = m_simplices[0].c[0]->d;
-        m_debug_seed_support_w = m_simplices[0].c[0]->w;
-#if defined(ROCKETGPU_CAN_COMPILE_OFFICIAL_HOST_HELPERS)
-        constexpr bool kTraceSeedSupport = true;
-#else
-        constexpr bool kTraceSeedSupport = false;
-#endif
-        const bool capture_seed_support =
-            kTraceSeedSupport ||
-            (debug_stop && debug_stop->requested_phase >= 229 && debug_stop->requested_phase <= 231);
-        if (capture_seed_support) {
-            const btVector3 seed_support0 = m_shape.Support0(m_simplices[0].c[0]->d);
-            const btVector3 seed_support1_dir_local = m_shape.m_toshape1 * (-m_simplices[0].c[0]->d);
-            const btVector3 seed_support1_local = m_shape.m_enableMargin
-                ? m_shape.m_shapes[1]->localGetSupportVertexNonVirtual(seed_support1_dir_local)
-                : m_shape.m_shapes[1]->localGetSupportVertexWithoutMarginNonVirtual(seed_support1_dir_local);
-            const btVector3 seed_support1 = m_shape.Support1(-m_simplices[0].c[0]->d);
-            m_debug_seed_support0 = seed_support0;
-            m_debug_seed_support1_dir_local = seed_support1_dir_local;
-            m_debug_seed_support1_local = seed_support1_local;
-            m_debug_seed_support1 = seed_support1;
-        }
-#endif
         m_ray = m_simplices[0].c[0]->w;
         sqdist = sqrl;
         lastw[0] =
@@ -839,10 +713,6 @@ struct GJK
             appendvertice(cs, -m_ray);
             const btVector3& w = cs.c[cs.rank - 1]->w;
 #if defined(ROCKETGPU_CAN_COMPILE_OFFICIAL_HOST_HELPERS)
-            const btVector3 iter_support1_dir_local = m_shape.m_toshape1 * (-cs.c[cs.rank - 1]->d);
-            const btVector3 iter_support1_local = m_shape.m_enableMargin
-                ? m_shape.m_shapes[1]->localGetSupportVertexNonVirtual(iter_support1_dir_local)
-                : m_shape.m_shapes[1]->localGetSupportVertexWithoutMarginNonVirtual(iter_support1_dir_local);
 #endif
             bool found = false;
             for (U i = 0; i < 4; ++i)
@@ -1221,50 +1091,6 @@ struct EPA
     U m_nextsv;
     sList m_hull;
     sList m_stock;
-    int32_t m_debug_first_iteration;
-    int32_t m_debug_last_iteration;
-    int32_t m_debug_first_support1_max_axis;
-    int32_t m_debug_last_support1_max_axis;
-    btScalar m_debug_first_best_d;
-    btScalar m_debug_first_wdist;
-    btScalar m_debug_last_best_d;
-    btScalar m_debug_last_wdist;
-    btVector3 m_debug_first_best_n;
-    btVector3 m_debug_first_best_w0;
-    btVector3 m_debug_first_best_w1;
-    btVector3 m_debug_first_best_w2;
-    btVector3 m_debug_first_support_vertex_d;
-    btVector3 m_debug_first_support0;
-    btVector3 m_debug_first_support1_dir_local;
-    btVector3 m_debug_first_support1_toshape1_row0;
-    btVector3 m_debug_first_support1_toshape1_row1;
-    btVector3 m_debug_first_support1_toshape1_row2;
-    btVector3 m_debug_first_support1_toshape0_row0;
-    btVector3 m_debug_first_support1_toshape0_row1;
-    btVector3 m_debug_first_support1_toshape0_row2;
-    btVector3 m_debug_first_support1_toshape0_origin;
-    btVector3 m_debug_first_support1_dots;
-    btVector3 m_debug_first_support1_local;
-    btVector3 m_debug_first_support1;
-    btVector3 m_debug_first_support_w;
-    btVector3 m_debug_last_best_n;
-    btVector3 m_debug_last_best_w0;
-    btVector3 m_debug_last_best_w1;
-    btVector3 m_debug_last_best_w2;
-    btVector3 m_debug_last_support_vertex_d;
-    btVector3 m_debug_last_support0;
-    btVector3 m_debug_last_support1_dir_local;
-    btVector3 m_debug_last_support1_toshape1_row0;
-    btVector3 m_debug_last_support1_toshape1_row1;
-    btVector3 m_debug_last_support1_toshape1_row2;
-    btVector3 m_debug_last_support1_toshape0_row0;
-    btVector3 m_debug_last_support1_toshape0_row1;
-    btVector3 m_debug_last_support1_toshape0_row2;
-    btVector3 m_debug_last_support1_toshape0_origin;
-    btVector3 m_debug_last_support1_dots;
-    btVector3 m_debug_last_support1_local;
-    btVector3 m_debug_last_support1;
-    btVector3 m_debug_last_support_w;
 
     ROCKETGPU_HD EPA()
     {
@@ -1304,124 +1130,10 @@ struct EPA
         m_nextsv = 0;
         m_hull = sList();
         m_stock = sList();
-#if defined(ROCKETGPU_GJK_EPA_DEBUG)
-        m_debug_first_iteration = -1;
-        m_debug_last_iteration = -1;
-        m_debug_first_support1_max_axis = -1;
-        m_debug_last_support1_max_axis = -1;
-        m_debug_first_best_d = 0.0f;
-        m_debug_first_wdist = 0.0f;
-        m_debug_last_best_d = 0.0f;
-        m_debug_last_wdist = 0.0f;
-        m_debug_first_best_n = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_best_w0 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_best_w1 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_best_w2 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_support_vertex_d = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_support0 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_support1_dir_local = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_support1_toshape1_row0 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_support1_toshape1_row1 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_support1_toshape1_row2 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_support1_toshape0_row0 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_support1_toshape0_row1 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_support1_toshape0_row2 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_support1_toshape0_origin = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_support1_dots = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_support1_local = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_support1 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_first_support_w = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_best_n = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_best_w0 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_best_w1 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_best_w2 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_support_vertex_d = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_support0 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_support1_dir_local = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_support1_toshape1_row0 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_support1_toshape1_row1 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_support1_toshape1_row2 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_support1_toshape0_row0 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_support1_toshape0_row1 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_support1_toshape0_row2 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_support1_toshape0_origin = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_support1_dots = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_support1_local = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_support1 = btVector3(0.0f, 0.0f, 0.0f);
-        m_debug_last_support_w = btVector3(0.0f, 0.0f, 0.0f);
-#endif
         for (U i = 0; i < EPA_MAX_FACES; ++i)
         {
             append(m_stock, &m_fc_store[EPA_MAX_FACES - i - 1]);
         }
-    }
-
-    ROCKETGPU_HD void CaptureIterationDebug(
-        int32_t iteration,
-        const sFace* best,
-        const sSV* w,
-        const btVector3& support0,
-        const btVector3& support1_dir_local,
-        const btVector3& support1_toshape1_row0,
-        const btVector3& support1_toshape1_row1,
-        const btVector3& support1_toshape1_row2,
-        const btVector3& support1_toshape0_row0,
-        const btVector3& support1_toshape0_row1,
-        const btVector3& support1_toshape0_row2,
-        const btVector3& support1_toshape0_origin,
-        const btVector3& support1_dots,
-        int32_t support1_max_axis,
-        const btVector3& support1_local,
-        const btVector3& support1,
-        btScalar wdist)
-    {
-        const bool capture_first = m_debug_first_iteration < 0;
-        if (capture_first) {
-            m_debug_first_iteration = iteration;
-            m_debug_first_support1_max_axis = support1_max_axis;
-            m_debug_first_best_d = best->d;
-            m_debug_first_wdist = wdist;
-            m_debug_first_best_n = best->n;
-            m_debug_first_best_w0 = best->c[0]->w;
-            m_debug_first_best_w1 = best->c[1]->w;
-            m_debug_first_best_w2 = best->c[2]->w;
-            m_debug_first_support_vertex_d = w->d;
-            m_debug_first_support0 = support0;
-            m_debug_first_support1_dir_local = support1_dir_local;
-            m_debug_first_support1_toshape1_row0 = support1_toshape1_row0;
-            m_debug_first_support1_toshape1_row1 = support1_toshape1_row1;
-            m_debug_first_support1_toshape1_row2 = support1_toshape1_row2;
-            m_debug_first_support1_toshape0_row0 = support1_toshape0_row0;
-            m_debug_first_support1_toshape0_row1 = support1_toshape0_row1;
-            m_debug_first_support1_toshape0_row2 = support1_toshape0_row2;
-            m_debug_first_support1_toshape0_origin = support1_toshape0_origin;
-            m_debug_first_support1_dots = support1_dots;
-            m_debug_first_support1_local = support1_local;
-            m_debug_first_support1 = support1;
-            m_debug_first_support_w = w->w;
-        }
-        m_debug_last_iteration = iteration;
-        m_debug_last_support1_max_axis = support1_max_axis;
-        m_debug_last_best_d = best->d;
-        m_debug_last_wdist = wdist;
-        m_debug_last_best_n = best->n;
-        m_debug_last_best_w0 = best->c[0]->w;
-        m_debug_last_best_w1 = best->c[1]->w;
-        m_debug_last_best_w2 = best->c[2]->w;
-        m_debug_last_support_vertex_d = w->d;
-        m_debug_last_support0 = support0;
-        m_debug_last_support1_dir_local = support1_dir_local;
-        m_debug_last_support1_toshape1_row0 = support1_toshape1_row0;
-        m_debug_last_support1_toshape1_row1 = support1_toshape1_row1;
-        m_debug_last_support1_toshape1_row2 = support1_toshape1_row2;
-        m_debug_last_support1_toshape0_row0 = support1_toshape0_row0;
-        m_debug_last_support1_toshape0_row1 = support1_toshape0_row1;
-        m_debug_last_support1_toshape0_row2 = support1_toshape0_row2;
-        m_debug_last_support1_toshape0_origin = support1_toshape0_origin;
-        m_debug_last_support1_dots = support1_dots;
-        m_debug_last_support1_local = support1_local;
-        m_debug_last_support1 = support1;
-        m_debug_last_support_w = w->w;
     }
 
     ROCKETGPU_HD eStatus::_ Evaluate(GJK& gjk, const btVector3& guess)
@@ -1477,54 +1189,6 @@ struct EPA
                         bool valid = true;
                         best->pass = (U1)(++pass);
                         gjk.getsupport(best->n, *w);
-#if defined(ROCKETGPU_GJK_EPA_DEBUG)
-                        const btVector3 support0 = gjk.m_shape.Support0(w->d);
-                        const btVector3 support1_dir_local = gjk.m_shape.m_toshape1 * (-w->d);
-                        const btVector3 support1_toshape1_row0 = gjk.m_shape.m_toshape1[0];
-                        const btVector3 support1_toshape1_row1 = gjk.m_shape.m_toshape1[1];
-                        const btVector3 support1_toshape1_row2 = gjk.m_shape.m_toshape1[2];
-                        const btVector3 support1_toshape0_row0 = gjk.m_shape.m_toshape0.getBasis()[0];
-                        const btVector3 support1_toshape0_row1 = gjk.m_shape.m_toshape0.getBasis()[1];
-                        const btVector3 support1_toshape0_row2 = gjk.m_shape.m_toshape0.getBasis()[2];
-                        const btVector3 support1_toshape0_origin = gjk.m_shape.m_toshape0.getOrigin();
-                        const btVector3 support1_vertex0 = gjk.m_shape.m_shapes[1]->m_vertices1[0];
-                        const btVector3 support1_vertex1 = gjk.m_shape.m_shapes[1]->m_vertices1[1];
-                        const btVector3 support1_vertex2 = gjk.m_shape.m_shapes[1]->m_vertices1[2];
-                        const btVector3 support1_dots =
-                            support1_dir_local.dot3(support1_vertex0, support1_vertex1, support1_vertex2);
-                        const int support1_max_axis = support1_dots.maxAxis();
-                        btVector3 support1_dir_norm = support1_dir_local;
-                        if (support1_dir_norm.length2() < (SIMD_EPSILON * SIMD_EPSILON))
-                        {
-                            support1_dir_norm.setValue(-1.0f, -1.0f, -1.0f);
-                        }
-                        support1_dir_norm.normalize();
-                        const btVector3 support1_norm_dots =
-                            support1_dir_norm.dot3(support1_vertex0, support1_vertex1, support1_vertex2);
-                        const btVector3 support1_local = gjk.m_shape.m_enableMargin
-                            ? gjk.m_shape.m_shapes[1]->localGetSupportVertexNonVirtual(support1_dir_local)
-                            : gjk.m_shape.m_shapes[1]->localGetSupportVertexWithoutMarginNonVirtual(support1_dir_local);
-                        const btVector3 support1 = gjk.m_shape.Support1(-w->d);
-                        const btScalar wdist_debug = btDot(best->n, w->w) - best->d;
-                        CaptureIterationDebug(
-                            static_cast<int32_t>(iterations),
-                            best,
-                            w,
-                            support0,
-                            support1_dir_local,
-                            support1_toshape1_row0,
-                            support1_toshape1_row1,
-                            support1_toshape1_row2,
-                            support1_toshape0_row0,
-                            support1_toshape0_row1,
-                            support1_toshape0_row2,
-                            support1_toshape0_origin,
-                            support1_dots,
-                            support1_max_axis,
-                            support1_local,
-                            support1,
-                            wdist_debug);
-#endif
                         const btScalar wdist = btDot(best->n, w->w) - best->d;
                         if (wdist > EPA_ACCURACY)
                         {
@@ -1823,10 +1487,6 @@ ROCKETGPU_HD void Initialize(const btConvexShape* shape0, const btTransform& wtr
 
 using namespace gjkepa2_impl;
 
-// GJK runs on every query; EPA (~26 KB) only when GJK finds the shapes inside each other. So the scratch holds the
-// GJK alone and EPA is leased for the one call that needs it: on the GPU from a pool of slots with busy flags
-// (filled by the host, see EnsureEpaScratchPool), on the CPU from a thread-local instance. EPA::Initialize resets
-// all the state Evaluate reads, so a slot carries nothing from one lease to the next.
 struct btGjkEpaScratch {
     GJK gjk;
 };
@@ -1965,25 +1625,6 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::Penetration(co
             EPA::eStatus::_ epa_status = epa.Evaluate(gjk, -guess);
             if (epa_status != EPA::eStatus::Failed)
             {
-#if defined(ROCKETGPU_GJK_EPA_DEBUG)
-                btVector3 debug_dirs[4] = {
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                };
-                btVector3 debug_ws[4] = {
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                };
-                for (U i = 0; i < epa.m_result.rank; ++i)
-                {
-                    debug_dirs[i] = epa.m_result.c[i] ? epa.m_result.c[i]->d : btVector3(0, 0, 0);
-                    debug_ws[i] = epa.m_result.c[i] ? epa.m_result.c[i]->w : btVector3(0, 0, 0);
-                }
-#endif
                 btVector3 w0 = btVector3(0, 0, 0);
                 btVector3 support0_dir_norm[4] = {
                     btVector3(0, 0, 0),
@@ -2018,16 +1659,6 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::Penetration(co
                         shape.m_shapes[0]->getMarginNonVirtual() * support0_dir_norm[i];
                     w0 += support0[i] * epa.m_result.p[i];
                 }
-#if !defined(__CUDA_ARCH__)
-                TraceDebugEpaWitnessReconstruct(
-                    support0_dir_norm,
-                    support0_without_margin,
-                    support0,
-                    w0,
-                    wtrs0,
-                    epa.m_normal,
-                    epa.m_depth);
-#endif
                 results.status = sResults::Penetrating;
                 results.witnesses[0] = wtrs0 * w0;
                 results.witnesses[1] = wtrs0 * (w0 - epa.m_normal * epa.m_depth);
@@ -2056,13 +1687,12 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::PenetrationWit
                                                           const btVector3& guess,
                                                           sResults& results,
                                                           btGjkEpaScratch& scratch,
-                                                          bool usemargins,
-                                                          btGjkEpaDebugStop* debug_stop)
+                                                          bool usemargins)
 {
     tShape shape;
     Initialize(shape0, wtrs0, shape1, wtrs1, results, shape, usemargins);
     scratch.gjk.Initialize();
-    GJK::eStatus::_ gjk_status = scratch.gjk.Evaluate(shape, -guess, debug_stop);
+    GJK::eStatus::_ gjk_status = scratch.gjk.Evaluate(shape, -guess);
     switch (gjk_status)
     {
         case GJK::eStatus::Inside:
@@ -2073,25 +1703,6 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::PenetrationWit
             EPA::eStatus::_ epa_status = epa.Evaluate(scratch.gjk, -guess);
             if (epa_status != EPA::eStatus::Failed)
             {
-#if defined(ROCKETGPU_GJK_EPA_DEBUG)
-                btVector3 debug_dirs[4] = {
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                };
-                btVector3 debug_ws[4] = {
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                };
-                for (U i = 0; i < epa.m_result.rank; ++i)
-                {
-                    debug_dirs[i] = epa.m_result.c[i] ? epa.m_result.c[i]->d : btVector3(0, 0, 0);
-                    debug_ws[i] = epa.m_result.c[i] ? epa.m_result.c[i]->w : btVector3(0, 0, 0);
-                }
-#endif
                 btVector3 w0 = btVector3(0, 0, 0);
                 btVector3 support0_dir_norm[4] = {
                     btVector3(0, 0, 0),
@@ -2126,16 +1737,6 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::PenetrationWit
                         shape.m_shapes[0]->getMarginNonVirtual() * support0_dir_norm[i];
                     w0 += support0[i] * epa.m_result.p[i];
                 }
-#if !defined(__CUDA_ARCH__)
-                TraceDebugEpaWitnessReconstruct(
-                    support0_dir_norm,
-                    support0_without_margin,
-                    support0,
-                    w0,
-                    wtrs0,
-                    epa.m_normal,
-                    epa.m_depth);
-#endif
                 results.status = sResults::Penetrating;
                 results.witnesses[0] = wtrs0 * w0;
                 results.witnesses[1] = wtrs0 * (w0 - epa.m_normal * epa.m_depth);

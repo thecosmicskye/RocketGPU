@@ -1,6 +1,7 @@
 #include <rocketgpu/rocketsim_compat.h>
 #include <rocketgpu/detail/math.hpp>
 #include <rocketgpu/detail/constants.hpp>
+#include <rocketgpu/detail/cuda_api.hpp>
 
 #include <algorithm>
 #include <functional>
@@ -185,13 +186,16 @@ Car* Arena::AddCar(Team team, const CarConfig& config) {
         throw std::runtime_error("rocketgpu::compat::Arena: car capacity exceeded");
     }
     slot_used_[static_cast<size_t>(slot)] = 1;
+    const int previous_count = car_count_;
     if (slot >= car_count_) {
         car_count_ = slot + 1;
     }
     PullStates();
     car_states_[static_cast<size_t>(slot)] = CarState{};
+    controls_[static_cast<size_t>(slot)] = CarControls{};
+    if (!bump_event_seen_tick_.empty()) bump_event_seen_tick_[static_cast<size_t>(slot)] = 0;
     for (int w = 0; w < 4; ++w) car_states_[static_cast<size_t>(slot)].wheels_with_contact[w] = 0;
-    PushStates();
+    PushCarState(slot);
     teams_[slot] = team;
     configs_[slot] = config;
 
@@ -199,6 +203,7 @@ Car* Arena::AddCar(Team team, const CarConfig& config) {
     sim_->set_car_configs(configs_.data(), configs_.size());
     const int32_t n = car_count_;
     sim_->set_env_car_count(&n, 1);
+    if (car_count_ != previous_count) NormalizeCarVisitOrder();
 
     Car* car = new Car(this, slot);
     car->id = next_car_id_++;
@@ -216,10 +221,37 @@ void Arena::PullStates() const {
     dirty_ = false;
 }
 
-void Arena::PushStates() {
-    sim_->upload_car_states(car_states_.data(), car_states_.size());
-    sim_->upload_ball_states(ball_states_.data(), ball_states_.size());
+void Arena::NormalizeCarVisitOrder() {
+    sim_->download_env_states(env_states_.data(), env_states_.size());
+    EnvState& env = env_states_[0];
+    if (env.car_visit_order_mode != 1 && env.car_visit_order_mode != 3) return;
+    int order[8];
+    int n = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int k = 0; k < 8; ++k) {
+            const int slot = CarVisitSlot(env, k, 8);
+            if ((slot < car_count_) == (pass == 0)) order[n++] = slot;
+        }
+    }
+    env.car_visit_order_packed = PackCarVisitOrder(order, 8);
+    sim_->upload_env_states(env_states_.data(), env_states_.size());
+    sim_->synchronize();
+}
 
+void Arena::PushCarState(int slot) {
+#if !defined(ROCKETGPU_USE_CUDA)
+    CanonicalizeImportedCarState(car_states_[static_cast<size_t>(slot)]);
+#endif
+    sim_->upload_car_states(car_states_.data(), car_states_.size(), nullptr,
+                            BatchSim::StateUploadMode::PreserveInternal);
+#if defined(ROCKETGPU_USE_CUDA)
+    detail::LaunchCanonicalizeImportedCars(sim_->device_view().car_states + slot, 1, nullptr);
+#endif
+    dirty_ = true;
+}
+
+void Arena::PushBallState() {
+    sim_->upload_ball_states(ball_states_.data(), ball_states_.size());
     dirty_ = true;
 }
 
@@ -250,7 +282,14 @@ bool Arena::RemoveCar(uint32_t id) {
     }
     Car* car = *it;
     const int slot = car->slot_;
+    const int previous_count = car_count_;
     PullStates();
+    for (CarState& state : car_states_) {
+        if (state.car_contact.other_car_id == static_cast<uint32_t>(slot + 1)) {
+            state.car_contact.other_car_id = 0;
+            state.car_contact.cooldown_timer = 0.0f;
+        }
+    }
 
     car_states_[static_cast<size_t>(slot)] = CarState{};
     car_states_[static_cast<size_t>(slot)].is_demoed = 1;
@@ -267,7 +306,8 @@ bool Arena::RemoveCar(uint32_t id) {
     car_count_ = highest + 1;
     const int32_t n = car_count_;
     sim_->set_env_car_count(&n, 1);
-    PushStates();
+    if (car_count_ != previous_count) NormalizeCarVisitOrder();
+    PushCarState(slot);
     cars.erase(it);
     delete car;
     dirty_ = true;
@@ -320,7 +360,7 @@ bool Arena::IsBallScored() const {
     PullStates();
     const BallState& b = ball_states_[0];
     const MutatorConfig& m = sim_->config().mutator;
-    return std::fabs(b.pos.y) > (m.goal_base_threshold_y + m.ball_radius);
+    return std::fabs(b.pos.y) >= (m.goal_base_threshold_y + m.ball_radius);
 }
 bool Arena::IsBallProbablyGoingIn(float max_time, float extra_margin, rocketgpu::Team* goal_team_out) const {
     if (mode_ != GameMode::SOCCAR) {
@@ -386,6 +426,13 @@ uint32_t Arena::CompatIdFromDeviceId(uint32_t device_id) const {
     }
     return slot_to_id_[static_cast<size_t>(device_id - 1)];
 }
+uint32_t Arena::DeviceIdFromCompatId(uint32_t compat_id) const {
+    if (compat_id == 0) return 0;
+    for (size_t slot = 0; slot < slot_to_id_.size(); ++slot) {
+        if (slot_to_id_[slot] == compat_id) return static_cast<uint32_t>(slot + 1);
+    }
+    return 0;
+}
 void Arena::DrainBumpEvents() {
     if (!bump_callback_) {
         return;
@@ -433,12 +480,64 @@ void Arena::Step(int ticks_to_simulate) {
 }
 
 void Arena::ResetToRandomKickoff(int seed) {
+    const bool has_holes = cars.size() != static_cast<size_t>(car_count_);
+    const int32_t active_count = static_cast<int32_t>(cars.size());
+    const int32_t slot_count = car_count_;
+    uint8_t saved_mode = 0;
+    uint32_t saved_order = 0;
+    if (has_holes) {
+        sim_->download_env_states(env_states_.data(), env_states_.size());
+        saved_mode = env_states_[0].car_visit_order_mode;
+        saved_order = env_states_[0].car_visit_order_packed;
+        int order[8];
+        int n = 0;
+        uint32_t selected = 0;
+        const int order_count = (saved_mode == 1 || saved_mode == 3) ? 8 : car_count_;
+        for (int k = 0; k < order_count; ++k) {
+            const int slot = CarVisitSlot(env_states_[0], k, car_count_);
+            if (slot_used_[static_cast<size_t>(slot)] && !(selected & (1u << slot))) {
+                order[n++] = slot;
+                selected |= 1u << slot;
+            }
+        }
+        for (int slot = 0; slot < 8; ++slot) {
+            if (slot_used_[static_cast<size_t>(slot)] && !(selected & (1u << slot))) {
+                order[n++] = slot;
+                selected |= 1u << slot;
+            }
+        }
+        for (int slot = 0; slot < 8; ++slot) {
+            if (!(selected & (1u << slot))) order[n++] = slot;
+        }
+        env_states_[0].car_visit_order_mode = 1;
+        env_states_[0].car_visit_order_packed = PackCarVisitOrder(order, 8);
+        sim_->upload_env_states(env_states_.data(), env_states_.size());
+        sim_->set_env_car_count(&active_count, 1);
+        sim_->synchronize();
+    }
     EnvCommand command;
     command.reset_to_kickoff = 1;
     command.reset_scoreboard = 1;
     command.reset_tick_count = 1;
     command.kickoff_seed_mode = seed == -1 ? 2 : 1;
     command.kickoff_seed = static_cast<uint64_t>(static_cast<uint32_t>(seed));
+    sim_->apply_env_commands(&command, 1);
+    sim_->download_env_states(env_states_.data(), env_states_.size());
+    env_states_[0].tick = static_cast<uint32_t>(tick_count_);
+    if (has_holes) {
+        env_states_[0].car_visit_order_mode = saved_mode;
+        env_states_[0].car_visit_order_packed = saved_mode == 3 ? 0x76543210u : saved_order;
+        if (saved_mode == 3) env_states_[0].car_visit_present_mask = 0xFFu;
+        sim_->set_env_car_count(&slot_count, 1);
+    }
+    sim_->upload_env_states(env_states_.data(), env_states_.size());
+    sim_->synchronize();
+    dirty_ = true;
+}
+
+void Arena::StartNewRoundBodies() {
+    EnvCommand command;
+    command.new_round_bodies = 1;
     sim_->apply_env_commands(&command, 1);
     dirty_ = true;
 }
@@ -448,18 +547,47 @@ void Arena::SetRespawnRngSeed(uint64_t seed) {
     dirty_ = true;
 }
 
+void Arena::SetRespawnSlotOverride(uint32_t car_id, int slot) {
+    Car* car = GetCar(car_id);
+    if (!car || slot < -1 || slot > 3) {
+        throw std::invalid_argument("SetRespawnSlotOverride: unknown car id or slot outside -1..3");
+    }
+    PullStates();
+    car_states_[static_cast<size_t>(car->slot_)].respawn_slot_override_plus1 = static_cast<uint8_t>(slot + 1);
+    sim_->upload_car_states(car_states_.data(), car_states_.size(), nullptr,
+                            BatchSim::StateUploadMode::PreserveInternal);
+    dirty_ = true;
+}
+
+void Arena::SetKickoffSpawnOverride(uint32_t car_id, int spot) {
+    Car* car = GetCar(car_id);
+    if (!car || spot < -1 || spot > 4) {
+        throw std::invalid_argument("SetKickoffSpawnOverride: unknown car id or spot outside -1..4");
+    }
+    PullStates();
+    car_states_[static_cast<size_t>(car->slot_)].respawn_slot_override_plus1 =
+        static_cast<uint8_t>(spot < 0 ? 0 : kKickoffSpawnOverridePlus1 + spot);
+    sim_->upload_car_states(car_states_.data(), car_states_.size(), nullptr,
+                            BatchSim::StateUploadMode::PreserveInternal);
+    dirty_ = true;
+}
+
 void Arena::SetCarVisitOrderMode(uint8_t mode) {
-    if (mode != 0 && mode != 2) {
-        throw std::invalid_argument("SetCarVisitOrderMode: mode must be 0 (slot order) or 2 (reverse slot order); use SetCarVisitOrder for an explicit order");
+    if (mode != 0 && mode != 2 && mode != 3) {
+        throw std::invalid_argument("SetCarVisitOrderMode: mode must be 0 (slot order), 2 (reverse slot order) or 3 (the game's vehicle order from slot order); use SetCarVisitOrder for an explicit order");
     }
     EnvState env;
     sim_->download_env_states(&env, 1);
     env.car_visit_order_mode = mode;
+    if (mode == 3) {
+        env.car_visit_order_packed = 0x76543210u;
+        env.car_visit_present_mask = 0xFFu;
+    }
     sim_->upload_env_states(&env, 1);
     dirty_ = true;
 }
 
-void Arena::SetCarVisitOrder(const std::vector<uint32_t>& compat_ids_in_visit_order) {
+void Arena::SetCarVisitOrder(const std::vector<uint32_t>& compat_ids_in_visit_order, bool game_order) {
     const int max_cars = sim_->config().max_cars_per_env;
     int slots[8];
     int count = 0;
@@ -481,8 +609,9 @@ void Arena::SetCarVisitOrder(const std::vector<uint32_t>& compat_ids_in_visit_or
     }
     EnvState env;
     sim_->download_env_states(&env, 1);
-    env.car_visit_order_mode = 1;
+    env.car_visit_order_mode = game_order ? 3 : 1;
     env.car_visit_order_packed = PackCarVisitOrder(slots, count);
+    env.car_visit_present_mask = 0xFFu;
     sim_->upload_env_states(&env, 1);
     dirty_ = true;
 }
@@ -562,7 +691,6 @@ void Car::SetState(const CarStateCompat& state) {
     s.pos = state.pos;
     SeedCarBasisFromRotMat(s, state.rotMat);
     s.set_wheel_normals_mask = 0;
-    // Velocities and the supersonic flag left as reported keep the step's values.
     const bool reported = (s.reported_flags & CarState::kReportedValid) != 0;
     const auto same = [](const Vec3& a, const Vec3& b) { return a.x == b.x && a.y == b.y && a.z == b.z; };
     s.vel = (reported && same(state.vel, s.reported_vel)) ? s.internal_vel : state.vel;
@@ -575,6 +703,7 @@ void Car::SetState(const CarStateCompat& state) {
     s.flip_rel_torque = state.flipRelTorque;
     s.jump_time = state.jumpTime;
     s.flip_time = state.flipTime;
+    s.flip_timer_live = 0;
     s.is_flipping = state.isFlipping ? 1 : 0;
     s.is_jumping = state.isJumping ? 1 : 0;
     s.air_time = state.airTime;
@@ -592,7 +721,7 @@ void Car::SetState(const CarStateCompat& state) {
     s.auto_flip_torque_scale = state.autoFlipTorqueScale;
     s.world_contact.has_contact = state.worldContact.hasContact ? 1 : 0;
     s.world_contact.contact_normal = state.worldContact.contactNormal;
-    s.car_contact.other_car_id = state.carContact.otherCarID;
+    s.car_contact.other_car_id = arena_->DeviceIdFromCompatId(state.carContact.otherCarID);
     s.car_contact.cooldown_timer = state.carContact.cooldownTimer;
     s.is_demoed = state.isDemoed ? 1 : 0;
     s.demo_respawn_timer = state.demoRespawnTimer;
@@ -607,21 +736,22 @@ void Car::SetState(const CarStateCompat& state) {
     s.latest_touch_location = state.latestTouch.location;
     s.latest_touch_normal = state.latestTouch.normal;
     s.tick_count_since_update = 0;
+    s.bump_event_tick = 0;
+    s.bump_event_was_bumper = 0;
+    if (!arena_->bump_event_seen_tick_.empty()) arena_->bump_event_seen_tick_[slot_] = 0;
     s.last_controls = state.lastControls;
-    arena_->PushStates();
+    arena_->PushCarState(slot_);
 }
 
 CarStateV3 Car::GetStateV3() const {
     arena_->PullStates();
     CarState s = arena_->car_states_[slot_];
     if (s.tick_count_since_update != 0) {
-        s.RestoreWorkingFields();  // the step's own velocities and flags, unless written since the step
+        s.RestoreWorkingFields();
     } else if (s.supersonic_time > 0.0f) {
-        s.is_supersonic = 1;  // as the next step reads a set state
+        s.is_supersonic = 1;
     }
     if (!s.supersonic_set_v3 && !s.is_demoed) {
-        // v3 updates the supersonic flag from the velocity at the end of a tick (car/base.rs post_tick_update); the
-        // step does it at the start of the next. Apply v3's update to this velocity.
         const MutatorConfig& m = arena_->GetMutatorConfig();
         const float speed_sq = s.vel.x * s.vel.x + s.vel.y * s.vel.y + s.vel.z * s.vel.z;
         const float start_sq = m.supersonic_start_speed * m.supersonic_start_speed;
@@ -674,12 +804,10 @@ CarStateV3 Car::GetStateV3() const {
     out.isDemoed = s.is_demoed != 0;
     out.demoRespawnTimer = s.demo_respawn_timer;
     out.isOnGround = s.is_on_ground != 0;
-    // v3 numbers each wheel pair the other way round (v3 wheel w is RocketGPU wheel w ^ 1).
     for (int w = 0; w < 4; ++w) out.wheelsWithContact[w] = s.wheels_with_contact[w ^ 1] != 0;
     out.hasWorldContact = s.world_contact.has_contact != 0;
     out.worldContactNormal = s.world_contact.contact_normal;
     out.prevControls = s.last_controls;
-    // Wheel contact normals a set state supplied stay pending until the next step reads them.
     out.hasWheelContactNormals = s.set_wheel_normals_mask != 0;
     for (int w = 0; w < 4; ++w) out.wheelContactNormals[w] = s.set_wheel_normals[w ^ 1];
     return out;
@@ -697,7 +825,6 @@ void Car::SetStateV3(const CarStateV3& state) {
     s.has_double_jumped = state.hasDoubleJumped ? 1 : 0;
     s.has_flipped = state.hasFlipped ? 1 : 0;
     s.flip_rel_torque = state.flipRelTorque;
-    // jump_time sums dt per tick for its first 1024 ticks, like the step's jump clock (see CarState::jump_time).
     float jump_time = 0.0f;
     if (state.jumpTicks > 1024) {
         jump_time = static_cast<float>(state.jumpTicks) * dt;
@@ -706,6 +833,7 @@ void Car::SetStateV3(const CarStateV3& state) {
     }
     s.jump_time = jump_time;
     s.flip_time = state.flipTime;
+    s.flip_timer_live = 0;
     s.is_flipping = state.isFlipping ? 1 : 0;
     s.is_jumping = state.isJumping ? 1 : 0;
     s.jump_hold_broken = state.jumpHoldBroken ? 1 : 0;
@@ -723,7 +851,7 @@ void Car::SetStateV3(const CarStateV3& state) {
     s.auto_flip_timer = state.autoFlipTimer;
     s.auto_flip_torque_scale = state.autoFlipTorqueScale;
     s.car_contact.cooldown_timer = state.bumpCooldownTimer;
-    s.car_contact.other_car_id = state.bumpCooldownVictim;
+    s.car_contact.other_car_id = arena_->DeviceIdFromCompatId(state.bumpCooldownVictim);
     if (state.lastExtraHitTick == ~0ULL) {
         s.ball_hit_info.tick_count_when_extra_impulse_applied = ~0ULL;
     } else {
@@ -745,10 +873,13 @@ void Car::SetStateV3(const CarStateV3& state) {
             if (state.wheelsWithContact[w]) s.set_wheel_normals_mask |= static_cast<uint8_t>(1u << (w ^ 1));
         }
     }
-    s.reported_flags = 0;  // every field above is the step's own value
+    s.reported_flags = 0;
     s.tick_count_since_update = 0;
+    s.bump_event_tick = 0;
+    s.bump_event_was_bumper = 0;
+    if (!arena_->bump_event_seen_tick_.empty()) arena_->bump_event_seen_tick_[slot_] = 0;
     arena_->controls_[slot_] = state.controls;
-    arena_->PushStates();
+    arena_->PushCarState(slot_);
 }
 
 void Car::SetControls(const CarControls& controls) {
@@ -799,7 +930,7 @@ void Ball::SetState(const BallStateCompat& state) {
     s.vel = state.vel;
     s.ang_vel = state.angVel;
     s.tick_count_since_update = 0;
-    arena_->PushStates();
+    arena_->PushBallState();
 }
 }
 }

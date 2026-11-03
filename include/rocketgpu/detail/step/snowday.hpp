@@ -1,5 +1,3 @@
-
-
 ROCKETGPU_HD constexpr int SnowdayPuckCirclePointAmount() { return 20; }
 ROCKETGPU_HD constexpr int SnowdayPuckPointCount() { return 2 * SnowdayPuckCirclePointAmount(); }
 ROCKETGPU_HD constexpr float SnowdayPuckRadiusUu() { return 114.25f; }
@@ -57,4 +55,3 @@ inline float ComputeSnowdayPuckContactBreakingThresholdBt(const Vec3* points_bt)
     return disc * 0.02f;
 }
 #endif
-

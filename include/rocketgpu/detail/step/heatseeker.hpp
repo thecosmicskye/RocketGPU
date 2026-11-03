@@ -1,5 +1,3 @@
-
-
 ROCKETGPU_HD constexpr float HeatseekerTargetSpeedIncrement() { return 85.0f; }
 ROCKETGPU_HD constexpr float HeatseekerMinSpeedupInterval() { return 1.0f; }
 ROCKETGPU_HD constexpr float HeatseekerTargetY() { return 5120.0f; }
@@ -41,9 +39,9 @@ ROCKETGPU_HD RsAngle RsAngleFromVec(const Vec3& forward) {
     RsAngle out;
     constexpr float kFltEpsilon = 1.1920929e-07f;
     if (fabsf(forward.y) > kFltEpsilon || fabsf(forward.x) > kFltEpsilon) {
-        out.yaw = GlibcAtan2f(forward.y, forward.x);
+        out.yaw = RocketGpuUcrtAtan2f(forward.y, forward.x);
         const float dist2d = sqrtf(forward.x * forward.x + forward.y * forward.y);
-        out.pitch = -GlibcAtan2f(-forward.z, dist2d);
+        out.pitch = -RocketGpuUcrtAtan2f(-forward.z, dist2d);
     } else {
         out.yaw = 0.0f;
         if (forward.z > kFltEpsilon) {
@@ -146,4 +144,3 @@ ROCKETGPU_HD bool HeatseekerOnWorldContact(BallState& ball, const Vec3& normal) 
     }
     return false;
 }
-

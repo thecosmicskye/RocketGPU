@@ -12,8 +12,6 @@ std::vector<uint16_t> BuildArenaBroadphaseCellMask(
     const std::vector<ArenaMeshBvhMeshInfo>& mesh_infos,
     ArenaBroadphaseGrid& out_grid);
 
-// Fills the per-mesh leaf grids WalkArenaMeshLeafGrid reads. A mesh whose BVH breaks the containment the grid relies
-// on gets none (cell_offset -1) and keeps the walk.
 void BuildArenaMeshLeafGrid(
     const std::vector<ArenaMeshBvhQuantization>& quantization,
     const std::vector<ArenaMeshBvhMeshInfo>& mesh_infos,
@@ -23,9 +21,9 @@ void BuildArenaMeshLeafGrid(
     std::vector<int32_t>& out_cell_start,
     std::vector<ArenaMeshLeafEntry>& out_entries);
 
-// Sets free_half_x / free_half_y on every mesh info: the largest-area origin-centred XY box (any z) that no mesh AABB
-// meets, each mesh lying beyond it in x or in y. Left 0 when some mesh straddles both axes.
 void SetArenaMeshFreeBox(std::vector<ArenaMeshBvhMeshInfo>& mesh_infos);
+
+void SetArenaMeshRayOrder(std::vector<ArenaMeshBvhMeshInfo>& mesh_infos, float neg_x_plane_max_x);
 
 std::vector<ArenaMeshTriangle> LoadArenaMeshTriangles(
     std::vector<ArenaMeshBvhQuantization>* out_quantization = nullptr,

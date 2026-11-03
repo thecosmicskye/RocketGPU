@@ -1,5 +1,3 @@
-
-
 ROCKETGPU_HD Vec3 FixArenaTriangleContactNormalDirectionBullet(
     const bullet_port::btConvexShape& shape_a,
     const bullet_port::btTransform& local_trans_a,
@@ -38,39 +36,6 @@ ROCKETGPU_HD Vec3 FromBulletPortVec3(const bullet_port::btVector3& v) {
     return Vec3(v.x(), v.y(), v.z());
 }
 
-struct BallCarContactGeometryDebug {
-    uint8_t valid = 0;
-    uint8_t used_gjk = 0;
-    uint16_t reserved = 0;
-    Vec3 gjk_cached_axis_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_normal_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_fixed_normal_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_point_on_car_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_point_on_ball_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_local_trans_a_origin_bt = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_local_trans_a_basis0 = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_local_trans_a_basis1 = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_local_trans_a_basis2 = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_support_axis_a0 = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_support_axis_a1 = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_support_axis_a2 = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_support_p_in_a0 = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_support_p_in_a1 = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 gjk_support_p_in_a2 = Vec3(0.0f, 0.0f, 0.0f);
-    float gjk_len_sqr = 0.0f;
-    float gjk_inv_len = 0.0f;
-    float gjk_distance_bt = 0.0f;
-};
-
-ROCKETGPU_HD bool GetCarBasisForBulletTransform(const CarState& car, Vec3& fwd, Vec3& rgt, Vec3& upv) {
-    if (car.basis_authoritative) {
-        CarBasisColumns(car, fwd, rgt, upv);
-        return false;
-    }
-    CarBasisColumns(car, fwd, rgt, upv);
-    return false;
-}
-
 ROCKETGPU_HD bullet_port::btConvexShape MakeBulletPortBoxShape(const Vec3& half_extents_with_margin, float margin) {
     bullet_port::btConvexShape shape;
     shape.m_kind = bullet_port::BT_SHAPE_BOX;
@@ -99,7 +64,7 @@ ROCKETGPU_HD bullet_port::btTransform MakeBulletPortBoxWorldTransform(const CarS
     Vec3 fwd;
     Vec3 rgt;
     Vec3 upv;
-    const bool used_host_validation_basis = GetCarBasisForBulletTransform(car, fwd, rgt, upv);
+    CarBasisColumns(car, fwd, rgt, upv);
     transform.setBasis(bullet_port::btMatrix3x3(
         bullet_port::btVector3(fwd.x, rgt.x, upv.x),
         bullet_port::btVector3(fwd.y, rgt.y, upv.y),
@@ -132,19 +97,6 @@ ROCKETGPU_HD bullet_port::btTransform MakeBulletPortBallWorldTransform(const Bal
 #define ROCKETGPU_TRIANGLE_CONTACT_NOINLINE
 #endif
 
-ROCKETGPU_HD bool StopCalcPenDepthDebug(uint8_t stop_phase,
-    int guess_index,
-    int reject_stage,
-    bool penetration_valid,
-    bool distance_valid,
-    float distance_bt,
-    const bullet_port::btVector3& guess_vector) {
-    if (0 != stop_phase) {
-        return false;
-    }
-    return true;
-}
-
 ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool BulletPortCalcPenDepth(
     const bullet_port::btConvexShape& a,
     const bullet_port::btTransform& transform_a,
@@ -156,8 +108,6 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool BulletPortCalcPenDepth(
     bullet_port::btGjkEpaScratch* scratch) {
     const bullet_port::btVector3 delta_origin =
         transform_b.getOrigin() - transform_a.getOrigin();
-    // The game's btGjkEpaPenetrationDepthSolver::calcPenDepth tries one guess, B.origin - A.origin
-    // (RocketSim adds eight fallback guesses).
     bullet_port::btVector3 guess_vectors[] = {
         delta_origin.safeNormalize(),
     };
@@ -165,63 +115,23 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool BulletPortCalcPenDepth(
     const int num_vectors = static_cast<int>(sizeof(guess_vectors) / sizeof(guess_vectors[0]));
     for (int i = 0; i < num_vectors; ++i) {
         bullet_port::btGjkEpaSolver2::sResults results;
-        if (i == 0 && StopCalcPenDepthDebug(220,
-                i,
-                10,
-                false,
-                false,
-                0.0f,
-                guess_vectors[i])) {
-            return false;
-        }
-        if (i == 0 && StopCalcPenDepthDebug(234,
-                i,
-                14,
-                false,
-                false,
-                0.0f,
-                guess_vectors[i])) {
-            return false;
-        }
-        bullet_port::btGjkEpaDebugStop penetration_debug;
 
 #if defined(__CUDA_ARCH__)
         if (scratch == nullptr) {
             return false;
         }
         const bool penetrated = bullet_port::btGjkEpaSolver2::PenetrationWithScratch(
-            &a, transform_a, &b, transform_b, guess_vectors[i], results, *scratch, true, &penetration_debug);
+            &a, transform_a, &b, transform_b, guess_vectors[i], results, *scratch, true);
 #else
         const bool penetrated = scratch
-            ? bullet_port::btGjkEpaSolver2::PenetrationWithScratch(&a, transform_a, &b, transform_b, guess_vectors[i], results, *scratch, true, &penetration_debug)
+            ? bullet_port::btGjkEpaSolver2::PenetrationWithScratch(&a, transform_a, &b, transform_b, guess_vectors[i], results, *scratch, true)
             : bullet_port::btGjkEpaSolver2::Penetration(&a, transform_a, &b, transform_b, guess_vectors[i], results, true);
 #endif
-        if (penetration_debug.hit_phase != 0) {
-            return false;
-        }
-        if (i == 0 && StopCalcPenDepthDebug(221,
-                i,
-                11,
-                penetrated,
-                false,
-                results.distance,
-                guess_vectors[i])) {
-            return false;
-        }
         if (penetrated) {
             out_witness_on_a = results.witnesses[0];
             out_witness_on_b = results.witnesses[1];
             io_v = results.normal;
             return true;
-        }
-        if (i == 0 && StopCalcPenDepthDebug(230,
-                i,
-                12,
-                false,
-                false,
-                results.distance,
-                guess_vectors[i])) {
-            return false;
         }
 #if defined(__CUDA_ARCH__)
         const bool separated = bullet_port::btGjkEpaSolver2::DistanceWithScratch(
@@ -231,15 +141,6 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool BulletPortCalcPenDepth(
             ? bullet_port::btGjkEpaSolver2::DistanceWithScratch(&a, transform_a, &b, transform_b, guess_vectors[i], results, *scratch)
             : bullet_port::btGjkEpaSolver2::Distance(&a, transform_a, &b, transform_b, guess_vectors[i], results);
 #endif
-        if (i == 0 && StopCalcPenDepthDebug(231,
-                i,
-                13,
-                false,
-                separated,
-                results.distance,
-                guess_vectors[i])) {
-            return false;
-        }
         if (separated) {
             out_witness_on_a = results.witnesses[0];
             out_witness_on_b = results.witnesses[1];
@@ -259,7 +160,7 @@ ROCKETGPU_HD Vec3 CarBodyLocalPointBt(const CarState& car, const Vec3& point_wor
     Vec3 fwd;
     Vec3 rgt;
     Vec3 upv;
-    GetCarBasisForBulletTransform(car, fwd, rgt, upv);
+    CarBasisColumns(car, fwd, rgt, upv);
     body_world.setBasis(bullet_port::btMatrix3x3(
         bullet_port::btVector3(fwd.x, rgt.x, upv.x),
         bullet_port::btVector3(fwd.y, rgt.y, upv.y),
@@ -274,7 +175,7 @@ ROCKETGPU_HD Vec3 CarBodyWorldPointBt(const CarState& car, const Vec3& point_loc
     Vec3 fwd;
     Vec3 rgt;
     Vec3 upv;
-    GetCarBasisForBulletTransform(car, fwd, rgt, upv);
+    CarBasisColumns(car, fwd, rgt, upv);
     body_world.setBasis(bullet_port::btMatrix3x3(
         bullet_port::btVector3(fwd.x, rgt.x, upv.x),
         bullet_port::btVector3(fwd.y, rgt.y, upv.y),
@@ -293,15 +194,12 @@ ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
     const CarState& car,
     const CarConfig& cfg,
     const ArenaMeshTriangle& tri,
-    float contact_threshold_bt,
     Vec3& out_normal,
     float& out_distance_bt,
     Vec3* out_point_on_a_bt,
     Vec3* out_point_on_b_bt,
     bullet_port::btGjkEpaScratch* gjk_epa_scratch,
     Vec3* io_cached_axis_bt,
-    TriangleContactDebugSummary* debug_summary,
-    uint8_t debug_triangle_phase,
     float tri_origin_y_bt) {
     constexpr float kUUToBT = 1.0f / 50.0f;
     constexpr float kRelError2 = 1.0e-6f;
@@ -309,7 +207,7 @@ ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
     constexpr float kBulletBoxMarginBt = 0.04f;
 
     const float requested_margin_a_bt = kBulletBoxMarginBt;
-    const Vec3 raw_half_extent_bt = (cfg.hitbox_size * 0.5f) * kUUToBT;
+    const Vec3 raw_half_extent_bt = (BulletHitboxSize(cfg) * 0.5f) * kUUToBT;
 
     const float requested_margin_b_bt = 0.0f;
     const float maximum_distance_squared = 100.0f;
@@ -342,9 +240,6 @@ ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
 
     Vec3 cached_axis = io_cached_axis_bt != nullptr ? *io_cached_axis_bt : Vec3(0.0f, 1.0f, 0.0f);
     Vec3 last_nonzero_axis = cached_axis;
-    Vec3 debug_gjk_axis_bt = cached_axis;
-    float debug_gjk_len_sqr = 0.0f;
-    float debug_gjk_squared_distance = 0.0f;
 
     bool is_valid = false;
     bool check_simplex = false;
@@ -367,8 +262,6 @@ ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
             cached_separating_axis * tri_transform.getBasis();
         const bullet_port::btVector3 p_in_a =
             box_shape.localGetSupportVertexWithoutMarginNonVirtual(separating_axis_in_a);
-        const bullet_port::btVector3 tri_support_dots =
-            separating_axis_in_b.dot3(tri_shape.m_vertices1[0], tri_shape.m_vertices1[1], tri_shape.m_vertices1[2]);
         const bullet_port::btVector3 q_in_b =
             tri_shape.localGetSupportVertexWithoutMarginNonVirtual(separating_axis_in_b);
         const bullet_port::btVector3 p_world_bt = local_trans_a(p_in_a);
@@ -447,10 +340,7 @@ ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
         }
 
         const float len_sqr = LengthSq(cached_axis);
-        debug_gjk_axis_bt = cached_axis;
-        debug_gjk_len_sqr = len_sqr;
-        debug_gjk_squared_distance = squared_distance;
-        if (len_sqr <= 0.0001f) {  // game: float len2 widened, < 0.0001 (double); same as <= 0.0001f
+        if (len_sqr <= 0.0001f) {
             degenerate_simplex = 5;
         }
         if (len_sqr > 1.1920929e-7f * 1.1920929e-7f) {
@@ -468,9 +358,8 @@ ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
 
                 {
                     const bool catch_degenerate_penetration_case_cuda =
-                        degenerate_simplex && ((distance_bt + margin_bt) <= 0.01f);  // game: < 0.01 (double); same as <= 0.01f
+                        degenerate_simplex && ((distance_bt + margin_bt) <= 0.01f);
                     if (catch_degenerate_penetration_case_cuda) {
-                        // Fall through to the shared catch_degenerate +
                     } else {
                         point_on_a_bt += position_offset_bt;
                         point_on_b_bt += position_offset_bt;
@@ -500,7 +389,7 @@ ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
     }
 
     const bool catch_degenerate_penetration_case =
-        degenerate_simplex && ((distance_bt + margin_bt) <= 0.01f);  // game: < 0.01 (double); same as <= 0.01f
+        degenerate_simplex && ((distance_bt + margin_bt) <= 0.01f);
 
 #if defined(__CUDA_ARCH__)
     const volatile int32_t method_before_penetration = last_used_method;
@@ -618,32 +507,6 @@ ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
 
 #if defined(ROCKETGPU_CAN_COMPILE_OFFICIAL_HOST_HELPERS)
 
-ROCKETGPU_HD bool ComputeCarArenaTriangleContactHost(
-    const CarState& car,
-    const CarConfig& cfg,
-    const ArenaMeshTriangleHost& tri,
-    float contact_threshold_bt,
-    Vec3& out_normal,
-    float& out_distance_bt) {
-    ArenaMeshTriangle common_tri;
-    common_tri.a = tri.a;
-    common_tri.b = tri.b;
-    common_tri.c = tri.c;
-    common_tri.normal = tri.normal;
-    common_tri.min = tri.min;
-    common_tri.max = tri.max;
-    common_tri.mesh_index = static_cast<uint8_t>(tri.mesh_index);
-    common_tri.quantized_aabb_min[0] = tri.quantized_aabb_min[0];
-    common_tri.quantized_aabb_min[1] = tri.quantized_aabb_min[1];
-    common_tri.quantized_aabb_min[2] = tri.quantized_aabb_min[2];
-    common_tri.quantized_aabb_max[0] = tri.quantized_aabb_max[0];
-    common_tri.quantized_aabb_max[1] = tri.quantized_aabb_max[1];
-    common_tri.quantized_aabb_max[2] = tri.quantized_aabb_max[2];
-    if (!ComputeCarArenaTriangleContact(car, cfg, common_tri, contact_threshold_bt, out_normal, out_distance_bt)) {
-        return false;
-    }
-    return out_distance_bt <= contact_threshold_bt;
-}
 #endif
 
 ROCKETGPU_HD float BallCarContactBreakingThresholdBT(const CarConfig& cfg, float ball_radius);
@@ -658,16 +521,18 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
     Vec3& out_rel_ball_contact,
     Vec3& out_rel_car_contact,
     bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr,
-    BallCarContactGeometryDebug* debug = nullptr,
+    bool* out_exact = nullptr,
     Vec3* out_bt_rel_ball_contact_for_solver = nullptr,
-    Vec3* out_bt_rel_car_contact_for_solver = nullptr) {
+    Vec3* out_bt_rel_car_contact_for_solver = nullptr,
+    Vec3* out_ball_local_bt = nullptr,
+    Vec3* out_car_local_bt = nullptr) {
     constexpr float kUUToBT = 1.0f / 50.0f;
     constexpr float kBTToUU = 50.0f;
     constexpr float kRelError2 = 1.0e-6f;
     constexpr int kGjkMaxIter = 1000;
     constexpr float kBulletBoxMarginBt = 0.04f;
 
-    const Vec3 raw_half_extent_bt = (cfg.hitbox_size * 0.5f) * kUUToBT;
+    const Vec3 raw_half_extent_bt = (BulletHitboxSize(cfg) * 0.5f) * kUUToBT;
     const bullet_port::btConvexShape box_shape =
         MakeBulletPortBoxShape(raw_half_extent_bt, kBulletBoxMarginBt);
     const bullet_port::btSphereShape sphere_shape(ball_radius * kUUToBT);
@@ -696,12 +561,6 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
     simplex.reset();
 
     Vec3 cached_axis(0.0f, 1.0f, 0.0f);
-    Vec3 debug_support_axis_a[4];
-    Vec3 debug_support_p_in_a[4];
-    for (int i = 0; i < 4; ++i) {
-        debug_support_axis_a[i] = Vec3(0.0f, 0.0f, 0.0f);
-        debug_support_p_in_a[i] = Vec3(0.0f, 0.0f, 0.0f);
-    }
     float squared_distance = 1.0e30f;
     bool check_simplex = false;
     bool is_valid = false;
@@ -746,11 +605,6 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
             break;
         }
 
-        const int simplex_slot = simplex.num_vertices;
-        if (simplex_slot >= 0 && simplex_slot < 4) {
-            debug_support_axis_a[simplex_slot] = FromBulletPortVec3(separating_axis_in_a);
-            debug_support_p_in_a[simplex_slot] = FromBulletPortVec3(p_in_a);
-        }
         simplex.add_vertex(w, p_world, q_world);
         Vec3 new_cached_axis(0.0f, 0.0f, 0.0f);
         if (!simplex.closest(new_cached_axis)) {
@@ -793,7 +647,7 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
     simplex.compute_points(point_on_a_bt, point_on_b_bt);
 
     const float len_sqr = LengthSq(cached_axis);
-    if (len_sqr <= 0.0001f) {  // game: float len2 widened, < 0.0001 (double); same as <= 0.0001f
+    if (len_sqr <= 0.0001f) {
         degenerate_simplex = 5;
     }
 
@@ -816,7 +670,7 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
     }
 
     const bool catch_degenerate_penetration_case =
-        degenerate_simplex && ((distance_bt + (margin_a_bt + margin_b_bt)) <= 0.01f);  // game: distance + (mA + mB), < 0.01 (double)
+        degenerate_simplex && ((distance_bt + (margin_a_bt + margin_b_bt)) <= 0.01f);
     if (!is_valid || catch_degenerate_penetration_case) {
         bullet_port::btVector3 cached_separating_axis(0.0f, 0.0f, 0.0f);
         bullet_port::btVector3 tmp_point_on_a_world(0.0f, 0.0f, 0.0f);
@@ -885,33 +739,13 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
         return false;
     }
 
-    const Vec3 point_on_car_bt = point_on_a_bt + position_offset_bt;
     const Vec3 point_on_ball_bt = point_on_b_bt + position_offset_bt;
     const Vec3 bullet_normal_bt = FixArenaTriangleContactNormalDirectionBullet(
         box_shape, local_trans_a, sphere_shape, local_trans_b, normal_bt);
     const Vec3 manifold_point_on_car_bt =
         point_on_ball_bt + bullet_normal_bt * distance_bt;
-    if (debug) {
-        debug->valid = 1;
-        debug->used_gjk = 1;
-        debug->gjk_cached_axis_bt = cached_axis;
-        debug->gjk_normal_bt = normal_bt;
-        debug->gjk_fixed_normal_bt = bullet_normal_bt;
-        debug->gjk_point_on_car_bt = point_on_car_bt;
-        debug->gjk_point_on_ball_bt = point_on_ball_bt;
-        debug->gjk_local_trans_a_origin_bt = FromBulletPortVec3(local_trans_a.getOrigin());
-        debug->gjk_local_trans_a_basis0 = FromBulletPortVec3(local_trans_a.getBasis()[0]);
-        debug->gjk_local_trans_a_basis1 = FromBulletPortVec3(local_trans_a.getBasis()[1]);
-        debug->gjk_local_trans_a_basis2 = FromBulletPortVec3(local_trans_a.getBasis()[2]);
-        debug->gjk_support_axis_a0 = debug_support_axis_a[0];
-        debug->gjk_support_axis_a1 = debug_support_axis_a[1];
-        debug->gjk_support_axis_a2 = debug_support_axis_a[2];
-        debug->gjk_support_p_in_a0 = debug_support_p_in_a[0];
-        debug->gjk_support_p_in_a1 = debug_support_p_in_a[1];
-        debug->gjk_support_p_in_a2 = debug_support_p_in_a[2];
-        debug->gjk_len_sqr = len_sqr;
-        debug->gjk_inv_len = inv_len;
-        debug->gjk_distance_bt = distance_bt;
+    if (out_exact) {
+        *out_exact = true;
     }
 
     out_normal = -bullet_normal_bt;
@@ -933,210 +767,12 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
     if (out_bt_rel_ball_contact_for_solver) {
         *out_bt_rel_ball_contact_for_solver = bt_rel_ball_contact_for_solver;
     }
-    return true;
-}
-
-ROCKETGPU_HD bool TraceBallCarGjkShadowEnabled() {
-    return false;
-}
-
-ROCKETGPU_HD bool TraceBallCarSphereBoxShadowEnabled() {
-    return false;
-}
-
-ROCKETGPU_HD bool DebugBallCarSolverTraceEnabledFor(int env_idx, int car_idx) {
-    (void)env_idx;
-    (void)car_idx;
-    return false;
-}
-
-ROCKETGPU_HD void TraceBallCarContactGeometryGjkShadow(
-    const BallState& ball,
-    const CarState& car,
-    const CarConfig& cfg,
-    float ball_radius) {
-    constexpr float kUUToBT = 1.0f / 50.0f;
-    constexpr float kRelError2 = 1.0e-6f;
-    constexpr int kGjkMaxIter = 1000;
-    constexpr float kBulletBoxMarginBt = 0.04f;
-    constexpr float kMaximumDistanceSquared = 100.0f;
-
-    const Vec3 raw_half_extent_bt = (cfg.hitbox_size * 0.5f) * kUUToBT;
-    const bullet_port::btConvexShape box_shape =
-        MakeBulletPortBoxShape(raw_half_extent_bt, kBulletBoxMarginBt);
-    const bullet_port::btSphereShape sphere_shape(ball_radius * kUUToBT);
-    const float margin_a_bt = box_shape.getMarginNonVirtual();
-    const float margin_b_bt = sphere_shape.getMarginNonVirtual();
-    const float margin_bt = margin_a_bt + margin_b_bt;
-    const bullet_port::btTransform car_transform =
-        MakeBulletPortBoxWorldTransform(car, car.pos_bt);
-    bullet_port::btTransform box_transform = car_transform;
-    box_transform.setOrigin(car_transform(ToBulletPortVec3(cfg.hitbox_offset * kUUToBT)));
-    const bullet_port::btTransform sphere_transform =
-        MakeBulletPortBallWorldTransform(ball, ball.pos_bt);
-
-    bullet_port::btTransform local_trans_a = box_transform;
-    bullet_port::btTransform local_trans_b = sphere_transform;
-    const bullet_port::btVector3 position_offset =
-        (local_trans_a.getOrigin() + local_trans_b.getOrigin()) * 0.5f;
-    local_trans_a.getOrigin() -= position_offset;
-    local_trans_b.getOrigin() -= position_offset;
-
-    GjkSimplexSolver simplex;
-    simplex.reset();
-
-    Vec3 cached_axis(0.0f, 1.0f, 0.0f);
-    float squared_distance = 1.0e30f;
-    bool check_simplex = false;
-    bool is_valid = false;
-    int degenerate_simplex = 0;
-    int last_used_method = -1;
-    int cur_iter = 0;
-    Vec3 point_on_a_bt(0.0f, 0.0f, 0.0f);
-    Vec3 point_on_b_bt(0.0f, 0.0f, 0.0f);
-
-    while (true) {
-        const bullet_port::btVector3 cached_separating_axis = ToBulletPortVec3(cached_axis);
-        const bullet_port::btVector3 separating_axis_in_a =
-            (-cached_separating_axis) * box_transform.getBasis();
-        const bullet_port::btVector3 separating_axis_in_b =
-            cached_separating_axis * sphere_transform.getBasis();
-
-        const bullet_port::btVector3 p_in_a =
-            box_shape.localGetSupportVertexWithoutMarginNonVirtual(separating_axis_in_a);
-        const bullet_port::btVector3 q_in_b =
-            sphere_shape.localGetSupportVertexWithoutMarginNonVirtual(separating_axis_in_b);
-
-        const bullet_port::btVector3 p_world_bt = local_trans_a(p_in_a);
-        const bullet_port::btVector3 q_world_bt = local_trans_b(q_in_b);
-        const Vec3 p_world = FromBulletPortVec3(p_world_bt);
-        const Vec3 q_world = FromBulletPortVec3(q_world_bt);
-        const Vec3 w = p_world - q_world;
-        const float delta = Dot(cached_axis, w);
-
-        if ((delta > 0.0f) && (delta * delta > squared_distance * kMaximumDistanceSquared)) {
-            degenerate_simplex = 10;
-            check_simplex = true;
-            break;
-        }
-
-        if (simplex.in_simplex(w)) {
-            degenerate_simplex = 1;
-            check_simplex = true;
-            break;
-        }
-
-        const float f0 = squared_distance - delta;
-        const float f1 = squared_distance * kRelError2;
-        if (f0 <= f1) {
-            degenerate_simplex = f0 <= 0.0f ? 2 : 11;
-            check_simplex = true;
-            break;
-        }
-
-        simplex.add_vertex(w, p_world, q_world);
-        Vec3 new_cached_axis(0.0f, 0.0f, 0.0f);
-        if (!simplex.closest(new_cached_axis)) {
-            degenerate_simplex = 3;
-            check_simplex = true;
-            break;
-        }
-
-        if (LengthSq(new_cached_axis) < kRelError2) {
-            cached_axis = new_cached_axis;
-            degenerate_simplex = 6;
-            check_simplex = true;
-            break;
-        }
-
-        const float previous_squared_distance = squared_distance;
-        squared_distance = LengthSq(new_cached_axis);
-        if (previous_squared_distance - squared_distance <= 1.1920929e-7f * previous_squared_distance) {
-            degenerate_simplex = 12;
-            check_simplex = true;
-            break;
-        }
-
-        cached_axis = new_cached_axis;
-        if (cur_iter++ > kGjkMaxIter) {
-            break;
-        }
-        if (simplex.full_simplex()) {
-            degenerate_simplex = 13;
-            break;
-        }
+    if (out_ball_local_bt) {
+        *out_ball_local_bt = FromBulletPortVec3(point_on_ball_local_bt);
     }
-
-    if (!check_simplex) {
-        return;
+    if (out_car_local_bt) {
+        *out_car_local_bt = FromBulletPortVec3(point_on_car_local_bt);
     }
-
-    simplex.compute_points(point_on_a_bt, point_on_b_bt);
-
-    const float len_sqr = LengthSq(cached_axis);
-    if (len_sqr <= 0.0001f) {  // game: float len2 widened, < 0.0001 (double); same as <= 0.0001f
-        degenerate_simplex = 5;
-    }
-
-    float distance_bt = 0.0f;
-    Vec3 normal_bt(0.0f, 0.0f, 0.0f);
-    if (len_sqr > 1.1920929e-7f * 1.1920929e-7f) {
-        const float rlen = 1.0f / SqrtScalar(len_sqr);
-        normal_bt = cached_axis * rlen;
-
-        const float s = SqrtScalar(squared_distance);
-        if (s > 0.0f) {
-            point_on_a_bt -= cached_axis * (margin_a_bt / s);
-            point_on_b_bt += cached_axis * (margin_b_bt / s);
-            distance_bt = (1.0f / rlen) - margin_bt;
-            is_valid = true;
-            last_used_method = 1;
-        } else {
-            last_used_method = 2;
-        }
-    } else {
-        last_used_method = 2;
-    }
-
-    const float distance_plus_margin = distance_bt + margin_bt;
-    const bool catch_degenerate_penetration_case =
-        degenerate_simplex && (distance_plus_margin <= 0.01f);  // game: < 0.01 (double); same as <= 0.01f
-    const bool needs_penetration = !is_valid || catch_degenerate_penetration_case;
-    if (needs_penetration) {
-        bullet_port::btVector3 cached_separating_axis(0.0f, 0.0f, 0.0f);
-        bullet_port::btVector3 tmp_point_on_a_world(0.0f, 0.0f, 0.0f);
-        bullet_port::btVector3 tmp_point_on_b_world(0.0f, 0.0f, 0.0f);
-        bullet_port::btGjkEpaScratch scratch = {};
-        const bool is_valid2 = BulletPortCalcPenDepth(
-            box_shape,
-            local_trans_a,
-            sphere_shape,
-            local_trans_b,
-            cached_separating_axis,
-            tmp_point_on_a_world,
-            tmp_point_on_b_world,
-            &scratch);
-        if (is_valid2) {
-            bullet_port::btVector3 tmp_normal_in_b = tmp_point_on_b_world - tmp_point_on_a_world;
-            float len_sqr_pen = tmp_normal_in_b.length2();
-            if (len_sqr_pen <= 1.1920929e-7f * 1.1920929e-7f) {
-                tmp_normal_in_b = cached_separating_axis;
-                len_sqr_pen = cached_separating_axis.length2();
-            }
-            if (len_sqr_pen > 1.1920929e-7f * 1.1920929e-7f) {
-                tmp_normal_in_b /= SqrtScalar(len_sqr_pen);
-            }
-        }
-    }
-    if (!is_valid) {
-        return;
-    }
-
-    normal_bt = FixArenaTriangleContactNormalDirectionBullet(
-        box_shape, local_trans_a, sphere_shape, local_trans_b, normal_bt);
-}
-
-ROCKETGPU_HD bool UseBallCarGjk() {
     return true;
 }
 
@@ -1212,10 +848,10 @@ ROCKETGPU_HD void ComputeBulletCarCompoundAabbBt(
     Vec3 fwd;
     Vec3 rgt;
     Vec3 upv;
-    GetCarBasisForBulletTransform(car, fwd, rgt, upv);
+    CarBasisColumns(car, fwd, rgt, upv);
 
     const Vec3 local_center_bt = cfg.hitbox_offset * kUUToBT;
-    const Vec3 local_half_extents_bt = (cfg.hitbox_size * 0.5f) * kUUToBT;
+    const Vec3 local_half_extents_bt = (BulletHitboxSize(cfg) * 0.5f) * kUUToBT;
     const Vec3 center_bt =
         car.pos_bt +
         fwd * local_center_bt.x +
@@ -1259,7 +895,7 @@ ROCKETGPU_HD BallCarRsBroadphaseProbe ComputeBulletRsBroadphaseBallCarProbe(
     if (dt > 0.0f) {
         CarState predicted_car = car;
         BallState predicted_ball = ball;
-        IntegrateCarTransformOnly(predicted_car, dt, false, NativeSseMath(mutator));
+        IntegrateCarTransformOnly(predicted_car, dt, NativeSseMath(mutator));
         IntegrateBallTransformOnly(predicted_ball, mutator, dt);
 
         Vec3 predicted_min;
@@ -1290,14 +926,10 @@ ROCKETGPU_HD bool BulletRsBroadphaseAllowsBallCarPair(
     const CarConfig& cfg,
     const MutatorConfig& mutator,
     float dt,
-    int env_idx = -1,
-    int car_idx = -1,
-    int phase = 0) {
+    int env_idx = -1) {
     if (dt <= 0.0f || env_idx < 0) {
         return true;
     }
-    // Both AABBs lie in cubes around the tick-start and predicted origins (car: bounding sphere radius; ball: radius
-    // plus margins), so an axis gap beyond both reaches, the motion over dt and 2 bt of slack rules out an overlap.
     const float reach_bt = (BoundingSphereRadius(cfg) + mutator.ball_radius) * (1.0f / 50.0f) +
                            (Length(car.vel_bt) + Length(ball.vel_bt)) * dt + 2.0f;
     const Vec3 gap_bt = ball.pos_bt - car.pos_bt;
@@ -1311,8 +943,6 @@ ROCKETGPU_HD bool BulletRsBroadphaseAllowsBallCarPair(
 #if !defined(__CUDA_ARCH__)
 #else
     (void)env_idx;
-    (void)car_idx;
-    (void)phase;
 #endif
     return allowed;
 }
@@ -1343,7 +973,7 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometrySphereBox(
 
     const float ball_radius_bt = ball_radius * kUUToBT_BallCar;
     const float box_margin_bt = BallCarShapeMargin(cfg) * kUUToBT_BallCar;
-    const Vec3 raw_half_extent_bt = (cfg.hitbox_size * 0.5f) * kUUToBT_BallCar;
+    const Vec3 raw_half_extent_bt = (BulletHitboxSize(cfg) * 0.5f) * kUUToBT_BallCar;
     const Vec3 implicit_inset_bt = BallCarHitboxInsetBt(cfg);
     const Vec3 box_half_extent_bt(
         raw_half_extent_bt.x - implicit_inset_bt.x,
@@ -1435,30 +1065,12 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometry(
     Vec3& out_rel_ball_contact,
     Vec3& out_rel_car_contact,
     bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr,
-    BallCarContactGeometryDebug* debug = nullptr,
+    bool* out_exact = nullptr,
     Vec3* out_bt_rel_ball_contact_for_solver = nullptr,
-    Vec3* out_bt_rel_car_contact_for_solver = nullptr) {
-    if (TraceBallCarGjkShadowEnabled()) {
-        TraceBallCarContactGeometryGjkShadow(ball, car, cfg, ball_radius);
-    }
-    if (TraceBallCarSphereBoxShadowEnabled()) {
-        Vec3 sphere_box_normal(0.0f, 0.0f, 0.0f);
-        float sphere_box_penetration = 0.0f;
-        Vec3 sphere_box_rel_ball_contact(0.0f, 0.0f, 0.0f);
-        Vec3 sphere_box_rel_car_contact(0.0f, 0.0f, 0.0f);
-        (void)ComputeBallCarContactGeometrySphereBox(
-            ball,
-            car,
-            cfg,
-            ball_radius,
-            0.0f,
-            sphere_box_normal,
-            sphere_box_penetration,
-            sphere_box_rel_ball_contact,
-            sphere_box_rel_car_contact);
-    }
-
-    if (UseBallCarGjk() && ComputeBallCarContactGeometryGjk(
+    Vec3* out_bt_rel_car_contact_for_solver = nullptr,
+    Vec3* out_ball_local_bt = nullptr,
+    Vec3* out_car_local_bt = nullptr) {
+    if (ComputeBallCarContactGeometryGjk(
             ball,
             car,
             cfg,
@@ -1468,9 +1080,11 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometry(
             out_rel_ball_contact,
             out_rel_car_contact,
             gjk_epa_scratch,
-            debug,
+            out_exact,
             out_bt_rel_ball_contact_for_solver,
-            out_bt_rel_car_contact_for_solver)) {
+            out_bt_rel_car_contact_for_solver,
+            out_ball_local_bt,
+            out_car_local_bt)) {
         return true;
     }
 
@@ -1486,9 +1100,6 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometry(
         out_rel_car_contact);
 }
 
-// The first two early-outs of RecordBallCarCollisionInfoIfOverlapping (demoed or just respawned; the
-// BulletRsBroadphaseAllowsBallCarPair reach test), which the caller runs over every car first. Every load is issued
-// before the first branch.
 ROCKETGPU_HD bool BallCarCollisionInfoMayOverlap(
     const BallState& ball, const CarState& car, const CarConfig& cfg, const MutatorConfig& mutator, float dt,
     int env_idx) {
@@ -1512,60 +1123,35 @@ ROCKETGPU_HD bool BallCarCollisionInfoMayOverlap(
     return !(Abs(gap_bt.x) > reach_bt || Abs(gap_bt.y) > reach_bt || Abs(gap_bt.z) > reach_bt);
 }
 
-ROCKETGPU_HD void RecordBallCarCollisionInfoIfOverlapping(
+struct BallCarHitStart {
+    Vec3 car_pos = Vec3(0.0f, 0.0f, 0.0f);
+    Quat car_rot = Quat(1.0f, 0.0f, 0.0f, 0.0f);
+    Vec3 ball_pos = Vec3(0.0f, 0.0f, 0.0f);
+};
+
+ROCKETGPU_HD void CommitBallCarHit(
     const BallState& ball,
     const CarState& car,
     uint32_t car_id,
     CarState& car_mut,
-    const CarConfig& cfg,
     const MutatorConfig& mutator,
     uint64_t env_tick,
     BallState& ball_mut,
-    bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr,
-    float broadphase_dt = -1.0f,
-    int env_idx = -1,
-    int other_local_idx = -1,
-    int8_t car_team = -1,
-    const Vec3* cal_car_start_vel = nullptr,
-    const Vec3* cal_ball_start_vel = nullptr) {
-    if (car.is_demoed || car.just_respawned) {
-        return;
-    }
-    if (!BulletRsBroadphaseAllowsBallCarPair(
-            ball,
-            car,
-            cfg,
-            mutator,
-            broadphase_dt,
-            env_idx,
-            other_local_idx,
-            0)) {
-        return;
-    }
-
-    Vec3 normal(1.0f, 0.0f, 0.0f);
-    float penetration = 0.0f;
-    Vec3 rel_ball_contact(0.0f, 0.0f, 0.0f);
-    Vec3 rel_car_contact(0.0f, 0.0f, 0.0f);
-    if (!ComputeBallCarContactGeometry(ball, car, cfg, mutator.ball_radius, normal, penetration, rel_ball_contact, rel_car_contact, gjk_epa_scratch) &&
-        !ComputeBallCarContactGeometrySphereBox(
-            ball,
-            car,
-            cfg,
-            mutator.ball_radius,
-            BallCarContactBreakingThresholdBT(cfg, mutator.ball_radius),
-            normal,
-            penetration,
-            rel_ball_contact,
-            rel_car_contact)) {
-        return;
-    }
-
+    const Vec3& normal,
+    const Vec3& rel_ball_contact,
+    const Vec3& rel_car_contact,
+    int8_t car_team,
+    const Vec3* cal_car_start_vel,
+    const Vec3* cal_ball_start_vel,
+    const BallCarHitStart* start = nullptr) {
+    const Vec3 car_pos = start ? start->car_pos : car.pos;
+    const Quat car_rot = start ? start->car_rot : car.rot;
+    const Vec3 ball_pos = start ? start->ball_pos : ball.pos;
     const bool contact_started = !car_mut.ball_contact_last_tick && !car_mut.ball_contact_this_tick;
     if (contact_started) {
         car_mut.RecordBallContactStart();
         car_mut.latest_touch_tick = env_tick;
-        car_mut.latest_touch_location = car.pos + rel_car_contact;
+        car_mut.latest_touch_location = car_pos + rel_car_contact;
         car_mut.latest_touch_normal = normal;
     }
     car_mut.ball_contact_this_tick = 1;
@@ -1587,7 +1173,7 @@ ROCKETGPU_HD void RecordBallCarCollisionInfoIfOverlapping(
     car_mut.ball_hit_info.tick_count_when_hit = env_tick;
     car_mut.ball_hit_info.hit_car_id = car_id;
     car_mut.ball_hit_info.relative_pos_on_ball = InverseRotate(ball.rot, rel_ball_contact);
-    car_mut.ball_hit_info.ball_pos = ball.pos;
+    car_mut.ball_hit_info.ball_pos = ball_pos;
     car_mut.ball_hit_info.extra_hit_vel = Vec3(0.0f, 0.0f, 0.0f);
     if (mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker) && car_team >= 0) {
         HeatseekerOnBallHit(ball_mut, static_cast<int>(car_team));
@@ -1598,43 +1184,25 @@ ROCKETGPU_HD void RecordBallCarCollisionInfoIfOverlapping(
         ((prev_extra_impulse_tick + 1ull) < env_tick);
 
     if (can_apply_extra) {
-        const Vec3 rel_pos_for_extra = ball.pos - car.pos;
+        const Vec3 rel_pos_for_extra = ball_pos - car_pos;
 
         const Vec3 rel_vel_for_extra =
             (cal_ball_start_vel ? *cal_ball_start_vel : ball.vel) - (cal_car_start_vel ? *cal_car_start_vel : car.vel);
         const float rel_speed = Min(Length(rel_vel_for_extra), mutator.ball_car_extra_impulse_max_delta_vel);
         if (rel_speed > 0.0f) {
-            Vec3 ei_fwd(1.0f, 0.0f, 0.0f);
-            Vec3 ei_rgt(0.0f, 1.0f, 0.0f);
-            Vec3 ei_up(0.0f, 0.0f, 1.0f);
-            CarBasisColumns(car, ei_fwd, ei_rgt, ei_up);
-            (void)ei_rgt; (void)ei_up;
-            // Car_TA.ApplyBallImpactForces takes
-            // ForwardDir = GetRotatorAxis(QuatToRotator(OldRBState.Quaternion), 0): QuatToRotator is FMatrix::Rotator
-            // (pitch/yaw = appRound(atan2f(..) * 32768 / PI), appRound = cvtss2si(2v + 0.5) >> 1), and
-            // GetRotatorAxis builds FRotationMatrix from UE3's 16384-entry sine table (index angle >> 2).
-            const auto ue3_round = [](float v) { return static_cast<int>(rintf(v + v + 0.5f)) >> 1; };
-            const int fwd_yaw = ue3_round(GlibcAtan2f(ei_fwd.y, ei_fwd.x) * 32768.0f / 3.14159274f);
-            const float fwd_xy = static_cast<float>(sqrt(static_cast<double>(ei_fwd.y * ei_fwd.y + ei_fwd.x * ei_fwd.x)));
-            const int fwd_pitch = ue3_round(GlibcAtan2f(ei_fwd.z, fwd_xy) * 32768.0f / 3.14159274f);
-            const auto sin_tab = [&](int a) { return Ue3SinTab((a >> 2) & 16383); };
-            const float cos_pitch = sin_tab(fwd_pitch + 16384);
-            const Vec3 car_forward(
-                cos_pitch * sin_tab(fwd_yaw + 16384), cos_pitch * sin_tab(fwd_yaw), sin_tab(fwd_pitch));
+            const Vec3 car_forward = Ue3RotatorForwardAxis(Ue3QuatToRotator(car_rot));
 
-            // HitDir = Normal(RelPosition); HitDir.Z *= PushZScale; HitDir = Normal(HitDir).
-            Vec3 hit_dir = RocketSimVecNormalized(rel_pos_for_extra);
+            Vec3 hit_dir = Ue3SafeNormal(rel_pos_for_extra);
             hit_dir.z *= mutator.ball_car_extra_impulse_z_scale;
-            hit_dir = RocketSimVecNormalized(hit_dir);
+            hit_dir = Ue3SafeNormal(hit_dir);
             const Vec3 forward_dir_adjustment =
                 (car_forward * Dot(hit_dir, car_forward)) *
                 (1.0f - mutator.ball_car_extra_impulse_forward_scale);
-            hit_dir = RocketSimVecNormalized(hit_dir - forward_dir_adjustment);
+            hit_dir = Ue3SafeNormal(hit_dir - forward_dir_adjustment);
             const Vec3 added_vel =
                 ((hit_dir * rel_speed) * EvalBallCarExtraImpulseFactor(rel_speed)) *
                 mutator.ball_hit_extra_force_scale;
-            ball_mut.vel_impulse_cache += added_vel;
-            ball_mut.vel_impulse_cache_bt += added_vel * (1.0f / 50.0f);
+            car_mut.ball_hit_info.extra_pending = 1;
             ball_mut.tick_count_when_extra_impulse_applied = env_tick;
             car_mut.ball_hit_info.tick_count_when_extra_impulse_applied = env_tick;
             car_mut.ball_hit_info.extra_hit_vel = added_vel;
@@ -1642,22 +1210,98 @@ ROCKETGPU_HD void RecordBallCarCollisionInfoIfOverlapping(
     }
 }
 
-// cal_ball_car_manifold: one retained manifold point handed to AppendBallCarContactRows in place of the
-// narrowphase (normal car toward ball; bt offsets from the body origins; penetration_uu = -distance * 50).
+ROCKETGPU_HD void RecordBallCarCollisionInfoIfOverlapping(
+    const BallState& ball,
+    const CarState& car,
+    uint32_t car_id,
+    CarState& car_mut,
+    const CarConfig& cfg,
+    const MutatorConfig& mutator,
+    uint64_t env_tick,
+    BallState& ball_mut,
+    bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr,
+    float broadphase_dt = -1.0f,
+    int env_idx = -1,
+    int8_t car_team = -1,
+    const Vec3* cal_car_start_vel = nullptr,
+    const Vec3* cal_ball_start_vel = nullptr) {
+    if (car.is_demoed || car.just_respawned) {
+        return;
+    }
+    if (!BulletRsBroadphaseAllowsBallCarPair(
+            ball,
+            car,
+            cfg,
+            mutator,
+            broadphase_dt,
+            env_idx)) {
+        return;
+    }
+
+    Vec3 normal(1.0f, 0.0f, 0.0f);
+    float penetration = 0.0f;
+    Vec3 rel_ball_contact(0.0f, 0.0f, 0.0f);
+    Vec3 rel_car_contact(0.0f, 0.0f, 0.0f);
+    if (!ComputeBallCarContactGeometry(ball, car, cfg, mutator.ball_radius, normal, penetration, rel_ball_contact, rel_car_contact, gjk_epa_scratch) &&
+        !ComputeBallCarContactGeometrySphereBox(
+            ball,
+            car,
+            cfg,
+            mutator.ball_radius,
+            BallCarContactBreakingThresholdBT(cfg, mutator.ball_radius),
+            normal,
+            penetration,
+            rel_ball_contact,
+            rel_car_contact)) {
+        return;
+    }
+
+    CommitBallCarHit(ball, car, car_id, car_mut, mutator, env_tick, ball_mut, normal, rel_ball_contact, rel_car_contact,
+                     car_team, cal_car_start_vel, cal_ball_start_vel);
+}
+
+ROCKETGPU_HD void CommitBallCarHitFromManifold(
+    const BallState& ball,
+    const CarState& car,
+    uint32_t car_id,
+    CarState& car_mut,
+    const MutatorConfig& mutator,
+    uint64_t env_tick,
+    BallState& ball_mut,
+    const BallCarRetainedManifold& manifold,
+    int8_t car_team,
+    const Vec3* cal_car_start_vel,
+    const Vec3* cal_ball_start_vel,
+    const BallCarHitStart* start) {
+    if (manifold.count == 0) {
+        return;
+    }
+    Vec3 pos_a(0.0f, 0.0f, 0.0f), pos_b(0.0f, 0.0f, 0.0f), normal(0.0f, 0.0f, 0.0f);
+    for (int k = 0; k < manifold.count; ++k) {
+        pos_a = pos_a + manifold.points[k].pos_a_bt;
+        pos_b = pos_b + manifold.points[k].pos_b_bt;
+        normal = normal + manifold.points[k].normal;
+    }
+    const float inv = 1.0f / static_cast<float>(manifold.count);
+    CommitBallCarHit(ball, car, car_id, car_mut, mutator, env_tick, ball_mut, Ue3SafeNormal(normal * inv),
+                     (pos_a * inv - ball.pos_bt) * 50.0f, (pos_b * inv - car.pos_bt) * 50.0f, car_team,
+                     cal_car_start_vel, cal_ball_start_vel, start);
+}
+
 struct BallCarContactOverride {
     Vec3 normal = Vec3(0.0f, 0.0f, 1.0f);
     float penetration_uu = 0.0f;
     Vec3 bt_rel_ball = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 bt_rel_car = Vec3(0.0f, 0.0f, 0.0f);
+    float distance_bt = 0.0f;
+    bool has_distance_bt = false;
 };
 
 ROCKETGPU_HD void AppendBallCarContactRows(
     BallState& ball,
     CarState& car,
-    uint32_t car_id,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
-    uint64_t env_tick,
     const Vec3& ball_external_linear_delta,
     const Vec3& external_linear_delta,
     const Vec3& external_angular_delta,
@@ -1673,7 +1317,6 @@ ROCKETGPU_HD void AppendBallCarContactRows(
     bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr,
     bool allow_midtick_demo_contact = false,
     const Vec3* bt_ball_linear_velocity_override = nullptr,
-    int8_t car_team = -1,
     const BallCarContactOverride* contact_override = nullptr) {
     if ((!allow_midtick_demo_contact && car.is_demoed) || car.just_respawned) {
         return;
@@ -1685,9 +1328,7 @@ ROCKETGPU_HD void AppendBallCarContactRows(
             cfg,
             mutator,
             split_dt,
-            env_idx,
-            other_local_idx,
-            1)) {
+            env_idx)) {
          return;
     }
 
@@ -1695,7 +1336,7 @@ ROCKETGPU_HD void AppendBallCarContactRows(
     float penetration = 0.0f;
     Vec3 rel_ball_contact(0.0f, 0.0f, 0.0f);
     Vec3 rel_car_contact(0.0f, 0.0f, 0.0f);
-    BallCarContactGeometryDebug contact_debug = {};
+    bool exact_contact = false;
     Vec3 bt_rel_ball_contact_for_solver_exact(0.0f, 0.0f, 0.0f);
     Vec3 bt_rel_car_contact_for_solver_exact(0.0f, 0.0f, 0.0f);
     if (contact_override) {
@@ -1715,7 +1356,7 @@ ROCKETGPU_HD void AppendBallCarContactRows(
             rel_ball_contact,
             rel_car_contact,
             gjk_epa_scratch,
-            &contact_debug,
+            &exact_contact,
             &bt_rel_ball_contact_for_solver_exact,
             &bt_rel_car_contact_for_solver_exact) ||
         ComputeBallCarContactGeometrySphereBox(
@@ -1735,7 +1376,7 @@ ROCKETGPU_HD void AppendBallCarContactRows(
 
     constexpr float kBtPerUuBallCar = 1.0f / 50.0f;
     const Vec3 bt_rel_ball_contact_for_solver = contact_override ? contact_override->bt_rel_ball :
-        (contact_debug.valid && contact_debug.used_gjk)
+        exact_contact
             ? bt_rel_ball_contact_for_solver_exact
             : UuVecToBtDiv(rel_ball_contact);
 
@@ -1745,28 +1386,23 @@ ROCKETGPU_HD void AppendBallCarContactRows(
     const Vec3 bc_car_local_point_bt =
         CarBodyLocalPointBt(car, bc_direct_contact_car_world_bt);
     const Vec3 bt_rel_car_contact_for_solver = contact_override ? contact_override->bt_rel_car :
-        (contact_debug.valid && contact_debug.used_gjk)
+        exact_contact
             ? bt_rel_car_contact_for_solver_exact
             : (CarBodyWorldPointBt(car, bc_car_local_point_bt) - bc_car_pos_bt);
 
-    const float bt_split_penetration_for_solver = Dot(
-        (bc_car_pos_bt + bt_rel_car_contact_for_solver) - (ball.pos_bt + bt_rel_ball_contact_for_solver),
-        normal);
+    const float bt_split_penetration_for_solver = (contact_override && contact_override->has_distance_bt)
+        ? -contact_override->distance_bt
+        : Dot((bc_car_pos_bt + bt_rel_car_contact_for_solver) - (ball.pos_bt + bt_rel_ball_contact_for_solver), normal);
 
 #if !defined(__CUDA_ARCH__)
     constexpr float kBtPerUuTrace = kBtPerUuBallCar;
-    const Vec3 ball_pos_bt = ball.pos_bt;
     const Vec3 car_pos_bt = car.pos_bt;
-    const bullet_port::btTransform ball_transform =
-        MakeBulletPortBallWorldTransform(ball, ball_pos_bt);
     const bullet_port::btVector3 direct_rel_car_contact_bt =
         ToBulletPortVec3(rel_car_contact * kBtPerUuTrace);
     const bullet_port::btVector3 direct_contact_point_car_world_bt =
         ToBulletPortVec3(car_pos_bt) + direct_rel_car_contact_bt;
     const Vec3 car_local_point_bt =
         CarBodyLocalPointBt(car, FromBulletPortVec3(direct_contact_point_car_world_bt));
-    const Vec3 refreshed_rel_car_contact_bt =
-        CarBodyWorldPointBt(car, car_local_point_bt) - car_pos_bt;
 #endif
 
     AppendBallCarSplitRow(
@@ -1790,9 +1426,6 @@ ROCKETGPU_HD void AppendBallCarContactRows(
     const Vec3 restitution_car_linear = car.vel;
     const Vec3 ball_angular = ball.ang_vel;
     const Vec3 car_angular = car.ang_vel;
-    const Vec3 rhs_ball_linear = ball.vel + ball_external_linear_delta;
-    const Vec3 rhs_car_linear = car.vel + external_linear_delta;
-    const Vec3 rhs_car_angular = car.ang_vel + external_angular_delta;
     constexpr float kBtPerUuTangent = 1.0f / 50.0f;
     const Vec3 bt_ball_linear_for_tangent = bt_ball_linear_velocity_override
         ? *bt_ball_linear_velocity_override
@@ -1867,10 +1500,6 @@ ROCKETGPU_HD void AppendBallCarContactRows(
         ball_angular,
         restitution_car_linear,
         car_angular,
-        rhs_ball_linear,
-        ball_angular,
-        rhs_car_linear,
-        rhs_car_angular,
         ball_external_linear_delta,
         Vec3(0.0f, 0.0f, 0.0f),
         external_linear_delta,
@@ -1890,13 +1519,9 @@ ROCKETGPU_HD void AppendBallCarContactRows(
         car.ext_force_impulse_bt_valid ? &car.ext_force_impulse_bt : nullptr,
 
         &car.ang_vel,
-
         car.ext_force_impulse_bt_valid ? &car.ext_torque_impulse : nullptr);
-    if (contact_debug.valid && normal_row_count > 0) {
-    }
 }
 
-// cal_ball_car_manifold helpers (v3 persistent_manifold.rs on the ball-car pair; body0 = ball, body1 = car).
 ROCKETGPU_HD Vec3 BallCarRetainedBallWorldPointBt(const BallState& ball, const Vec3& local_bt) {
     Vec3 bx, by, bz;
     GetBallBasisColumns(ball, bx, by, bz);
@@ -1914,7 +1539,6 @@ ROCKETGPU_HD Vec3 BallCarRetainedBallLocalPointBt(const BallState& ball, const V
     return Vec3(Dot(rel, bx), Dot(rel, by), Dot(rel, bz));
 }
 
-// v3 PersistentManifold::refresh_contact_points.
 ROCKETGPU_HD void RefreshBallCarRetainedManifold(
     BallCarRetainedManifold& manifold, const BallState& ball, const CarState& car, float threshold_bt) {
     const int count = manifold.count;
@@ -1947,9 +1571,6 @@ ROCKETGPU_HD float BallCarRetainedRes(const Vec3& local, const Vec3& p1, const V
     return Dot(c, c);
 }
 
-// btPersistentManifold::getCacheEntry / addManifoldPoint / sortCachedPoints (keeping the deepest point). Both
-// match and replace on m_localPointA, which is in body0's frame. In the game's ball-car manifold body0 is the car
-// (the lower broadphase uid; the GJK already takes the car box as shape A), so these use the car-local points.
 ROCKETGPU_HD void AddBallCarRetainedPoint(
     BallCarRetainedManifold& manifold, const BallCarRetainedPoint& point, float threshold_bt) {
     const int count = manifold.count;
@@ -2005,9 +1626,6 @@ ROCKETGPU_HD void AddBallCarRetainedPoint(
     manifold.points[biggest] = point;
 }
 
-// The early-out of AppendBallCarContactRowsRetained, which the caller runs first (retained.count = 0 when false): the
-// car is not demoed (unless allowed) or just respawned, and the car box child AABB overlaps the ball AABB. Every load
-// is issued before the first branch.
 ROCKETGPU_HD bool BallCarRetainedPairOverlaps(
     const BallState& ball, const CarState& car, const CarConfig& cfg, const MutatorConfig& mutator,
     bool allow_midtick_demo_contact) {
@@ -2050,17 +1668,11 @@ ROCKETGPU_HD bool BallCarRetainedPairOverlaps(
              cmin.z > bmax.z || cmax.z < bmin.z);
 }
 
-// cal_ball_car_manifold: v3 near_callback_with_bounds for the ball-car pair. The car box child AABB must overlap
-// the ball AABB (radius + SPHERE_RADIUS_MARGIN) or the manifold is released; the fresh sphere-OBB point (same
-// narrowphase as AppendBallCarContactRows) merges into the refreshed retained manifold, and every retained point,
-// positive distances included, becomes a ball-car solver row.
 ROCKETGPU_HD void AppendBallCarContactRowsRetained(
     BallState& ball,
     CarState& car,
-    uint32_t car_id,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
-    uint64_t env_tick,
     const Vec3& ball_external_linear_delta,
     const Vec3& external_linear_delta,
     const Vec3& external_angular_delta,
@@ -2076,7 +1688,6 @@ ROCKETGPU_HD void AppendBallCarContactRowsRetained(
     bullet_port::btGjkEpaScratch* gjk_epa_scratch,
     bool allow_midtick_demo_contact,
     const Vec3* bt_ball_linear_velocity_override,
-    int8_t car_team,
     BallCarRetainedManifold& retained) {
     constexpr float kUUToBT = 1.0f / 50.0f;
     const float threshold_bt = BallCarContactBreakingThresholdBT(cfg, mutator.ball_radius);
@@ -2085,20 +1696,23 @@ ROCKETGPU_HD void AppendBallCarContactRowsRetained(
     float penetration = 0.0f;
     Vec3 rel_ball_contact(0.0f, 0.0f, 0.0f);
     Vec3 rel_car_contact(0.0f, 0.0f, 0.0f);
-    BallCarContactGeometryDebug contact_debug = {};
+    bool exact_contact = false;
     Vec3 bt_rel_ball_exact(0.0f, 0.0f, 0.0f);
     Vec3 bt_rel_car_exact(0.0f, 0.0f, 0.0f);
+    Vec3 ball_local_exact(0.0f, 0.0f, 0.0f);
+    Vec3 car_local_exact(0.0f, 0.0f, 0.0f);
     const bool has_fresh =
         ComputeBallCarContactGeometry(
             ball, car, cfg, mutator.ball_radius, normal, penetration, rel_ball_contact, rel_car_contact,
-            gjk_epa_scratch, &contact_debug, &bt_rel_ball_exact, &bt_rel_car_exact) ||
+            gjk_epa_scratch, &exact_contact, &bt_rel_ball_exact, &bt_rel_car_exact, &ball_local_exact,
+            &car_local_exact) ||
         ComputeBallCarContactGeometrySphereBox(
             ball, car, cfg, mutator.ball_radius, BallCarContactBreakingThresholdBT(cfg, mutator.ball_radius),
             normal, penetration, rel_ball_contact, rel_car_contact);
 
     RefreshBallCarRetainedManifold(retained, ball, car, threshold_bt);
     if (has_fresh) {
-        const bool exact = contact_debug.valid && contact_debug.used_gjk;
+        const bool exact = exact_contact;
         const Vec3 bt_rel_ball = exact ? bt_rel_ball_exact : UuVecToBtDiv(rel_ball_contact);
         const Vec3 bt_rel_car = exact
             ? bt_rel_car_exact
@@ -2110,8 +1724,8 @@ ROCKETGPU_HD void AppendBallCarContactRowsRetained(
             BallCarRetainedManifold fresh;
             BallCarRetainedPoint& point = fresh.points[0];
             point.normal = normal;
-            point.local_a_bt = BallCarRetainedBallLocalPointBt(ball, pos_a);
-            point.local_b_bt = CarBodyLocalPointBt(car, pos_b);
+            point.local_a_bt = exact ? ball_local_exact : BallCarRetainedBallLocalPointBt(ball, pos_a);
+            point.local_b_bt = exact ? car_local_exact : CarBodyLocalPointBt(car, pos_b);
             point.distance_bt = depth;
             fresh.count = 1;
             RefreshBallCarRetainedManifold(fresh, ball, car, threshold_bt);
@@ -2127,11 +1741,13 @@ ROCKETGPU_HD void AppendBallCarContactRowsRetained(
         ov.penetration_uu = -point.distance_bt * 50.0f;
         ov.bt_rel_ball = point.pos_a_bt - ball.pos_bt;
         ov.bt_rel_car = point.pos_b_bt - car.pos_bt;
+        ov.distance_bt = point.distance_bt;
+        ov.has_distance_bt = true;
         AppendBallCarContactRows(
-            ball, car, car_id, cfg, mutator, env_tick, ball_external_linear_delta, external_linear_delta,
+            ball, car, cfg, mutator, ball_external_linear_delta, external_linear_delta,
             external_angular_delta, normal_rows, normal_row_count, friction_rows, friction_row_count, split_rows,
             split_row_count, other_local_idx, split_dt, env_idx, gjk_epa_scratch, allow_midtick_demo_contact,
-            bt_ball_linear_velocity_override, car_team, &ov);
+            bt_ball_linear_velocity_override, &ov);
     }
 }
 
@@ -2153,14 +1769,8 @@ struct ObbContactFeature {
     uint8_t axis_b = 0;
 };
 
-struct FaceClipPoint {
-    float u = 0.0f;
-    float v = 0.0f;
-    float w = 0.0f;
-};
-
 constexpr int kMaxApproxCarCarContactPoints = 4;
-constexpr float kLargeFaceClipFloat = 1.0e18f;  // BT_LARGE_FLOAT, cullPoints2's degenerate-area fallback
+constexpr float kLargeFaceClipFloat = 1.0e18f;
 
 ROCKETGPU_HD float ObbHalfExtentComponent(const ObbData& obb, int idx) {
     return (&obb.half_extent.x)[idx];
@@ -2252,7 +1862,7 @@ ROCKETGPU_HD void CullFacePoints2(int count, float points[16], int max_points, i
         }
         q = points[count * 2 - 2] * points[1] - points[0] * points[count * 2 - 1];
         const float denom = area_sum + q;
-        const float scale = Abs(denom) > 1.1920929e-7f ? (1.0f / (3.0f * denom)) : kLargeFaceClipFloat;  // SIMD_EPSILON
+        const float scale = Abs(denom) > 1.1920929e-7f ? (1.0f / (3.0f * denom)) : kLargeFaceClipFloat;
         cx = scale * (cx + q * (points[count * 2 - 2] + points[0]));
         cy = scale * (cy + q * (points[count * 2 - 1] + points[1]));
     }
@@ -2302,10 +1912,9 @@ ROCKETGPU_HD int ComputeFaceClippedCarCarContactAnchorPairs(
     Vec3* out_ref_points,
     Vec3* out_inc_points,
     int max_points,
-    int debug_env_idx = -1,
-    int debug_car_idx_a = -1,
-    int debug_car_idx_b = -1,
-    int debug_ref_is_a = -1) {
+    int ref_is_a = -1,
+    Vec3* out_game_points = nullptr,
+    float* out_game_depths = nullptr) {
     if (!out_ref_points || !out_inc_points || max_points <= 0) {
         return 0;
     }
@@ -2448,7 +2057,13 @@ ROCKETGPU_HD int ComputeFaceClippedCarCarContactAnchorPairs(
 
         const Vec3 ref_point = incident_point + ref_normal * depths[idx];
         out_ref_points[i] = ref_point;
-        out_inc_points[i] = debug_ref_is_a ? incident_point : (ref_point + ref_normal * (-depths[idx]));
+        out_inc_points[i] = ref_is_a ? incident_point : (ref_point + ref_normal * (-depths[idx]));
+        if (out_game_points) {
+            out_game_points[i] = ref_is_a ? ref_point : incident_point;
+        }
+        if (out_game_depths) {
+            out_game_depths[i] = -depths[idx];
+        }
     }
 
     return output_count;
@@ -2481,38 +2096,81 @@ ROCKETGPU_HD bool ComputeEdgeEdgeCarCarContactAnchorsBulletStyle(
     int axis_a_idx,
     const ObbData& b,
     int axis_b_idx,
-    const Vec3& normal,
-    float penetration_bt,
+    Vec3& out_normal,
     Vec3& out_point_a,
-    Vec3& out_point_b) {
+    Vec3& out_point_b,
+    float* out_game_s = nullptr) {
     if (axis_a_idx < 0 || axis_a_idx > 2 || axis_b_idx < 0 || axis_b_idx > 2) {
         return false;
     }
-
-    Vec3 pa = a.center;
-    for (int j = 0; j < 3; ++j) {
-        const float sign = Dot(normal, a.axis[j]) > 0.0f ? 1.0f : -1.0f;
-        pa += a.axis[j] * (sign * ObbHalfExtentComponent(a, j));
+    const ObbData& box1 = b;
+    const ObbData& box2 = a;
+    const int i = axis_b_idx;
+    const int j = axis_a_idx;
+    const Vec3 p = box2.center - box1.center;
+    const float pp[3] = {Dot(box1.axis[0], p), Dot(box1.axis[1], p), Dot(box1.axis[2], p)};
+    float r[3];
+    for (int k = 0; k < 3; ++k) {
+        r[k] = Dot(box1.axis[k], box2.axis[j]);
+    }
+    float expr1;
+    Vec3 n_c;
+    if (i == 0) {
+        expr1 = pp[2] * r[1] - pp[1] * r[2];
+        n_c = Vec3(0.0f, -r[2], r[1]);
+    } else if (i == 1) {
+        expr1 = pp[0] * r[2] - pp[2] * r[0];
+        n_c = Vec3(r[2], 0.0f, -r[0]);
+    } else {
+        expr1 = pp[1] * r[0] - pp[0] * r[1];
+        n_c = Vec3(-r[1], r[0], 0.0f);
+    }
+    const float l = SqrtScalar(n_c.x * n_c.x + n_c.y * n_c.y + n_c.z * n_c.z);
+    if (!(l > 1.1920929e-07f)) {
+        return false;
+    }
+    if (out_game_s) {
+        constexpr float kFudge2 = 1.0e-5f;
+        const int lo = i == 0 ? 1 : 0;
+        const int hi = i == 2 ? 1 : 2;
+        const int k1 = j == 0 ? 1 : 0;
+        const int k2 = j == 2 ? 1 : 2;
+        const float q_hi_j = Abs(r[hi]) + kFudge2;
+        const float q_lo_j = Abs(r[lo]) + kFudge2;
+        const float q_i_k2 = Abs(Dot(box1.axis[i], box2.axis[k2])) + kFudge2;
+        const float q_i_k1 = Abs(Dot(box1.axis[i], box2.axis[k1])) + kFudge2;
+        const float expr2 = ((ObbHalfExtentComponent(box1, lo) * q_hi_j + ObbHalfExtentComponent(box1, hi) * q_lo_j) +
+                             ObbHalfExtentComponent(box2, k1) * q_i_k2) +
+                            ObbHalfExtentComponent(box2, k2) * q_i_k1;
+        *out_game_s = (Abs(expr1) - expr2) / l;
+    }
+    n_c = Vec3(n_c.x / l, n_c.y / l, n_c.z / l);
+    Vec3 normal(
+        box1.axis[0].x * n_c.x + box1.axis[1].x * n_c.y + box1.axis[2].x * n_c.z,
+        box1.axis[0].y * n_c.x + box1.axis[1].y * n_c.y + box1.axis[2].y * n_c.z,
+        box1.axis[0].z * n_c.x + box1.axis[1].z * n_c.y + box1.axis[2].z * n_c.z);
+    if (expr1 < 0.0f) {
+        normal = Vec3(-normal.x, -normal.y, -normal.z);
     }
 
-    Vec3 pb = b.center;
-    for (int j = 0; j < 3; ++j) {
-        const float sign = Dot(normal, b.axis[j]) > 0.0f ? -1.0f : 1.0f;
-        pb += b.axis[j] * (sign * ObbHalfExtentComponent(b, j));
+    Vec3 pa = box1.center;
+    for (int k = 0; k < 3; ++k) {
+        const float sign = Dot(normal, box1.axis[k]) > 0.0f ? 1.0f : -1.0f;
+        pa += box1.axis[k] * (sign * ObbHalfExtentComponent(box1, k));
     }
-
-    const Vec3 ua = a.axis[axis_a_idx];
-    const Vec3 ub = b.axis[axis_b_idx];
+    Vec3 pb = box2.center;
+    for (int k = 0; k < 3; ++k) {
+        const float sign = Dot(normal, box2.axis[k]) > 0.0f ? -1.0f : 1.0f;
+        pb += box2.axis[k] * (sign * ObbHalfExtentComponent(box2, k));
+    }
+    const Vec3 ua = box1.axis[i];
+    const Vec3 ub = box2.axis[j];
     float alpha = 0.0f;
     float beta = 0.0f;
     ComputeLineClosestApproachParams(pa, ua, pb, ub, alpha, beta);
-
-    out_point_b = pb + ub * beta;
-    if (penetration_bt > 0.0f) {
-        out_point_a = out_point_b + normal * penetration_bt;
-    } else {
-        out_point_a = pa + ua * alpha;
-    }
+    out_normal = normal;
+    out_point_a = pb + ub * beta;
+    out_point_b = pa + ua * alpha;
     return true;
 }
 
@@ -2539,11 +2197,7 @@ ROCKETGPU_HD bool ComputeObbContact(
     float contact_threshold_uu,
     Vec3& out_normal,
     float& out_signed_overlap,
-    ObbContactFeature* out_feature = nullptr,
-    int debug_env_idx = -1,
-    int debug_slot_a = -1,
-    int debug_slot_b = -1,
-    int debug_call_tag = -1) {
+    ObbContactFeature* out_feature = nullptr) {
     constexpr float kEps = 1e-5f;
 
     float R[3][3];
@@ -2565,7 +2219,7 @@ ROCKETGPU_HD bool ComputeObbContact(
     };
 
     constexpr float kEdgeFudgeFactor = 1.05f;
-    constexpr float kEdgeSepEps = 1.1920929e-7f;  // dBoxBox2 edge-axis TST: SIMD_EPSILON for the exit and the |n| test
+    constexpr float kEdgeSepEps = 1.1920929e-7f;
     bool have_best_axis = false;
     float best_s2 = -1.0e30f;
     Vec3 best_axis(1.0f, 0.0f, 0.0f);
@@ -2657,7 +2311,6 @@ ROCKETGPU_HD bool ComputeObbContact(
                 (((&a.half_extent.x)[a_lo] * AbsR[a_hi][j] + (&a.half_extent.x)[a_hi] * AbsR[a_lo][j]) +
                  (&b.half_extent.x)[b_lo] * AbsR[i][b_hi]) +
                 (&b.half_extent.x)[b_hi] * AbsR[i][b_lo];
-            const float axis_len = SqrtScalar(n_local.x * n_local.x + n_local.y * n_local.y + n_local.z * n_local.z);
             if (!consider_edge_axis(
                     n_local,
                     expr1,
@@ -2684,88 +2337,351 @@ ROCKETGPU_HD bool ComputeObbContact(
     return true;
 }
 
+ROCKETGPU_HD bool ComputeObbContactGameOrder(
+    const ObbData& a,
+    const ObbData& b,
+    float contact_threshold_uu,
+    Vec3& out_normal,
+    float& out_signed_overlap,
+    ObbContactFeature* out_feature = nullptr) {
+    Vec3 normal_ba;
+    ObbContactFeature feature_ba;
+    if (!ComputeObbContact(b, a, contact_threshold_uu, normal_ba, out_signed_overlap, &feature_ba)) {
+        return false;
+    }
+    out_normal = -normal_ba;
+    if (out_feature) {
+        ObbContactFeature f = feature_ba;
+        if (feature_ba.kind == OBB_CONTACT_FEATURE_FACE_A) {
+            f.kind = OBB_CONTACT_FEATURE_FACE_B;
+        } else if (feature_ba.kind == OBB_CONTACT_FEATURE_FACE_B) {
+            f.kind = OBB_CONTACT_FEATURE_FACE_A;
+        }
+        f.axis_a = feature_ba.axis_b;
+        f.axis_b = feature_ba.axis_a;
+        *out_feature = f;
+    }
+    return true;
+}
+
 ROCKETGPU_HD bool InForwardCone(
     const CarState& a, const CarConfig& a_cfg, const CarState& v, const CarConfig& v_cfg, bool reverse, float max_yaw_deg);
 
-ROCKETGPU_HD void AdvancePose(CarState& s, const Vec3& vel, float t) {
-    Vec3 f(1.0f, 0.0f, 0.0f), r(0.0f, 1.0f, 0.0f), u(0.0f, 0.0f, 1.0f);
-    CarBasisColumns(s, f, r, u);
-    s.pos = s.pos + vel * t;
-    const float w = Length(s.ang_vel);
-    const float th = w * t;
-    if (w > 0.0f && th != 0.0f) {
-        const Vec3 k = s.ang_vel / w;
-        const float c = cosf(th), sn = sinf(th);
-        auto rot = [&](const Vec3& x) { return x * c + Cross(k, x) * sn + k * (Dot(k, x) * (1.0f - c)); };
-        f = rot(f); r = rot(r); u = rot(u);
-    }
-    s.basis_forward = f; s.basis_right = r; s.basis_up = u;
-    s.basis_authoritative = 1;
+struct CarToiTransform {
+    Vec3 fwd, right, up, origin;
+};
+
+ROCKETGPU_HD bullet_port::btTransform CarToiBt(const CarToiTransform& t) {
+    bullet_port::btTransform out;
+    out.setBasis(bullet_port::btMatrix3x3(
+        bullet_port::btVector3(t.fwd.x, t.right.x, t.up.x),
+        bullet_port::btVector3(t.fwd.y, t.right.y, t.up.y),
+        bullet_port::btVector3(t.fwd.z, t.right.z, t.up.z)));
+    out.setOrigin(ToBulletPortVec3(t.origin));
+    return out;
 }
 
-ROCKETGPU_HD float BoxSeparation(const CarState& a, const CarConfig& a_cfg, const CarState& b, const CarConfig& b_cfg) {
-    Vec3 ra[3], rb[3];
-    CarBasisColumns(a, ra[0], ra[1], ra[2]);
-    CarBasisColumns(b, rb[0], rb[1], rb[2]);
-    const Vec3 ha = a_cfg.hitbox_size * 0.5f, hb = b_cfg.hitbox_size * 0.5f;
-    const float h_a[3] = {ha.x, ha.y, ha.z}, h_b[3] = {hb.x, hb.y, hb.z};
-    const Vec3 ca = a.pos + ra[0] * a_cfg.hitbox_offset.x + ra[1] * a_cfg.hitbox_offset.y + ra[2] * a_cfg.hitbox_offset.z;
-    const Vec3 cb = b.pos + rb[0] * b_cfg.hitbox_offset.x + rb[1] * b_cfg.hitbox_offset.y + rb[2] * b_cfg.hitbox_offset.z;
-    const Vec3 d = cb - ca;
-    float best = -1e30f;
-    auto test = [&](const Vec3& L) {
-        float sep = fabsf(Dot(d, L));
-        for (int i = 0; i < 3; ++i) {
-            sep -= fabsf(Dot(ra[i], L)) * h_a[i] + fabsf(Dot(rb[i], L)) * h_b[i];
-        }
-        best = best > sep ? best : sep;
+ROCKETGPU_HD CarToiTransform CarToiIntegrate(const CarToiTransform& t, const Vec3& lin, const Vec3& ang, float dt) {
+    CarToiTransform out = t;
+    out.origin = Vec3(dt * lin.x + t.origin.x, dt * lin.y + t.origin.y, dt * lin.z + t.origin.z);
+    Quat q;
+    GameIntegrateOrientationBasisColumns(out.fwd, out.right, out.up, q, ang, dt);
+    return out;
+}
+
+ROCKETGPU_HD Vec3 CarToiAngularVelocity(const CarToiTransform& t0, const CarToiTransform& t1) {
+    const float m00 = t0.fwd.x, m01 = t0.right.x, m02 = t0.up.x;
+    const float m10 = t0.fwd.y, m11 = t0.right.y, m12 = t0.up.y;
+    const float m20 = t0.fwd.z, m21 = t0.right.z, m22 = t0.up.z;
+    const float co0 = m11 * m22 - m12 * m21, co1 = m12 * m20 - m10 * m22, co2 = m10 * m21 - m11 * m20;
+    const float s = 1.0f / ((m00 * co0 + m01 * co1) + m02 * co2);
+    const float i00 = co0 * s, i01 = (m02 * m21 - m01 * m22) * s, i02 = (m01 * m12 - m02 * m11) * s;
+    const float i10 = co1 * s, i11 = (m00 * m22 - m02 * m20) * s, i12 = (m02 * m10 - m00 * m12) * s;
+    const float i20 = co2 * s, i21 = (m01 * m20 - m00 * m21) * s, i22 = (m00 * m11 - m01 * m10) * s;
+    auto row = [&](float b0, float b1, float b2) {
+        return Vec3((i00 * b0 + i10 * b1) + i20 * b2, (i01 * b0 + i11 * b1) + i21 * b2, (i02 * b0 + i12 * b1) + i22 * b2);
     };
-    for (int i = 0; i < 3; ++i) {
-        test(ra[i]);
-        test(rb[i]);
+    const Vec3 d0 = row(t1.fwd.x, t1.right.x, t1.up.x);
+    const Vec3 d1 = row(t1.fwd.y, t1.right.y, t1.up.y);
+    const Vec3 d2 = row(t1.fwd.z, t1.right.z, t1.up.z);
+    const Quat q = GameQuatNormalizeScalar(
+        GameGetRotationScalar(Vec3(d0.x, d1.x, d2.x), Vec3(d0.y, d1.y, d2.y), Vec3(d0.z, d1.z, d2.z)), -1.0f);
+    float w = q.w;
+    w = -1.0f <= w ? w : -1.0f;
+    w = w <= 1.0f ? w : 1.0f;
+    const float half = RocketGpuUcrtAcosf(w);
+    const float angle = half + half;
+    const float len2 = (q.x * q.x + q.y * q.y) + q.z * q.z;
+    Vec3 axis(1.0f, 0.0f, 0.0f);
+    if (len2 >= 1.42108547e-14f) {
+        const float inv = 1.0f / sqrtf(len2);
+        axis = Vec3(inv * q.x, q.y * inv, inv * q.z);
     }
-    for (int i = 0; i < 3; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            const Vec3 L = Cross(ra[i], rb[j]);
-            const float n = Length(L);
-            if (n > 1e-6f) {
-                test(L / n);
+    return Vec3(axis.x * angle, axis.y * angle, axis.z * angle);
+}
+
+ROCKETGPU_HD float CarToiAngularMotionDisc(const bullet_port::btConvexShape& box) {
+    const float m = box.getMarginNonVirtual();
+    const float ex = box.m_implicitShapeDimensions.x() + m;
+    const float ey = box.m_implicitShapeDimensions.y() + m;
+    const float ez = box.m_implicitShapeDimensions.z() + m;
+    const float dx = ex - -ex, dy = ey - -ey, dz = ez - -ez;
+    return sqrtf((dx * dx + dy * dy) + dz * dz) * 0.5f;
+}
+
+ROCKETGPU_HD Quat GameUeQuatSlerp(const Quat& q1, const Quat& q2, float t) {
+    const float raw = ((q1.x * q2.x + q1.y * q2.y) + q1.z * q2.z) + q1.w * q2.w;
+    const float cosom = raw >= 0.0f ? raw : -raw;
+    float scale0, scale1;
+    if (cosom < 0.9999f) {
+        const float c = -1.0f > cosom ? -1.0f : (cosom < 1.0f ? cosom : 1.0f);
+        const float omega = RocketGpuUcrtAcosf(c);
+        const float inv_sin = 1.0f / RocketGpuUcrtSinf(omega);
+        scale0 = RocketGpuUcrtSinf((1.0f - t) * omega) * inv_sin;
+        scale1 = RocketGpuUcrtSinf(omega * t) * inv_sin;
+    } else {
+        scale0 = 1.0f - t;
+        scale1 = t;
+    }
+    if (!(raw >= 0.0f)) {
+        scale1 = -scale1;
+    }
+    return Quat(scale1 * q2.w + q1.w * scale0, scale1 * q2.x + q1.x * scale0, scale1 * q2.y + q1.y * scale0,
+                scale1 * q2.z + q1.z * scale0);
+}
+
+ROCKETGPU_HD bool CarToiClosestPoints(
+    const bullet_port::btConvexShape& shape_a, const bullet_port::btTransform& trans_a,
+    const bullet_port::btConvexShape& shape_b, const bullet_port::btTransform& trans_b,
+    float& out_distance, Vec3& out_normal, Vec3& out_point) {
+    constexpr float kRelError2 = 1.0e-6f;
+    constexpr int kGjkMaxIter = 1000;
+    constexpr float kMaximumDistanceSquared = 1.0e18f;
+    const float margin_a = shape_a.getMarginNonVirtual();
+    const float margin_b = shape_b.getMarginNonVirtual();
+
+    bullet_port::btTransform local_trans_a = trans_a;
+    bullet_port::btTransform local_trans_b = trans_b;
+    const bullet_port::btVector3 position_offset = (local_trans_a.getOrigin() + local_trans_b.getOrigin()) * 0.5f;
+    local_trans_a.getOrigin() -= position_offset;
+    local_trans_b.getOrigin() -= position_offset;
+
+    GjkSimplexSolver simplex;
+    simplex.reset();
+    Vec3 cached_axis(0.0f, 1.0f, 0.0f);
+    float squared_distance = 1.0e30f;
+    bool check_simplex = false;
+    bool is_valid = false;
+    int degenerate_simplex = 0;
+    int cur_iter = 0;
+    float distance = 0.0f;
+    Vec3 normal(0.0f, 0.0f, 0.0f);
+
+    while (true) {
+        const bullet_port::btVector3 axis_bt = ToBulletPortVec3(cached_axis);
+        const bullet_port::btVector3 p_in_a =
+            shape_a.localGetSupportVertexWithoutMarginNonVirtual((-axis_bt) * trans_a.getBasis());
+        const bullet_port::btVector3 q_in_b =
+            shape_b.localGetSupportVertexWithoutMarginNonVirtual(axis_bt * trans_b.getBasis());
+        const Vec3 p_world = FromBulletPortVec3(local_trans_a(p_in_a));
+        const Vec3 q_world = FromBulletPortVec3(local_trans_b(q_in_b));
+        const Vec3 w = p_world - q_world;
+        const float delta = Dot(cached_axis, w);
+        if ((delta > 0.0f) && (delta * delta > squared_distance * kMaximumDistanceSquared)) {
+            degenerate_simplex = 10;
+            check_simplex = true;
+            break;
+        }
+        if (simplex.in_simplex(w)) {
+            degenerate_simplex = 1;
+            check_simplex = true;
+            break;
+        }
+        const float f0 = squared_distance - delta;
+        const float f1 = squared_distance * kRelError2;
+        if (f0 <= f1) {
+            degenerate_simplex = f0 <= 0.0f ? 2 : 11;
+            check_simplex = true;
+            break;
+        }
+        simplex.add_vertex(w, p_world, q_world);
+        Vec3 new_cached_axis(0.0f, 0.0f, 0.0f);
+        if (!simplex.closest(new_cached_axis)) {
+            degenerate_simplex = 3;
+            check_simplex = true;
+            break;
+        }
+        if (LengthSq(new_cached_axis) < kRelError2) {
+            cached_axis = new_cached_axis;
+            degenerate_simplex = 6;
+            check_simplex = true;
+            break;
+        }
+        const float previous_squared_distance = squared_distance;
+        squared_distance = LengthSq(new_cached_axis);
+        if (previous_squared_distance - squared_distance <= 1.1920929e-7f * previous_squared_distance) {
+            degenerate_simplex = 12;
+            check_simplex = true;
+            break;
+        }
+        cached_axis = new_cached_axis;
+        if (cur_iter++ > kGjkMaxIter) {
+            break;
+        }
+        if (simplex.full_simplex()) {
+            degenerate_simplex = 13;
+            break;
+        }
+    }
+    if (!check_simplex) {
+        return false;
+    }
+
+    Vec3 point_on_a(0.0f, 0.0f, 0.0f);
+    Vec3 point_on_b(0.0f, 0.0f, 0.0f);
+    simplex.compute_points(point_on_a, point_on_b);
+    const float len_sqr = LengthSq(cached_axis);
+    if (len_sqr <= 0.0001f) {
+        degenerate_simplex = 5;
+    }
+    const float s = SqrtScalar(squared_distance);
+    if (len_sqr > 1.1920929e-7f * 1.1920929e-7f) {
+        const float inv_len = 1.0f / SqrtScalar(len_sqr);
+        normal = cached_axis * inv_len;
+        if (s > 0.0f) {
+            point_on_a -= cached_axis * (margin_a / s);
+            point_on_b += cached_axis * (margin_b / s);
+            distance = (1.0f / inv_len) - (margin_a + margin_b);
+            is_valid = true;
+        }
+    }
+
+    if (!is_valid || (degenerate_simplex && ((distance + (margin_a + margin_b)) <= 0.01f))) {
+        bullet_port::btVector3 sep_axis(0.0f, 0.0f, 0.0f);
+        bullet_port::btVector3 tmp_a(0.0f, 0.0f, 0.0f);
+        bullet_port::btVector3 tmp_b(0.0f, 0.0f, 0.0f);
+        bullet_port::btGjkEpaScratch scratch = {};
+        if (BulletPortCalcPenDepth(shape_a, local_trans_a, shape_b, local_trans_b, sep_axis, tmp_a, tmp_b, &scratch)) {
+            bullet_port::btVector3 tmp_normal = tmp_b - tmp_a;
+            float len_sqr_pen = tmp_normal.length2();
+            if (len_sqr_pen <= 1.1920929e-7f * 1.1920929e-7f) {
+                tmp_normal = sep_axis;
+                len_sqr_pen = sep_axis.length2();
+            }
+            if (len_sqr_pen > 1.1920929e-7f * 1.1920929e-7f) {
+                tmp_normal /= SqrtScalar(len_sqr_pen);
+                const float distance2 = -Length(FromBulletPortVec3(tmp_a - tmp_b));
+                if (!is_valid || distance2 < distance) {
+                    distance = distance2;
+                    point_on_a = FromBulletPortVec3(tmp_a);
+                    point_on_b = FromBulletPortVec3(tmp_b);
+                    normal = FromBulletPortVec3(tmp_normal);
+                    is_valid = true;
+                }
+            }
+        } else if (sep_axis.length2() > 0.0f) {
+            const float distance2 = Length(FromBulletPortVec3(tmp_a - tmp_b)) - (margin_a + margin_b);
+            if (!is_valid || distance2 < distance) {
+                point_on_a = FromBulletPortVec3(tmp_a - sep_axis * margin_a);
+                point_on_b = FromBulletPortVec3(tmp_b + sep_axis * margin_b);
+                normal = Normalize(FromBulletPortVec3(sep_axis), normal);
+                distance = distance2;
+                is_valid = true;
             }
         }
     }
-    return best;
+    if (!is_valid || !((distance < 0.0f) || (distance * distance < kMaximumDistanceSquared))) {
+        return false;
+    }
+    out_normal = FixArenaTriangleContactNormalDirectionBullet(shape_a, local_trans_a, shape_b, local_trans_b, normal);
+    out_point = point_on_b + FromBulletPortVec3(position_offset);
+    out_distance = distance;
+    return distance < 1.0e18f;
 }
 
 ROCKETGPU_HD void CarCarTimeOfImpact(CarState& a, const CarConfig& a_cfg, const Vec3& a_vel,
                                    CarState& v, const CarConfig& v_cfg, const Vec3& v_vel, float tick_dt) {
-    constexpr float kPenetration = 0.039f * 50.0f;
-    auto sep = [&](float lambda) {
-        const float t = (2.0f * lambda - 1.0f) * tick_dt;
-        CarState ai = a, vi = v;
-        AdvancePose(ai, a_vel, t);
-        AdvancePose(vi, v_vel, t);
-        return BoxSeparation(ai, a_cfg, vi, v_cfg) + kPenetration;
+    constexpr float kAllowedPenetration = 0.04f;
+    constexpr float kEpsilon = 1.1920929e-7f;
+    constexpr float kUUToBT = 1.0f / 50.0f;
+    auto sweep = [&](const CarState& s, const Vec3& vel, CarToiTransform& from, CarToiTransform& to) {
+        CarToiTransform t0;
+        GameSetRotationScalarColumns(s.rot, t0.fwd, t0.right, t0.up);
+        t0.origin = Vec3(s.pos.x * kUUToBT, s.pos.y * kUUToBT, s.pos.z * kUUToBT);
+        const Vec3 lin(vel.x * kUUToBT, vel.y * kUUToBT, vel.z * kUUToBT);
+        from = CarToiIntegrate(t0, Vec3(-lin.x, -lin.y, -lin.z), Vec3(-s.ang_vel.x, -s.ang_vel.y, -s.ang_vel.z), tick_dt);
+        to = CarToiIntegrate(t0, lin, s.ang_vel, tick_dt);
     };
-    float lambda;
-    if (sep(0.0f) <= 0.0f) {
-        lambda = 0.0f;
-    } else if (sep(1.0f) > 0.0f) {
+    CarToiTransform from_a, to_a, from_b, to_b;
+    sweep(a, a_vel, from_a, to_a);
+    sweep(v, v_vel, from_b, to_b);
+
+    auto child = [](const CarToiTransform& t, const CarConfig& cfg) {
+        CarToiTransform c = t;
+        c.origin = FromBulletPortVec3(CarToiBt(t)(ToBulletPortVec3(cfg.hitbox_offset * kUUToBT)));
+        return c;
+    };
+    const CarToiTransform ca0 = child(from_a, a_cfg), ca1 = child(to_a, a_cfg);
+    const CarToiTransform cb0 = child(from_b, v_cfg), cb1 = child(to_b, v_cfg);
+    const bullet_port::btConvexShape box_a = MakeBulletPortBoxShape((BulletHitboxSize(a_cfg) * 0.5f) * kUUToBT, 0.04f);
+    const bullet_port::btConvexShape box_b = MakeBulletPortBoxShape((BulletHitboxSize(v_cfg) * 0.5f) * kUUToBT, 0.04f);
+
+    const Vec3 lin_a(ca1.origin.x - ca0.origin.x, ca1.origin.y - ca0.origin.y, ca1.origin.z - ca0.origin.z);
+    const Vec3 lin_b(cb1.origin.x - cb0.origin.x, cb1.origin.y - cb0.origin.y, cb1.origin.z - cb0.origin.z);
+    const Vec3 ang_a = CarToiAngularVelocity(ca0, ca1);
+    const Vec3 ang_b = CarToiAngularVelocity(cb0, cb1);
+    const float max_ang = sqrtf((ang_a.x * ang_a.x + ang_a.y * ang_a.y) + ang_a.z * ang_a.z) * CarToiAngularMotionDisc(box_a) +
+                          sqrtf((ang_b.x * ang_b.x + ang_b.y * ang_b.y) + ang_b.z * ang_b.z) * CarToiAngularMotionDisc(box_b);
+    const Vec3 rel(lin_b.x - lin_a.x, lin_b.y - lin_a.y, lin_b.z - lin_a.z);
+    if (sqrtf((rel.x * rel.x + rel.y * rel.y) + rel.z * rel.z) + max_ang == 0.0f) {
         return;
-    } else {
-        float lo = 0.0f, hi = 1.0f;
-        for (int i = 0; i < 24; ++i) {
-            const float m = (lo + hi) * 0.5f;
-            if (sep(m) > 0.0f) {
-                lo = m;
-            } else {
-                hi = m;
-            }
-        }
-        lambda = hi;
     }
-    const float t = (2.0f * lambda - 1.0f) * tick_dt;
-    AdvancePose(a, a_vel, t);
-    AdvancePose(v, v_vel, t);
+    float d = 0.0f;
+    Vec3 n(0.0f, 0.0f, 0.0f), c(0.0f, 0.0f, 0.0f);
+    if (!CarToiClosestPoints(box_a, CarToiBt(ca0), box_b, CarToiBt(cb0), d, n, c)) {
+        return;
+    }
+    float dist = d + kAllowedPenetration;
+    if (((rel.x * n.x + rel.y * n.y) + rel.z * n.z) + max_ang <= kEpsilon) {
+        return;
+    }
+    float lambda = 0.0f, fraction = 0.0f;
+    int iter = 0;
+    while (dist > 0.001f) {
+        const float proj = ((rel.x * n.x + rel.y * n.y) + rel.z * n.z) + max_ang;
+        if (proj <= kEpsilon) {
+            return;
+        }
+        fraction = lambda + dist / proj;
+        if (fraction > 1.0f || fraction < 0.0f || fraction <= lambda) {
+            return;
+        }
+        const CarToiTransform ia = CarToiIntegrate(ca0, lin_a, ang_a, fraction);
+        const CarToiTransform ib = CarToiIntegrate(cb0, lin_b, ang_b, fraction);
+        if (!CarToiClosestPoints(box_a, CarToiBt(ia), box_b, CarToiBt(ib), d, n, c)) {
+            return;
+        }
+        dist = d + kAllowedPenetration;
+        if (++iter > 64) {
+            return;
+        }
+        lambda = fraction;
+    }
+    if (!(fraction < 1.0f)) {
+        return;
+    }
+
+    auto pose = [fraction](CarState& s, const CarToiTransform& from, const CarToiTransform& to) {
+        s.pos = Vec3((to.origin.x * 50.0f - from.origin.x * 50.0f) * fraction + from.origin.x * 50.0f,
+                     (to.origin.y * 50.0f - from.origin.y * 50.0f) * fraction + from.origin.y * 50.0f,
+                     (to.origin.z * 50.0f - from.origin.z * 50.0f) * fraction + from.origin.z * 50.0f);
+        s.rot = GameQuatNormalizeScalar(
+            GameUeQuatSlerp(GameGetRotationScalar(from.fwd, from.right, from.up),
+                            GameGetRotationScalar(to.fwd, to.right, to.up), fraction),
+            1e-8f);
+    };
+    pose(a, from_a, to_a);
+    pose(v, from_b, to_b);
 }
 
 ROCKETGPU_HD bool ShouldDemolish(
@@ -2775,8 +2691,7 @@ ROCKETGPU_HD bool ShouldDemolish(
     if (!a.is_supersonic) {
         return false;
     }
-    Vec3 fwd(1.0f, 0.0f, 0.0f), right(0.0f, 1.0f, 0.0f), up(0.0f, 0.0f, 1.0f);
-    CarBasisColumns(a, fwd, right, up);
+    const Vec3 fwd = Ue3RotatorForwardAxis(Ue3QuatToRotator(a.rot));
     const float forward_speed = Dot(a_start_vel, fwd);
     const bool reverse = forward_speed < 0.0f;
     if (fabsf(forward_speed) < mutator.supersonic_maintain_min_speed) {
@@ -2792,10 +2707,12 @@ ROCKETGPU_HD bool ShouldDemolish(
 
 ROCKETGPU_HD bool InForwardCone(
     const CarState& a, const CarConfig& a_cfg, const CarState& v, const CarConfig& v_cfg, bool reverse, float max_yaw_deg) {
-    Vec3 fwd(1.0f, 0.0f, 0.0f), right(0.0f, 1.0f, 0.0f), up(0.0f, 0.0f, 1.0f);
-    CarBasisColumns(a, fwd, right, up);
-    const Vec3 pa = a.pos + InverseRotateCarBasis(a, a_cfg.hitbox_offset);
-    const Vec3 pv = v.pos + InverseRotateCarBasis(v, v_cfg.hitbox_offset);
+    Vec3 fwd, right, up, v_x, v_y, v_z;
+    Ue3RotatorAxes(Ue3QuatToRotator(a.rot), fwd, right, up);
+    Ue3RotatorAxes(Ue3QuatToRotator(v.rot), v_x, v_y, v_z);
+    const Vec3 a_off = a_cfg.hitbox_offset, v_off = v_cfg.hitbox_offset;
+    const Vec3 pa = a.pos + Vec3(Dot(fwd, a_off), Dot(right, a_off), Dot(up, a_off));
+    const Vec3 pv = v.pos + Vec3(Dot(v_x, v_off), Dot(v_y, v_off), Dot(v_z, v_off));
     Vec3 d = pv - pa;
     const float d2 = LengthSq(d);
     if (d2 != 1.0f) {
@@ -2812,7 +2729,7 @@ ROCKETGPU_HD bool InForwardCone(
         }
         float c = Dot(f, p);
         c = c < -1.0f ? -1.0f : (c > 1.0f ? 1.0f : c);
-        return acosf(c) * 57.29578f;
+        return RocketGpuUcrtAcosf(c) * 57.29578f;
     };
     if (angle_deg(right) > 36.8698959f) {
         return false;
@@ -2836,7 +2753,7 @@ ROCKETGPU_HD bool BumpCone(
         DemolishCar(victim, mutator);
     } else if (bumper) {
         const float speed = SqrtScalar(LengthSq(hitter_start_vel));
-        const Vec3 vel_dir = hitter_start_vel / speed;
+        const Vec3 vel_dir = hitter_start_vel * (1.0f / speed);
         auto curve = [speed](float y0, float y1, float y2) {
             if (speed <= 0.0f) {
                 return y0;
@@ -2851,16 +2768,24 @@ ROCKETGPU_HD bool BumpCone(
         };
         Vec3 impulse;
         if (victim.is_on_ground != 0) {
-            Vec3 v_fwd(1.0f, 0.0f, 0.0f), v_rgt(0.0f, 1.0f, 0.0f), v_up(0.0f, 0.0f, 1.0f);
-            CarBasisColumns(victim, v_fwd, v_rgt, v_up);
-            impulse = vel_dir * curve(150.0f, 200000.0f, 275000.0f) + v_up * curve(50.0f, 50000.0f, 75000.0f);
+            const Vec3 up_dir = Ue3RotatorUpAxis(Ue3QuatToRotator(victim.rot));
+            impulse = vel_dir * curve(150.0f, 200000.0f, 275000.0f) + up_dir * curve(50.0f, 50000.0f, 75000.0f);
         } else {
             impulse = vel_dir * curve(150.0f, 250000.0f, 350000.0f);
         }
 
-        const Vec3 impulse_bt = impulse * (mutator.bump_force_scale * ((1.0f / 50.0f) / 180.0f));
+        const Vec3 impulse_bt = ((impulse * mutator.bump_force_scale) * (1.0f / 50.0f)) * (1.0f / mutator.car_mass);
         victim.vel_impulse_cache_bt += impulse_bt;
         victim.vel_impulse_cache += impulse_bt * 50.0f;
+        if (victim.pending_bump_count < CarState::kMaxPendingBumps) {
+            int slot = victim.pending_bump_count++;
+            for (; slot > 0 && victim.pending_bump_hitter[slot - 1] > hitter_id; --slot) {
+                victim.pending_bump_bt[slot] = victim.pending_bump_bt[slot - 1];
+                victim.pending_bump_hitter[slot] = victim.pending_bump_hitter[slot - 1];
+            }
+            victim.pending_bump_bt[slot] = impulse_bt;
+            victim.pending_bump_hitter[slot] = hitter_id;
+        }
     }
     hitter.car_contact.other_car_id = victim_id;
     hitter.car_contact.cooldown_timer = mutator.bump_cooldown_time + tick_dt * 0.5f;
@@ -2932,7 +2857,7 @@ ROCKETGPU_HD bool ResolveCarCarDirectionalContact(
         if (speed_towards <= 0.0f) {
             return false;
         }
-        const Vec3 vel_dir = vel / speed;
+        const Vec3 vel_dir = vel * (1.0f / speed);
         if (Dot(*victim_start_vel, vel_dir) >= speed_towards) {
             return false;
         }
@@ -2965,9 +2890,6 @@ ROCKETGPU_HD bool ResolveCarCarDirectionalContact(
                     mutator.physics_events.EmitForCar(hitter_id, event);
                 }
                 return true;
-            }
-            if (demo_only) {
-                return false;
             }
         }
         if (in_cooldown) {
@@ -3025,7 +2947,7 @@ ROCKETGPU_HD bool ResolveCarCarDirectionalContact(
             }
             return true;
         }
-        if (demo_only || in_cooldown) {
+        if (in_cooldown) {
             return false;
         }
     }
@@ -3125,9 +3047,14 @@ ROCKETGPU_HD int ComputeApproxCarCarContactAnchorPairs(
     float contact_overlap_uu = 0.0f,
     Vec3* out_points_a_bt = nullptr,
     Vec3* out_points_b_bt = nullptr,
-    int debug_env_idx = -1,
-    int debug_car_idx_a = -1,
-    int debug_car_idx_b = -1) {
+    bool game_face_contacts = false,
+    Vec3* out_game_points_a_bt = nullptr,
+    float* out_game_depths_bt = nullptr,
+    bool* out_game_points_valid = nullptr,
+    Vec3* out_game_normal_bt = nullptr) {
+    if (out_game_points_valid) {
+        *out_game_points_valid = false;
+    }
     if (!out_points_a || !out_points_b || max_points <= 0) {
         return 0;
     }
@@ -3150,11 +3077,16 @@ ROCKETGPU_HD int ComputeApproxCarCarContactAnchorPairs(
             ref_points_bt,
             inc_points_bt,
             max_points,
-            debug_env_idx,
-            debug_car_idx_a,
-            debug_car_idx_b,
-            1);
+            1,
+            out_game_points_a_bt,
+            out_game_depths_bt);
         if (pair_count_bt > 0) {
+            if (out_game_points_valid) {
+                *out_game_points_valid = out_game_points_a_bt && out_game_depths_bt && out_game_normal_bt;
+            }
+            if (out_game_normal_bt) {
+                *out_game_normal_bt = normal;
+            }
             for (int i = 0; i < pair_count_bt; ++i) {
                 const Vec3 point_a_bt = CarBodyManifoldWorldPointBt(a, ref_points_bt[i]);
                 const Vec3 point_b_bt = CarBodyManifoldWorldPointBt(b, inc_points_bt[i]);
@@ -3180,11 +3112,16 @@ ROCKETGPU_HD int ComputeApproxCarCarContactAnchorPairs(
             ref_points_bt,
             inc_points_bt,
             max_points,
-            debug_env_idx,
-            debug_car_idx_a,
-            debug_car_idx_b,
-            0);
+            0,
+            out_game_points_a_bt,
+            out_game_depths_bt);
         if (pair_count_bt > 0) {
+            if (out_game_points_valid) {
+                *out_game_points_valid = out_game_points_a_bt && out_game_depths_bt && out_game_normal_bt;
+            }
+            if (out_game_normal_bt) {
+                *out_game_normal_bt = normal;
+            }
             for (int i = 0; i < pair_count_bt; ++i) {
                 const Vec3 point_a_bt = CarBodyManifoldWorldPointBt(a, inc_points_bt[i]);
                 const Vec3 point_b_bt = CarBodyManifoldWorldPointBt(b, ref_points_bt[i]);
@@ -3200,32 +3137,45 @@ ROCKETGPU_HD int ComputeApproxCarCarContactAnchorPairs(
             return pair_count_bt;
         }
     }
+    if (game_face_contacts && feature.kind != OBB_CONTACT_FEATURE_EDGE_EDGE) {
+        return 0;
+    }
 
     if (feature.kind == OBB_CONTACT_FEATURE_EDGE_EDGE) {
         Vec3 point_a_bt;
         Vec3 point_b_bt;
+        Vec3 game_normal_bt;
+        float game_s_bt = 0.0f;
         if (ComputeEdgeEdgeCarCarContactAnchorsBulletStyle(
                 obb_a_bt,
                 static_cast<int>(feature.axis_a),
                 obb_b_bt,
                 static_cast<int>(feature.axis_b),
-                normal,
-                contact_overlap_uu * kUUToBT,
+                game_normal_bt,
                 point_a_bt,
-                point_b_bt)) {
+                point_b_bt,
+                &game_s_bt)) {
             float overlap_bt = contact_overlap_uu * kUUToBT;
             {
                 Vec3 sat_normal_bt(0.0f, 0.0f, 0.0f);
                 float sat_overlap_bt = 0.0f;
                 ObbContactFeature sat_feature_bt;
-                if (ComputeObbContact(obb_a_bt, obb_b_bt, 0.0f, sat_normal_bt, sat_overlap_bt, &sat_feature_bt) &&
+                if (ComputeObbContactGameOrder(obb_a_bt, obb_b_bt, 0.0f, sat_normal_bt, sat_overlap_bt, &sat_feature_bt) &&
                     sat_feature_bt.kind == OBB_CONTACT_FEATURE_EDGE_EDGE &&
                     sat_feature_bt.axis_a == feature.axis_a && sat_feature_bt.axis_b == feature.axis_b) {
                     overlap_bt = sat_overlap_bt;
                 }
             }
-            const Vec3 raw_point_b_bt = point_b_bt;
-            const Vec3 raw_point_a_bt = overlap_bt > 0.0f ? (raw_point_b_bt + normal * overlap_bt) : point_a_bt;
+            const Vec3 raw_point_a_bt = point_a_bt;
+            if (out_game_points_a_bt && out_game_depths_bt && out_game_normal_bt) {
+                out_game_points_a_bt[0] = raw_point_a_bt;
+                out_game_depths_bt[0] = game_s_bt;
+                *out_game_normal_bt = -game_normal_bt;
+                if (out_game_points_valid) {
+                    *out_game_points_valid = true;
+                }
+            }
+            const Vec3 raw_point_b_bt = overlap_bt > 0.0f ? (raw_point_a_bt + game_normal_bt * overlap_bt) : point_b_bt;
             point_b_bt = CarBodyManifoldWorldPointBt(b, raw_point_b_bt);
             point_a_bt = CarBodyManifoldWorldPointBt(a, raw_point_a_bt);
             if (out_points_a_bt) {
@@ -3292,7 +3242,7 @@ ROCKETGPU_HD CarState BuildPredictedCarSolverState(
     float dt,
     bool native_sse_math = false) {
     CarState predicted = car;
-    IntegrateCarTransformOnly(predicted, dt, false, native_sse_math);
+    IntegrateCarTransformOnly(predicted, dt, native_sse_math);
     predicted.vel += external_linear_delta;
     predicted.ang_vel += external_angular_delta;
     return predicted;
