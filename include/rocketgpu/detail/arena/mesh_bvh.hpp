@@ -78,6 +78,8 @@ struct ArenaMeshLeafGrid {
     const ArenaMeshLeafEntry* entries = nullptr;
 };
 
+struct BulletSweepHistory;
+
 struct ArenaBroadphaseGrid {
     Vec3 min_bt = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 max_bt = Vec3(0.0f, 0.0f, 0.0f);
@@ -88,6 +90,7 @@ struct ArenaBroadphaseGrid {
     const uint16_t* cell_mesh_mask = nullptr;
     int32_t cell_count = 0;
     ArenaMeshLeafGrid leaf_grid;
+    const BulletSweepHistory* sweep_statics = nullptr;
 
     ROCKETGPU_HD bool valid() const {
         return cell_mesh_mask != nullptr && cell_count > 0 && cell_size_bt > 0.0f &&

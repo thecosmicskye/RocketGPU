@@ -554,6 +554,14 @@ struct BatchSim::Impl {
                 arena_mesh_bvh_meshes.copy_from_host(host_mesh_infos.data(), host_mesh_infos.size());
                 cfg.arena_mesh_bvh_meshes = arena_mesh_bvh_meshes.data();
                 cfg.arena_mesh_bvh_mesh_count = static_cast<int32_t>(arena_mesh_bvh_meshes.size());
+                detail::BulletSweepHistory sweep_statics[2];
+                for (int goal_floors = 0; goal_floors < 2; ++goal_floors) {
+                    detail::BulletSweepAddStatics(sweep_statics[goal_floors], true, goal_floors != 0,
+                                                  host_mesh_infos.data(), static_cast<int>(host_mesh_infos.size()));
+                }
+                arena_sweep_statics.resize(2);
+                arena_sweep_statics.copy_from_host(sweep_statics, 2);
+                cfg.arena_sweep_statics = arena_sweep_statics.data();
                 arena_mesh_bvh_nodes.resize(host_mesh_nodes.size());
                 arena_mesh_bvh_nodes.copy_from_host(host_mesh_nodes.data(), host_mesh_nodes.size());
                 cfg.arena_mesh_bvh_nodes = arena_mesh_bvh_nodes.data();
@@ -636,6 +644,7 @@ struct BatchSim::Impl {
     detail::Buffer<detail::ArenaMeshLeafGridInfo> arena_mesh_leaf_grid_infos;
     detail::Buffer<int32_t> arena_mesh_leaf_cell_start;
     detail::Buffer<detail::ArenaMeshLeafEntry> arena_mesh_leaf_entries;
+    detail::Buffer<detail::BulletSweepHistory> arena_sweep_statics;
     detail::Buffer<uint16_t> arena_broadphase_cell_mask;
     detail::Buffer<uint32_t> native_sphere_rsqrt;
     detail::Buffer<CarState> car_states;

@@ -3130,6 +3130,7 @@ ROCKETGPU_HD ArenaBroadphaseGrid MakeArenaBroadphaseGrid(const ::rocketgpu::SimC
     grid.leaf_grid.infos = cfg.arena_mesh_leaf_grid_infos;
     grid.leaf_grid.cell_start = cfg.arena_mesh_leaf_cell_start;
     grid.leaf_grid.entries = cfg.arena_mesh_leaf_entries;
+    grid.sweep_statics = cfg.arena_sweep_statics;
     return grid;
 }
 
@@ -3443,6 +3444,98 @@ ROCKETGPU_HD void ComputeBulletBodyProxy(
     proxy.is_ball = 0;
 }
 
+// A fresh sweep's sentinels and static handles. Static-static pairs are never cached, so the result depends on the
+// arena alone; SimConfig::arena_sweep_statics holds it built once (BulletSweepCopyStatics).
+ROCKETGPU_HD void BulletSweepAddStatics(BulletSweepHistory& h, bool arena_static, bool goal_floors,
+                                       const ArenaMeshBvhMeshInfo* mesh_infos, int mesh_info_count) {
+    h.sap_next_fresh = 1;
+    h.sap_free_count = 0;
+    for (int axis = 0; axis < 3; ++axis) {
+        h.sap_edge_pos[axis][0] = 0;
+        h.sap_edge_handle[axis][0] = 0;
+        h.sap_edge_pos[axis][1] = 0xffff;
+        h.sap_edge_handle[axis][1] = 0;
+        h.sap_min_edge[0][axis] = 0;
+        h.sap_max_edge[0][axis] = 1;
+    }
+    const auto sort_down = [&](int axis, int index, bool is_max_edge) {
+        const int moving = h.sap_edge_handle[axis][index];
+        while (index > 0 && h.sap_edge_pos[axis][index] < h.sap_edge_pos[axis][index - 1]) {
+            const int prev = h.sap_edge_handle[axis][index - 1];
+            const bool prev_is_max = (h.sap_edge_pos[axis][index - 1] & 1) != 0;
+            ++(prev_is_max ? h.sap_max_edge[prev][axis] : h.sap_min_edge[prev][axis]);
+            --(is_max_edge ? h.sap_max_edge[moving][axis] : h.sap_min_edge[moving][axis]);
+            const uint16_t pos = h.sap_edge_pos[axis][index];
+            const uint8_t owner = h.sap_edge_handle[axis][index];
+            h.sap_edge_pos[axis][index] = h.sap_edge_pos[axis][index - 1];
+            h.sap_edge_handle[axis][index] = h.sap_edge_handle[axis][index - 1];
+            h.sap_edge_pos[axis][index - 1] = pos;
+            h.sap_edge_handle[axis][index - 1] = owner;
+            --index;
+        }
+    };
+    const auto add_handle = [&](const ::rocketgpu::Vec3& aabb_min, const ::rocketgpu::Vec3& aabb_max, int16_t id) {
+        const float mn[3] = {aabb_min.x, aabb_min.y, aabb_min.z};
+        const float mx[3] = {aabb_max.x, aabb_max.y, aabb_max.z};
+        const int handle = h.sap_next_fresh++;
+        const int limit = 2 * ++h.sap_handle_count;
+        h.sap_static_id[handle] = id;
+        for (int axis = 0; axis < 3; ++axis) {
+            h.sap_max_edge[0][axis] = static_cast<uint8_t>(h.sap_max_edge[0][axis] + 2);
+            h.sap_edge_pos[axis][limit + 1] = h.sap_edge_pos[axis][limit - 1];
+            h.sap_edge_handle[axis][limit + 1] = h.sap_edge_handle[axis][limit - 1];
+            h.sap_edge_pos[axis][limit - 1] = ArenaSweepQuantize(mn[axis], 0);
+            h.sap_edge_handle[axis][limit - 1] = static_cast<uint8_t>(handle);
+            h.sap_edge_pos[axis][limit] = ArenaSweepQuantize(mx[axis], 1);
+            h.sap_edge_handle[axis][limit] = static_cast<uint8_t>(handle);
+            h.sap_min_edge[handle][axis] = static_cast<uint8_t>(limit - 1);
+            h.sap_max_edge[handle][axis] = static_cast<uint8_t>(limit);
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            sort_down(axis, h.sap_min_edge[handle][axis], false);
+            sort_down(axis, h.sap_max_edge[handle][axis], true);
+        }
+    };
+    for (int k = goal_floors ? 0 : 2; arena_static && k < 6; ++k) {
+        const int plane_rank = k < 2 ? 4 + k : k - 2;
+        ::rocketgpu::Vec3 shape_min(0.0f, 0.0f, 0.0f), shape_max(0.0f, 0.0f, 0.0f);
+        BulletStaticPlaneShapeAabb(plane_rank, shape_min, shape_max);
+        add_handle(shape_min, shape_max, static_cast<int16_t>(100 + plane_rank));
+    }
+    for (int slot = 0; arena_static && slot < mesh_info_count; ++slot) {
+        const ArenaMeshBvhMeshInfo& info = mesh_infos[slot];
+        if (info.mesh_index >= 0 && info.triangle_count > 0 &&
+            h.sap_handle_count + kBulletSweepMaxBodies < kAxisSweepMaxHandles) {
+            add_handle(info.aabb_min, info.aabb_max, static_cast<int16_t>(info.mesh_index));
+        }
+    }
+    h.sap_static_count = h.sap_handle_count;
+}
+
+// BulletSweepAddStatics on a history with no handles, copied from s: writes the same entries.
+ROCKETGPU_HD void BulletSweepCopyStatics(BulletSweepHistory& h, const BulletSweepHistory& s) {
+    const int n = s.sap_handle_count;
+    h.sap_handle_count = s.sap_handle_count;
+    h.sap_static_count = s.sap_static_count;
+    h.sap_next_fresh = s.sap_next_fresh;
+    h.sap_free_count = 0;
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int e = 0; e < 2 * n + 2; ++e) {
+            h.sap_edge_pos[axis][e] = s.sap_edge_pos[axis][e];
+            h.sap_edge_handle[axis][e] = s.sap_edge_handle[axis][e];
+        }
+    }
+    for (int k = 0; k <= n; ++k) {
+        for (int axis = 0; axis < 3; ++axis) {
+            h.sap_min_edge[k][axis] = s.sap_min_edge[k][axis];
+            h.sap_max_edge[k][axis] = s.sap_max_edge[k][axis];
+        }
+        if (k > 0) {
+            h.sap_static_id[k] = s.sap_static_id[k];
+        }
+    }
+}
+
 ROCKETGPU_HD int BuildBulletManifoldList(
     const ::rocketgpu::BallState& ball,
     int car_count,
@@ -3707,30 +3800,11 @@ ROCKETGPU_HD int BuildBulletManifoldList(
         bp_history->w3_removed_count = 0;
     }
     if (sweep_fresh) {
-        h.sap_next_fresh = 1;
-        h.sap_free_count = 0;
-        for (int axis = 0; axis < 3; ++axis) {
-            h.sap_edge_pos[axis][0] = 0;
-            h.sap_edge_handle[axis][0] = 0;
-            h.sap_edge_pos[axis][1] = 0xffff;
-            h.sap_edge_handle[axis][1] = 0;
-            h.sap_min_edge[0][axis] = 0;
-            h.sap_max_edge[0][axis] = 1;
+        if (arena_static && grid.sweep_statics) {
+            BulletSweepCopyStatics(h, grid.sweep_statics[goal_floors ? 1 : 0]);
+        } else {
+            BulletSweepAddStatics(h, arena_static, goal_floors, mesh_infos, mesh_info_count);
         }
-        for (int k = goal_floors ? 0 : 2; arena_static && k < 6; ++k) {
-            const int plane_rank = k < 2 ? 4 + k : k - 2;
-            ::rocketgpu::Vec3 shape_min(0.0f, 0.0f, 0.0f), shape_max(0.0f, 0.0f, 0.0f);
-            BulletStaticPlaneShapeAabb(plane_rank, shape_min, shape_max);
-            add_handle(shape_min, shape_max, static_cast<int16_t>(100 + plane_rank));
-        }
-        for (int slot = 0; arena_static && slot < mesh_info_count; ++slot) {
-            const ArenaMeshBvhMeshInfo& info = mesh_infos[slot];
-            if (info.mesh_index >= 0 && info.triangle_count > 0 &&
-                h.sap_handle_count + kMaxBodies < kAxisSweepMaxHandles) {
-                add_handle(info.aabb_min, info.aabb_max, static_cast<int16_t>(info.mesh_index));
-            }
-        }
-        h.sap_static_count = h.sap_handle_count;
     }
     for (int body = 1; phase != 2 && body < body_count; ++body) {
         if (!proxies[body].valid && h.sap_body_handle[body] != 0) {
@@ -3746,10 +3820,26 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             h.sap_obj[h.sap_obj_count++] = static_cast<uint8_t>(body);
         }
     };
+    // The game adds the bodies, removes the round's bodies and adds them again. With empty caches and no body
+    // handles, the first add and removal leave only each valid body's fresh handle on the free list, in body order;
+    // the edges and pairs come back. Any other (set) state takes the full round.
+    bool round_cached = false;
+    if (sweep_fresh) {
+        bool empty = bp.bp_pair_count == 0 && bp.bp_manifold_count == 0 && h.sap_obj_count == 0;
+        for (int body = 0; empty && body < body_count; ++body) {
+            empty = h.sap_body_handle[body] == 0;
+        }
+        round_cached = !empty;
+        for (int body = 0; empty && body < body_count; ++body) {
+            if (proxies[body].valid && h.sap_handle_count + h.sap_free_count < kAxisSweepMaxHandles - 1) {
+                h.sap_free[h.sap_free_count++] = h.sap_next_fresh++;
+            }
+        }
+    }
     for (int body = 0; phase != 2 && body < body_count; ++body) {
         add_body(body);
     }
-    if (sweep_fresh) {
+    if (round_cached) {
         BulletSweepRemoveRoundBodies(bp, body_count - 1);
         for (int body = 0; body < body_count; ++body) {
             add_body(body);

@@ -14,6 +14,7 @@ struct ArenaMeshBvhSubtreeInfo;
 struct ArenaMeshLeafGridInfo;
 struct ArenaMeshLeafEntry;
 struct ArenaMeshBvhMeshInfo;
+struct BulletSweepHistory;
 struct WheelRuntimeState;
 struct WorldSolverScratch;
 struct WorldSolverScratchRowPoolHost;
@@ -804,6 +805,8 @@ struct SimConfig {
     int32_t arena_broadphase_cells_x = 0;
     int32_t arena_broadphase_cells_y = 0;
     int32_t arena_broadphase_cells_z = 0;
+    // A fresh broadphase sweep holding only the arena's static handles, without and with goal floors (set by BatchSim).
+    const detail::BulletSweepHistory* arena_sweep_statics = nullptr;
     // CUDA step kernels: thread i simulates env env_step_order[i] (envs grouped by car count; set by BatchSim).
     const int32_t* env_step_order = nullptr;
     // The cars in all envs when BatchSim set env_step_order (0: unknown); the staged step sizes its env groups by it.
