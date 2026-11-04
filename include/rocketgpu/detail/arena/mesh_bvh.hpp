@@ -483,6 +483,49 @@ ROCKETGPU_HD void SelectArenaMeshBvhDfsOrderSubtrees(
 #endif
 }
 
+ROCKETGPU_HD bool ValidateArenaMeshDfsOrderSubtrees(
+    const ArenaMeshBvhMeshInfo& mesh_info,
+    const ArenaMeshBvhNode* nodes,
+    int node_count,
+    const ArenaMeshBvhSubtreeInfo* subtrees,
+    int subtree_count) {
+    const int begin = mesh_info.node_offset;
+    const int end = mesh_info.node_offset + mesh_info.node_count;
+    if (nodes == nullptr || mesh_info.node_count <= 0 || begin < 0 || end > node_count) {
+        return false;
+    }
+    if (mesh_info.subtree_count <= 0 || mesh_info.subtree_offset < 0 || mesh_info.dfs_subtree_offset < 0 ||
+        subtrees == nullptr || mesh_info.dfs_subtree_offset + mesh_info.subtree_count > subtree_count) {
+        return true;
+    }
+    int last_leaf_node = begin - 1;
+    int header_leaves = 0;
+    for (int h = 0; h < mesh_info.subtree_count; ++h) {
+        const ArenaMeshBvhSubtreeInfo& header = subtrees[mesh_info.dfs_subtree_offset + h];
+        const int h_begin = header.root_node_index;
+        const int h_end = header.root_node_index + header.subtree_size;
+        if (header.subtree_size <= 0 || h_begin < begin || h_end > end) {
+            return false;
+        }
+        for (int j = h_begin; j < h_end; ++j) {
+            if (nodes[j].is_leaf_node()) {
+                if (j <= last_leaf_node) {
+                    return false;
+                }
+                last_leaf_node = j;
+                ++header_leaves;
+            }
+        }
+    }
+    int total_leaves = 0;
+    for (int j = begin; j < end; ++j) {
+        if (nodes[j].is_leaf_node()) {
+            ++total_leaves;
+        }
+    }
+    return header_leaves == total_leaves;
+}
+
 template <typename Callback, typename LeafTest = ArenaMeshBvhAnyLeaf>
 ROCKETGPU_HD void WalkArenaMeshBvhStacklessQuantizedTreeCacheFriendly(
     const ArenaMeshBvhNode* nodes,

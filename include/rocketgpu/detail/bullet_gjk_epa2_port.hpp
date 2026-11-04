@@ -673,6 +673,13 @@ struct GJK
         const tShape& shapearg,
         const btVector3& guess)
     {
+        m_shape = shapearg;
+        return Evaluate(guess);
+    }
+
+    ROCKETGPU_HD eStatus::_ Evaluate(
+        const btVector3& guess)
+    {
         U iterations = 0;
         btScalar sqdist = 0;
         btScalar alpha = 0;
@@ -685,7 +692,6 @@ struct GJK
         m_nfree = 4;
         m_current = 0;
         m_status = eStatus::Valid;
-        m_shape = shapearg;
         m_distance = 0;
         m_simplices[0].rank = 0;
         m_ray = guess;
@@ -1082,12 +1088,20 @@ struct EPA
         };
     };
 
+    struct sExpandFrame
+    {
+        U1 f;
+        U1 e;
+        U1 stage;
+    };
+
     eStatus::_ m_status;
     GJK::sSimplex m_result;
     btVector3 m_normal;
     btScalar m_depth;
     sSV m_sv_store[EPA_MAX_VERTICES];
     sFace m_fc_store[EPA_MAX_FACES];
+    sExpandFrame m_expand_frames[EPA_MAX_FACES];
     U m_nextsv;
     sList m_hull;
     sList m_stock;
@@ -1369,17 +1383,11 @@ struct EPA
         return (minf);
     }
 
-    struct sExpandFrame
-    {
-        U1 f;
-        U1 e;
-        U1 stage;
-    };
     ROCKETGPU_HD bool expand(U pass, sSV* w, sFace* f, U e, sHorizon& horizon)
     {
         static const U i1m3[] = {1, 2, 0};
         static const U i2m3[] = {2, 0, 1};
-        sExpandFrame frames[EPA_MAX_FACES];
+        sExpandFrame* const frames = m_expand_frames;
         U sp = 0;
         frames[sp].f = (U1)(f - m_fc_store);
         frames[sp].e = (U1)e;
@@ -1577,10 +1585,9 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::DistanceWithSc
                                                        sResults& results,
                                                        btGjkEpaScratch& scratch)
 {
-    tShape shape;
-    Initialize(shape0, wtrs0, shape1, wtrs1, results, shape, false);
+    Initialize(shape0, wtrs0, shape1, wtrs1, results, scratch.gjk.m_shape, false);
     scratch.gjk.Initialize();
-    GJK::eStatus::_ gjk_status = scratch.gjk.Evaluate(shape, guess);
+    GJK::eStatus::_ gjk_status = scratch.gjk.Evaluate(guess);
     if (gjk_status == GJK::eStatus::Valid)
     {
         btVector3 w0 = btVector3(0, 0, 0);
@@ -1588,8 +1595,8 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::DistanceWithSc
         for (U i = 0; i < scratch.gjk.m_simplex->rank; ++i)
         {
             const btScalar p = scratch.gjk.m_simplex->p[i];
-            w0 += shape.Support(scratch.gjk.m_simplex->c[i]->d, 0) * p;
-            w1 += shape.Support(-scratch.gjk.m_simplex->c[i]->d, 1) * p;
+            w0 += scratch.gjk.m_shape.Support(scratch.gjk.m_simplex->c[i]->d, 0) * p;
+            w1 += scratch.gjk.m_shape.Support(-scratch.gjk.m_simplex->c[i]->d, 1) * p;
         }
         results.witnesses[0] = wtrs0 * w0;
         results.witnesses[1] = wtrs0 * w1;
@@ -1626,38 +1633,20 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::Penetration(co
             if (epa_status != EPA::eStatus::Failed)
             {
                 btVector3 w0 = btVector3(0, 0, 0);
-                btVector3 support0_dir_norm[4] = {
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                };
-                btVector3 support0_without_margin[4] = {
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                };
-                btVector3 support0[4] = {
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                };
                 for (U i = 0; i < epa.m_result.rank; ++i)
                 {
-                    support0_dir_norm[i] = epa.m_result.c[i]->d;
-                    if (support0_dir_norm[i].length2() < (SIMD_EPSILON * SIMD_EPSILON)) {
-                        support0_dir_norm[i].setValue(-1.0f, -1.0f, -1.0f);
+                    btVector3 support0_dir_norm = epa.m_result.c[i]->d;
+                    if (support0_dir_norm.length2() < (SIMD_EPSILON * SIMD_EPSILON)) {
+                        support0_dir_norm.setValue(-1.0f, -1.0f, -1.0f);
                     }
-                    support0_dir_norm[i].normalize();
-                    support0_without_margin[i] =
+                    support0_dir_norm.normalize();
+                    const btVector3 support0_without_margin =
                         shape.m_shapes[0]->localGetSupportVertexWithoutMarginNonVirtual(
-                            support0_dir_norm[i]);
-                    support0[i] =
-                        support0_without_margin[i] +
-                        shape.m_shapes[0]->getMarginNonVirtual() * support0_dir_norm[i];
-                    w0 += support0[i] * epa.m_result.p[i];
+                            support0_dir_norm);
+                    const btVector3 support0 =
+                        support0_without_margin +
+                        shape.m_shapes[0]->getMarginNonVirtual() * support0_dir_norm;
+                    w0 += support0 * epa.m_result.p[i];
                 }
                 results.status = sResults::Penetrating;
                 results.witnesses[0] = wtrs0 * w0;
@@ -1689,10 +1678,9 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::PenetrationWit
                                                           btGjkEpaScratch& scratch,
                                                           bool usemargins)
 {
-    tShape shape;
-    Initialize(shape0, wtrs0, shape1, wtrs1, results, shape, usemargins);
+    Initialize(shape0, wtrs0, shape1, wtrs1, results, scratch.gjk.m_shape, usemargins);
     scratch.gjk.Initialize();
-    GJK::eStatus::_ gjk_status = scratch.gjk.Evaluate(shape, -guess);
+    GJK::eStatus::_ gjk_status = scratch.gjk.Evaluate(-guess);
     switch (gjk_status)
     {
         case GJK::eStatus::Inside:
@@ -1704,38 +1692,20 @@ ROCKETGPU_HD ROCKETGPU_BULLET_PORT_NOINLINE bool btGjkEpaSolver2::PenetrationWit
             if (epa_status != EPA::eStatus::Failed)
             {
                 btVector3 w0 = btVector3(0, 0, 0);
-                btVector3 support0_dir_norm[4] = {
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                };
-                btVector3 support0_without_margin[4] = {
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                };
-                btVector3 support0[4] = {
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                    btVector3(0, 0, 0),
-                };
                 for (U i = 0; i < epa.m_result.rank; ++i)
                 {
-                    support0_dir_norm[i] = epa.m_result.c[i]->d;
-                    if (support0_dir_norm[i].length2() < (SIMD_EPSILON * SIMD_EPSILON)) {
-                        support0_dir_norm[i].setValue(-1.0f, -1.0f, -1.0f);
+                    btVector3 support0_dir_norm = epa.m_result.c[i]->d;
+                    if (support0_dir_norm.length2() < (SIMD_EPSILON * SIMD_EPSILON)) {
+                        support0_dir_norm.setValue(-1.0f, -1.0f, -1.0f);
                     }
-                    support0_dir_norm[i].normalize();
-                    support0_without_margin[i] =
-                        shape.m_shapes[0]->localGetSupportVertexWithoutMarginNonVirtual(
-                            support0_dir_norm[i]);
-                    support0[i] =
-                        support0_without_margin[i] +
-                        shape.m_shapes[0]->getMarginNonVirtual() * support0_dir_norm[i];
-                    w0 += support0[i] * epa.m_result.p[i];
+                    support0_dir_norm.normalize();
+                    const btVector3 support0_without_margin =
+                        scratch.gjk.m_shape.m_shapes[0]->localGetSupportVertexWithoutMarginNonVirtual(
+                            support0_dir_norm);
+                    const btVector3 support0 =
+                        support0_without_margin +
+                        scratch.gjk.m_shape.m_shapes[0]->getMarginNonVirtual() * support0_dir_norm;
+                    w0 += support0 * epa.m_result.p[i];
                 }
                 results.status = sResults::Penetrating;
                 results.witnesses[0] = wtrs0 * w0;

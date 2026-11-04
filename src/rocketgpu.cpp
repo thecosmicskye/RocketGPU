@@ -25,6 +25,9 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 #include "rocketgpu/detail/arena/mesh_loader.hpp"
 #include "rocketgpu/detail/arena/mesh_path.hpp"
@@ -46,6 +49,26 @@ inline void CpuRelax() {
 #endif
 }
 
+inline int DefaultCpuHardwareThreads() {
+#if defined(__linux__)
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    if (sched_getaffinity(0, sizeof(cpuset), &cpuset) == 0) {
+        const int count = CPU_COUNT(&cpuset);
+        if (count > 0) {
+            return count;
+        }
+    }
+#elif defined(__APPLE__)
+    int perf_cores = 0;
+    size_t len = sizeof(perf_cores);
+    if (sysctlbyname("hw.perflevel0.logicalcpu", &perf_cores, &len, nullptr, 0) == 0 && perf_cores > 0) {
+        return perf_cores;
+    }
+#endif
+    return std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+}
+
 class CpuEnvPool {
 public:
     explicit CpuEnvPool(int env_count) {
@@ -54,31 +77,19 @@ public:
             n = std::atoi(s);
         }
         if (n <= 0) {
-            n = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
-#if defined(__linux__) && defined(CPU_COUNT)
-            cpu_set_t affinity;
-            if (sched_getaffinity(0, sizeof(affinity), &affinity) == 0) {
-                n = std::min(n, std::max(1, CPU_COUNT(&affinity)));
-            }
-#endif
-            n = std::min(n, std::max(1, env_count / 16));
+            n = std::min(DefaultCpuHardwareThreads(), std::max(1, env_count / 4));
         }
-        for (int i = 1; i < n; ++i) {
-            workers_.emplace_back([this] { work(); });
+        try {
+            for (int i = 1; i < n; ++i) {
+                workers_.emplace_back([this] { work(); });
+            }
+        } catch (...) {
+            shutdown();
+            throw;
         }
     }
 
-    ~CpuEnvPool() {
-        {
-            const std::lock_guard<std::mutex> lock(mutex_);
-            stop_ = true;
-            gen_.fetch_add(1, std::memory_order_release);
-        }
-        cv_.notify_all();
-        for (std::thread& t : workers_) {
-            t.join();
-        }
-    }
+    ~CpuEnvPool() { shutdown(); }
 
     template <class F>
     void run(int count, F&& fn) {
@@ -91,29 +102,52 @@ public:
         call_ = [](void* ctx, int i) { (*static_cast<std::remove_reference_t<F>*>(ctx))(i); };
         ctx_ = &fn;
         count_ = count;
-        chunk_ = std::max(1, count / (static_cast<int>(workers_.size() + 1) * 8));
+        chunk_ = std::max(1, count / (static_cast<int>(workers_.size() + 1) * 16));
         next_.store(0, std::memory_order_relaxed);
         done_.store(0, std::memory_order_relaxed);
-        {
+        gen_.fetch_add(1, std::memory_order_seq_cst);
+        if (parked_.load(std::memory_order_seq_cst) != 0) {
             const std::lock_guard<std::mutex> lock(mutex_);
-            gen_.fetch_add(1, std::memory_order_release);
+            cv_.notify_all();
         }
-        cv_.notify_all();
         drain();
-        while (done_.load(std::memory_order_acquire) != static_cast<int>(workers_.size())) {
-            std::this_thread::yield();
+        int spins = 0;
+        const int expected = static_cast<int>(workers_.size());
+        while (done_.load(std::memory_order_acquire) != expected) {
+            if (++spins < 4096) {
+                CpuRelax();
+            } else {
+                std::this_thread::yield();
+            }
         }
     }
 
 private:
+    void shutdown() {
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+            gen_.fetch_add(1, std::memory_order_seq_cst);
+        }
+        cv_.notify_all();
+        for (std::thread& t : workers_) {
+            t.join();
+        }
+    }
+
     void drain() {
+        const int count = count_;
+        const int chunk = chunk_;
+        const auto call = call_;
+        void* const ctx = ctx_;
         for (;;) {
-            const int i0 = next_.fetch_add(chunk_, std::memory_order_relaxed);
-            if (i0 >= count_) {
+            const int i0 = next_.fetch_add(chunk, std::memory_order_relaxed);
+            if (i0 >= count) {
                 return;
             }
-            for (int i = i0; i < std::min(count_, i0 + chunk_); ++i) {
-                call_(ctx_, i);
+            const int i1 = std::min(count, i0 + chunk);
+            for (int i = i0; i < i1; ++i) {
+                call(ctx, i);
             }
         }
     }
@@ -121,15 +155,16 @@ private:
     void work() {
         uint64_t seen = 0;
         for (;;) {
-            for (int k = 0; k < 4000 && gen_.load(std::memory_order_acquire) == seen; ++k) {
+            for (int k = 0; k < 4096 && gen_.load(std::memory_order_acquire) == seen; ++k) {
                 CpuRelax();
-            }
-            for (int k = 0; k < 200 && gen_.load(std::memory_order_acquire) == seen; ++k) {
-                std::this_thread::yield();
             }
             if (gen_.load(std::memory_order_acquire) == seen) {
                 std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [&] { return gen_.load(std::memory_order_acquire) != seen; });
+                parked_.fetch_add(1, std::memory_order_seq_cst);
+                if (!stop_ && gen_.load(std::memory_order_seq_cst) == seen) {
+                    cv_.wait(lock, [&] { return stop_ || gen_.load(std::memory_order_acquire) != seen; });
+                }
+                parked_.fetch_sub(1, std::memory_order_relaxed);
             }
             seen = gen_.load(std::memory_order_acquire);
             if (stop_) {
@@ -143,9 +178,10 @@ private:
     std::vector<std::thread> workers_;
     std::mutex mutex_;
     std::condition_variable cv_;
-    std::atomic<uint64_t> gen_{0};
-    std::atomic<int> next_{0};
-    std::atomic<int> done_{0};
+    alignas(128) std::atomic<uint64_t> gen_{0};
+    alignas(128) std::atomic<int> next_{0};
+    alignas(128) std::atomic<int> done_{0};
+    alignas(128) std::atomic<int> parked_{0};
     void (*call_)(void*, int) = nullptr;
     void* ctx_ = nullptr;
     int count_ = 0;
@@ -732,51 +768,43 @@ struct BatchSim::Impl {
     }
 #endif
 
-    bool prepare_respawn_slot_overrides(cudaStream_t stream, const int32_t* device_order = nullptr) {
+#if !defined(ROCKETGPU_USE_CUDA)
+    void ensure_host_respawn_slot_overrides_sized() {
         if (!cfg.mirror_official_respawn_rng) {
-            return false;
+            return;
         }
-
-#if defined(ROCKETGPU_USE_CUDA)
-        detail::LaunchPrepareRespawnSlots(cfg, car_states.data(), env_car_count.data(), env_states.data(),
-            device_respawn_rng.data(), device_order, respawn_slot_overrides.data(), stream);
-        return true;
-#else
-        (void)device_order;
-        (void)stream;
-        const CarState* const cars_ptr = car_states.data();
-        const int32_t* const counts_ptr = env_car_count.data();
-        bool any_respawn = false;
-
-        for (int env_idx = 0; env_idx < cfg.env_count; ++env_idx) {
-            const int base = env_idx * cfg.max_cars_per_env;
-            const int count = counts_ptr[static_cast<size_t>(env_idx)];
-            for (int i = 0; i < count; ++i) {
-                const CarState& car = cars_ptr[static_cast<size_t>(base + i)];
-                if (!car.is_demoed || car.respawn_slot_override_plus1 >= kKickoffSpawnOverridePlus1) {
-                    continue;
-                }
-                if (Max(0.0f, car.demo_respawn_timer - cfg.tick_dt) > 0.0f) {
-                    continue;
-                }
-                if (!any_respawn) {
-                    const size_t car_capacity =
-                        static_cast<size_t>(cfg.env_count) * static_cast<size_t>(cfg.max_cars_per_env);
-                    if (host_respawn_slot_overrides.size() != car_capacity) {
-                        host_respawn_slot_overrides.assign(car_capacity, kNoRespawnSlotOverride);
-                    } else {
-                        std::fill(host_respawn_slot_overrides.begin(), host_respawn_slot_overrides.end(),
-                                  kNoRespawnSlotOverride);
-                    }
-                    any_respawn = true;
-                }
-                host_respawn_slot_overrides[static_cast<size_t>(base + i)] =
-                    static_cast<uint8_t>(respawn_rng_env[static_cast<size_t>(env_idx)]() % 4);
-            }
+        const size_t car_capacity = static_cast<size_t>(cfg.env_count) * static_cast<size_t>(cfg.max_cars_per_env);
+        if (host_respawn_slot_overrides.size() != car_capacity) {
+            host_respawn_slot_overrides.assign(car_capacity, kNoRespawnSlotOverride);
         }
-        return any_respawn;
-#endif
     }
+
+    const uint8_t* prepare_respawn_slot_overrides_env(int env_idx) {
+        if (!cfg.mirror_official_respawn_rng) {
+            return nullptr;
+        }
+        const int base = env_idx * cfg.max_cars_per_env;
+        const int count = env_car_count.data()[static_cast<size_t>(env_idx)];
+        bool any_respawn = false;
+        for (int i = 0; i < count; ++i) {
+            const CarState& car = car_states.data()[static_cast<size_t>(base + i)];
+            if (!car.is_demoed || car.respawn_slot_override_plus1 >= kKickoffSpawnOverridePlus1) {
+                continue;
+            }
+            if (Max(0.0f, car.demo_respawn_timer - cfg.tick_dt) > 0.0f) {
+                continue;
+            }
+            if (!any_respawn) {
+                std::fill_n(host_respawn_slot_overrides.data() + static_cast<size_t>(base),
+                            static_cast<size_t>(cfg.max_cars_per_env), kNoRespawnSlotOverride);
+                any_respawn = true;
+            }
+            host_respawn_slot_overrides[static_cast<size_t>(base + i)] =
+                static_cast<uint8_t>(respawn_rng_env[static_cast<size_t>(env_idx)]() % 4);
+        }
+        return any_respawn ? host_respawn_slot_overrides.data() : nullptr;
+    }
+#endif
 
     bool exact_host_validation = false;
     void mark_exact_host_dirty() {}
@@ -1016,9 +1044,9 @@ struct BatchSim::Impl {
 
     void reset_to_kickoff(uint64_t new_seed, cudaStream_t stream) {
         seed = new_seed;
+#if defined(ROCKETGPU_USE_CUDA)
         solver_scratch.memset_zero(stream);
         memset_zero_solver_rows(stream);
-#if defined(ROCKETGPU_USE_CUDA)
         detail::LaunchResetToKickoff(
             cfg,
             teams.data(),
@@ -1034,29 +1062,29 @@ struct BatchSim::Impl {
             car_configs.data(),
             stream);
 #else
-        {
-            for (int env_idx = 0; env_idx < cfg.env_count; ++env_idx) {
-                int kickoff_order[5];
-                const bool have_order = host_kickoff_order(env_idx, seed, 0, kickoff_order);
-                detail::ResetEnvToKickoff(
-                    env_idx,
-                    cfg,
-                    teams.data(),
-                    env_car_count.data(),
-                    car_states.data(),
-                    controls.data(),
-                    ball_states.data(),
-                    boost_pad_states.data(),
-                    seed,
-                    false,
-                    env_states.data(),
-                    0,
-                    nullptr,
-                    have_order ? kickoff_order : nullptr,
-                    false,
-                    car_configs.data());
-            }
-        }
+        cpu_envs().run(cfg.env_count, [&](int env_idx) {
+            solver_scratch.data()[env_idx] = detail::WorldSolverScratch{};
+            detail::ZeroWorldSolverScratchRows(solver_row_pool.view(static_cast<size_t>(env_idx)), solver_row_pool.caps);
+            int kickoff_order[5];
+            const bool have_order = host_kickoff_order(env_idx, seed, 0, kickoff_order);
+            detail::ResetEnvToKickoff(
+                env_idx,
+                cfg,
+                teams.data(),
+                env_car_count.data(),
+                car_states.data(),
+                controls.data(),
+                ball_states.data(),
+                boost_pad_states.data(),
+                seed,
+                false,
+                env_states.data(),
+                0,
+                nullptr,
+                have_order ? kickoff_order : nullptr,
+                false,
+                car_configs.data());
+        });
         (void)stream;
 #endif
     }
@@ -1067,6 +1095,15 @@ struct BatchSim::Impl {
         }
         if (count > static_cast<size_t>(cfg.env_count)) {
             throw std::out_of_range("apply_env_commands_host count exceeds env_count");
+        }
+        size_t active_cmds = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const EnvCommand& c = host_commands[i];
+            active_cmds += static_cast<size_t>((c.reset_to_kickoff | c.reset_scoreboard | c.reset_tick_count | c.new_round_bodies) != 0);
+        }
+        if (active_cmds == 0) {
+            (void)stream;
+            return;
         }
 #if defined(ROCKETGPU_USE_CUDA)
         env_command_scratch.copy_from_host(host_commands, count, stream);
@@ -1086,36 +1123,47 @@ struct BatchSim::Impl {
             car_configs.data(),
             stream);
 #else
-        cpu_envs().run(static_cast<int>(count), [&](int env) {
-                const size_t env_idx = static_cast<size_t>(env);
-                int kickoff_order[5];
-                const bool have_order = host_commands[env_idx].reset_to_kickoff &&
-                    host_kickoff_order(static_cast<int>(env_idx), host_commands[env_idx].kickoff_seed,
-                                       host_commands[env_idx].kickoff_seed_mode, kickoff_order);
-                detail::ApplyEnvCommandBodies(solver_scratch.data()[env_idx], host_commands[env_idx],
-                                              env_car_count.data()[env_idx],
-                                              car_states.data() + env_idx * cfg.max_cars_per_env);
-                detail::ApplyEnvCommand(
-                    static_cast<int>(env_idx),
-                    cfg,
-                    teams.data(),
-                    env_car_count.data(),
-                    car_states.data(),
-                    controls.data(),
-                    ball_states.data(),
-                    env_states.data(),
-                    boost_pad_states.data(),
-                    host_commands[env_idx],
-                    nullptr,
-                    have_order ? kickoff_order : nullptr,
-                    car_configs.data());
-                if (host_commands[env_idx].reset_to_kickoff) {
-                    const detail::BulletBroadphaseHistory bp = solver_scratch.data()[env_idx].bp;
-                    solver_scratch.data()[env_idx] = detail::WorldSolverScratch{};
-                    solver_scratch.data()[env_idx].bp = bp;
-                    detail::ZeroWorldSolverScratchRows(solver_row_pool.view(env_idx), solver_row_pool.caps);
-                }
-        });
+        auto apply_one = [&](int env) {
+            const size_t env_idx = static_cast<size_t>(env);
+            const EnvCommand& cmd = host_commands[env_idx];
+            if ((cmd.reset_to_kickoff | cmd.reset_scoreboard | cmd.reset_tick_count | cmd.new_round_bodies) == 0) {
+                return;
+            }
+            int kickoff_order[5];
+            const bool have_order = cmd.reset_to_kickoff &&
+                host_kickoff_order(static_cast<int>(env_idx), cmd.kickoff_seed,
+                                   cmd.kickoff_seed_mode, kickoff_order);
+            detail::ApplyEnvCommandBodies(solver_scratch.data()[env_idx], cmd,
+                                          env_car_count.data()[env_idx],
+                                          car_states.data() + env_idx * cfg.max_cars_per_env);
+            detail::ApplyEnvCommand(
+                static_cast<int>(env_idx),
+                cfg,
+                teams.data(),
+                env_car_count.data(),
+                car_states.data(),
+                controls.data(),
+                ball_states.data(),
+                env_states.data(),
+                boost_pad_states.data(),
+                cmd,
+                nullptr,
+                have_order ? kickoff_order : nullptr,
+                car_configs.data());
+            if (cmd.reset_to_kickoff) {
+                const detail::BulletBroadphaseHistory bp = solver_scratch.data()[env_idx].bp;
+                solver_scratch.data()[env_idx] = detail::WorldSolverScratch{};
+                solver_scratch.data()[env_idx].bp = bp;
+                detail::ZeroWorldSolverScratchRows(solver_row_pool.view(env_idx), solver_row_pool.caps);
+            }
+        };
+        if (active_cmds < 16) {
+            for (int env = 0; env < static_cast<int>(count); ++env) {
+                apply_one(env);
+            }
+        } else {
+            cpu_envs().run(static_cast<int>(count), apply_one);
+        }
         (void)stream;
 #endif
     }
@@ -1213,9 +1261,48 @@ struct BatchSim::Impl {
                     seed,
                     ticks);
             });
-            return;
-        }
-        cpu_step_envs(ticks, stream, [&](int env_idx, int32_t, const uint8_t* respawn_override_ptr) {
+        } else {
+            ensure_host_respawn_slot_overrides_sized();
+            const float window_dt = static_cast<float>(ticks) * cfg.tick_dt;
+            const bool fresh_demo_safe = ticks <= 16 && cfg.tick_dt > 0.0f && std::isnormal(cfg.tick_dt) &&
+                                         cfg.mutator.demo_respawn_time > (ticks <= 4 ? window_dt : window_dt + cfg.tick_dt);
+            cpu_envs().run(cfg.env_count, [&](int env_idx) {
+                if (fresh_demo_safe && ticks > 1) {
+                    const int base = env_idx * cfg.max_cars_per_env;
+                    const int count = env_car_count.data()[static_cast<size_t>(env_idx)];
+                    const CarState* const cars_ptr = car_states.data();
+                    bool any_expiring_demo = false;
+                    for (int i = 0; i < count; ++i) {
+                        const CarState& car = cars_ptr[static_cast<size_t>(base + i)];
+                        if (car.is_demoed && car.respawn_slot_override_plus1 < kKickoffSpawnOverridePlus1 &&
+                            !(car.demo_respawn_timer > window_dt + cfg.tick_dt)) {
+                            any_expiring_demo = true;
+                            break;
+                        }
+                    }
+                    if (!any_expiring_demo) {
+                        detail::StepEnv(
+                            env_idx,
+                            cfg,
+                            teams.data(),
+                            env_car_count.data(),
+                            car_states.data(),
+                            wheel_runtime_states.data(),
+                            solver_scratch.data(),
+                            solver_row_pool,
+                            controls.data(),
+                            car_configs.data(),
+                            ball_states.data(),
+                            env_states.data(),
+                            boost_pad_states.data(),
+                            nullptr,
+                            seed,
+                            ticks);
+                        return;
+                    }
+                }
+                for (int32_t tick = 0; tick < ticks; ++tick) {
+                    const uint8_t* respawn_override_ptr = prepare_respawn_slot_overrides_env(env_idx);
                     detail::StepEnv(
                         env_idx,
                         cfg,
@@ -1233,7 +1320,9 @@ struct BatchSim::Impl {
                         respawn_override_ptr,
                         seed,
                         1);
-        });
+                }
+            });
+        }
         (void)stream;
 #endif
     }
@@ -1273,8 +1362,74 @@ struct BatchSim::Impl {
             order,
             cfg.mirror_official_respawn_rng ? respawn_slot_overrides.data() : nullptr);
 #else
-        {
-            cpu_step_envs(ticks, stream, [&](int env_idx, int32_t tick, const uint8_t* respawn_override_ptr) {
+        if (!cfg.mirror_official_respawn_rng) {
+            cpu_envs().run(cfg.env_count, [&](int env_idx) {
+                detail::StepEnvWithControlStream(
+                    env_idx,
+                    cfg,
+                    teams.data(),
+                    env_car_count.data(),
+                    car_states.data(),
+                    wheel_runtime_states.data(),
+                    solver_scratch.data(),
+                    solver_row_pool,
+                    controls.data(),
+                    device_controls_by_tick,
+                    control_stride,
+                    car_configs.data(),
+                    ball_states.data(),
+                    env_states.data(),
+                    boost_pad_states.data(),
+                    nullptr,
+                    seed,
+                    detail::kStepEnvPhaseFull,
+                    ticks);
+            });
+        } else {
+            ensure_host_respawn_slot_overrides_sized();
+            const float window_dt = static_cast<float>(ticks) * cfg.tick_dt;
+            const bool fresh_demo_safe = ticks <= 16 && cfg.tick_dt > 0.0f && std::isnormal(cfg.tick_dt) &&
+                                         cfg.mutator.demo_respawn_time > (ticks <= 4 ? window_dt : window_dt + cfg.tick_dt);
+            cpu_envs().run(cfg.env_count, [&](int env_idx) {
+                if (fresh_demo_safe && ticks > 1) {
+                    const int base = env_idx * cfg.max_cars_per_env;
+                    const int count = env_car_count.data()[static_cast<size_t>(env_idx)];
+                    const CarState* const cars_ptr = car_states.data();
+                    bool any_expiring_demo = false;
+                    for (int i = 0; i < count; ++i) {
+                        const CarState& car = cars_ptr[static_cast<size_t>(base + i)];
+                        if (car.is_demoed && car.respawn_slot_override_plus1 < kKickoffSpawnOverridePlus1 &&
+                            !(car.demo_respawn_timer > window_dt + cfg.tick_dt)) {
+                            any_expiring_demo = true;
+                            break;
+                        }
+                    }
+                    if (!any_expiring_demo) {
+                        detail::StepEnvWithControlStream(
+                            env_idx,
+                            cfg,
+                            teams.data(),
+                            env_car_count.data(),
+                            car_states.data(),
+                            wheel_runtime_states.data(),
+                            solver_scratch.data(),
+                            solver_row_pool,
+                            controls.data(),
+                            device_controls_by_tick,
+                            control_stride,
+                            car_configs.data(),
+                            ball_states.data(),
+                            env_states.data(),
+                            boost_pad_states.data(),
+                            nullptr,
+                            seed,
+                            detail::kStepEnvPhaseFull,
+                            ticks);
+                        return;
+                    }
+                }
+                for (int32_t tick = 0; tick < ticks; ++tick) {
+                    const uint8_t* respawn_override_ptr = prepare_respawn_slot_overrides_env(env_idx);
                     detail::StepEnvWithControlStream(
                         env_idx,
                         cfg,
@@ -1293,12 +1448,12 @@ struct BatchSim::Impl {
                         boost_pad_states.data(),
                         respawn_override_ptr,
                         seed);
+                }
             });
-
-            std::memcpy(controls.data(),
-                        device_controls_by_tick + static_cast<size_t>(ticks - 1) * static_cast<size_t>(control_stride),
-                        static_cast<size_t>(cfg.env_count) * static_cast<size_t>(cfg.max_cars_per_env) * sizeof(CarControls));
         }
+        std::memcpy(controls.data(),
+                    device_controls_by_tick + static_cast<size_t>(ticks - 1) * static_cast<size_t>(control_stride),
+                    static_cast<size_t>(cfg.env_count) * static_cast<size_t>(cfg.max_cars_per_env) * sizeof(CarControls));
         (void)stream;
 #endif
     }
@@ -1354,31 +1509,31 @@ struct BatchSim::Impl {
 #else
         {
             cpu_step_envs(ticks, stream, [&](int env_idx, int32_t tick, const uint8_t* respawn_override_ptr) {
-                    int kickoff_order[5];
-                    const EnvCommand& tick_command = device_env_commands_by_tick[static_cast<size_t>(tick) * static_cast<size_t>(env_command_stride) + static_cast<size_t>(env_idx)];
-                    const bool have_order = tick_command.reset_to_kickoff &&
-                        host_kickoff_order(env_idx, tick_command.kickoff_seed, tick_command.kickoff_seed_mode, kickoff_order);
-                    detail::StepEnvWithCommandStreams(
-                        env_idx,
-                        cfg,
-                        teams.data(),
-                        env_car_count.data(),
-                        car_states.data(),
-                        wheel_runtime_states.data(),
-                        solver_scratch.data(),
-                        solver_row_pool,
-                        controls.data(),
-                        device_controls_by_tick + static_cast<size_t>(tick) * static_cast<size_t>(control_stride),
-                        control_stride,
-                        device_env_commands_by_tick + static_cast<size_t>(tick) * static_cast<size_t>(env_command_stride),
-                        env_command_stride,
-                        car_configs.data(),
-                        ball_states.data(),
-                        env_states.data(),
-                        boost_pad_states.data(),
-                        respawn_override_ptr,
-                        seed,
-                        have_order ? kickoff_order : nullptr);
+                int kickoff_order[5];
+                const EnvCommand& tick_command = device_env_commands_by_tick[static_cast<size_t>(tick) * static_cast<size_t>(env_command_stride) + static_cast<size_t>(env_idx)];
+                const bool have_order = tick_command.reset_to_kickoff &&
+                    host_kickoff_order(env_idx, tick_command.kickoff_seed, tick_command.kickoff_seed_mode, kickoff_order);
+                detail::StepEnvWithCommandStreams(
+                    env_idx,
+                    cfg,
+                    teams.data(),
+                    env_car_count.data(),
+                    car_states.data(),
+                    wheel_runtime_states.data(),
+                    solver_scratch.data(),
+                    solver_row_pool,
+                    controls.data(),
+                    device_controls_by_tick + static_cast<size_t>(tick) * static_cast<size_t>(control_stride),
+                    control_stride,
+                    device_env_commands_by_tick + static_cast<size_t>(tick) * static_cast<size_t>(env_command_stride),
+                    env_command_stride,
+                    car_configs.data(),
+                    ball_states.data(),
+                    env_states.data(),
+                    boost_pad_states.data(),
+                    respawn_override_ptr,
+                    seed,
+                    have_order ? kickoff_order : nullptr);
             });
 
             std::memcpy(controls.data(),
@@ -1399,6 +1554,7 @@ struct BatchSim::Impl {
 
     template <class F>
     void cpu_step_envs(int32_t ticks, cudaStream_t stream, F&& one) {
+        (void)stream;
         if (!cfg.mirror_official_respawn_rng) {
             cpu_envs().run(cfg.env_count, [&](int env_idx) {
                 for (int32_t tick = 0; tick < ticks; ++tick) {
@@ -1407,10 +1563,16 @@ struct BatchSim::Impl {
             });
             return;
         }
-        for (int32_t tick = 0; tick < ticks; ++tick) {
-            const uint8_t* overrides = prepare_respawn_slot_overrides(stream) ? host_respawn_slot_overrides.data() : nullptr;
-            cpu_envs().run(cfg.env_count, [&](int env_idx) { one(env_idx, tick, overrides); });
+        const size_t car_capacity = static_cast<size_t>(cfg.env_count) * static_cast<size_t>(cfg.max_cars_per_env);
+        if (host_respawn_slot_overrides.size() != car_capacity) {
+            host_respawn_slot_overrides.assign(car_capacity, kNoRespawnSlotOverride);
         }
+        cpu_envs().run(cfg.env_count, [&](int env_idx) {
+            for (int32_t tick = 0; tick < ticks; ++tick) {
+                const uint8_t* overrides = prepare_respawn_slot_overrides_env(env_idx);
+                one(env_idx, tick, overrides);
+            }
+        });
     }
 
     std::unique_ptr<CpuEnvPool> cpu_pool;

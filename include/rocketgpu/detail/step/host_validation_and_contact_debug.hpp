@@ -7,20 +7,13 @@ struct WheelStepState {
     Vec3 ray_source_bt = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 wheel_dir_ws = Vec3(0.0f, 0.0f, -1.0f);
     Vec3 wheel_axle_ws = Vec3(0.0f, -1.0f, 0.0f);
-    Vec3 contact_point_ws = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 contact_point_bt = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 contact_normal_ws = Vec3(0.0f, 0.0f, 1.0f);
-    Vec3 vel_at_contact = Vec3(0.0f, 0.0f, 0.0f);
-    Vec3 impulse = Vec3(0.0f, 0.0f, 0.0f);
-    float suspension_length = 0.0f;
-    float wheel_trace_length = 0.0f;
-    float unclamped_wheel_trace_length = 0.0f;
 
     float wheel_trace_len_bt = 0.0f;
 
     float suspension_len_bt = 0.0f;
     float suspension_relative_velocity_bt = 0.0f;
-    float debug_hit_fraction = 0.0f;
     float suspension_relative_velocity = 0.0f;
     float clipped_inv_contact_dot_suspension = 1.0f;
     float extra_pushback = 0.0f;
@@ -174,10 +167,12 @@ struct CarFrame {
     Vec3 fwd, right, up;
     Vec3 inv_inertia_local_bt;
     Vec3 inv_world_row0_bt, inv_world_row1_bt, inv_world_row2_bt;
+#if !defined(__CUDA_ARCH__)
     mutable bool has_inertia_world_bt = false;
     mutable bool has_inertia_world_uu = false;
     mutable Vec3 inertia_world_bt_row0, inertia_world_bt_row1, inertia_world_bt_row2;
     mutable Vec3 inertia_world_uu_row0, inertia_world_uu_row1, inertia_world_uu_row2;
+#endif
     mutable bool queue_forces = false;
     mutable Vec3 queued_force = Vec3(0.0f, 0.0f, 0.0f);
     mutable Vec3 queued_ang_accel = Vec3(0.0f, 0.0f, 0.0f);
@@ -606,6 +601,7 @@ ROCKETGPU_HD Vec3 ComputeBulletStyleExternalTorqueInput(
     float mass,
     const Vec3& ang_accel_world,
     const CarFrame* frame = nullptr) {
+#if !defined(__CUDA_ARCH__)
     if (frame) {
         if (!frame->has_inertia_world_uu) {
             Vec3 inv_r0, inv_r1, inv_r2;
@@ -617,6 +613,9 @@ ROCKETGPU_HD Vec3 ComputeBulletStyleExternalTorqueInput(
         return Mul3x3Vec(frame->inertia_world_uu_row0, frame->inertia_world_uu_row1, frame->inertia_world_uu_row2,
                          ang_accel_world);
     }
+#else
+    (void)frame;
+#endif
     Vec3 inv_r0, inv_r1, inv_r2;
     BuildInvInertiaTensorWorld(car, cfg, mass, inv_r0, inv_r1, inv_r2);
     Vec3 i_r0, i_r1, i_r2;
@@ -631,8 +630,14 @@ ROCKETGPU_HD void QueueCentralForce(WheelRuntimeState* wheel_runtime_state, cons
     }
     if (frame && frame->queue_forces) {
         frame->queued_force += force_bt;
-        if (frame->n_force_items < CarFrame::kQueueItems) {
-            frame->force_items[frame->n_force_items] = force_bt;
+        if (frame->n_force_items == 0) {
+            frame->force_items[0] = force_bt;
+        } else if (frame->n_force_items == 1) {
+            frame->force_items[1] = force_bt;
+        } else if (frame->n_force_items == 2) {
+            frame->force_items[2] = force_bt;
+        } else if (frame->n_force_items == 3) {
+            frame->force_items[3] = force_bt;
         }
         ++frame->n_force_items;
         return;
@@ -665,8 +670,14 @@ ROCKETGPU_HD void QueueOfficialTorqueBt(WheelRuntimeState* wheel_runtime_state, 
     }
     if (frame && frame->queue_forces) {
         frame->queued_torque_bt += torque_bt;
-        if (frame->n_torque_items < CarFrame::kQueueItems) {
-            frame->torque_items[frame->n_torque_items] = torque_bt;
+        if (frame->n_torque_items == 0) {
+            frame->torque_items[0] = torque_bt;
+        } else if (frame->n_torque_items == 1) {
+            frame->torque_items[1] = torque_bt;
+        } else if (frame->n_torque_items == 2) {
+            frame->torque_items[2] = torque_bt;
+        } else if (frame->n_torque_items == 3) {
+            frame->torque_items[3] = torque_bt;
         }
         ++frame->n_torque_items;
         return;
@@ -686,13 +697,15 @@ ROCKETGPU_HD void QueueFirstForceAndTorqueBt(WheelRuntimeState* wheel_runtime_st
         return;
     }
     Vec3 force = force_bt;
-    for (int i = 0; i < frame->n_force_items; ++i) {
-        force += frame->force_items[i];
-    }
+    if (frame->n_force_items > 0) force += frame->force_items[0];
+    if (frame->n_force_items > 1) force += frame->force_items[1];
+    if (frame->n_force_items > 2) force += frame->force_items[2];
+    if (frame->n_force_items > 3) force += frame->force_items[3];
     Vec3 torque = torque_bt;
-    for (int i = 0; i < frame->n_torque_items; ++i) {
-        torque += frame->torque_items[i];
-    }
+    if (frame->n_torque_items > 0) torque += frame->torque_items[0];
+    if (frame->n_torque_items > 1) torque += frame->torque_items[1];
+    if (frame->n_torque_items > 2) torque += frame->torque_items[2];
+    if (frame->n_torque_items > 3) torque += frame->torque_items[3];
     frame->queued_force = force;
     frame->queued_torque_bt = torque;
     frame->n_force_items = CarFrame::kQueueItems + 1;
@@ -720,15 +733,22 @@ ROCKETGPU_HD void BuildInertiaTensorWorldBtInverse(
     Vec3& out_row1,
     Vec3& out_row2) {
     if (frame) {
+#if defined(__CUDA_ARCH__)
+        InverseMatrix3x3BulletStyle(frame->inv_world_row0_bt, frame->inv_world_row1_bt, frame->inv_world_row2_bt,
+                                    out_row0, out_row1, out_row2);
+        return;
+#else
         if (!frame->has_inertia_world_bt) {
-            BuildInertiaTensorWorldBtInverse(car, cfg, mass, frame->inertia_world_bt_row0,
-                                             frame->inertia_world_bt_row1, frame->inertia_world_bt_row2);
+            InverseMatrix3x3BulletStyle(frame->inv_world_row0_bt, frame->inv_world_row1_bt, frame->inv_world_row2_bt,
+                                        frame->inertia_world_bt_row0, frame->inertia_world_bt_row1,
+                                        frame->inertia_world_bt_row2);
             frame->has_inertia_world_bt = true;
         }
         out_row0 = frame->inertia_world_bt_row0;
         out_row1 = frame->inertia_world_bt_row1;
         out_row2 = frame->inertia_world_bt_row2;
         return;
+#endif
     }
     BuildInertiaTensorWorldBtInverse(car, cfg, mass, out_row0, out_row1, out_row2);
 }
@@ -1338,6 +1358,45 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
                 local_triangles ? local_triangles + global_tri_idx : nullptr);
         };
         if constexpr (split_headers) {
+            if (leaf_grid != nullptr && leaf_grid->infos != nullptr) {
+                const ArenaMeshLeafGridInfo& lg_info = leaf_grid->infos[ray_info >= 0 ? ray_info : ray_pos];
+                if (lg_info.cell_offset >= 0 &&
+                    quantized_query_aabb_max[0] - quantized_query_aabb_min[0] <= lg_info.cell_width[0] &&
+                    quantized_query_aabb_max[1] - quantized_query_aabb_min[1] <= lg_info.cell_width[1] &&
+                    quantized_query_aabb_max[2] - quantized_query_aabb_min[2] <= lg_info.cell_width[2]) {
+                    int cell[3];
+                    for (int a = 0; a < 3; ++a) {
+                        cell[a] = quantized_query_aabb_min[a] / lg_info.cell_width[a];
+                        cell[a] = cell[a] < lg_info.cells[a] ? cell[a] : lg_info.cells[a] - 1;
+                    }
+                    const int cell_idx = lg_info.cell_offset + (cell[2] * lg_info.cells[1] + cell[1]) * lg_info.cells[0] + cell[0];
+                    const int e = leaf_grid->cell_start[cell_idx];
+                    const int end = leaf_grid->cell_start[cell_idx + 1];
+                    if (end - e <= 65536) {
+                        for (int idx = e + mesh_first; idx < end; idx += mesh_step) {
+                            ArenaMeshLeafEntry entry;
+#if defined(__CUDA_ARCH__)
+                            const uint4 raw = __ldg(reinterpret_cast<const uint4*>(&leaf_grid->entries[idx]));
+                            memcpy(&entry, &raw, sizeof(entry));
+#else
+                            entry = leaf_grid->entries[idx];
+#endif
+                            if (TestQuantizedAabbAgainstQuantizedAabb(
+                                    quantized_query_aabb_min, quantized_query_aabb_max,
+                                    entry.quantized_aabb_min, entry.quantized_aabb_max) &&
+                                ray_leaf(entry.quantized_aabb_min, entry.quantized_aabb_max)) {
+                                const float fraction_before = best_fraction;
+                                const uint8_t hit_before = best.hit;
+                                leaf(entry.triangle_index);
+                                if (best_mesh != nullptr && best.hit && (!hit_before || best_fraction < fraction_before)) {
+                                    *best_mesh = (ray_pos << 16) | (idx - e);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
             if (mesh_subtree_count > 0) {
                 for (int h = mesh_first; h < mesh_subtree_count; h += mesh_step) {
                     const ArenaMeshBvhSubtreeInfo& subtree = mesh_subtrees[h];

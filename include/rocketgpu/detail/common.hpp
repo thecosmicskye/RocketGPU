@@ -41,15 +41,41 @@ using cudaStream_t = void*;
 #define ROCKETGPU_RESTRICT
 #endif
 
-ROCKETGPU_HD int CountTrailingZeros64(uint64_t mask) {
+#ifndef ROCKETGPU_NOINLINE
 #if defined(__CUDA_ARCH__)
-    return __ffsll(static_cast<long long>(mask)) - 1;
+#define ROCKETGPU_NOINLINE __noinline__
 #else
-    int bit = 0;
-    while (((mask >> bit) & 1u) == 0) {
-        ++bit;
+#define ROCKETGPU_NOINLINE
+#endif
+#endif
+
+ROCKETGPU_HD int CountTrailingZeros32(uint32_t x) {
+#if defined(__CUDA_ARCH__)
+    return __ffs(static_cast<int>(x)) - 1;
+#elif defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctz(x);
+#else
+    int n = 0;
+    while ((x & 1u) == 0u) {
+        x >>= 1;
+        ++n;
     }
-    return bit;
+    return n;
+#endif
+}
+
+ROCKETGPU_HD int CountTrailingZeros64(uint64_t x) {
+#if defined(__CUDA_ARCH__)
+    return __ffsll(static_cast<long long>(x)) - 1;
+#elif defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctzll(x);
+#else
+    int n = 0;
+    while ((x & 1u) == 0u) {
+        x >>= 1;
+        ++n;
+    }
+    return n;
 #endif
 }
 

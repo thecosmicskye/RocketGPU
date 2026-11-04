@@ -99,15 +99,25 @@ ROCKETGPU_HD constexpr uint8_t BoostPadIsBigSoccar(int index) {
 
 ROCKETGPU_HD constexpr float SteerDegToRad() { return 0.01745329238474369f; }
 
+template <int I, int N>
+ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE float EvalInterpCurveLinearStep(
+    const float (&in)[N], const float (&out)[N], float x) {
+    if constexpr (I < N) {
+        if (in[I] > x) {
+            return (out[I] - out[I - 1]) * ((x - in[I - 1]) / (in[I] - in[I - 1])) + out[I - 1];
+        }
+        return EvalInterpCurveLinearStep<I + 1, N>(in, out, x);
+    } else {
+        return out[N - 1];
+    }
+}
+
 template <int N>
-ROCKETGPU_HD float EvalInterpCurveLinear(const float (&in)[N], const float (&out)[N], float x) {
+ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE float EvalInterpCurveLinear(
+    const float (&in)[N], const float (&out)[N], float x) {
     if (N < 2 || in[0] >= x) return out[0];
     if (x >= in[N - 1]) return out[N - 1];
-#pragma unroll
-    for (int i = 1; i < N; ++i) {
-        if (in[i] > x) return (out[i] - out[i - 1]) * ((x - in[i - 1]) / (in[i] - in[i - 1])) + out[i - 1];
-    }
-    return out[N - 1];
+    return EvalInterpCurveLinearStep<1, N>(in, out, x);
 }
 
 ROCKETGPU_HD float EvalSteerAngleFromSpeed(const float (&c)[6], float speed_abs) {

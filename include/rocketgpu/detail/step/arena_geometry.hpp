@@ -154,7 +154,11 @@ ROCKETGPU_HD ::rocketgpu::Vec3 BallCarHitboxInsetBt(const ::rocketgpu::CarConfig
     return BallCarHitboxInset(cfg) * kUUToBT;
 }
 
+#if defined(__CUDA_ARCH__)
+constexpr int kMaxBallSplitCars = 8;
+#else
 constexpr int kMaxBallSplitCars = 32;
+#endif
 constexpr int kMaxBallSplitContactRows = 32;
 constexpr int kMaxBallVelocityContactRows = 32;
 constexpr int kMaxBallFrictionContactRows = 32;
@@ -1134,17 +1138,11 @@ struct WorldSolverScratchRowPoolHost {
 #endif
 
 struct WheelRayStage {
-    ::rocketgpu::Vec3 contact_point_ws;
     ::rocketgpu::Vec3 contact_point_bt;
     ::rocketgpu::Vec3 contact_normal_ws;
-    ::rocketgpu::Vec3 vel_at_contact;
-    float suspension_length;
-    float wheel_trace_length;
-    float unclamped_wheel_trace_length;
     float wheel_trace_len_bt;
     float suspension_len_bt;
     float suspension_relative_velocity_bt;
-    float debug_hit_fraction;
     float suspension_relative_velocity;
     float clipped_inv_contact_dot_suspension;
     float extra_pushback;
@@ -1250,6 +1248,7 @@ struct WorldSolverScratch {
     int32_t shared_contact_order_group_count = 0;
 
     WheelRayStage wheel_ray_stage[kWheelRayStageSlots] = {};
+    alignas(16) uint8_t wheel_ray_ordered[kWheelRayStageSlots] = {};
     WorldStepCarry world_step_carry = {};
     CarWorldRowsOut car_world_rows_out[8] = {};
     uint8_t pair_cache_cars = 8;
@@ -2905,37 +2904,39 @@ ROCKETGPU_HD void MarkBtSplitAccumulators(
         }
     }
 
-    for (int pass = 0; pass < kMarkCars; ++pass) {
-        bool changed = false;
-        for (int r = 0; pair_rows && r < pair_row_count; ++r) {
-            const CarSharedSplitContactRow& row = pair_rows[r];
-            if (!row.valid) {
-                continue;
+    if ((pair_rows && pair_row_count > 0) || (ball_rows && ball_row_count > 0)) {
+        for (int pass = 0; pass < kMarkCars; ++pass) {
+            bool changed = false;
+            for (int r = 0; pair_rows && r < pair_row_count; ++r) {
+                const CarSharedSplitContactRow& row = pair_rows[r];
+                if (!row.valid) {
+                    continue;
+                }
+                const int a = row.body_a_local_idx;
+                const int b = row.body_b_local_idx;
+                if (a < 0 || a >= kMarkCars || b < 0 || b >= kMarkCars) {
+                    continue;
+                }
+                if (blocked[a] != blocked[b]) {
+                    blocked[a] = true;
+                    blocked[b] = true;
+                    changed = true;
+                }
             }
-            const int a = row.body_a_local_idx;
-            const int b = row.body_b_local_idx;
-            if (a < 0 || a >= kMarkCars || b < 0 || b >= kMarkCars) {
-                continue;
+            for (int r = 0; ball_rows && r < ball_row_count; ++r) {
+                const BallSplitContactRow& row = ball_rows[r];
+                if (!row.valid || row.other_local_idx < 0 || row.other_local_idx >= kMarkCars) {
+                    continue;
+                }
+                if (blocked[row.other_local_idx] != ball_blocked) {
+                    blocked[row.other_local_idx] = true;
+                    ball_blocked = true;
+                    changed = true;
+                }
             }
-            if (blocked[a] != blocked[b]) {
-                blocked[a] = true;
-                blocked[b] = true;
-                changed = true;
+            if (!changed) {
+                break;
             }
-        }
-        for (int r = 0; ball_rows && r < ball_row_count; ++r) {
-            const BallSplitContactRow& row = ball_rows[r];
-            if (!row.valid || row.other_local_idx < 0 || row.other_local_idx >= kMarkCars) {
-                continue;
-            }
-            if (blocked[row.other_local_idx] != ball_blocked) {
-                blocked[row.other_local_idx] = true;
-                ball_blocked = true;
-                changed = true;
-            }
-        }
-        if (!changed) {
-            break;
         }
     }
     if (ball_split) {
@@ -3363,35 +3364,35 @@ ROCKETGPU_HD void ComputeBulletBodyProxy(
     const bool predict_snap = bp_history != nullptr && car_idx < 8 && bp_history->car_predict_valid[car_idx] != 0;
     const ::rocketgpu::Vec3 predict_vel = predict_snap ? bp_history->car_predict_vel[car_idx] : car.vel;
     const ::rocketgpu::Vec3 predict_ang_vel = predict_snap ? bp_history->car_predict_ang_vel[car_idx] : car.ang_vel;
-    ::rocketgpu::Quat predicted_rot = car.rot;
-    ::rocketgpu::Vec3 pred_basis_fwd = car.basis_forward;
-    ::rocketgpu::Vec3 pred_basis_right = car.basis_right;
-    ::rocketgpu::Vec3 pred_basis_up = car.basis_up;
-    if (car.basis_authoritative && !native_sse_math) {
-        GameIntegrateOrientationBasisColumns(pred_basis_fwd, pred_basis_right, pred_basis_up, predicted_rot, predict_ang_vel, dt);
-    } else if (car.basis_authoritative) {
-        IntegrateOrientationBasisColumns(
-            pred_basis_fwd, pred_basis_right, pred_basis_up, predicted_rot, predict_ang_vel, dt, native_sse_math);
-    } else {
-        IntegrateOrientation(predicted_rot, predict_ang_vel, dt);
-    }
-    const ::rocketgpu::Vec3 origin_bt = car.pos_bt;
-    const ::rocketgpu::Vec3 predicted_origin_bt = origin_bt + predict_vel * (kUUToBT * dt);
-
     ::rocketgpu::Vec3 axis_x(1.0f, 0.0f, 0.0f);
     ::rocketgpu::Vec3 axis_y(0.0f, 1.0f, 0.0f);
     ::rocketgpu::Vec3 axis_z(0.0f, 0.0f, 1.0f);
-    CarBasisColumns(car, axis_x, axis_y, axis_z);
     ::rocketgpu::Vec3 pred_axis_x(1.0f, 0.0f, 0.0f);
     ::rocketgpu::Vec3 pred_axis_y(0.0f, 1.0f, 0.0f);
     ::rocketgpu::Vec3 pred_axis_z(0.0f, 0.0f, 1.0f);
     if (car.basis_authoritative) {
-        pred_axis_x = pred_basis_fwd;
-        pred_axis_y = pred_basis_right;
-        pred_axis_z = pred_basis_up;
+        axis_x = car.basis_forward;
+        axis_y = car.basis_right;
+        axis_z = car.basis_up;
+        pred_axis_x = axis_x;
+        pred_axis_y = axis_y;
+        pred_axis_z = axis_z;
+        ::rocketgpu::Quat unused_rot{};
+        if (!native_sse_math) {
+            GameIntegrateOrientationBasisColumns(
+                pred_axis_x, pred_axis_y, pred_axis_z, unused_rot, predict_ang_vel, dt);
+        } else {
+            IntegrateOrientationBasisColumns(
+                pred_axis_x, pred_axis_y, pred_axis_z, unused_rot, predict_ang_vel, dt, native_sse_math);
+        }
     } else {
+        ::rocketgpu::Quat predicted_rot = car.rot;
+        GetBasisVectors(predicted_rot, axis_x, axis_y, axis_z);
+        IntegrateOrientation(predicted_rot, predict_ang_vel, dt);
         GetBasisVectors(predicted_rot, pred_axis_x, pred_axis_y, pred_axis_z);
     }
+    const ::rocketgpu::Vec3 origin_bt = car.pos_bt;
+    const ::rocketgpu::Vec3 predicted_origin_bt = origin_bt + predict_vel * (kUUToBT * dt);
 
     const auto box_center = [](const ::rocketgpu::Vec3& origin,
                                const ::rocketgpu::Vec3& ax,
@@ -3418,15 +3419,6 @@ ROCKETGPU_HD void ComputeBulletBodyProxy(
         box_center(predicted_origin_bt, pred_axis_x, pred_axis_y, pred_axis_z, child_origin_bt);
     const ::rocketgpu::Vec3 extent_now = box_extent(axis_x, axis_y, axis_z, half_extent_bt);
     const ::rocketgpu::Vec3 extent_pred = box_extent(pred_axis_x, pred_axis_y, pred_axis_z, half_extent_bt);
-    proxy.aabb_min = ::rocketgpu::Vec3(
-        Min(center_now.x - extent_now.x, center_pred.x - extent_pred.x) - kContactThresholdBt,
-        Min(center_now.y - extent_now.y, center_pred.y - extent_pred.y) - kContactThresholdBt,
-        Min(center_now.z - extent_now.z, center_pred.z - extent_pred.z) - kContactThresholdBt);
-    proxy.aabb_max = ::rocketgpu::Vec3(
-        Max(center_now.x + extent_now.x, center_pred.x + extent_pred.x) + kContactThresholdBt,
-        Max(center_now.y + extent_now.y, center_pred.y + extent_pred.y) + kContactThresholdBt,
-        Max(center_now.z + extent_now.z, center_pred.z + extent_pred.z) + kContactThresholdBt);
-
     proxy.child_aabb_min = ::rocketgpu::Vec3(
         center_now.x - extent_now.x,
         center_now.y - extent_now.y,
@@ -3435,6 +3427,14 @@ ROCKETGPU_HD void ComputeBulletBodyProxy(
         center_now.x + extent_now.x,
         center_now.y + extent_now.y,
         center_now.z + extent_now.z);
+    proxy.aabb_min = ::rocketgpu::Vec3(
+        Min(proxy.child_aabb_min.x, center_pred.x - extent_pred.x) - kContactThresholdBt,
+        Min(proxy.child_aabb_min.y, center_pred.y - extent_pred.y) - kContactThresholdBt,
+        Min(proxy.child_aabb_min.z, center_pred.z - extent_pred.z) - kContactThresholdBt);
+    proxy.aabb_max = ::rocketgpu::Vec3(
+        Max(proxy.child_aabb_max.x, center_pred.x + extent_pred.x) + kContactThresholdBt,
+        Max(proxy.child_aabb_max.y, center_pred.y + extent_pred.y) + kContactThresholdBt,
+        Max(proxy.child_aabb_max.z, center_pred.z + extent_pred.z) + kContactThresholdBt);
     proxy.child_center = center_now;
     proxy.child_axis[0] = axis_x;
     proxy.child_axis[1] = axis_y;
@@ -3513,7 +3513,42 @@ ROCKETGPU_HD void BulletSweepAddStatics(BulletSweepHistory& h, bool arena_static
 }
 
 // BulletSweepAddStatics on a history with no handles, copied from s: writes the same entries.
-ROCKETGPU_HD void BulletSweepCopyStatics(BulletSweepHistory& h, const BulletSweepHistory& s) {
+ROCKETGPU_HD void BulletSweepCopyStatics(BulletSweepHistory& h, const BulletSweepHistory& s, bool whole) {
+    if (whole) {
+        struct alignas(16) Words {
+            uint32_t v[4];
+        };
+        constexpr size_t end = offsetof(BulletSweepHistory, sap_static_id) + sizeof(BulletSweepHistory::sap_static_id);
+        constexpr int words = static_cast<int>(end / sizeof(Words));
+        static_assert(words * sizeof(Words) >= offsetof(BulletSweepHistory, sap_static_id), "tail is static ids");
+#if defined(__CUDA_ARCH__)
+        const auto* src = static_cast<const unsigned char*>(__builtin_assume_aligned(&s, 16));
+        auto* dst = static_cast<unsigned char*>(__builtin_assume_aligned(&h, 16));
+#else
+        const auto* src = reinterpret_cast<const unsigned char*>(&s);
+        auto* dst = reinterpret_cast<unsigned char*>(&h);
+#endif
+        for (int i = 0; i < words; i += 4) {
+            Words w[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                if (i + j < words) {
+                    memcpy(&w[j], src + (i + j) * sizeof(Words), sizeof(Words));
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                if (i + j < words) {
+                    memcpy(dst + (i + j) * sizeof(Words), &w[j], sizeof(Words));
+                }
+            }
+        }
+        for (int k = static_cast<int>((words * sizeof(Words) - offsetof(BulletSweepHistory, sap_static_id)) / 2);
+             k <= kAxisSweepMaxHandles; ++k) {
+            h.sap_static_id[k] = s.sap_static_id[k];
+        }
+        return;
+    }
     const int n = s.sap_handle_count;
     h.sap_handle_count = s.sap_handle_count;
     h.sap_static_count = s.sap_static_count;
@@ -3536,6 +3571,7 @@ ROCKETGPU_HD void BulletSweepCopyStatics(BulletSweepHistory& h, const BulletSwee
     }
 }
 
+template <int kPhase = 0>
 ROCKETGPU_HD int BuildBulletManifoldList(
     const ::rocketgpu::BallState& ball,
     int car_count,
@@ -3553,35 +3589,30 @@ ROCKETGPU_HD int BuildBulletManifoldList(
     WorldSolverScratch* bp_history = nullptr,
     bool native_sse_math = false,
     int8_t* body_islands = nullptr,
-    int phase = 0,
     bool proxies_ready = false,
     bool goal_floors = false,
     bool ball_static_pairs_skipped = false) {
-    if (!out_entries || max_entries <= 0 || !grid.valid() || !mesh_infos || mesh_info_count <= 0) {
+    if (!out_entries || max_entries <= 0 || !grid.valid() || !mesh_infos || mesh_info_count <= 0 ||
+        bp_history == nullptr) {
         return 0;
     }
 
     constexpr int kMaxBodies = 9;
+    BulletBroadphaseProxy* const proxies = bp_history->w3_proxies;
 
-    UninitArray<BulletBroadphaseProxy, kMaxBodies> proxy_slots;
-    BulletBroadphaseProxy* const proxies =
-        phase != 0 || proxies_ready ? bp_history->w3_proxies : static_cast<BulletBroadphaseProxy*>(proxy_slots);
-
-    if (phase != 2 && !proxies_ready) {
-        ComputeBulletBodyProxy(0, ball, cars, pre_contact_cars, car_configs, ball_radius, dt, bp_history, native_sse_math,
-                               proxies[0]);
-    }
-
+    if constexpr (kPhase != 2) {
+        if (!proxies_ready) {
+            ComputeBulletBodyProxy(0, ball, cars, pre_contact_cars, car_configs, ball_radius, dt, bp_history, native_sse_math,
+                                   proxies[0]);
 #pragma unroll 1
-    for (int car_idx = 0; phase != 2 && !proxies_ready && car_idx < car_count && car_idx < kMaxBodies - 1; ++car_idx) {
-        ComputeBulletBodyProxy(car_idx + 1, ball, cars, pre_contact_cars, car_configs, ball_radius, dt, bp_history,
-                               native_sse_math, proxies[car_idx + 1]);
+            for (int car_idx = 0; car_idx < car_count && car_idx < kMaxBodies - 1; ++car_idx) {
+                ComputeBulletBodyProxy(car_idx + 1, ball, cars, pre_contact_cars, car_configs, ball_radius, dt, bp_history,
+                                       native_sse_math, proxies[car_idx + 1]);
+            }
+        }
     }
 
     const int body_count = Min(car_count + 1, kMaxBodies);
-    if (bp_history == nullptr) {
-        return 0;
-    }
     BulletBroadphaseHistory& bp = bp_history->bp;
     BulletSweepHistory& h = bp.sweep;
 
@@ -3649,7 +3680,14 @@ ROCKETGPU_HD int BuildBulletManifoldList(
         return true;
     };
     const auto find = [](const uint32_t* list, int n, uint32_t key) {
-        for (int i = 0; i < n; ++i) {
+        int i = 0;
+        for (; i + 4 <= n; i += 4) {
+            const uint32_t a = list[i], b = list[i + 1], c = list[i + 2], d = list[i + 3];
+            if (a == key || b == key || c == key || d == key) {
+                return a == key ? i : b == key ? i + 1 : c == key ? i + 2 : i + 3;
+            }
+        }
+        for (; i < n; ++i) {
             if (list[i] == key) {
                 return i;
             }
@@ -3710,7 +3748,7 @@ ROCKETGPU_HD int BuildBulletManifoldList(
         const int at = find(bp.bp_pairs, bp.bp_pair_count, key);
         if (at >= 0) {
             swap_remove(bp.bp_pairs, bp.bp_pair_count, at);
-            if (phase != 1) {
+            if constexpr (kPhase != 1) {
                 swap_remove(bp.bp_manifolds, bp.bp_manifold_count, find(bp.bp_manifolds, bp.bp_manifold_count, key));
             } else if (find(bp.bp_manifolds, bp.bp_manifold_count, key) >= 0 &&
                        find(bp_history->w3_removed, bp_history->w3_removed_count, key) < 0) {
@@ -3726,19 +3764,16 @@ ROCKETGPU_HD int BuildBulletManifoldList(
                  h.sap_max_edge[a][axis2] < h.sap_min_edge[b][axis2] ||
                  h.sap_max_edge[b][axis2] < h.sap_min_edge[a][axis2]);
     };
-    const auto swap_edges = [&](int axis, int i, int j) {
-        const uint16_t pos = h.sap_edge_pos[axis][i];
-        const uint8_t owner = h.sap_edge_handle[axis][i];
-        h.sap_edge_pos[axis][i] = h.sap_edge_pos[axis][j];
-        h.sap_edge_handle[axis][i] = h.sap_edge_handle[axis][j];
-        h.sap_edge_pos[axis][j] = pos;
-        h.sap_edge_handle[axis][j] = owner;
-    };
     const auto sort_down = [&](int axis, int index, bool is_max_edge, bool update) {
-        const int moving = h.sap_edge_handle[axis][index];
-        while (index > 0 && h.sap_edge_pos[axis][index] < h.sap_edge_pos[axis][index - 1]) {
-            const int prev = h.sap_edge_handle[axis][index - 1];
-            const bool prev_is_max = (h.sap_edge_pos[axis][index - 1] & 1) != 0;
+        const uint8_t moving_owner = h.sap_edge_handle[axis][index];
+        const int moving = moving_owner;
+        const uint16_t moving_pos = h.sap_edge_pos[axis][index];
+        const int start_index = index;
+        while (index > 0 && moving_pos < h.sap_edge_pos[axis][index - 1]) {
+            const uint8_t prev_owner = h.sap_edge_handle[axis][index - 1];
+            const uint16_t prev_pos = h.sap_edge_pos[axis][index - 1];
+            const int prev = prev_owner;
+            const bool prev_is_max = (prev_pos & 1) != 0;
             if (update && prev_is_max != is_max_edge && overlap_2d(moving, prev, axis)) {
                 if (is_max_edge) {
                     sap_remove_pair(moving, prev);
@@ -3748,17 +3783,27 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             }
             ++(prev_is_max ? h.sap_max_edge[prev][axis] : h.sap_min_edge[prev][axis]);
             --(is_max_edge ? h.sap_max_edge[moving][axis] : h.sap_min_edge[moving][axis]);
-            swap_edges(axis, index, index - 1);
+            h.sap_edge_pos[axis][index] = prev_pos;
+            h.sap_edge_handle[axis][index] = prev_owner;
             --index;
+        }
+        if (index != start_index) {
+            h.sap_edge_pos[axis][index] = moving_pos;
+            h.sap_edge_handle[axis][index] = moving_owner;
         }
     };
     const auto sort_up = [&](int axis, int index, bool is_max_edge, bool update) {
-        const int moving = h.sap_edge_handle[axis][index];
+        const uint8_t moving_owner = h.sap_edge_handle[axis][index];
+        const int moving = moving_owner;
+        const uint16_t moving_pos = h.sap_edge_pos[axis][index];
+        const int start_index = index;
         const int len = 2 * h.sap_handle_count + 2;
         while (index + 1 < len && h.sap_edge_handle[axis][index + 1] != 0 &&
-               h.sap_edge_pos[axis][index] >= h.sap_edge_pos[axis][index + 1]) {
-            const int next = h.sap_edge_handle[axis][index + 1];
-            const bool next_is_max = (h.sap_edge_pos[axis][index + 1] & 1) != 0;
+               moving_pos >= h.sap_edge_pos[axis][index + 1]) {
+            const uint8_t next_owner = h.sap_edge_handle[axis][index + 1];
+            const uint16_t next_pos = h.sap_edge_pos[axis][index + 1];
+            const int next = next_owner;
+            const bool next_is_max = (next_pos & 1) != 0;
             if (update && next_is_max != is_max_edge && overlap_2d(moving, next, axis)) {
                 if (is_max_edge) {
                     sap_add_pair(moving, next);
@@ -3768,9 +3813,62 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             }
             --(next_is_max ? h.sap_max_edge[next][axis] : h.sap_min_edge[next][axis]);
             ++(is_max_edge ? h.sap_max_edge[moving][axis] : h.sap_min_edge[moving][axis]);
-            swap_edges(axis, index, index + 1);
+            h.sap_edge_pos[axis][index] = next_pos;
+            h.sap_edge_handle[axis][index] = next_owner;
             ++index;
         }
+        if (index != start_index) {
+            h.sap_edge_pos[axis][index] = moving_pos;
+            h.sap_edge_handle[axis][index] = moving_owner;
+        }
+    };
+    const auto sort_down_far = [&](int axis, int index, int moving, uint16_t pos, bool is_max_edge, bool update) {
+        constexpr int kChunk = 4;
+        for (bool more = true; more;) {
+            uint16_t p[kChunk];
+            uint8_t o[kChunk];
+            int n = 0;
+#pragma unroll
+            for (int k = 0; k < kChunk; ++k) {
+                const int j = index - 1 - k;
+                p[k] = j >= 0 ? h.sap_edge_pos[axis][j] : 0;
+                o[k] = j >= 0 ? h.sap_edge_handle[axis][j] : 0;
+                n += n == k && pos < p[k];
+            }
+            uint8_t c[kChunk];
+            bool ov[kChunk];
+#pragma unroll
+            for (int k = 0; k < kChunk; ++k) {
+                if (k < n) {
+                    c[k] = (p[k] & 1) ? h.sap_max_edge[o[k]][axis] : h.sap_min_edge[o[k]][axis];
+                    ov[k] = update && ((p[k] & 1) != 0) != is_max_edge && overlap_2d(moving, o[k], axis);
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < kChunk; ++k) {
+                if (k < n && ov[k]) {
+                    if (is_max_edge) {
+                        sap_remove_pair(moving, o[k]);
+                    } else {
+                        sap_add_pair(moving, o[k]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < kChunk; ++k) {
+                if (k < n) {
+                    ((p[k] & 1) ? h.sap_max_edge[o[k]][axis] : h.sap_min_edge[o[k]][axis]) =
+                        static_cast<uint8_t>(c[k] + 1);
+                    h.sap_edge_pos[axis][index - k] = p[k];
+                    h.sap_edge_handle[axis][index - k] = o[k];
+                }
+            }
+            index -= n;
+            more = n == kChunk;
+        }
+        h.sap_edge_pos[axis][index] = pos;
+        h.sap_edge_handle[axis][index] = static_cast<uint8_t>(moving);
+        (is_max_edge ? h.sap_max_edge[moving][axis] : h.sap_min_edge[moving][axis]) = static_cast<uint8_t>(index);
     };
     const auto add_handle = [&](const ::rocketgpu::Vec3& aabb_min, const ::rocketgpu::Vec3& aabb_max, int16_t id) {
         uint16_t qmin[3], qmax[3];
@@ -3791,22 +3889,29 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             h.sap_max_edge[handle][axis] = static_cast<uint8_t>(limit);
         }
         for (int axis = 0; axis < 3; ++axis) {
-            sort_down(axis, h.sap_min_edge[handle][axis], false, axis == 2);
-            sort_down(axis, h.sap_max_edge[handle][axis], true, axis == 2);
+            sort_down_far(axis, limit - 1, handle, qmin[axis], false, axis == 2);
+            sort_down_far(axis, limit, handle, qmax[axis], true, axis == 2);
         }
     };
-    const bool sweep_fresh = phase != 2 && h.sap_handle_count == 0;
-    if (phase == 1) {
+    if constexpr (kPhase != 2) {
+    const bool sweep_fresh = h.sap_handle_count == 0;
+    if constexpr (kPhase == 1) {
         bp_history->w3_removed_count = 0;
     }
+    const BulletSweepHistory* statics_whole = nullptr;
     if (sweep_fresh) {
         if (arena_static && grid.sweep_statics) {
-            BulletSweepCopyStatics(h, grid.sweep_statics[goal_floors ? 1 : 0]);
+            bool whole = h.sap_obj_count == 0;
+            for (int body = 0; whole && body < kBulletSweepMaxBodies; ++body) {
+                whole = h.sap_body_handle[body] == 0;
+            }
+            BulletSweepCopyStatics(h, grid.sweep_statics[goal_floors ? 1 : 0], whole);
+            statics_whole = whole ? &grid.sweep_statics[goal_floors ? 1 : 0] : nullptr;
         } else {
             BulletSweepAddStatics(h, arena_static, goal_floors, mesh_infos, mesh_info_count);
         }
     }
-    for (int body = 1; phase != 2 && body < body_count; ++body) {
+    for (int body = 1; body < body_count; ++body) {
         if (!proxies[body].valid && h.sap_body_handle[body] != 0) {
             BulletSweepRemoveBody(bp, body);
         }
@@ -3816,8 +3921,102 @@ ROCKETGPU_HD int BuildBulletManifoldList(
         if (proxy.valid && h.sap_body_handle[body] == 0 && h.sap_handle_count < kAxisSweepMaxHandles - 1) {
             h.sap_body_handle[body] = h.sap_free_count > 0 ? h.sap_free[h.sap_free_count - 1] : h.sap_next_fresh;
             add_handle(proxy.child_aabb_min, proxy.child_aabb_max, static_cast<int16_t>(-1 - body));
-            BulletSweepStoreBodyAabb(h, body, proxy.child_aabb_min, proxy.child_aabb_max);
             h.sap_obj[h.sap_obj_count++] = static_cast<uint8_t>(body);
+        }
+    };
+    const auto add_bodies_merged = [&](const BulletSweepHistory& s) {
+        uint8_t new_handle[kBulletSweepMaxBodies];
+        uint8_t new_body[kBulletSweepMaxBodies];
+        uint16_t q[kBulletSweepMaxBodies][2][3];
+        const int old_count = 2 * h.sap_handle_count + 2;
+        int n = 0;
+        for (int body = 0; body < body_count; ++body) {
+            const BulletBroadphaseProxy& proxy = proxies[body];
+            if (!proxy.valid || h.sap_handle_count >= kAxisSweepMaxHandles - 1) {
+                continue;
+            }
+            const int handle = h.sap_free_count > 0 ? h.sap_free[--h.sap_free_count] : h.sap_next_fresh++;
+            ++h.sap_handle_count;
+            h.sap_body_handle[body] = static_cast<uint8_t>(handle);
+            h.sap_static_id[handle] = static_cast<int16_t>(-1 - body);
+            h.sap_obj[h.sap_obj_count++] = static_cast<uint8_t>(body);
+            quantize_point(proxy.child_aabb_min, q[n][0], 0);
+            quantize_point(proxy.child_aabb_max, q[n][1], 1);
+            new_handle[n] = static_cast<uint8_t>(handle);
+            new_body[n++] = static_cast<uint8_t>(body);
+        }
+        const int new_count = 2 * n;
+        for (int axis = 0; axis < 3; ++axis) {
+            uint32_t key[2 * kBulletSweepMaxBodies];
+            for (int e = 0; e < new_count; ++e) {
+                const uint32_t v = (static_cast<uint32_t>(q[e >> 1][e & 1][axis]) << 5) | static_cast<uint32_t>(e);
+                int j = e;
+                for (; j > 0 && key[j - 1] < v; --j) {
+                    key[j] = key[j - 1];
+                }
+                key[j] = v;
+            }
+            int old = old_count - 1;
+            int dst = old_count + new_count - 1;
+            h.sap_edge_pos[axis][dst] = s.sap_edge_pos[axis][old];
+            h.sap_edge_handle[axis][dst] = s.sap_edge_handle[axis][old];
+            h.sap_max_edge[s.sap_edge_handle[axis][old]][axis] = static_cast<uint8_t>(dst);
+            --old;
+            --dst;
+            for (int e = 0; e < new_count; --dst) {
+                uint16_t pos = s.sap_edge_pos[axis][old];
+                uint8_t handle;
+                if (pos > static_cast<uint16_t>(key[e] >> 5)) {
+                    handle = s.sap_edge_handle[axis][old--];
+                } else {
+                    pos = static_cast<uint16_t>(key[e] >> 5);
+                    handle = new_handle[(key[e++] & 31u) >> 1];
+                }
+                h.sap_edge_pos[axis][dst] = pos;
+                h.sap_edge_handle[axis][dst] = handle;
+                ((pos & 1) ? h.sap_max_edge[handle][axis] : h.sap_min_edge[handle][axis]) = static_cast<uint8_t>(dst);
+            }
+        }
+        for (int k = 0; k < n; ++k) {
+            const int moving = new_handle[k];
+            const int min_id = -1 - new_body[k];
+            const uint8_t m0 = h.sap_min_edge[moving][0], m1 = h.sap_min_edge[moving][1];
+            const uint8_t x0 = h.sap_max_edge[moving][0], x1 = h.sap_max_edge[moving][1];
+            for (int is_max = 0; is_max < 2; ++is_max) {
+                const uint16_t pos = q[k][is_max][2];
+                for (int i = old_count + new_count - 2, more = 1; more; i -= 4) {
+                    constexpr int kChunk = 4;
+                    uint16_t p[kChunk];
+                    uint8_t o[kChunk];
+#pragma unroll
+                    for (int c = 0; c < kChunk; ++c) {
+                        p[c] = i - c >= 0 ? h.sap_edge_pos[2][i - c] : 0;
+                        o[c] = i - c >= 0 ? h.sap_edge_handle[2][i - c] : 0;
+                    }
+                    int16_t id[kChunk];
+                    uint8_t b0[kChunk], b1[kChunk], y0[kChunk], y1[kChunk];
+#pragma unroll
+                    for (int c = 0; c < kChunk; ++c) {
+                        id[c] = h.sap_static_id[o[c]];
+                        b0[c] = h.sap_min_edge[o[c]][0];
+                        b1[c] = h.sap_min_edge[o[c]][1];
+                        y0[c] = h.sap_max_edge[o[c]][0];
+                        y1[c] = h.sap_max_edge[o[c]][1];
+                    }
+#pragma unroll
+                    for (int c = 0; c < kChunk; ++c) {
+                        more = more && p[c] > pos;
+                        if (more && (p[c] & 1) != is_max && id[c] > min_id &&
+                            !(x0 < b0[c] || y0[c] < m0 || x1 < b1[c] || y1[c] < m1)) {
+                            if (is_max) {
+                                sap_remove_pair(moving, o[c]);
+                            } else {
+                                sap_add_pair(moving, o[c]);
+                            }
+                        }
+                    }
+                }
+            }
         }
     };
     // The game adds the bodies, removes the round's bodies and adds them again. With empty caches and no body
@@ -3836,8 +4035,12 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             }
         }
     }
-    for (int body = 0; phase != 2 && body < body_count; ++body) {
-        add_body(body);
+    if (statics_whole != nullptr && !round_cached) {
+        add_bodies_merged(*statics_whole);
+    } else {
+        for (int body = 0; body < body_count; ++body) {
+            add_body(body);
+        }
     }
     if (round_cached) {
         BulletSweepRemoveRoundBodies(bp, body_count - 1);
@@ -3868,8 +4071,12 @@ ROCKETGPU_HD int BuildBulletManifoldList(
                 if (dmin == 0 && dmax == 0) {
                     continue;
                 }
-                h.sap_edge_pos[axis][emin] = qmin[axis];
-                h.sap_edge_pos[axis][emax] = qmax[axis];
+                if (dmin != 0) {
+                    h.sap_edge_pos[axis][emin] = qmin[axis];
+                }
+                if (dmax != 0) {
+                    h.sap_edge_pos[axis][emax] = qmax[axis];
+                }
                 if (dmin < 0) {
                     sort_down(axis, emin, false, true);
                 }
@@ -3885,10 +4092,10 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             }
         }
     };
-    if (phase == 1) {
+    if constexpr (kPhase == 1) {
         update_aabbs();
         return 0;
-    }
+    } else {
     for (int i = 0; i < bp.bp_predictive_count; ++i) {
         swap_remove(bp.bp_manifolds, bp.bp_manifold_count,
                     find(bp.bp_manifolds, bp.bp_manifold_count, bp.bp_predictive[i]));
@@ -3904,15 +4111,31 @@ ROCKETGPU_HD int BuildBulletManifoldList(
         bp.bp_manifolds[bp.bp_manifold_count++] = key;
         bp.bp_predictive[bp.bp_predictive_count++] = key;
     }
-    if (phase == 0) {
-        update_aabbs();
+    update_aabbs();
+    }
     } else {
-        for (int i = 0; i < bp_history->w3_removed_count; ++i) {
-            swap_remove(bp.bp_manifolds, bp.bp_manifold_count,
-                        find(bp.bp_manifolds, bp.bp_manifold_count, bp_history->w3_removed[i]));
+    for (int i = 0; i < bp.bp_predictive_count; ++i) {
+        swap_remove(bp.bp_manifolds, bp.bp_manifold_count,
+                    find(bp.bp_manifolds, bp.bp_manifold_count, bp.bp_predictive[i]));
+    }
+    bp.bp_predictive_count = 0;
+    for (int obj = 0; obj < h.sap_obj_count && bp_history->predictive_hit_mask != 0; ++obj) {
+        const int body = h.sap_obj[obj];
+        if (body >= body_count || ((bp_history->predictive_hit_mask >> body) & 1u) == 0 ||
+            bp.bp_manifold_count >= kMaxBulletManifoldEntries) {
+            continue;
         }
+        const uint32_t key = PackBulletPairKey(body == 0 ? 0 : 2, body - 1, -1, kBulletPredictiveStaticId);
+        bp.bp_manifolds[bp.bp_manifold_count++] = key;
+        bp.bp_predictive[bp.bp_predictive_count++] = key;
+    }
+    for (int i = 0; i < bp_history->w3_removed_count; ++i) {
+        swap_remove(bp.bp_manifolds, bp.bp_manifold_count,
+                    find(bp.bp_manifolds, bp.bp_manifold_count, bp_history->w3_removed[i]));
+    }
     }
 
+    if constexpr (kPhase != 1) {
     for (int i = 0; i < bp.bp_pair_count; ++i) {
         const uint32_t packed = bp.bp_pairs[i];
         const BulletManifoldEntry key = UnpackBulletPairKey(packed);
@@ -3968,20 +4191,25 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             }
         }
     }
+    int8_t root_tag[kMaxBodies];
+    for (int b = 0; b < kMaxBodies; ++b) {
+        const int r = tag[b] >= 0 ? find_root(tag[b]) : -1;
+        root_tag[b] = static_cast<int8_t>(r);
+        if (body_islands != nullptr) {
+            body_islands[b] = static_cast<int8_t>(r);
+        }
+    }
     const int entry_count = Min(static_cast<int>(bp.bp_manifold_count), Min(max_entries, kMaxBulletManifoldEntries));
     for (int i = 0; i < entry_count; ++i) {
         BulletManifoldEntry entry = UnpackBulletPairKey(bp.bp_manifolds[i]);
-        const int entry_tag = tag[entry.kind <= 1 ? 0 : entry.body_a + 1];
-        entry.island_id = entry_tag >= 0 ? find_root(entry_tag) : -1;
+        entry.island_id = root_tag[entry.kind <= 1 ? 0 : entry.body_a + 1];
         out_entries[i] = entry;
     }
-    for (int b = 0; body_islands != nullptr && b < kMaxBodies; ++b) {
-        body_islands[b] = static_cast<int8_t>(tag[b] >= 0 ? find_root(tag[b]) : -1);
-    }
     return entry_count;
+    }
 }
 
-ROCKETGPU_HD void SolveUnifiedSplitContactRows(
+ROCKETGPU_HD ROCKETGPU_NOINLINE void SolveUnifiedSplitContactRows(
     ::rocketgpu::BallState& ball,
     int count,
     ::rocketgpu::CarState* cars,
@@ -4021,10 +4249,11 @@ ROCKETGPU_HD void SolveUnifiedSplitContactRows(
     constexpr int kMaxUnifiedSplitRows =
         kMaxCarWorldSplitContactRows + kMaxCarPairSplitContactRows + kMaxBallSplitContactRows;
     uint8_t unified_split_bucket[kMaxUnifiedSplitRows];
-    int16_t unified_split_row[kMaxUnifiedSplitRows];
+    uint8_t unified_split_row[kMaxUnifiedSplitRows];
     int unified_split_count = 0;
     bool unified_split_valid = false;
     if (sorted_manifolds != nullptr && sorted_manifold_count > 0 &&
+        (active_world_rows + active_pair_rows + active_ball_rows) > 1 &&
         (active_world_rows + active_pair_rows + active_ball_rows) <= kMaxUnifiedSplitRows) {
         EnvStridedArray<const BulletManifoldEntry> entries = sorted_manifolds;
         const int entry_count = sorted_manifold_count;
@@ -4033,16 +4262,16 @@ ROCKETGPU_HD void SolveUnifiedSplitContactRows(
             RowUsedBits world_used;
             RowUsedBits pair_used;
             RowUsedBits ball_used;
-            int8_t world_body_a[128];
-            int16_t world_source_tag[128];
+            uint16_t world_key[128];
             for (int row_idx = 0; row_idx < active_world_rows; ++row_idx) {
                 const CarSharedSplitContactRow& row = world_rows[row_idx];
-                if (!row.valid) {
-                    world_body_a[row_idx] = -2;
-                    world_source_tag[row_idx] = -2;
+                if (!row.valid || row.body_a_local_idx < 0 || row.body_a_local_idx >= 8 ||
+                    row.source_tag < 0 || row.source_tag > 0x0FFE) {
+                    world_key[row_idx] = 0xFFFFu;
                 } else {
-                    world_body_a[row_idx] = static_cast<int8_t>(row.body_a_local_idx);
-                    world_source_tag[row_idx] = static_cast<int16_t>(row.source_tag);
+                    world_key[row_idx] =
+                        (static_cast<uint16_t>(row.body_a_local_idx) << 12) |
+                        static_cast<uint16_t>(row.source_tag);
                 }
             }
             const auto push_split = [&](int bucket, int row_idx) {
@@ -4050,7 +4279,7 @@ ROCKETGPU_HD void SolveUnifiedSplitContactRows(
                     return;
                 }
                 unified_split_bucket[unified_split_count] = static_cast<uint8_t>(bucket);
-                unified_split_row[unified_split_count] = static_cast<int16_t>(row_idx);
+                unified_split_row[unified_split_count] = static_cast<uint8_t>(row_idx);
                 ++unified_split_count;
             };
             for (int order_idx = 0; order_idx < entry_count; ++order_idx) {
@@ -4062,9 +4291,12 @@ ROCKETGPU_HD void SolveUnifiedSplitContactRows(
                     } else if (entry.static_id >= 0) {
                         expected_tag = 100 + entry.static_id;
                     }
+                    const uint16_t expected_key =
+                        (entry.body_a >= 0 && entry.body_a < 8 && expected_tag >= 0 && expected_tag <= 0x0FFE)
+                            ? ((static_cast<uint16_t>(entry.body_a) << 12) | static_cast<uint16_t>(expected_tag))
+                            : 0xFFFEu;
                     for (int row_idx = 0; row_idx < active_world_rows; ++row_idx) {
-                        if (world_used.Test(row_idx) || world_body_a[row_idx] != entry.body_a ||
-                            world_source_tag[row_idx] != expected_tag) {
+                        if (world_used.Test(row_idx) || world_key[row_idx] != expected_key) {
                             continue;
                         }
                         world_used.Set(row_idx);
@@ -4221,7 +4453,8 @@ ROCKETGPU_HD void SolveUnifiedSplitContactRows(
     }
 }
 
-ROCKETGPU_HD int FindSharedContactOrderParent(int* parent, int idx) {
+template <typename Int>
+ROCKETGPU_HD int FindSharedContactOrderParent(Int* parent, int idx) {
 #pragma unroll 1
     for (int step = 0; step < 8 && idx >= 0 && idx < 8 && parent[idx] != idx; ++step) {
         idx = parent[idx];
@@ -4229,22 +4462,25 @@ ROCKETGPU_HD int FindSharedContactOrderParent(int* parent, int idx) {
     return idx;
 }
 
-ROCKETGPU_HD void ResolveSharedContactOrderCarIslandIds(int* parent, const int* component_max, int* car_island_id) {
+template <typename Int>
+ROCKETGPU_HD void ResolveSharedContactOrderCarIslandIds(Int* parent, const Int* component_max, Int* car_island_id) {
 #pragma unroll 1
     for (int i = 0; i < 8; ++i) {
         const int root = FindSharedContactOrderParent(parent, i);
-        car_island_id[i] = (root >= 0 && root < 8 ? component_max[root] : i) + 1;
+        car_island_id[i] = static_cast<Int>((root >= 0 && root < 8 ? static_cast<int>(component_max[root]) : i) + 1);
     }
 }
 
-ROCKETGPU_HD int SharedContactOrderIslandIdForBody(const int* car_island_id, int body_a_local_idx) {
+template <typename Int>
+ROCKETGPU_HD int SharedContactOrderIslandIdForBody(const Int* car_island_id, int body_a_local_idx) {
     if (body_a_local_idx >= 0 && body_a_local_idx < 8) {
         return car_island_id[body_a_local_idx];
     }
     return body_a_local_idx + 1;
 }
 
-ROCKETGPU_HD void UnionSharedContactOrderParents(int* parent, int a, int b) {
+template <typename Int>
+ROCKETGPU_HD void UnionSharedContactOrderParents(Int* parent, int a, int b) {
     if (a < 0 || a >= 8 || b < 0 || b >= 8) {
         return;
     }
@@ -4254,9 +4490,9 @@ ROCKETGPU_HD void UnionSharedContactOrderParents(int* parent, int a, int b) {
         return;
     }
     if (root_a < root_b) {
-        parent[root_a] = root_b;
+        parent[root_a] = static_cast<Int>(root_b);
     } else {
-        parent[root_b] = root_a;
+        parent[root_b] = static_cast<Int>(root_a);
     }
 }
 
@@ -4310,7 +4546,7 @@ ROCKETGPU_HD void QuickSortSharedContactOrderIndices(
     }
 }
 
-ROCKETGPU_HD int FirstSharedContactOrderBucket(
+ROCKETGPU_HD ROCKETGPU_NOINLINE int FirstSharedContactOrderBucket(
     EnvStridedArray<const SharedContactOrderGroup> groups,
     int group_count,
     int car_count) {
@@ -4318,11 +4554,11 @@ ROCKETGPU_HD int FirstSharedContactOrderBucket(
         return -1;
     }
 
-    int parent[8];
-    int component_max[8];
+    int8_t parent[8];
+    int8_t component_max[8];
     for (int i = 0; i < 8; ++i) {
-        parent[i] = i;
-        component_max[i] = i;
+        parent[i] = static_cast<int8_t>(i);
+        component_max[i] = static_cast<int8_t>(i);
     }
     for (int group_idx = 0; group_idx < group_count && group_idx < kMaxSharedContactOrderGroups; ++group_idx) {
         const SharedContactOrderGroup& group = groups[group_idx];
@@ -4335,15 +4571,15 @@ ROCKETGPU_HD int FirstSharedContactOrderBucket(
     for (int i = 0; i < car_count && i < 8; ++i) {
         const int root = FindSharedContactOrderParent(parent, i);
         if (root >= 0 && root < 8) {
-            component_max[root] = Max(component_max[root], i);
+            component_max[root] = static_cast<int8_t>(Max(static_cast<int>(component_max[root]), i));
         }
     }
 
-    int car_island_id[8];
+    int8_t car_island_id[8];
     ResolveSharedContactOrderCarIslandIds(parent, component_max, car_island_id);
 
-    int16_t order[kMaxSharedContactOrderGroups];
-    int16_t island_ids[kMaxSharedContactOrderGroups];
+    int8_t order[kMaxSharedContactOrderGroups];
+    int8_t island_ids[kMaxSharedContactOrderGroups];
     int active_count = 0;
     for (int group_idx = 0; group_idx < group_count && group_idx < kMaxSharedContactOrderGroups; ++group_idx) {
         const SharedContactOrderGroup& group = groups[group_idx];
@@ -4358,7 +4594,7 @@ ROCKETGPU_HD int FirstSharedContactOrderBucket(
             order[insert] = order[insert - 1];
             --insert;
         }
-        order[insert] = static_cast<int16_t>(group_idx);
+        order[insert] = static_cast<int8_t>(group_idx);
         ++active_count;
     }
     if (active_count <= 0) {
@@ -4367,7 +4603,7 @@ ROCKETGPU_HD int FirstSharedContactOrderBucket(
     for (int order_idx = 0; order_idx < active_count; ++order_idx) {
         const SharedContactOrderGroup& group = groups[order[order_idx]];
         island_ids[order[order_idx]] =
-            static_cast<int16_t>(SharedContactOrderIslandIdForBody(car_island_id, group.body_a_local_idx));
+            static_cast<int8_t>(SharedContactOrderIslandIdForBody(car_island_id, group.body_a_local_idx));
     }
     if (active_count > 1) {
         QuickSortSharedContactOrderIndices(order, island_ids, 0, active_count - 1);
@@ -4580,7 +4816,7 @@ ROCKETGPU_HD void ConvertRowUnits(EnvStridedArray<T> rows, int n) {
     }
 }
 
-ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
+ROCKETGPU_HD ROCKETGPU_NOINLINE void SolveUnifiedVelocityContactRowsGeneral(
     ::rocketgpu::BallState& ball,
     int count,
     ::rocketgpu::CarState* cars,
@@ -4598,33 +4834,16 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
     int world_friction_row_count,
     EnvStridedArray<CarSharedFrictionContactRow> pair_friction_rows,
     int pair_friction_row_count,
-    EnvStridedArray<const SharedContactOrderGroup> contact_order_groups = nullptr,
-    int contact_order_group_count = 0,
-    const ::rocketgpu::Vec3* bt_ball_linear_velocity_override = nullptr,
-    EnvStridedArray<const BulletManifoldEntry> sorted_manifolds = nullptr,
-    int sorted_manifold_count = 0,
-    bool register_iterations = false) {
-    if (count < 0 || count > 8 || (count > 0 && (!cars || !car_configs))) {
-        return;
-    }
-    if ((!ball_normal_rows || ball_normal_row_count <= 0) &&
-        (!ball_friction_rows || ball_friction_row_count <= 0) &&
-        (!world_normal_rows || world_normal_row_count <= 0) &&
-        (!pair_normal_rows || pair_normal_row_count <= 0) &&
-        (!world_friction_rows || world_friction_row_count <= 0) &&
-        (!pair_friction_rows || pair_friction_row_count <= 0)) {
-        return;
-    }
-
+    bool pair_first,
+    const ::rocketgpu::Vec3* bt_ball_linear_velocity_override,
+    EnvStridedArray<const BulletManifoldEntry> sorted_manifolds,
+    int sorted_manifold_count) {
     BallVelocityAccumulator ball_acc;
     UninitArray<BallVelocityAccumulator, 8> car_accs_storage;
     BallVelocityAccumulator* const car_accs = car_accs_storage.data();
     for (int i = 0; i < count; ++i) {
         car_accs[i] = BallVelocityAccumulator{};
     }
-
-    constexpr float kUnifiedRowConversionBtPerUu = 1.0f / 50.0f;
-    constexpr float kUnifiedRowConversionUuPerBt = 50.0f;
 
     ConvertRowUnits<true>(pair_normal_rows, pair_normal_row_count);
     ConvertRowUnits<true>(world_normal_rows, world_normal_row_count);
@@ -4643,105 +4862,138 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
     constexpr int kMaxUnifiedRows =
         kMaxCarWorldSharedVelocityContactRows + kMaxCarPairSharedVelocityContactRows + kMaxBallVelocityContactRows;
     uint8_t unified_normal_bucket[kMaxUnifiedRows];
-    int16_t unified_normal_row[kMaxUnifiedRows];
+    uint8_t unified_normal_row[kMaxUnifiedRows];
     int unified_normal_count = 0;
-    uint8_t unified_friction_bucket[kMaxUnifiedRows];
-    int16_t unified_friction_row[kMaxUnifiedRows];
+    alignas(2) uint8_t unified_friction_storage[2 * kMaxUnifiedRows];
+    uint8_t* const unified_friction_bucket = unified_friction_storage;
+    uint8_t* const unified_friction_row = unified_friction_storage + kMaxUnifiedRows;
+    int8_t scratch_i8[kMaxCarWorldSharedVelocityContactRows];
     int unified_friction_count = 0;
     bool unified_order_valid = false;
-    if (sorted_manifolds != nullptr && sorted_manifold_count > 0 &&
+    if (world_normal_row_count + pair_normal_row_count + ball_normal_row_count <= 1 &&
+        world_friction_row_count + pair_friction_row_count + ball_friction_row_count <= 1) {
+        if (world_normal_row_count == 1) {
+            unified_normal_bucket[0] = static_cast<uint8_t>(kUnifiedRowBucketWorld);
+            unified_normal_row[0] = 0;
+            unified_normal_count = 1;
+        } else if (pair_normal_row_count == 1) {
+            unified_normal_bucket[0] = static_cast<uint8_t>(kUnifiedRowBucketPair);
+            unified_normal_row[0] = 0;
+            unified_normal_count = 1;
+        } else if (ball_normal_row_count == 1) {
+            unified_normal_bucket[0] = static_cast<uint8_t>(kUnifiedRowBucketBall);
+            unified_normal_row[0] = 0;
+            unified_normal_count = 1;
+        }
+        if (world_friction_row_count == 1) {
+            unified_friction_bucket[0] = static_cast<uint8_t>(kUnifiedRowBucketWorld);
+            unified_friction_row[0] = 0;
+            unified_friction_count = 1;
+        } else if (pair_friction_row_count == 1) {
+            unified_friction_bucket[0] = static_cast<uint8_t>(kUnifiedRowBucketPair);
+            unified_friction_row[0] = 0;
+            unified_friction_count = 1;
+        } else if (ball_friction_row_count == 1) {
+            unified_friction_bucket[0] = static_cast<uint8_t>(kUnifiedRowBucketBall);
+            unified_friction_row[0] = 0;
+            unified_friction_count = 1;
+        }
+        unified_order_valid = true;
+    } else if (sorted_manifolds != nullptr && sorted_manifold_count > 0 &&
         (world_normal_row_count + pair_normal_row_count + ball_normal_row_count) <= kMaxUnifiedRows) {
         EnvStridedArray<const BulletManifoldEntry> entries = sorted_manifolds;
         const int entry_count = sorted_manifold_count;
         {
-            RowUsedBits world_used;
-            RowUsedBits pair_used;
-            RowUsedBits ball_used;
-            int8_t world_body_a[kMaxCarWorldSharedVelocityContactRows];
-            int16_t world_source_tag[kMaxCarWorldSharedVelocityContactRows];
-            for (int row_idx = 0; row_idx < world_normal_row_count; ++row_idx) {
-                const CarSharedVelocityContactRow& row = world_normal_rows[row_idx];
-                if (!row.valid) {
-                    world_body_a[row_idx] = -2;
-                    world_source_tag[row_idx] = -2;
-                } else {
-                    world_body_a[row_idx] = static_cast<int8_t>(row.body_a_local_idx);
-                    world_source_tag[row_idx] = static_cast<int16_t>(row.source_tag);
-                }
-            }
-            const auto push_row = [&](int bucket, int row_idx) {
-                if (unified_normal_count >= kMaxUnifiedRows) {
-                    return;
-                }
-                unified_normal_bucket[unified_normal_count] = static_cast<uint8_t>(bucket);
-                unified_normal_row[unified_normal_count] = static_cast<int16_t>(row_idx);
-                ++unified_normal_count;
-            };
-            for (int order_idx = 0; order_idx < entry_count; ++order_idx) {
-                const BulletManifoldEntry& entry = entries[order_idx];
-                if (entry.kind == 2) {
-                    int expected_tag = -1;
-                    if (entry.static_id >= 100) {
-                        expected_tag = BulletPlaneStaticSourceTag(entry.static_id);
-                    } else if (entry.static_id >= 0) {
-                        expected_tag = 100 + entry.static_id;
+            {
+                RowUsedBits world_used;
+                RowUsedBits pair_used;
+                RowUsedBits ball_used;
+                int8_t* const world_body_a = scratch_i8;
+                int16_t* const world_source_tag = reinterpret_cast<int16_t*>(unified_friction_storage);
+                for (int row_idx = 0; row_idx < world_normal_row_count; ++row_idx) {
+                    const CarSharedVelocityContactRow& row = world_normal_rows[row_idx];
+                    if (!row.valid) {
+                        world_body_a[row_idx] = -2;
+                        world_source_tag[row_idx] = -2;
+                    } else {
+                        world_body_a[row_idx] = static_cast<int8_t>(row.body_a_local_idx);
+                        world_source_tag[row_idx] = static_cast<int16_t>(row.source_tag);
                     }
-                    for (int row_idx = 0; row_idx < world_normal_row_count; ++row_idx) {
-                        if (world_used.Test(row_idx) || world_body_a[row_idx] != entry.body_a ||
-                            world_source_tag[row_idx] != expected_tag) {
-                            continue;
+                }
+                const auto push_row = [&](int bucket, int row_idx) {
+                    if (unified_normal_count >= kMaxUnifiedRows) {
+                        return;
+                    }
+                    unified_normal_bucket[unified_normal_count] = static_cast<uint8_t>(bucket);
+                    unified_normal_row[unified_normal_count] = static_cast<uint8_t>(row_idx);
+                    ++unified_normal_count;
+                };
+                for (int order_idx = 0; order_idx < entry_count; ++order_idx) {
+                    const BulletManifoldEntry& entry = entries[order_idx];
+                    if (entry.kind == 2) {
+                        int expected_tag = -1;
+                        if (entry.static_id >= 100) {
+                            expected_tag = BulletPlaneStaticSourceTag(entry.static_id);
+                        } else if (entry.static_id >= 0) {
+                            expected_tag = 100 + entry.static_id;
                         }
-                        world_used.Set(row_idx);
+                        for (int row_idx = 0; row_idx < world_normal_row_count; ++row_idx) {
+                            if (world_used.Test(row_idx) || world_body_a[row_idx] != entry.body_a ||
+                                world_source_tag[row_idx] != expected_tag) {
+                                continue;
+                            }
+                            world_used.Set(row_idx);
+                            push_row(kUnifiedRowBucketWorld, row_idx);
+                        }
+                    } else if (entry.kind == 3) {
+                        for (int row_idx = 0; row_idx < pair_normal_row_count; ++row_idx) {
+                            const CarSharedVelocityContactRow& row = pair_normal_rows[row_idx];
+                            if (pair_used.Test(row_idx) || !row.valid) {
+                                continue;
+                            }
+                            const int lo = Min(row.body_a_local_idx, row.body_b_local_idx);
+                            const int hi = Max(row.body_a_local_idx, row.body_b_local_idx);
+                            if (lo != entry.body_a || hi != entry.body_b) {
+                                continue;
+                            }
+                            pair_used.Set(row_idx);
+                            push_row(kUnifiedRowBucketPair, row_idx);
+                        }
+                    } else if (entry.kind == 1) {
+                        for (int row_idx = 0; row_idx < ball_normal_row_count; ++row_idx) {
+                            const BallVelocityContactRow& row = ball_normal_rows[row_idx];
+                            if (ball_used.Test(row_idx) || !row.valid || row.other_local_idx != entry.body_a) {
+                                continue;
+                            }
+                            ball_used.Set(row_idx);
+                            push_row(kUnifiedRowBucketBall, row_idx);
+                        }
+                    } else if (entry.kind == 0 && entry.static_id == kBulletPredictiveStaticId) {
+                        for (int row_idx = 0; row_idx < ball_normal_row_count; ++row_idx) {
+                            const BallVelocityContactRow& row = ball_normal_rows[row_idx];
+                            if (ball_used.Test(row_idx) || !row.valid || !row.predictive) {
+                                continue;
+                            }
+                            ball_used.Set(row_idx);
+                            push_row(kUnifiedRowBucketBall, row_idx);
+                        }
+                    }
+                }
+
+                for (int row_idx = 0; row_idx < world_normal_row_count; ++row_idx) {
+                    if (!world_used.Test(row_idx)) {
                         push_row(kUnifiedRowBucketWorld, row_idx);
                     }
-                } else if (entry.kind == 3) {
-                    for (int row_idx = 0; row_idx < pair_normal_row_count; ++row_idx) {
-                        const CarSharedVelocityContactRow& row = pair_normal_rows[row_idx];
-                        if (pair_used.Test(row_idx) || !row.valid) {
-                            continue;
-                        }
-                        const int lo = Min(row.body_a_local_idx, row.body_b_local_idx);
-                        const int hi = Max(row.body_a_local_idx, row.body_b_local_idx);
-                        if (lo != entry.body_a || hi != entry.body_b) {
-                            continue;
-                        }
-                        pair_used.Set(row_idx);
+                }
+                for (int row_idx = 0; row_idx < pair_normal_row_count; ++row_idx) {
+                    if (!pair_used.Test(row_idx)) {
                         push_row(kUnifiedRowBucketPair, row_idx);
                     }
-                } else if (entry.kind == 1) {
-                    for (int row_idx = 0; row_idx < ball_normal_row_count; ++row_idx) {
-                        const BallVelocityContactRow& row = ball_normal_rows[row_idx];
-                        if (ball_used.Test(row_idx) || !row.valid || row.other_local_idx != entry.body_a) {
-                            continue;
-                        }
-                        ball_used.Set(row_idx);
+                }
+                for (int row_idx = 0; row_idx < ball_normal_row_count; ++row_idx) {
+                    if (!ball_used.Test(row_idx)) {
                         push_row(kUnifiedRowBucketBall, row_idx);
                     }
-                } else if (entry.kind == 0 && entry.static_id == kBulletPredictiveStaticId) {
-                    for (int row_idx = 0; row_idx < ball_normal_row_count; ++row_idx) {
-                        const BallVelocityContactRow& row = ball_normal_rows[row_idx];
-                        if (ball_used.Test(row_idx) || !row.valid || !row.predictive) {
-                            continue;
-                        }
-                        ball_used.Set(row_idx);
-                        push_row(kUnifiedRowBucketBall, row_idx);
-                    }
-                }
-            }
-
-            for (int row_idx = 0; row_idx < world_normal_row_count; ++row_idx) {
-                if (!world_used.Test(row_idx)) {
-                    push_row(kUnifiedRowBucketWorld, row_idx);
-                }
-            }
-            for (int row_idx = 0; row_idx < pair_normal_row_count; ++row_idx) {
-                if (!pair_used.Test(row_idx)) {
-                    push_row(kUnifiedRowBucketPair, row_idx);
-                }
-            }
-            for (int row_idx = 0; row_idx < ball_normal_row_count; ++row_idx) {
-                if (!ball_used.Test(row_idx)) {
-                    push_row(kUnifiedRowBucketBall, row_idx);
                 }
             }
             unified_order_valid =
@@ -4750,7 +5002,7 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
                 RowUsedBits world_friction_used;
                 RowUsedBits pair_friction_used;
                 RowUsedBits ball_friction_used;
-                int8_t world_fric_by_norm[kMaxCarWorldSharedVelocityContactRows];
+                int8_t* const world_fric_by_norm = scratch_i8;
                 for (int i = 0; i < world_normal_row_count; ++i) {
                     world_fric_by_norm[i] = -1;
                 }
@@ -4770,7 +5022,7 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
                         return;
                     }
                     unified_friction_bucket[unified_friction_count] = static_cast<uint8_t>(bucket);
-                    unified_friction_row[unified_friction_count] = static_cast<int16_t>(row_idx);
+                    unified_friction_row[unified_friction_count] = static_cast<uint8_t>(row_idx);
                     ++unified_friction_count;
                 };
                 for (int order_idx = 0; order_idx < unified_normal_count; ++order_idx) {
@@ -4839,9 +5091,9 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
     static_assert(kMaxCarWorldSharedFrictionContactRows + kMaxCarPairSharedFrictionContactRows +
                       kMaxBallFrictionContactRows <= kMaxUnifiedRows, "fallback friction order fits the unified lists");
     if (!unified_order_valid) {
-        int ball_normal_solve_order[kMaxBallVelocityContactRows];
+        uint8_t* const ball_normal_solve_order = reinterpret_cast<uint8_t*>(scratch_i8);
         for (int i = 0; i < ball_normal_row_count; ++i) {
-            ball_normal_solve_order[i] = i;
+            ball_normal_solve_order[i] = static_cast<uint8_t>(i);
         }
         if (sorted_manifolds != nullptr && sorted_manifold_count > 0 && ball_normal_row_count > 1) {
             int out_count = 0;
@@ -4863,7 +5115,7 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
                         }
                     }
                     if (!already && out_count < ball_normal_row_count) {
-                        ball_normal_solve_order[out_count++] = row_idx;
+                        ball_normal_solve_order[out_count++] = static_cast<uint8_t>(row_idx);
                     }
                 }
             }
@@ -4876,11 +5128,11 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
                     }
                 }
                 if (!present) {
-                    ball_normal_solve_order[out_count++] = row_idx;
+                    ball_normal_solve_order[out_count++] = static_cast<uint8_t>(row_idx);
                 }
             }
         }
-        int ball_friction_solve_order[kMaxBallFrictionContactRows];
+        uint8_t* const ball_friction_solve_order = reinterpret_cast<uint8_t*>(scratch_i8) + kMaxBallVelocityContactRows;
         {
             int friction_order_count = 0;
             for (int order_idx = 0; order_idx < ball_normal_row_count; ++order_idx) {
@@ -4888,7 +5140,7 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
                 for (int friction_idx = 0; friction_idx < ball_friction_row_count; ++friction_idx) {
                     if (ball_friction_rows[friction_idx].normal_row_idx == normal_row_idx &&
                         friction_order_count < ball_friction_row_count) {
-                        ball_friction_solve_order[friction_order_count++] = friction_idx;
+                        ball_friction_solve_order[friction_order_count++] = static_cast<uint8_t>(friction_idx);
                     }
                 }
             }
@@ -4903,12 +5155,10 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
                     }
                 }
                 if (!present) {
-                    ball_friction_solve_order[friction_order_count++] = friction_idx;
+                    ball_friction_solve_order[friction_order_count++] = static_cast<uint8_t>(friction_idx);
                 }
             }
         }
-        const bool pair_first =
-            FirstSharedContactOrderBucket(contact_order_groups, contact_order_group_count, count) == 0;
         unified_normal_count = 0;
         unified_friction_count = 0;
         for (int k = 0; k < 2; ++k) {
@@ -4916,276 +5166,37 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
             const int n = pair ? pair_normal_row_count : world_normal_row_count;
             for (int row_idx = 0; row_idx < n; ++row_idx) {
                 unified_normal_bucket[unified_normal_count] = pair ? kUnifiedRowBucketPair : kUnifiedRowBucketWorld;
-                unified_normal_row[unified_normal_count++] = static_cast<int16_t>(row_idx);
+                unified_normal_row[unified_normal_count++] = static_cast<uint8_t>(row_idx);
             }
             const int nf = pair ? pair_friction_row_count : world_friction_row_count;
             for (int row_idx = 0; row_idx < nf; ++row_idx) {
                 unified_friction_bucket[unified_friction_count] = pair ? kUnifiedRowBucketPair : kUnifiedRowBucketWorld;
-                unified_friction_row[unified_friction_count++] = static_cast<int16_t>(row_idx);
+                unified_friction_row[unified_friction_count++] = static_cast<uint8_t>(row_idx);
             }
         }
         for (int order_idx = 0; order_idx < ball_normal_row_count; ++order_idx) {
             unified_normal_bucket[unified_normal_count] = kUnifiedRowBucketBall;
-            unified_normal_row[unified_normal_count++] = static_cast<int16_t>(ball_normal_solve_order[order_idx]);
+            unified_normal_row[unified_normal_count++] = ball_normal_solve_order[order_idx];
         }
         for (int order_idx = 0; order_idx < ball_friction_row_count; ++order_idx) {
             unified_friction_bucket[unified_friction_count] = kUnifiedRowBucketBall;
-            unified_friction_row[unified_friction_count++] = static_cast<int16_t>(ball_friction_solve_order[order_idx]);
+            unified_friction_row[unified_friction_count++] = ball_friction_solve_order[order_idx];
         }
     }
     const int iterations = BallVelocityContactIterations();
 
-        const auto solve_ball_normal_row = [&](int iter, int row_idx) {
-            BallVelocityContactRow& row = ball_normal_rows[row_idx];
-            return SolveBallVelocityNormalRowWithAccumulators(
-                count,
-                row,
-                ball_acc,
-                car_accs,
-                mutator.solver_use_fma != 0);
-        };
-        const auto solve_ball_friction_row = [&](int iter, int row_idx) {
-            BallFrictionContactRow& row = ball_friction_rows[row_idx];
-            return SolveBallVelocityFrictionRowWithAccumulators(
-                count,
-                ball_normal_rows,
-                ball_normal_row_count,
-                row,
-                ball_acc,
-                car_accs,
-                mutator.solver_use_fma != 0);
-        };
-
-    constexpr int kRegRows = 3;
-    bool solved_in_registers = false;
-    if (register_iterations && ball_normal_row_count <= 0 && ball_friction_row_count <= 0 &&
-        pair_normal_row_count <= 0 && pair_friction_row_count <= 0 && unified_normal_count <= kRegRows &&
-        unified_friction_count <= kRegRows &&
-        unified_normal_count == world_normal_row_count && unified_friction_count == world_friction_row_count) {
-        struct RegRow {
-            ::rocketgpu::Vec3 dir;
-            ::rocketgpu::Vec3 linear;
-            ::rocketgpu::Vec3 rel_cross;
-            ::rocketgpu::Vec3 angular;
-            float rhs;
-            float jac;
-            float applied;
-            float friction;
-            int normal_slot;
-            bool active;
-            bool has_rhs_bt;
-            bool second_car;
-        };
-        RegRow normal[kRegRows];
-        RegRow fric[kRegRows];
-        int body0 = -1;
-        int body1 = -1;
-        bool fits = true;
-        const auto take_car = [&](int body, bool& second) {
-            if (body0 < 0 || body0 == body) {
-                body0 = body;
-                second = false;
-                return true;
-            }
-            if (body1 < 0 || body1 == body) {
-                body1 = body;
-                second = true;
-                return true;
-            }
-            return false;
-        };
-#pragma unroll
-        for (int o = 0; o < kRegRows; ++o) {
-            RegRow& s = normal[o];
-            s.active = false;
-            s.applied = 0.0f;
-            if (o >= unified_normal_count) {
-                continue;
-            }
-            const CarSharedVelocityContactRow& row = world_normal_rows[unified_normal_row[o]];
-            s.applied = row.applied_impulse;
-            if (!row.valid || row.body_a_local_idx < 0 || row.body_a_local_idx >= count) {
-                continue;
-            }
-            fits = fits && !(row.body_b_local_idx >= 0 && row.body_b_local_idx < count) &&
-                   take_car(row.body_a_local_idx, s.second_car);
-            s.active = true;
-            s.dir = row.normal_a;
-            s.linear = row.normal_a * row.inv_mass_a;
-            s.rel_cross = row.rel_a_cross_normal;
-            s.angular = row.angular_component_a;
-            s.has_rhs_bt = row.has_rhs_bt != 0;
-            s.rhs = s.has_rhs_bt ? row.rhs_bt : row.rhs;
-            s.jac = row.jac_diag_ab_inv;
-        }
-#pragma unroll
-        for (int o = 0; o < kRegRows; ++o) {
-            RegRow& s = fric[o];
-            s.active = false;
-            if (o >= unified_friction_count) {
-                continue;
-            }
-            const CarSharedFrictionContactRow& row = world_friction_rows[unified_friction_row[o]];
-            if (!row.valid || row.normal_row_idx < 0 || row.normal_row_idx >= world_normal_row_count ||
-                row.body_a_local_idx < 0 || row.body_a_local_idx >= count) {
-                continue;
-            }
-            bool normal_found = false;
-            s.normal_slot = 0;
-#pragma unroll
-            for (int k = 0; k < kRegRows; ++k) {
-                if (!normal_found && k < unified_normal_count && unified_normal_row[k] == row.normal_row_idx) {
-                    s.normal_slot = k;
-                    normal_found = true;
-                }
-            }
-            fits = fits && normal_found && !(row.body_b_local_idx >= 0 && row.body_b_local_idx < count) &&
-                   take_car(row.body_a_local_idx, s.second_car);
-            s.active = true;
-            s.dir = row.tangent_a;
-            s.linear = row.tangent_a * row.inv_mass_a;
-            s.rel_cross = row.rel_a_cross_tangent;
-            s.angular = row.angular_component_a;
-            s.rhs = row.has_rhs_bt ? row.rhs_bt : row.rhs * kUnifiedRowConversionBtPerUu;
-            s.jac = row.jac_diag_ab_inv;
-            s.applied = row.applied_impulse;
-            s.friction = row.friction;
-        }
-        if (fits) {
-            const bool use_fma = mutator.solver_use_fma != 0;
-            BallVelocityAccumulator acc0 = body0 >= 0 ? car_accs[body0] : BallVelocityAccumulator{};
-            BallVelocityAccumulator acc1 = body1 >= 0 ? car_accs[body1] : BallVelocityAccumulator{};
-            for (int iter = 0; iter < iterations; ++iter) {
-                bool changed = false;
-#pragma unroll
-                for (int o = 0; o < kRegRows; ++o) {
-                    RegRow& s = normal[o];
-                    if (!s.active) {
-                        continue;
-                    }
-                    const float applied_before = s.applied;
-                    BallVelocityAccumulator acc = s.second_car ? acc1 : acc0;
-                    const float delta_impulse_vel_a_bt =
-                        SolverRowDot(s.dir, acc.delta_linear, use_fma) +
-                        SolverRowDot(s.rel_cross, acc.delta_angular, use_fma);
-                    const float delta_impulse_vel_b_bt = 0.0f;
-                    float delta_impulse;
-                    if (s.has_rhs_bt) {
-                        float delta_impulse_bt = s.rhs;
-                        delta_impulse_bt = SolverRowSubtract(delta_impulse_bt, delta_impulse_vel_a_bt, s.jac, use_fma);
-                        delta_impulse_bt = SolverRowSubtract(delta_impulse_bt, delta_impulse_vel_b_bt, s.jac, use_fma);
-                        const float sum_bt = s.applied + delta_impulse_bt;
-                        if (sum_bt < 0.0f) {
-                            delta_impulse = -s.applied;
-                            s.applied = 0.0f;
-                        } else {
-                            delta_impulse = delta_impulse_bt;
-                            s.applied = sum_bt;
-                        }
-                    } else {
-                        const float delta_impulse_vel_a_uu = delta_impulse_vel_a_bt * kUnifiedRowConversionUuPerBt;
-                        const float delta_impulse_vel_b_uu = delta_impulse_vel_b_bt * kUnifiedRowConversionUuPerBt;
-                        const float applied_uu = s.applied * kUnifiedRowConversionUuPerBt;
-                        delta_impulse = s.rhs;
-                        delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_a_uu, s.jac, use_fma);
-                        delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_b_uu, s.jac, use_fma);
-                        const float sum = applied_uu + delta_impulse;
-                        if (sum < 0.0f) {
-                            delta_impulse = -applied_uu;
-                            s.applied = 0.0f;
-                        } else {
-                            s.applied = sum * kUnifiedRowConversionBtPerUu;
-                        }
-                        delta_impulse *= kUnifiedRowConversionBtPerUu;
-                    }
-                    changed = changed || GlibcFloatBits(applied_before) != GlibcFloatBits(s.applied);
-                    if (delta_impulse == 0.0f) {
-                        continue;
-                    }
-                    changed = true;
-                    ApplyBallVelocityAccumulatorImpulse(acc, s.linear, s.angular, delta_impulse, use_fma);
-                    if (s.second_car) {
-                        acc1 = acc;
-                    } else {
-                        acc0 = acc;
-                    }
-                }
-#pragma unroll
-                for (int o = 0; o < kRegRows; ++o) {
-                    RegRow& s = fric[o];
-                    if (!s.active) {
-                        continue;
-                    }
-                    float total_impulse = normal[0].applied;
-#pragma unroll
-                    for (int k = 1; k < kRegRows; ++k) {
-                        if (s.normal_slot == k) {
-                            total_impulse = normal[k].applied;
-                        }
-                    }
-                    if (total_impulse <= 0.0f) {
-                        continue;
-                    }
-                    const float max_impulse = s.friction * total_impulse;
-                    float delta_impulse = s.rhs;
-                    BallVelocityAccumulator acc = s.second_car ? acc1 : acc0;
-                    const float delta_impulse_vel_a_bt =
-                        SolverRowDot(s.dir, acc.delta_linear, use_fma) +
-                        SolverRowDot(s.rel_cross, acc.delta_angular, use_fma);
-                    delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_a_bt, s.jac, use_fma);
-                    const float applied_before = s.applied;
-                    const float sum = s.applied + delta_impulse;
-                    if (sum < -max_impulse) {
-                        delta_impulse = -max_impulse - s.applied;
-                        s.applied = -max_impulse;
-                    } else if (sum > max_impulse) {
-                        delta_impulse = max_impulse - s.applied;
-                        s.applied = max_impulse;
-                    } else {
-                        s.applied = sum;
-                    }
-                    changed = changed || GlibcFloatBits(applied_before) != GlibcFloatBits(s.applied);
-                    if (delta_impulse == 0.0f) {
-                        continue;
-                    }
-                    changed = true;
-                    ApplyBallVelocityAccumulatorImpulse(acc, s.linear, s.angular, delta_impulse, use_fma);
-                    if (s.second_car) {
-                        acc1 = acc;
-                    } else {
-                        acc0 = acc;
-                    }
-                }
-                if (!changed) {
-                    break;
-                }
-            }
-#pragma unroll
-            for (int o = 0; o < kRegRows; ++o) {
-                if (normal[o].active) {
-                    world_normal_rows[unified_normal_row[o]].applied_impulse = normal[o].applied;
-                }
-                if (fric[o].active) {
-                    world_friction_rows[unified_friction_row[o]].applied_impulse = fric[o].applied;
-                }
-            }
-            if (body0 >= 0) {
-                car_accs[body0] = acc0;
-            }
-            if (body1 >= 0) {
-                car_accs[body1] = acc1;
-            }
-            solved_in_registers = true;
-        }
-    }
-
-    for (int iter = 0; iter < (solved_in_registers ? 0 : iterations); ++iter) {
+    for (int iter = 0; iter < iterations; ++iter) {
         bool changed = false;
         for (int order_idx = 0; order_idx < unified_normal_count; ++order_idx) {
             const int row_idx = unified_normal_row[order_idx];
             const int bucket = unified_normal_bucket[order_idx];
             if (bucket == kUnifiedRowBucketBall) {
-                changed = solve_ball_normal_row(iter, row_idx) || changed;
+                changed = SolveBallVelocityNormalRowWithAccumulators(
+                    count,
+                    ball_normal_rows[row_idx],
+                    ball_acc,
+                    car_accs,
+                    mutator.solver_use_fma != 0) || changed;
             } else {
                 const bool world = bucket == kUnifiedRowBucketWorld;
                 changed = SolveSharedCarVelocityNormalRow(
@@ -5201,7 +5212,14 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
             const int row_idx = unified_friction_row[order_idx];
             const int bucket = unified_friction_bucket[order_idx];
             if (bucket == kUnifiedRowBucketBall) {
-                changed = solve_ball_friction_row(iter, row_idx) || changed;
+                changed = SolveBallVelocityFrictionRowWithAccumulators(
+                    count,
+                    ball_normal_rows,
+                    ball_normal_row_count,
+                    ball_friction_rows[row_idx],
+                    ball_acc,
+                    car_accs,
+                    mutator.solver_use_fma != 0) || changed;
             } else {
                 const bool world = bucket == kUnifiedRowBucketWorld;
                 changed = SolveSharedCarVelocityFrictionRow(
@@ -5238,6 +5256,557 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
         SetCarLinearVelocityBt(cars[i], cars[i].vel_bt + car_accs[i].delta_linear);
         cars[i].ang_vel += car_accs[i].delta_angular;
     }
+}
+
+ROCKETGPU_HD ROCKETGPU_NOINLINE bool TrySolveUnifiedVelocityContactRowsReg(
+    ::rocketgpu::BallState& ball,
+    int count,
+    ::rocketgpu::CarState* cars,
+    const ::rocketgpu::MutatorConfig& mutator,
+    EnvStridedArray<BallVelocityContactRow> ball_normal_rows,
+    int ball_normal_row_count,
+    EnvStridedArray<BallFrictionContactRow> ball_friction_rows,
+    int ball_friction_row_count,
+    EnvStridedArray<CarSharedVelocityContactRow> world_normal_rows,
+    int world_normal_row_count,
+    EnvStridedArray<CarSharedFrictionContactRow> world_friction_rows,
+    int world_friction_row_count,
+    const ::rocketgpu::Vec3* bt_ball_linear_velocity_override,
+    EnvStridedArray<const BulletManifoldEntry> sorted_manifolds,
+    int sorted_manifold_count) {
+    constexpr float kUnifiedRowConversionBtPerUu = 1.0f / 50.0f;
+    constexpr float kUnifiedRowConversionUuPerBt = 50.0f;
+    constexpr int kRegRows = 4;
+    {
+        struct RegRow {
+            ::rocketgpu::Vec3 dir;
+            ::rocketgpu::Vec3 linear;
+            ::rocketgpu::Vec3 rel_cross;
+            ::rocketgpu::Vec3 angular;
+            float rhs;
+            float jac;
+            float applied;
+            float friction;
+            int normal_slot;
+            int body_slot;
+            bool active;
+            bool has_rhs_bt;
+            bool is_ball;
+        };
+        RegRow normal[kRegRows];
+        RegRow fric[kRegRows];
+        int body0 = -1;
+        int body1 = -1;
+        bool fits = true;
+        const auto take_car = [&](int body, int& slot_out) {
+            if (body0 < 0 || body0 == body) {
+                body0 = body;
+                slot_out = 0;
+                return true;
+            }
+            if (body1 < 0 || body1 == body) {
+                body1 = body;
+                slot_out = 1;
+                return true;
+            }
+            slot_out = 0;
+            return false;
+        };
+        int norm_order_bucket[kRegRows];
+        int norm_order_idx[kRegRows];
+        int fric_order_bucket[kRegRows];
+        int fric_order_idx[kRegRows];
+        int norm_count = 0;
+        int fric_count = 0;
+        if (sorted_manifolds != nullptr && sorted_manifold_count > 0 &&
+            (world_normal_row_count + ball_normal_row_count > 1 ||
+             world_friction_row_count + ball_friction_row_count > 1)) {
+            uint32_t world_used = 0u;
+            uint32_t ball_used = 0u;
+            int8_t world_body_a[kRegRows];
+            int16_t world_source_tag[kRegRows];
+#pragma unroll
+            for (int r = 0; r < kRegRows; ++r) {
+                if (r < world_normal_row_count && world_normal_rows[r].valid) {
+                    world_body_a[r] = static_cast<int8_t>(world_normal_rows[r].body_a_local_idx);
+                    world_source_tag[r] = static_cast<int16_t>(world_normal_rows[r].source_tag);
+                } else {
+                    world_body_a[r] = -2;
+                    world_source_tag[r] = -2;
+                }
+            }
+            for (int order_idx = 0; order_idx < sorted_manifold_count; ++order_idx) {
+                const BulletManifoldEntry& entry = sorted_manifolds[order_idx];
+                if (entry.kind == 2) {
+                    int expected_tag = -1;
+                    if (entry.static_id >= 100) {
+                        expected_tag = BulletPlaneStaticSourceTag(entry.static_id);
+                    } else if (entry.static_id >= 0) {
+                        expected_tag = 100 + entry.static_id;
+                    }
+#pragma unroll
+                    for (int r = 0; r < kRegRows; ++r) {
+                        if (r < world_normal_row_count && ((world_used >> r) & 1u) == 0u &&
+                            world_body_a[r] == entry.body_a && world_source_tag[r] == expected_tag &&
+                            norm_count < kRegRows) {
+                            world_used |= 1u << r;
+                            norm_order_bucket[norm_count] = 0;
+                            norm_order_idx[norm_count++] = r;
+                        }
+                    }
+                } else if (entry.kind == 1) {
+                    fits = false;
+                } else if (entry.kind == 0 && entry.static_id == kBulletPredictiveStaticId) {
+#pragma unroll
+                    for (int r = 0; r < kRegRows; ++r) {
+                        if (r < ball_normal_row_count && ((ball_used >> r) & 1u) == 0u &&
+                            ball_normal_rows[r].valid && ball_normal_rows[r].predictive && norm_count < kRegRows) {
+                            ball_used |= 1u << r;
+                            norm_order_bucket[norm_count] = 2;
+                            norm_order_idx[norm_count++] = r;
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kRegRows; ++r) {
+                if (r < world_normal_row_count && ((world_used >> r) & 1u) == 0u && norm_count < kRegRows) {
+                    world_used |= 1u << r;
+                    norm_order_bucket[norm_count] = 0;
+                    norm_order_idx[norm_count++] = r;
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kRegRows; ++r) {
+                if (r < ball_normal_row_count && ((ball_used >> r) & 1u) == 0u && norm_count < kRegRows) {
+                    ball_used |= 1u << r;
+                    norm_order_bucket[norm_count] = 2;
+                    norm_order_idx[norm_count++] = r;
+                }
+            }
+            uint32_t world_f_used = 0u;
+            uint32_t ball_f_used = 0u;
+#pragma unroll
+            for (int o = 0; o < kRegRows; ++o) {
+                if (o >= norm_count) {
+                    continue;
+                }
+                const int n_idx = norm_order_idx[o];
+                if (norm_order_bucket[o] == 0) {
+#pragma unroll
+                    for (int r = 0; r < kRegRows; ++r) {
+                        if (r < world_friction_row_count && ((world_f_used >> r) & 1u) == 0u &&
+                            world_friction_rows[r].normal_row_idx == n_idx && fric_count < kRegRows) {
+                            world_f_used |= 1u << r;
+                            fric_order_bucket[fric_count] = 0;
+                            fric_order_idx[fric_count++] = r;
+                        }
+                    }
+                } else {
+#pragma unroll
+                    for (int r = 0; r < kRegRows; ++r) {
+                        if (r < ball_friction_row_count && ((ball_f_used >> r) & 1u) == 0u &&
+                            ball_friction_rows[r].normal_row_idx == n_idx && fric_count < kRegRows) {
+                            ball_f_used |= 1u << r;
+                            fric_order_bucket[fric_count] = 2;
+                            fric_order_idx[fric_count++] = r;
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kRegRows; ++r) {
+                if (r < world_friction_row_count && ((world_f_used >> r) & 1u) == 0u && fric_count < kRegRows) {
+                    world_f_used |= 1u << r;
+                    fric_order_bucket[fric_count] = 0;
+                    fric_order_idx[fric_count++] = r;
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kRegRows; ++r) {
+                if (r < ball_friction_row_count && ((ball_f_used >> r) & 1u) == 0u && fric_count < kRegRows) {
+                    ball_f_used |= 1u << r;
+                    fric_order_bucket[fric_count] = 2;
+                    fric_order_idx[fric_count++] = r;
+                }
+            }
+            fits = fits && (norm_count == world_normal_row_count + ball_normal_row_count) &&
+                   (fric_count == world_friction_row_count + ball_friction_row_count);
+        } else {
+            fits = fits && (ball_friction_row_count <= 1);
+#pragma unroll
+            for (int r = 0; r < kRegRows; ++r) {
+                if (r < world_normal_row_count && norm_count < kRegRows) {
+                    norm_order_bucket[norm_count] = 0;
+                    norm_order_idx[norm_count++] = r;
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kRegRows; ++r) {
+                if (r < ball_normal_row_count && norm_count < kRegRows) {
+                    norm_order_bucket[norm_count] = 2;
+                    norm_order_idx[norm_count++] = r;
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kRegRows; ++r) {
+                if (r < world_friction_row_count && fric_count < kRegRows) {
+                    fric_order_bucket[fric_count] = 0;
+                    fric_order_idx[fric_count++] = r;
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kRegRows; ++r) {
+                if (r < ball_friction_row_count && fric_count < kRegRows) {
+                    fric_order_bucket[fric_count] = 2;
+                    fric_order_idx[fric_count++] = r;
+                }
+            }
+        }
+#pragma unroll
+        for (int o = 0; o < kRegRows; ++o) {
+            RegRow& s = normal[o];
+            s.active = false;
+            s.applied = 0.0f;
+            if (o >= norm_count) {
+                continue;
+            }
+            if (norm_order_bucket[o] == 2) {
+                const BallVelocityContactRow& row = ball_normal_rows[norm_order_idx[o]];
+                s.applied = row.valid ? row.applied_impulse * kUnifiedRowConversionBtPerUu : row.applied_impulse;
+                if (!row.valid) {
+                    continue;
+                }
+                if (row.other_local_idx >= 0 && row.other_local_idx < count) {
+                    fits = false;
+                    continue;
+                }
+                s.active = true;
+                s.is_ball = true;
+                s.body_slot = 2;
+                s.dir = row.normal;
+                s.linear = row.normal * row.ball_inv_mass;
+                s.rel_cross = row.has_bt
+                    ? row.rel_ball_cross_normal_bt
+                    : row.rel_ball_cross_normal * kUnifiedRowConversionBtPerUu;
+                s.angular = row.has_bt
+                    ? row.ball_angular_component_bt
+                    : row.ball_angular_component * kUnifiedRowConversionUuPerBt;
+                s.has_rhs_bt = true;
+                s.rhs = row.has_bt ? row.rhs_bt : row.rhs * kUnifiedRowConversionBtPerUu;
+                s.jac = row.jac_diag_ab_inv;
+                continue;
+            }
+            const CarSharedVelocityContactRow& row = world_normal_rows[norm_order_idx[o]];
+            s.applied = row.valid ? row.applied_impulse * kUnifiedRowConversionBtPerUu : row.applied_impulse;
+            if (!row.valid || row.body_a_local_idx < 0 || row.body_a_local_idx >= count) {
+                continue;
+            }
+            fits = fits && !(row.body_b_local_idx >= 0 && row.body_b_local_idx < count) &&
+                   take_car(row.body_a_local_idx, s.body_slot);
+            s.active = true;
+            s.is_ball = false;
+            s.dir = row.normal_a;
+            s.linear = row.normal_a * row.inv_mass_a;
+            s.rel_cross = row.has_bt
+                ? row.rel_a_cross_normal_bt
+                : row.rel_a_cross_normal * kUnifiedRowConversionBtPerUu;
+            s.angular = row.has_bt
+                ? row.angular_component_a_bt
+                : row.angular_component_a * kUnifiedRowConversionUuPerBt;
+            s.has_rhs_bt = row.has_rhs_bt != 0;
+            s.rhs = s.has_rhs_bt ? row.rhs_bt : row.rhs;
+            s.jac = row.jac_diag_ab_inv;
+        }
+#pragma unroll
+        for (int o = 0; o < kRegRows; ++o) {
+            RegRow& s = fric[o];
+            s.active = false;
+            if (o >= fric_count) {
+                continue;
+            }
+            if (fric_order_bucket[o] == 2) {
+                const BallFrictionContactRow& row = ball_friction_rows[fric_order_idx[o]];
+                if (!row.valid || row.normal_row_idx < 0 || row.normal_row_idx >= ball_normal_row_count) {
+                    continue;
+                }
+                if (row.other_local_idx >= 0 && row.other_local_idx < count) {
+                    fits = false;
+                    continue;
+                }
+                bool normal_found = false;
+                s.normal_slot = 0;
+#pragma unroll
+                for (int k = 0; k < kRegRows; ++k) {
+                    if (!normal_found && k < norm_count && norm_order_bucket[k] == 2 &&
+                        norm_order_idx[k] == row.normal_row_idx) {
+                        s.normal_slot = k;
+                        normal_found = true;
+                    }
+                }
+                fits = fits && normal_found;
+                s.active = true;
+                s.is_ball = true;
+                s.body_slot = 2;
+                s.dir = row.tangent;
+                s.linear = row.tangent * row.ball_inv_mass;
+                s.rel_cross = row.has_bt
+                    ? row.rel_ball_cross_tangent_bt
+                    : row.rel_ball_cross_tangent * kUnifiedRowConversionBtPerUu;
+                s.angular = row.has_bt
+                    ? row.ball_angular_component_bt
+                    : row.ball_angular_component * kUnifiedRowConversionUuPerBt;
+                s.rhs = row.has_bt ? row.rhs_bt : row.rhs * kUnifiedRowConversionBtPerUu;
+                s.jac = row.jac_diag_ab_inv;
+                s.applied = row.applied_impulse * kUnifiedRowConversionBtPerUu;
+                s.friction = row.friction;
+                continue;
+            }
+            const CarSharedFrictionContactRow& row = world_friction_rows[fric_order_idx[o]];
+            if (!row.valid || row.normal_row_idx < 0 || row.normal_row_idx >= world_normal_row_count ||
+                row.body_a_local_idx < 0 || row.body_a_local_idx >= count) {
+                continue;
+            }
+            bool normal_found = false;
+            s.normal_slot = 0;
+#pragma unroll
+            for (int k = 0; k < kRegRows; ++k) {
+                if (!normal_found && k < norm_count && norm_order_bucket[k] == 0 &&
+                    norm_order_idx[k] == row.normal_row_idx) {
+                    s.normal_slot = k;
+                    normal_found = true;
+                }
+            }
+            fits = fits && normal_found && !(row.body_b_local_idx >= 0 && row.body_b_local_idx < count) &&
+                   take_car(row.body_a_local_idx, s.body_slot);
+            s.active = true;
+            s.is_ball = false;
+            s.dir = row.tangent_a;
+            s.linear = row.tangent_a * row.inv_mass_a;
+            s.rel_cross = row.has_bt
+                ? row.rel_a_cross_tangent_bt
+                : row.rel_a_cross_tangent * kUnifiedRowConversionBtPerUu;
+            s.angular = row.has_bt
+                ? row.angular_component_a_bt
+                : row.angular_component_a * kUnifiedRowConversionUuPerBt;
+            s.rhs = row.has_rhs_bt ? row.rhs_bt : row.rhs * kUnifiedRowConversionBtPerUu;
+            s.jac = row.jac_diag_ab_inv;
+            s.applied = row.applied_impulse * kUnifiedRowConversionBtPerUu;
+            s.friction = row.friction;
+        }
+        if (fits) {
+            const int iterations = BallVelocityContactIterations();
+            const bool use_fma = mutator.solver_use_fma != 0;
+            BallVelocityAccumulator acc0{};
+            BallVelocityAccumulator acc1{};
+            BallVelocityAccumulator ball_acc{};
+            for (int iter = 0; iter < iterations; ++iter) {
+                bool changed = false;
+#pragma unroll
+                for (int o = 0; o < kRegRows; ++o) {
+                    RegRow& s = normal[o];
+                    if (!s.active) {
+                        continue;
+                    }
+                    const float applied_before = s.applied;
+                    BallVelocityAccumulator acc = s.body_slot == 2 ? ball_acc : (s.body_slot == 1 ? acc1 : acc0);
+                    const float delta_impulse_vel_a_bt =
+                        SolverRowDot(s.dir, acc.delta_linear, use_fma) +
+                        SolverRowDot(s.rel_cross, acc.delta_angular, use_fma);
+                    float delta_impulse;
+                    if (s.has_rhs_bt) {
+                        float delta_impulse_bt = s.rhs;
+                        delta_impulse_bt = SolverRowSubtract(delta_impulse_bt, delta_impulse_vel_a_bt, s.jac, use_fma);
+                        if (!s.is_ball) {
+                            delta_impulse_bt = SolverRowSubtract(delta_impulse_bt, 0.0f, s.jac, use_fma);
+                        }
+                        const float sum_bt = s.applied + delta_impulse_bt;
+                        if (sum_bt < 0.0f) {
+                            delta_impulse = -s.applied;
+                            s.applied = 0.0f;
+                        } else {
+                            delta_impulse = delta_impulse_bt;
+                            s.applied = sum_bt;
+                        }
+                    } else {
+                        const float delta_impulse_vel_a_uu = delta_impulse_vel_a_bt * kUnifiedRowConversionUuPerBt;
+                        const float applied_uu = s.applied * kUnifiedRowConversionUuPerBt;
+                        delta_impulse = s.rhs;
+                        delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_a_uu, s.jac, use_fma);
+                        if (!s.is_ball) {
+                            delta_impulse = SolverRowSubtract(delta_impulse, 0.0f, s.jac, use_fma);
+                        }
+                        const float sum = applied_uu + delta_impulse;
+                        if (sum < 0.0f) {
+                            delta_impulse = -applied_uu;
+                            s.applied = 0.0f;
+                        } else {
+                            s.applied = sum * kUnifiedRowConversionBtPerUu;
+                        }
+                        delta_impulse *= kUnifiedRowConversionBtPerUu;
+                    }
+                    changed = changed || GlibcFloatBits(applied_before) != GlibcFloatBits(s.applied);
+                    if (delta_impulse == 0.0f) {
+                        continue;
+                    }
+                    changed = true;
+                    ApplyBallVelocityAccumulatorImpulse(acc, s.linear, s.angular, delta_impulse, use_fma);
+                    if (s.body_slot == 2) {
+                        ball_acc = acc;
+                    } else if (s.body_slot == 1) {
+                        acc1 = acc;
+                    } else {
+                        acc0 = acc;
+                    }
+                }
+#pragma unroll
+                for (int o = 0; o < kRegRows; ++o) {
+                    RegRow& s = fric[o];
+                    if (!s.active) {
+                        continue;
+                    }
+                    float total_impulse = normal[0].applied;
+#pragma unroll
+                    for (int k = 1; k < kRegRows; ++k) {
+                        if (s.normal_slot == k) {
+                            total_impulse = normal[k].applied;
+                        }
+                    }
+                    if (total_impulse <= 0.0f) {
+                        continue;
+                    }
+                    const float max_impulse = s.friction * total_impulse;
+                    float delta_impulse = s.rhs;
+                    BallVelocityAccumulator acc = s.body_slot == 2 ? ball_acc : (s.body_slot == 1 ? acc1 : acc0);
+                    const float delta_impulse_vel_a_bt =
+                        SolverRowDot(s.dir, acc.delta_linear, use_fma) +
+                        SolverRowDot(s.rel_cross, acc.delta_angular, use_fma);
+                    delta_impulse = SolverRowSubtract(delta_impulse, delta_impulse_vel_a_bt, s.jac, use_fma);
+                    const float applied_before = s.applied;
+                    const float sum = s.applied + delta_impulse;
+                    if (sum < -max_impulse) {
+                        delta_impulse = -max_impulse - s.applied;
+                        s.applied = -max_impulse;
+                    } else if (sum > max_impulse) {
+                        delta_impulse = max_impulse - s.applied;
+                        s.applied = max_impulse;
+                    } else {
+                        s.applied = sum;
+                    }
+                    changed = changed || GlibcFloatBits(applied_before) != GlibcFloatBits(s.applied);
+                    if (delta_impulse == 0.0f) {
+                        continue;
+                    }
+                    changed = true;
+                    ApplyBallVelocityAccumulatorImpulse(acc, s.linear, s.angular, delta_impulse, use_fma);
+                    if (s.body_slot == 2) {
+                        ball_acc = acc;
+                    } else if (s.body_slot == 1) {
+                        acc1 = acc;
+                    } else {
+                        acc0 = acc;
+                    }
+                }
+                if (!changed) {
+                    break;
+                }
+            }
+            const ::rocketgpu::Vec3 ball_base_linear_bt = bt_ball_linear_velocity_override
+                ? *bt_ball_linear_velocity_override
+                : ball.vel_bt;
+            SetBallLinearVelocityBt(ball, ball_base_linear_bt + ball_acc.delta_linear);
+            ball.ang_vel += ball_acc.delta_angular;
+            for (int i = 0; i < count; ++i) {
+                const BallVelocityAccumulator acc =
+                    i == body0 ? acc0 : (i == body1 ? acc1 : BallVelocityAccumulator{});
+                SetCarLinearVelocityBt(cars[i], cars[i].vel_bt + acc.delta_linear);
+                cars[i].ang_vel += acc.delta_angular;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
+    ::rocketgpu::BallState& ball,
+    int count,
+    ::rocketgpu::CarState* cars,
+    const ::rocketgpu::CarConfig* car_configs,
+    const ::rocketgpu::MutatorConfig& mutator,
+    EnvStridedArray<BallVelocityContactRow> ball_normal_rows,
+    int ball_normal_row_count,
+    EnvStridedArray<BallFrictionContactRow> ball_friction_rows,
+    int ball_friction_row_count,
+    EnvStridedArray<CarSharedVelocityContactRow> world_normal_rows,
+    int world_normal_row_count,
+    EnvStridedArray<CarSharedVelocityContactRow> pair_normal_rows,
+    int pair_normal_row_count,
+    EnvStridedArray<CarSharedFrictionContactRow> world_friction_rows,
+    int world_friction_row_count,
+    EnvStridedArray<CarSharedFrictionContactRow> pair_friction_rows,
+    int pair_friction_row_count,
+    EnvStridedArray<const SharedContactOrderGroup> contact_order_groups = nullptr,
+    int contact_order_group_count = 0,
+    const ::rocketgpu::Vec3* bt_ball_linear_velocity_override = nullptr,
+    EnvStridedArray<const BulletManifoldEntry> sorted_manifolds = nullptr,
+    int sorted_manifold_count = 0,
+    bool register_iterations = false) {
+    if (count < 0 || count > 8 || (count > 0 && (!cars || !car_configs))) {
+        return;
+    }
+    if ((!ball_normal_rows || ball_normal_row_count <= 0) &&
+        (!ball_friction_rows || ball_friction_row_count <= 0) &&
+        (!world_normal_rows || world_normal_row_count <= 0) &&
+        (!pair_normal_rows || pair_normal_row_count <= 0) &&
+        (!world_friction_rows || world_friction_row_count <= 0) &&
+        (!pair_friction_rows || pair_friction_row_count <= 0)) {
+        return;
+    }
+
+    constexpr int kRegRows = 4;
+
+    if (register_iterations && pair_normal_row_count <= 0 && pair_friction_row_count <= 0 &&
+        world_normal_row_count + ball_normal_row_count <= kRegRows &&
+        world_friction_row_count + ball_friction_row_count <= kRegRows &&
+        TrySolveUnifiedVelocityContactRowsReg(
+            ball, count, cars, mutator,
+            ball_normal_rows, ball_normal_row_count,
+            ball_friction_rows, ball_friction_row_count,
+            world_normal_rows, world_normal_row_count,
+            world_friction_rows, world_friction_row_count,
+            bt_ball_linear_velocity_override,
+            sorted_manifolds, sorted_manifold_count)) {
+        return;
+    }
+
+    constexpr int kMaxUnifiedRows =
+        kMaxCarWorldSharedVelocityContactRows + kMaxCarPairSharedVelocityContactRows + kMaxBallVelocityContactRows;
+    const bool need_fallback_order =
+        !(world_normal_row_count + pair_normal_row_count + ball_normal_row_count <= 1 &&
+          world_friction_row_count + pair_friction_row_count + ball_friction_row_count <= 1) &&
+        !(sorted_manifolds != nullptr && sorted_manifold_count > 0 &&
+          world_normal_row_count >= 0 && pair_normal_row_count >= 0 && ball_normal_row_count >= 0 &&
+          world_friction_row_count >= 0 && pair_friction_row_count >= 0 && ball_friction_row_count >= 0 &&
+          world_normal_row_count + pair_normal_row_count + ball_normal_row_count <= kMaxUnifiedRows &&
+          world_friction_row_count + pair_friction_row_count + ball_friction_row_count <= kMaxUnifiedRows);
+    const bool pair_first =
+        need_fallback_order &&
+        (world_normal_row_count > 0 || world_friction_row_count > 0) &&
+        (pair_normal_row_count > 0 || pair_friction_row_count > 0) &&
+        FirstSharedContactOrderBucket(contact_order_groups, contact_order_group_count, count) == 0;
+
+    SolveUnifiedVelocityContactRowsGeneral(
+        ball, count, cars, car_configs, mutator,
+        ball_normal_rows, ball_normal_row_count,
+        ball_friction_rows, ball_friction_row_count,
+        world_normal_rows, world_normal_row_count,
+        pair_normal_rows, pair_normal_row_count,
+        world_friction_rows, world_friction_row_count,
+        pair_friction_rows, pair_friction_row_count,
+        pair_first,
+        bt_ball_linear_velocity_override,
+        sorted_manifolds, sorted_manifold_count);
 }
 
 ROCKETGPU_HD void SolveCarWorldVelocityContactRows(
@@ -5524,10 +6093,16 @@ ROCKETGPU_HD void AppendBallStaticSplitRow(
         return;
     }
 
+    const float scaled_penetration = penetration * BallStaticSplitPenetrationScale();
+    if (scaled_penetration <= 0.0f || dt <= 0.0f) {
+        rows[row_count] = BallSplitContactRow{};
+        return;
+    }
+
     BallSplitContactRow row;
     InitializeBallSplitContactRow(
         row,
-        penetration * BallStaticSplitPenetrationScale(),
+        scaled_penetration,
         normal,
         1.0f / mutator.ball_mass,
         rel_ball_contact,
@@ -5565,8 +6140,15 @@ ROCKETGPU_HD void AppendBallCarSplitRow(
     const ::rocketgpu::Vec3* rel_ball_contact_bt = nullptr,
     const ::rocketgpu::Vec3* rel_car_contact_bt = nullptr,
     const float* penetration_bt = nullptr,
-    const ::rocketgpu::BallState* ball_for_bt = nullptr) {
+    const ::rocketgpu::BallState* ball_for_bt = nullptr,
+    const ::rocketgpu::Vec3* car_inv_bt_rows = nullptr) {
     if (!rows || row_count >= kMaxBallSplitContactRows) {
+        return;
+    }
+
+    const float scaled_penetration = penetration * BallCarSplitPenetrationScale();
+    if (scaled_penetration <= 0.0f || dt <= 0.0f) {
+        rows[row_count] = BallSplitContactRow{};
         return;
     }
 
@@ -5574,8 +6156,13 @@ ROCKETGPU_HD void AppendBallCarSplitRow(
 
     ::rocketgpu::Vec3 car_angular_component_bt(0.0f, 0.0f, 0.0f);
     if (rel_car_contact_bt) {
-        car_angular_component_bt =
-            ApplyInverseBodyInertiaWorldBt(car, cfg, mutator.car_mass, -Cross(*rel_car_contact_bt, normal));
+        const ::rocketgpu::Vec3 torque_bt = -Cross(*rel_car_contact_bt, normal);
+        car_angular_component_bt = car_inv_bt_rows
+            ? ::rocketgpu::Vec3(
+                  Dot(car_inv_bt_rows[0], torque_bt),
+                  Dot(car_inv_bt_rows[1], torque_bt),
+                  Dot(car_inv_bt_rows[2], torque_bt))
+            : ApplyInverseBodyInertiaWorldBt(car, cfg, mutator.car_mass, torque_bt);
     }
 
     ::rocketgpu::Vec3 ball_angular_component_bt(0.0f, 0.0f, 0.0f);
@@ -5584,7 +6171,7 @@ ROCKETGPU_HD void AppendBallCarSplitRow(
     }
     InitializeBallSplitContactRow(
         row,
-        penetration * BallCarSplitPenetrationScale(),
+        scaled_penetration,
         normal,
         1.0f / mutator.ball_mass,
         rel_ball_contact,

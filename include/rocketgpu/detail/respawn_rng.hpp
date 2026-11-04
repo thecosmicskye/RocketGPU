@@ -11,6 +11,54 @@ struct RespawnRngState {
     RespawnRngKind kind = RespawnRngKind::MinStd0;
 };
 
+struct TempRespawnRngState {
+    uint32_t w_cur = 0;
+    uint32_t w_far = 0;
+    uint32_t index = 0;
+    RespawnRngKind kind = RespawnRngKind::MinStd0;
+};
+
+ROCKETGPU_HD uint32_t Mt19937InitStep(uint32_t previous, uint32_t i) {
+    return 1812433253u * (previous ^ (previous >> 30)) + i;
+}
+
+ROCKETGPU_HD void SeedTempRespawnRng(TempRespawnRngState& state, RespawnRngKind kind, uint32_t seed) {
+    state.kind = kind;
+    if (kind != RespawnRngKind::Mt19937) {
+        state.w_cur = seed % 2147483647u;
+        if (state.w_cur == 0) state.w_cur = 1;
+        state.w_far = 0;
+        state.index = 0;
+        return;
+    }
+    state.w_cur = seed;
+    uint32_t w = seed;
+    for (uint32_t i = 1; i <= 397; ++i) {
+        w = Mt19937InitStep(w, i);
+    }
+    state.w_far = w;
+    state.index = 0;
+}
+
+ROCKETGPU_HD uint32_t NextRespawnRng(TempRespawnRngState& state) {
+    if (state.kind != RespawnRngKind::Mt19937) {
+        const uint64_t multiplier = state.kind == RespawnRngKind::MinStd0 ? 16807u : 48271u;
+        state.w_cur = static_cast<uint32_t>((multiplier * state.w_cur) % 2147483647u);
+        return state.w_cur;
+    }
+    const uint32_t i = state.index++;
+    const uint32_t w_next = Mt19937InitStep(state.w_cur, i + 1u);
+    const uint32_t y_twist = (state.w_cur & 0x80000000u) | (w_next & 0x7fffffffu);
+    uint32_t y = state.w_far ^ (y_twist >> 1) ^ ((y_twist & 1u) ? 0x9908b0dfu : 0u);
+    state.w_cur = w_next;
+    state.w_far = Mt19937InitStep(state.w_far, i + 398u);
+    y ^= y >> 11;
+    y ^= (y << 7) & 0x9d2c5680u;
+    y ^= (y << 15) & 0xefc60000u;
+    y ^= y >> 18;
+    return y;
+}
+
 ROCKETGPU_HD void SeedRespawnRng(RespawnRngState& state, RespawnRngKind kind, uint32_t seed) {
     state.kind = kind;
     if (kind != RespawnRngKind::Mt19937) {
@@ -63,7 +111,8 @@ ROCKETGPU_HD void RespawnRngSwapInt(int* a, int* b) {
     *b = t;
 }
 
-ROCKETGPU_HD uint64_t LibstdcxxUniformInt(RespawnRngState& state, uint64_t urange) {
+template <typename RngState>
+ROCKETGPU_HD uint64_t LibstdcxxUniformInt(RngState& state, uint64_t urange) {
     const uint64_t urngmin = RespawnRngMinValue(state.kind);
     const uint64_t urngrange = static_cast<uint64_t>(RespawnRngMaxValue(state.kind)) - urngmin;
     if (urngrange > urange) {
@@ -82,7 +131,8 @@ ROCKETGPU_HD uint64_t LibstdcxxUniformInt(RespawnRngState& state, uint64_t urang
     return 0;
 }
 
-ROCKETGPU_HD void ShuffleLikeLibstdcxx(int* order, RespawnRngState& state) {
+template <typename RngState>
+ROCKETGPU_HD void ShuffleLikeLibstdcxx(int* order, RngState& state) {
     const uint64_t urngmin = RespawnRngMinValue(state.kind);
     const uint64_t urngrange = static_cast<uint64_t>(RespawnRngMaxValue(state.kind)) - urngmin;
     const uint64_t urange = static_cast<uint64_t>(5);
@@ -110,7 +160,8 @@ ROCKETGPU_HD void ShuffleLikeLibstdcxx(int* order, RespawnRngState& state) {
     }
 }
 
-ROCKETGPU_HD uint64_t MsvcRngFromUrng(RespawnRngState& state, uint64_t index) {
+template <typename RngState>
+ROCKETGPU_HD uint64_t MsvcRngFromUrng(RngState& state, uint64_t index) {
     const uint64_t bmask = 0xffffffffull;
     for (;;) {
         uint64_t ret = 0u;
@@ -127,7 +178,8 @@ ROCKETGPU_HD uint64_t MsvcRngFromUrng(RespawnRngState& state, uint64_t index) {
     }
 }
 
-ROCKETGPU_HD void ShuffleLikeMsvc(int* order, RespawnRngState& state) {
+template <typename RngState>
+ROCKETGPU_HD void ShuffleLikeMsvc(int* order, RngState& state) {
     for (int target = 1; target < 5; ++target) {
         const int off = static_cast<int>(MsvcRngFromUrng(state, static_cast<uint64_t>(target) + 1u));
         if (off != target) {
@@ -142,7 +194,8 @@ ROCKETGPU_HD int RespawnRngFloorLog2(uint64_t v) {
     return r;
 }
 
-ROCKETGPU_HD uint64_t LibcxxUniformInt(RespawnRngState& state, uint64_t b) {
+template <typename RngState>
+ROCKETGPU_HD uint64_t LibcxxUniformInt(RngState& state, uint64_t b) {
     const uint64_t rp = b - 0 + 1u;
     if (rp == 1u) return 0;
     const uint64_t engine_min = RespawnRngMinValue(state.kind);
@@ -184,7 +237,8 @@ ROCKETGPU_HD uint64_t LibcxxUniformInt(RespawnRngState& state, uint64_t b) {
     return u + 0;
 }
 
-ROCKETGPU_HD void ShuffleLikeLibcxx(int* order, RespawnRngState& state) {
+template <typename RngState>
+ROCKETGPU_HD void ShuffleLikeLibcxx(int* order, RngState& state) {
     int d = 5 - 1;
     for (int first = 0; first < 5 - 1; ++first, --d) {
         const int i = static_cast<int>(LibcxxUniformInt(state, static_cast<uint64_t>(d)));
@@ -194,7 +248,8 @@ ROCKETGPU_HD void ShuffleLikeLibcxx(int* order, RespawnRngState& state) {
     }
 }
 
-ROCKETGPU_HD void ShuffleLikePlatformStd(int* order, RespawnRngState& state) {
+template <typename RngState>
+ROCKETGPU_HD void ShuffleLikePlatformStd(int* order, RngState& state) {
     switch (state.kind) {
         case RespawnRngKind::Mt19937: ShuffleLikeMsvc(order, state); break;
         case RespawnRngKind::MinStd: ShuffleLikeLibcxx(order, state); break;

@@ -454,14 +454,13 @@ void Arena::DrainBumpEvents() {
 }
 
 void Arena::Step(int ticks_to_simulate) {
-    sim_->upload_controls(controls_.data(), controls_.size());
-
     if ((goal_callback_ || bump_callback_) && ticks_to_simulate > 1) {
         for (int i = 0; i < ticks_to_simulate; ++i) {
             Step(1);
         }
         return;
     }
+    sim_->upload_controls(controls_.data(), controls_.size());
     sim_->step(ticks_to_simulate);
     tick_count_ += static_cast<uint64_t>(ticks_to_simulate);
     dirty_ = true;

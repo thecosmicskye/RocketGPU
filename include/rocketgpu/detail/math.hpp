@@ -4,7 +4,7 @@
 
 constexpr unsigned int kRocketGpuUcrtSinfLimit = 0x4b800456u;
 constexpr unsigned int kRocketGpuUcrtCosfLimit = 0x4f490fdbu;
-ROCKETGPU_HD unsigned int RocketGpuUcrtAbsBits(float x) {
+ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE unsigned int RocketGpuUcrtAbsBits(float x) {
 #if defined(__CUDA_ARCH__)
     return __float_as_uint(x) & 0x7fffffffu;
 #else
@@ -37,9 +37,9 @@ ROCKETGPU_HD double RocketGpuUcrtReduce(double a, int* quadrant) {
 }
 ROCKETGPU_HD float RocketGpuUcrtSinf(float x) {
     const unsigned int ax = RocketGpuUcrtAbsBits(x);
+    if (ax < 0x39000000u) return x;
     const double d = static_cast<double>(x);
     if (ax <= 0x3f490fdbu) {
-        if (ax < 0x39000000u) return x;
         if (ax < 0x3c000000u) return static_cast<float>(fma(-((d * d) * d), 0x1.5555555555555p-3, d));
         return static_cast<float>(RocketGpuUcrtSinPoly(d));
     }
@@ -50,9 +50,9 @@ ROCKETGPU_HD float RocketGpuUcrtSinf(float x) {
 }
 ROCKETGPU_HD float RocketGpuUcrtCosf(float x) {
     const unsigned int ax = RocketGpuUcrtAbsBits(x);
+    if (ax < 0x39000000u) return 1.0f;
     const double d = static_cast<double>(x);
     if (ax <= 0x3f490fdbu) {
-        if (ax < 0x39000000u) return 1.0f;
         if (ax < 0x3c000000u) return static_cast<float>(fma(-(d * 0.5), d, 1.0));
         return static_cast<float>(RocketGpuUcrtCosPoly(d));
     }
@@ -546,12 +546,11 @@ __device__ __forceinline__ double RocketGpuGlibcReduceLarge(unsigned int xi, int
     *np = static_cast<int>(n);
     return static_cast<double>(static_cast<long long>(res0)) * 0x1.921FB54442D18p-62;
 }
-__device__ __forceinline__ float RocketGpuSinf(float y) {
+__device__ inline float RocketGpuSinf(float y) {
     if (RocketGpuUcrtAbsBits(y) < kRocketGpuUcrtSinfLimit) {
         return RocketGpuUcrtSinf(y);
     }
     const unsigned int top = RocketGpuGlibcAbstop12(y);
-    const double x = static_cast<double>(y);
     if (top < RocketGpuGlibcAbstop12(__int_as_float(0x7f800000))) {
         const unsigned int xi = __float_as_uint(y);
         int n = 0;
@@ -561,14 +560,13 @@ __device__ __forceinline__ float RocketGpuSinf(float y) {
         const RocketGpuGlibcSincosTable& p = RocketGpuGlibcSincosEntry((ns & 2) ? 1 : 0);
         return RocketGpuGlibcSinfPoly(xr * sgn, xr * xr, p, n);
     }
-    return static_cast<float>(sin(x));
+    return static_cast<float>(sin(y));
 }
-__device__ __forceinline__ float RocketGpuCosf(float y) {
+__device__ inline float RocketGpuCosf(float y) {
     if (RocketGpuUcrtAbsBits(y) < kRocketGpuUcrtCosfLimit) {
         return RocketGpuUcrtCosf(y);
     }
     const unsigned int top = RocketGpuGlibcAbstop12(y);
-    const double x = static_cast<double>(y);
     if (top < RocketGpuGlibcAbstop12(__int_as_float(0x7f800000))) {
         int n = 0;
         const double xr = RocketGpuGlibcReduceLarge(__float_as_uint(y), &n);
@@ -576,7 +574,7 @@ __device__ __forceinline__ float RocketGpuCosf(float y) {
         const RocketGpuGlibcSincosTable& p = RocketGpuGlibcSincosEntry((n & 2) ? 1 : 0);
         return RocketGpuGlibcSinfPoly(xr * sgn, xr * xr, p, n ^ 1);
     }
-    return static_cast<float>(cos(x));
+    return static_cast<float>(cos(y));
 }
 #else
 inline float RocketGpuSinf(float x) {
@@ -967,36 +965,40 @@ ROCKETGPU_HD Quat BulletQuatFromBasisColumns(const Vec3& fwd, const Vec3& right,
     const float m20 = fwd.z, m21 = right.z, m22 = up.z;
 
     const float trace = m00 + m11 + m22;
-    float raw[4];
+    float raw0, raw1, raw2, raw3;
     float x;
     if (trace > 0.0f) {
         x = trace + 1.0f;
-        raw[0] = m21 - m12;
-        raw[1] = m02 - m20;
-        raw[2] = m10 - m01;
-        raw[3] = x;
+        raw0 = m21 - m12;
+        raw1 = m02 - m20;
+        raw2 = m10 - m01;
+        raw3 = x;
     } else {
-        int i = m00 < m11 ? (m11 < m22 ? 2 : 1) : (m00 < m22 ? 2 : 0);
-        int j = (i + 1) % 3;
-        int k = (i + 2) % 3;
-        auto mel = [&](int r, int c) -> float {
-            const float rows[3][3] = {
-                {m00, m01, m02},
-                {m10, m11, m12},
-                {m20, m21, m22}
-            };
-            return rows[r][c];
-        };
-        x = mel(i, i) - mel(j, j) - mel(k, k) + 1.0f;
-        raw[3] = mel(k, j) - mel(j, k);
-        raw[j] = mel(j, i) + mel(i, j);
-        raw[k] = mel(k, i) + mel(i, k);
-        raw[i] = x;
+        const int i = m00 < m11 ? (m11 < m22 ? 2 : 1) : (m00 < m22 ? 2 : 0);
+        if (i == 0) {
+            x = m00 - m11 - m22 + 1.0f;
+            raw0 = x;
+            raw1 = m10 + m01;
+            raw2 = m20 + m02;
+            raw3 = m21 - m12;
+        } else if (i == 1) {
+            x = m11 - m22 - m00 + 1.0f;
+            raw0 = m01 + m10;
+            raw1 = x;
+            raw2 = m21 + m12;
+            raw3 = m02 - m20;
+        } else {
+            x = m22 - m00 - m11 + 1.0f;
+            raw0 = m02 + m20;
+            raw1 = m12 + m21;
+            raw2 = x;
+            raw3 = m10 - m01;
+        }
     }
 
     const float s = sqrtf(x);
     const float scale = 0.5f / s;
-    return Quat(raw[3] * scale, raw[0] * scale, raw[1] * scale, raw[2] * scale);
+    return Quat(raw3 * scale, raw0 * scale, raw1 * scale, raw2 * scale);
 }
 
 ROCKETGPU_HD Quat BulletQuatFromSetRotationBasis(const Quat& q) {

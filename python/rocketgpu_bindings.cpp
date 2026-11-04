@@ -614,11 +614,14 @@ PYBIND11_MODULE(rocketgpu_py, m) {
             stream.records = reinterpret_cast<rocketgpu::PhysicsEvent*>(records);
             stream.windows = reinterpret_cast<rocketgpu::PhysicsEventWindow*>(windows);
             stream.capacity_per_env = capacity;
-            stream.goal_only = goal_only;
-            stream.env_count = static_cast<uint32_t>(sim.env_count());
-            stream.cars_per_env = static_cast<uint32_t>(sim.car_capacity()/sim.env_count());
+            if (records || windows || capacity) {
+                stream.goal_only = goal_only;
+                stream.env_count = static_cast<uint32_t>(sim.env_count());
+                stream.cars_per_env = static_cast<uint32_t>(sim.car_capacity()/sim.env_count());
+            }
             sim.set_physics_event_stream(stream);
-        }, py::arg("records"), py::arg("windows"), py::arg("capacity"), py::arg("goal_only") = false)
+        }, py::arg("records"), py::arg("windows"), py::arg("capacity"), py::arg("goal_only") = false,
+           "Pass zeros to disable; wait for pending work and retire old CUDA graphs before freeing buffers.")
         .def("device_arrays",
              [](rocketgpu::BatchSim& sim) {
                  const rocketgpu::DeviceView v = sim.device_view();

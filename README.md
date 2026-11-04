@@ -73,18 +73,22 @@ For RocketSim v3's own conventions, use `get_state_v3` / `set_state_v3` (C++ `Ca
 
 ## Speed
 
-For CPU builds, `ROCKETGPU_CPU_THREADS` sets the worker count; set it before creating a batch. Unset or 0 uses the
-available hardware threads (on Linux, those in the creating thread's CPU affinity), at most one per 16 environments.
+For CPU builds, `ROCKETGPU_CPU_THREADS` sets the worker count, including the calling thread; set it before creating a
+batch. Unset or 0 uses the available hardware threads (on Linux, those in the creating thread's CPU affinity), at most
+one per 4 environments.
+
+CUDA builds use one GPU per process. CUDA graphs that capture RocketGPU steps share scratch with all other RocketGPU
+steps: serialize steps and graph replays, and recapture the graphs after creating another batch or changing a config.
 
 Arena-ticks/s. RocketGPU on an RTX 5090; RocketSim v3 0.3.5 on a Ryzen 7 9800X3D with 16 threads. Random controls,
 55% 1v1, 27% 2v2 and 18% 3v3 arenas:
 
 | Arenas | RocketGPU | RocketSim v3 |
 |---|---|---|
-| 1,024 | 3.59M | 4.10M |
-| 4,096 | 8.94M | 4.38M |
-| 8,192 | 12.68M | 4.72M |
-| 16,384 | 12.01M | 5.49M |
+| 1,024 | 3.98M | 4.10M |
+| 4,096 | 10.36M | 4.38M |
+| 8,192 | 13.55M | 4.72M |
+| 16,384 | 14.55M | 5.49M |
 
 ## Accuracy
 

@@ -155,6 +155,19 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool BulletPortCalcPenDepth(
     return false;
 }
 
+ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool BulletPortCalcPenDepthLocalScratch(
+    const bullet_port::btConvexShape& a,
+    const bullet_port::btTransform& transform_a,
+    const bullet_port::btConvexShape& b,
+    const bullet_port::btTransform& transform_b,
+    bullet_port::btVector3& io_v,
+    bullet_port::btVector3& out_witness_on_a,
+    bullet_port::btVector3& out_witness_on_b) {
+    bullet_port::btGjkEpaScratch scratch{};
+    return BulletPortCalcPenDepth(
+        a, transform_a, b, transform_b, io_v, out_witness_on_a, out_witness_on_b, &scratch);
+}
+
 ROCKETGPU_HD Vec3 CarBodyLocalPointBt(const CarState& car, const Vec3& point_world_bt) {
     bullet_port::btTransform body_world;
     Vec3 fwd;
@@ -190,76 +203,30 @@ ROCKETGPU_HD Vec3 CarBodyManifoldWorldPointBt(const CarState& car, const Vec3& p
     return CarBodyWorldPointBt(car, CarBodyLocalPointBt(car, point_world_bt));
 }
 
-ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
-    const CarState& car,
-    const CarConfig& cfg,
-    const ArenaMeshTriangle& tri,
-    Vec3& out_normal,
-    float& out_distance_bt,
-    Vec3* out_point_on_a_bt,
-    Vec3* out_point_on_b_bt,
-    bullet_port::btGjkEpaScratch* gjk_epa_scratch,
-    Vec3* io_cached_axis_bt,
-    float tri_origin_y_bt) {
-    constexpr float kUUToBT = 1.0f / 50.0f;
+ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool RunCarArenaTriangleGjkSimplex(
+    const bullet_port::btConvexShape& box_shape,
+    const bullet_port::btConvexShape& tri_shape,
+    const bullet_port::btTransform& local_trans_a,
+    const bullet_port::btTransform& local_trans_b,
+    Vec3& cached_axis,
+    Vec3& last_nonzero_axis,
+    int& degenerate_simplex,
+    float& squared_distance,
+    Vec3& point_on_a_bt,
+    Vec3& point_on_b_bt) {
     constexpr float kRelError2 = 1.0e-6f;
     constexpr int kGjkMaxIter = 1000;
-    constexpr float kBulletBoxMarginBt = 0.04f;
-
-    const float requested_margin_a_bt = kBulletBoxMarginBt;
-    const Vec3 raw_half_extent_bt = (BulletHitboxSize(cfg) * 0.5f) * kUUToBT;
-
-    const float requested_margin_b_bt = 0.0f;
-    const float maximum_distance_squared = 100.0f;
-    const bullet_port::btConvexShape box_shape =
-        MakeBulletPortBoxShape(raw_half_extent_bt, requested_margin_a_bt);
-    const bullet_port::btConvexShape tri_shape =
-        MakeBulletPortTriangleShape(tri.a, tri.b, tri.c, requested_margin_b_bt);
-    const float margin_a_bt = box_shape.getMarginNonVirtual();
-    const float margin_b_bt = tri_shape.getMarginNonVirtual();
-    const bullet_port::btTransform body_transform = MakeBulletPortBoxWorldTransform(car, car.pos_bt);
-    const bullet_port::btVector3 child_origin_bt = ToBulletPortVec3(cfg.hitbox_offset * kUUToBT);
-    bullet_port::btTransform box_transform = body_transform;
-    box_transform.setOrigin(box_transform * child_origin_bt);
-    const float margin_bt = margin_a_bt + margin_b_bt;
-
-    bullet_port::btTransform tri_transform;
-    if (tri_origin_y_bt != 0.0f) {
-        tri_transform.setOrigin(bullet_port::btVector3(0.0f, tri_origin_y_bt, 0.0f));
-    }
-    bullet_port::btTransform local_trans_a = box_transform;
-    bullet_port::btTransform local_trans_b = tri_transform;
-    const bullet_port::btVector3 position_offset =
-        (local_trans_a.getOrigin() + local_trans_b.getOrigin()) * 0.5f;
-    local_trans_a.getOrigin() -= position_offset;
-    local_trans_b.getOrigin() -= position_offset;
-    const Vec3 position_offset_bt = FromBulletPortVec3(position_offset);
-
+    constexpr float kMaxDistSq = 100.0f;
     GjkSimplexSolver simplex;
     simplex.reset();
-
-    Vec3 cached_axis = io_cached_axis_bt != nullptr ? *io_cached_axis_bt : Vec3(0.0f, 1.0f, 0.0f);
-    Vec3 last_nonzero_axis = cached_axis;
-
-    bool is_valid = false;
     bool check_simplex = false;
-    int degenerate_simplex = 0;
-    int last_used_method = -1;
     int cur_iter = 0;
-    float squared_distance = 1.0e30f;
-    float distance_bt = 0.0f;
-    bool used_penetration_depth_solver = false;
-    bool penetration_valid = false;
-    Vec3 normal_bt(0.0f, 0.0f, 0.0f);
-    Vec3 point_on_a_bt(0.0f, 0.0f, 0.0f);
-    Vec3 point_on_b_bt(0.0f, 0.0f, 0.0f);
-
     while (true) {
         const bullet_port::btVector3 cached_separating_axis = ToBulletPortVec3(cached_axis);
         const bullet_port::btVector3 separating_axis_in_a =
-            (-cached_separating_axis) * box_transform.getBasis();
+            (-cached_separating_axis) * local_trans_a.getBasis();
         const bullet_port::btVector3 separating_axis_in_b =
-            cached_separating_axis * tri_transform.getBasis();
+            cached_separating_axis * local_trans_b.getBasis();
         const bullet_port::btVector3 p_in_a =
             box_shape.localGetSupportVertexWithoutMarginNonVirtual(separating_axis_in_a);
         const bullet_port::btVector3 q_in_b =
@@ -274,18 +241,16 @@ ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
         const float f0 = squared_distance - delta;
         const float f1 = squared_distance * kRelError2;
 
-        if ((delta > 0.0f) && (delta * delta > squared_distance * maximum_distance_squared)) {
+        if ((delta > 0.0f) && (delta * delta > squared_distance * kMaxDistSq)) {
             degenerate_simplex = 10;
             check_simplex = true;
             break;
         }
-
         if (in_simplex) {
             degenerate_simplex = 1;
             check_simplex = true;
             break;
         }
-
         if (f0 <= f1) {
             degenerate_simplex = f0 <= 0.0f ? 2 : 11;
             check_simplex = true;
@@ -300,11 +265,9 @@ ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
             check_simplex = true;
             break;
         }
-
         if (LengthSq(new_cached_axis) >= kRelError2) {
             last_nonzero_axis = Normalize(new_cached_axis, last_nonzero_axis);
         }
-
         if (LengthSq(new_cached_axis) < kRelError2) {
             cached_axis = new_cached_axis;
             degenerate_simplex = 6;
@@ -321,20 +284,81 @@ ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
         }
 
         cached_axis = new_cached_axis;
-
         if (cur_iter++ > kGjkMaxIter) {
             break;
         }
-
         if (simplex.full_simplex()) {
             degenerate_simplex = 13;
             break;
         }
     }
+    if (check_simplex) {
+        simplex.compute_points(point_on_a_bt, point_on_b_bt);
+    }
+    return check_simplex;
+}
+
+ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
+    const CarState& car,
+    const CarConfig& cfg,
+    const ArenaMeshTriangle& tri,
+    Vec3& out_normal,
+    float& out_distance_bt,
+    Vec3* out_point_on_a_bt,
+    Vec3* out_point_on_b_bt,
+    bullet_port::btGjkEpaScratch* gjk_epa_scratch,
+    Vec3* io_cached_axis_bt,
+    float tri_origin_y_bt) {
+    constexpr float kUUToBT = 1.0f / 50.0f;
+    constexpr float kRelError2 = 1.0e-6f;
+    constexpr float kBulletBoxMarginBt = 0.04f;
+
+    const float requested_margin_a_bt = kBulletBoxMarginBt;
+    const Vec3 raw_half_extent_bt = (BulletHitboxSize(cfg) * 0.5f) * kUUToBT;
+
+    const float requested_margin_b_bt = 0.0f;
+    const float maximum_distance_squared = 100.0f;
+    const bullet_port::btConvexShape box_shape =
+        MakeBulletPortBoxShape(raw_half_extent_bt, requested_margin_a_bt);
+    const bullet_port::btConvexShape tri_shape =
+        MakeBulletPortTriangleShape(tri.a, tri.b, tri.c, requested_margin_b_bt);
+    const float margin_a_bt = box_shape.getMarginNonVirtual();
+    const float margin_b_bt = tri_shape.getMarginNonVirtual();
+    const bullet_port::btVector3 child_origin_bt = ToBulletPortVec3(cfg.hitbox_offset * kUUToBT);
+    bullet_port::btTransform local_trans_a = MakeBulletPortBoxWorldTransform(car, car.pos_bt);
+    local_trans_a.setOrigin(local_trans_a * child_origin_bt);
+    const float margin_bt = margin_a_bt + margin_b_bt;
+
+    bullet_port::btTransform local_trans_b;
+    if (tri_origin_y_bt != 0.0f) {
+        local_trans_b.setOrigin(bullet_port::btVector3(0.0f, tri_origin_y_bt, 0.0f));
+    }
+    const bullet_port::btVector3 position_offset =
+        (local_trans_a.getOrigin() + local_trans_b.getOrigin()) * 0.5f;
+    local_trans_a.getOrigin() -= position_offset;
+    local_trans_b.getOrigin() -= position_offset;
+    const Vec3 position_offset_bt = FromBulletPortVec3(position_offset);
+
+    Vec3 cached_axis = io_cached_axis_bt != nullptr ? *io_cached_axis_bt : Vec3(0.0f, 1.0f, 0.0f);
+    Vec3 last_nonzero_axis = cached_axis;
+
+    bool is_valid = false;
+    int degenerate_simplex = 0;
+    int last_used_method = -1;
+    float squared_distance = 1.0e30f;
+    float distance_bt = 0.0f;
+    bool used_penetration_depth_solver = false;
+    bool penetration_valid = false;
+    Vec3 normal_bt(0.0f, 0.0f, 0.0f);
+    Vec3 point_on_a_bt(0.0f, 0.0f, 0.0f);
+    Vec3 point_on_b_bt(0.0f, 0.0f, 0.0f);
+
+    const bool check_simplex = RunCarArenaTriangleGjkSimplex(
+        box_shape, tri_shape, local_trans_a, local_trans_b,
+        cached_axis, last_nonzero_axis, degenerate_simplex, squared_distance, point_on_a_bt, point_on_b_bt);
 
     Vec3 gjk_normal_hint = last_nonzero_axis;
     if (check_simplex) {
-        simplex.compute_points(point_on_a_bt, point_on_b_bt);
         if (LengthSq(cached_axis) > kRelError2) {
             gjk_normal_hint = Normalize(cached_axis, gjk_normal_hint);
         }
@@ -511,71 +535,29 @@ ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
 
 ROCKETGPU_HD float BallCarContactBreakingThresholdBT(const CarConfig& cfg, float ball_radius);
 
-ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
-    const BallState& ball,
-    const CarState& car,
-    const CarConfig& cfg,
-    float ball_radius,
-    Vec3& out_normal,
-    float& out_penetration,
-    Vec3& out_rel_ball_contact,
-    Vec3& out_rel_car_contact,
-    bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr,
-    bool* out_exact = nullptr,
-    Vec3* out_bt_rel_ball_contact_for_solver = nullptr,
-    Vec3* out_bt_rel_car_contact_for_solver = nullptr,
-    Vec3* out_ball_local_bt = nullptr,
-    Vec3* out_car_local_bt = nullptr) {
-    constexpr float kUUToBT = 1.0f / 50.0f;
-    constexpr float kBTToUU = 50.0f;
+ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool RunBallCarGjkSimplex(
+    const bullet_port::btConvexShape& box_shape,
+    const bullet_port::btSphereShape& sphere_shape,
+    const bullet_port::btTransform& local_trans_a,
+    const bullet_port::btTransform& local_trans_b,
+    float maximum_distance_squared,
+    Vec3& cached_axis,
+    int& degenerate_simplex,
+    float& squared_distance,
+    Vec3& point_on_a_bt,
+    Vec3& point_on_b_bt) {
     constexpr float kRelError2 = 1.0e-6f;
     constexpr int kGjkMaxIter = 1000;
-    constexpr float kBulletBoxMarginBt = 0.04f;
-
-    const Vec3 raw_half_extent_bt = (BulletHitboxSize(cfg) * 0.5f) * kUUToBT;
-    const bullet_port::btConvexShape box_shape =
-        MakeBulletPortBoxShape(raw_half_extent_bt, kBulletBoxMarginBt);
-    const bullet_port::btSphereShape sphere_shape(ball_radius * kUUToBT);
-    const float margin_a_bt = box_shape.getMarginNonVirtual();
-    const float margin_b_bt = sphere_shape.getMarginNonVirtual();
-
-    const float contact_breaking_threshold_bt = BallCarContactBreakingThresholdBT(cfg, ball_radius);
-    float maximum_distance_squared = margin_a_bt + margin_b_bt + contact_breaking_threshold_bt;
-    maximum_distance_squared *= maximum_distance_squared;
-    const bullet_port::btTransform car_transform =
-        MakeBulletPortBoxWorldTransform(car, car.pos_bt);
-    bullet_port::btTransform box_transform = car_transform;
-
-    box_transform.setOrigin(car_transform(ToBulletPortVec3(cfg.hitbox_offset * kUUToBT)));
-    const bullet_port::btTransform sphere_transform =
-        MakeBulletPortBallWorldTransform(ball, ball.pos_bt);
-    bullet_port::btTransform local_trans_a = box_transform;
-    bullet_port::btTransform local_trans_b = sphere_transform;
-    const bullet_port::btVector3 position_offset =
-        (local_trans_a.getOrigin() + local_trans_b.getOrigin()) * 0.5f;
-    local_trans_a.getOrigin() -= position_offset;
-    local_trans_b.getOrigin() -= position_offset;
-    const Vec3 position_offset_bt = FromBulletPortVec3(position_offset);
-
     GjkSimplexSolver simplex;
     simplex.reset();
-
-    Vec3 cached_axis(0.0f, 1.0f, 0.0f);
-    float squared_distance = 1.0e30f;
     bool check_simplex = false;
-    bool is_valid = false;
-    int degenerate_simplex = 0;
-    int last_used_method = -1;
     int cur_iter = 0;
-    float distance_bt = 0.0f;
-    Vec3 normal_bt(0.0f, 0.0f, 0.0f);
-
     while (true) {
         const bullet_port::btVector3 cached_separating_axis = ToBulletPortVec3(cached_axis);
         const bullet_port::btVector3 separating_axis_in_a =
-            (-cached_separating_axis) * box_transform.getBasis();
+            (-cached_separating_axis) * local_trans_a.getBasis();
         const bullet_port::btVector3 separating_axis_in_b =
-            cached_separating_axis * sphere_transform.getBasis();
+            cached_separating_axis * local_trans_b.getBasis();
         const bullet_port::btVector3 p_in_a =
             box_shape.localGetSupportVertexWithoutMarginNonVirtual(separating_axis_in_a);
         const bullet_port::btVector3 q_in_b =
@@ -590,13 +572,11 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
             check_simplex = true;
             break;
         }
-
         if (simplex.in_simplex(w)) {
             degenerate_simplex = 1;
             check_simplex = true;
             break;
         }
-
         const float f0 = squared_distance - delta;
         const float f1 = squared_distance * kRelError2;
         if (f0 <= f1) {
@@ -612,7 +592,6 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
             check_simplex = true;
             break;
         }
-
         if (LengthSq(new_cached_axis) < kRelError2) {
             cached_axis = new_cached_axis;
             degenerate_simplex = 6;
@@ -637,14 +616,72 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
             break;
         }
     }
-
     if (!check_simplex) {
         return false;
     }
+    simplex.compute_points(point_on_a_bt, point_on_b_bt);
+    return true;
+}
 
+ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool ComputeBallCarContactGeometryGjk(
+    const BallState& ball,
+    const CarState& car,
+    const CarConfig& cfg,
+    float ball_radius,
+    Vec3& out_normal,
+    float& out_penetration,
+    Vec3& out_rel_ball_contact,
+    Vec3& out_rel_car_contact,
+    bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr,
+    bool* out_exact = nullptr,
+    Vec3* out_bt_rel_ball_contact_for_solver = nullptr,
+    Vec3* out_bt_rel_car_contact_for_solver = nullptr,
+    Vec3* out_ball_local_bt = nullptr,
+    Vec3* out_car_local_bt = nullptr,
+    float precomputed_threshold_bt = -1.0f) {
+    constexpr float kUUToBT = 1.0f / 50.0f;
+    constexpr float kBTToUU = 50.0f;
+    constexpr float kBulletBoxMarginBt = 0.04f;
+
+    const Vec3 raw_half_extent_bt = (BulletHitboxSize(cfg) * 0.5f) * kUUToBT;
+    const bullet_port::btConvexShape box_shape =
+        MakeBulletPortBoxShape(raw_half_extent_bt, kBulletBoxMarginBt);
+    const bullet_port::btSphereShape sphere_shape(ball_radius * kUUToBT);
+    const float margin_a_bt = box_shape.getMarginNonVirtual();
+    const float margin_b_bt = sphere_shape.getMarginNonVirtual();
+
+    const float contact_breaking_threshold_bt =
+        precomputed_threshold_bt >= 0.0f ? precomputed_threshold_bt
+                                         : BallCarContactBreakingThresholdBT(cfg, ball_radius);
+    float maximum_distance_squared = margin_a_bt + margin_b_bt + contact_breaking_threshold_bt;
+    maximum_distance_squared *= maximum_distance_squared;
+    bullet_port::btTransform local_trans_a =
+        MakeBulletPortBoxWorldTransform(car, car.pos_bt);
+    local_trans_a.setOrigin(local_trans_a(ToBulletPortVec3(cfg.hitbox_offset * kUUToBT)));
+    bullet_port::btTransform local_trans_b =
+        MakeBulletPortBallWorldTransform(ball, ball.pos_bt);
+    const bullet_port::btVector3 position_offset =
+        (local_trans_a.getOrigin() + local_trans_b.getOrigin()) * 0.5f;
+    local_trans_a.getOrigin() -= position_offset;
+    local_trans_b.getOrigin() -= position_offset;
+    const Vec3 position_offset_bt = FromBulletPortVec3(position_offset);
+
+    Vec3 cached_axis(0.0f, 1.0f, 0.0f);
+    float squared_distance = 1.0e30f;
+    bool is_valid = false;
+    int degenerate_simplex = 0;
+    int last_used_method = -1;
+    float distance_bt = 0.0f;
+    Vec3 normal_bt(0.0f, 0.0f, 0.0f);
     Vec3 point_on_a_bt(0.0f, 0.0f, 0.0f);
     Vec3 point_on_b_bt(0.0f, 0.0f, 0.0f);
-    simplex.compute_points(point_on_a_bt, point_on_b_bt);
+
+    if (!RunBallCarGjkSimplex(
+            box_shape, sphere_shape, local_trans_a, local_trans_b,
+            maximum_distance_squared, cached_axis, degenerate_simplex, squared_distance,
+            point_on_a_bt, point_on_b_bt)) {
+        return false;
+    }
 
     const float len_sqr = LengthSq(cached_axis);
     if (len_sqr <= 0.0001f) {
@@ -750,14 +787,20 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometryGjk(
 
     out_normal = -bullet_normal_bt;
     out_penetration = -distance_bt * kBTToUU;
-    const Vec3 car_origin_bt = FromBulletPortVec3(car_transform.getOrigin());
-    const Vec3 ball_origin_bt = FromBulletPortVec3(sphere_transform.getOrigin());
+    const Vec3 car_origin_bt = car.pos_bt;
+    const Vec3 ball_origin_bt = ball.pos_bt;
+    const bullet_port::btVector3 car_origin_vec = ToBulletPortVec3(car_origin_bt);
+    const bullet_port::btVector3 ball_origin_vec = ToBulletPortVec3(ball_origin_bt);
+    const bullet_port::btMatrix3x3& car_basis = local_trans_a.getBasis();
+    const bullet_port::btMatrix3x3& ball_basis = local_trans_b.getBasis();
     const bullet_port::btVector3 point_on_car_local_bt =
-        (ToBulletPortVec3(manifold_point_on_car_bt) - car_transform.getOrigin()) * car_transform.getBasis();
+        (ToBulletPortVec3(manifold_point_on_car_bt) - car_origin_vec) * car_basis;
     const bullet_port::btVector3 point_on_ball_local_bt =
-        (ToBulletPortVec3(point_on_ball_bt) - sphere_transform.getOrigin()) * sphere_transform.getBasis();
-    const Vec3 refreshed_point_on_car_bt = FromBulletPortVec3(car_transform(point_on_car_local_bt));
-    const Vec3 refreshed_point_on_ball_bt = FromBulletPortVec3(sphere_transform(point_on_ball_local_bt));
+        (ToBulletPortVec3(point_on_ball_bt) - ball_origin_vec) * ball_basis;
+    const Vec3 refreshed_point_on_car_bt =
+        FromBulletPortVec3(point_on_car_local_bt.dot3(car_basis[0], car_basis[1], car_basis[2]) + car_origin_vec);
+    const Vec3 refreshed_point_on_ball_bt =
+        FromBulletPortVec3(point_on_ball_local_bt.dot3(ball_basis[0], ball_basis[1], ball_basis[2]) + ball_origin_vec);
     const Vec3 bt_rel_ball_contact_for_solver = refreshed_point_on_ball_bt - ball_origin_bt;
     out_rel_ball_contact = bt_rel_ball_contact_for_solver * kBTToUU;
     out_rel_car_contact = (refreshed_point_on_car_bt - car_origin_bt) * kBTToUU;
@@ -1069,7 +1112,8 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometry(
     Vec3* out_bt_rel_ball_contact_for_solver = nullptr,
     Vec3* out_bt_rel_car_contact_for_solver = nullptr,
     Vec3* out_ball_local_bt = nullptr,
-    Vec3* out_car_local_bt = nullptr) {
+    Vec3* out_car_local_bt = nullptr,
+    float precomputed_threshold_bt = -1.0f) {
     if (ComputeBallCarContactGeometryGjk(
             ball,
             car,
@@ -1084,7 +1128,8 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometry(
             out_bt_rel_ball_contact_for_solver,
             out_bt_rel_car_contact_for_solver,
             out_ball_local_bt,
-            out_car_local_bt)) {
+            out_car_local_bt,
+            precomputed_threshold_bt)) {
         return true;
     }
 
@@ -1093,7 +1138,7 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometry(
         car,
         cfg,
         ball_radius,
-        0.0f,
+        Max(0.0f, precomputed_threshold_bt),
         out_normal,
         out_penetration,
         out_rel_ball_contact,
@@ -1242,17 +1287,10 @@ ROCKETGPU_HD void RecordBallCarCollisionInfoIfOverlapping(
     float penetration = 0.0f;
     Vec3 rel_ball_contact(0.0f, 0.0f, 0.0f);
     Vec3 rel_car_contact(0.0f, 0.0f, 0.0f);
-    if (!ComputeBallCarContactGeometry(ball, car, cfg, mutator.ball_radius, normal, penetration, rel_ball_contact, rel_car_contact, gjk_epa_scratch) &&
-        !ComputeBallCarContactGeometrySphereBox(
-            ball,
-            car,
-            cfg,
-            mutator.ball_radius,
-            BallCarContactBreakingThresholdBT(cfg, mutator.ball_radius),
-            normal,
-            penetration,
-            rel_ball_contact,
-            rel_car_contact)) {
+    const float threshold_bt = BallCarContactBreakingThresholdBT(cfg, mutator.ball_radius);
+    if (!ComputeBallCarContactGeometry(
+            ball, car, cfg, mutator.ball_radius, normal, penetration, rel_ball_contact, rel_car_contact,
+            gjk_epa_scratch, nullptr, nullptr, nullptr, nullptr, nullptr, threshold_bt)) {
         return;
     }
 
@@ -1260,7 +1298,7 @@ ROCKETGPU_HD void RecordBallCarCollisionInfoIfOverlapping(
                      car_team, cal_car_start_vel, cal_ball_start_vel);
 }
 
-ROCKETGPU_HD void CommitBallCarHitFromManifold(
+ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE void CommitBallCarHitFromManifold(
     const BallState& ball,
     const CarState& car,
     uint32_t car_id,
@@ -1297,7 +1335,7 @@ struct BallCarContactOverride {
     bool has_distance_bt = false;
 };
 
-ROCKETGPU_HD void AppendBallCarContactRows(
+ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE void AppendBallCarContactRows(
     BallState& ball,
     CarState& car,
     const CarConfig& cfg,
@@ -1344,34 +1382,28 @@ ROCKETGPU_HD void AppendBallCarContactRows(
         penetration = contact_override->penetration_uu;
         rel_ball_contact = contact_override->bt_rel_ball * 50.0f;
         rel_car_contact = contact_override->bt_rel_car * 50.0f;
-    }
-    const bool has_contact = contact_override != nullptr ||
-        ComputeBallCarContactGeometry(
-            ball,
-            car,
-            cfg,
-            mutator.ball_radius,
-            normal,
-            penetration,
-            rel_ball_contact,
-            rel_car_contact,
-            gjk_epa_scratch,
-            &exact_contact,
-            &bt_rel_ball_contact_for_solver_exact,
-            &bt_rel_car_contact_for_solver_exact) ||
-        ComputeBallCarContactGeometrySphereBox(
-            ball,
-            car,
-            cfg,
-            mutator.ball_radius,
-            BallCarContactBreakingThresholdBT(cfg, mutator.ball_radius),
-            normal,
-            penetration,
-            rel_ball_contact,
-            rel_car_contact);
-
-    if (!has_contact) {
-        return;
+    } else {
+        const float threshold_bt = BallCarContactBreakingThresholdBT(cfg, mutator.ball_radius);
+        const bool has_contact =
+            ComputeBallCarContactGeometry(
+                ball,
+                car,
+                cfg,
+                mutator.ball_radius,
+                normal,
+                penetration,
+                rel_ball_contact,
+                rel_car_contact,
+                gjk_epa_scratch,
+                &exact_contact,
+                &bt_rel_ball_contact_for_solver_exact,
+                &bt_rel_car_contact_for_solver_exact,
+                nullptr,
+                nullptr,
+                threshold_bt);
+        if (!has_contact) {
+            return;
+        }
     }
 
     constexpr float kBtPerUuBallCar = 1.0f / 50.0f;
@@ -1381,29 +1413,20 @@ ROCKETGPU_HD void AppendBallCarContactRows(
             : UuVecToBtDiv(rel_ball_contact);
 
     const Vec3 bc_car_pos_bt = car.pos_bt;
-    const Vec3 bc_direct_contact_car_world_bt =
-        bc_car_pos_bt + rel_car_contact * kBtPerUuBallCar;
-    const Vec3 bc_car_local_point_bt =
-        CarBodyLocalPointBt(car, bc_direct_contact_car_world_bt);
     const Vec3 bt_rel_car_contact_for_solver = contact_override ? contact_override->bt_rel_car :
         exact_contact
             ? bt_rel_car_contact_for_solver_exact
-            : (CarBodyWorldPointBt(car, bc_car_local_point_bt) - bc_car_pos_bt);
+            : (CarBodyWorldPointBt(
+                   car, CarBodyLocalPointBt(car, bc_car_pos_bt + rel_car_contact * kBtPerUuBallCar)) -
+               bc_car_pos_bt);
 
     const float bt_split_penetration_for_solver = (contact_override && contact_override->has_distance_bt)
         ? -contact_override->distance_bt
         : Dot((bc_car_pos_bt + bt_rel_car_contact_for_solver) - (ball.pos_bt + bt_rel_ball_contact_for_solver), normal);
 
-#if !defined(__CUDA_ARCH__)
-    constexpr float kBtPerUuTrace = kBtPerUuBallCar;
-    const Vec3 car_pos_bt = car.pos_bt;
-    const bullet_port::btVector3 direct_rel_car_contact_bt =
-        ToBulletPortVec3(rel_car_contact * kBtPerUuTrace);
-    const bullet_port::btVector3 direct_contact_point_car_world_bt =
-        ToBulletPortVec3(car_pos_bt) + direct_rel_car_contact_bt;
-    const Vec3 car_local_point_bt =
-        CarBodyLocalPointBt(car, FromBulletPortVec3(direct_contact_point_car_world_bt));
-#endif
+    Vec3 car_inv_bt_rows[3];
+    BuildInvInertiaTensorWorldBt(
+        car, cfg, mutator.car_mass, car_inv_bt_rows[0], car_inv_bt_rows[1], car_inv_bt_rows[2]);
 
     AppendBallCarSplitRow(
         split_rows,
@@ -1420,7 +1443,8 @@ ROCKETGPU_HD void AppendBallCarContactRows(
         &bt_rel_ball_contact_for_solver,
         &bt_rel_car_contact_for_solver,
         &bt_split_penetration_for_solver,
-        &ball);
+        &ball,
+        car_inv_bt_rows);
 
     const Vec3 restitution_ball_linear = ball.vel;
     const Vec3 restitution_car_linear = car.vel;
@@ -1450,10 +1474,10 @@ ROCKETGPU_HD void AppendBallCarContactRows(
         Cross(rel_ball_contact, normal));
     const Vec3 bt_ball_normal_component = ApplyInverseBallInertiaWorldBtMutator(ball, mutator,
         Cross(bt_rel_ball_contact_for_solver, normal));
-    const Vec3 bt_car_normal_component = ApplyInverseBodyInertiaWorldBt(
-        car,
-        cfg,
-        mutator.car_mass,
+    const Vec3 bt_car_normal_component = Mul3x3Vec(
+        car_inv_bt_rows[0],
+        car_inv_bt_rows[1],
+        car_inv_bt_rows[2],
         Cross(bt_rel_car_contact_for_tangent, -normal));
     const Vec3 car_normal_component = bt_car_normal_component * kBtPerUuTangent;
 
@@ -1473,10 +1497,10 @@ ROCKETGPU_HD void AppendBallCarContactRows(
         Cross(rel_ball_contact, tangent));
     const Vec3 bt_ball_tangent_component = ApplyInverseBallInertiaWorldBtMutator(ball, mutator,
         Cross(bt_rel_ball_contact_for_solver, tangent));
-    const Vec3 bt_car_tangent_component = ApplyInverseBodyInertiaWorldBt(
-        car,
-        cfg,
-        mutator.car_mass,
+    const Vec3 bt_car_tangent_component = Mul3x3Vec(
+        car_inv_bt_rows[0],
+        car_inv_bt_rows[1],
+        car_inv_bt_rows[2],
         Cross(bt_rel_car_contact_for_tangent, -tangent));
     const Vec3 car_tangent_component = bt_car_tangent_component * kBtPerUuTangent;
     AppendBallVelocityContactRows(
@@ -1668,7 +1692,7 @@ ROCKETGPU_HD bool BallCarRetainedPairOverlaps(
              cmin.z > bmax.z || cmax.z < bmin.z);
 }
 
-ROCKETGPU_HD void AppendBallCarContactRowsRetained(
+ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE void AppendBallCarContactRowsRetained(
     BallState& ball,
     CarState& car,
     const CarConfig& cfg,
@@ -1705,10 +1729,7 @@ ROCKETGPU_HD void AppendBallCarContactRowsRetained(
         ComputeBallCarContactGeometry(
             ball, car, cfg, mutator.ball_radius, normal, penetration, rel_ball_contact, rel_car_contact,
             gjk_epa_scratch, &exact_contact, &bt_rel_ball_exact, &bt_rel_car_exact, &ball_local_exact,
-            &car_local_exact) ||
-        ComputeBallCarContactGeometrySphereBox(
-            ball, car, cfg, mutator.ball_radius, BallCarContactBreakingThresholdBT(cfg, mutator.ball_radius),
-            normal, penetration, rel_ball_contact, rel_car_contact);
+            &car_local_exact, threshold_bt);
 
     RefreshBallCarRetainedManifold(retained, ball, car, threshold_bt);
     if (has_fresh) {
@@ -2364,6 +2385,11 @@ ROCKETGPU_HD bool ComputeObbContactGameOrder(
     return true;
 }
 
+ROCKETGPU_HD bool InForwardConePose(
+    const Vec3& a_pos, const Quat& a_rot, const CarConfig& a_cfg,
+    const Vec3& v_pos, const Quat& v_rot, const CarConfig& v_cfg,
+    bool reverse, float max_yaw_deg);
+
 ROCKETGPU_HD bool InForwardCone(
     const CarState& a, const CarConfig& a_cfg, const CarState& v, const CarConfig& v_cfg, bool reverse, float max_yaw_deg);
 
@@ -2450,39 +2476,30 @@ ROCKETGPU_HD Quat GameUeQuatSlerp(const Quat& q1, const Quat& q2, float t) {
                 scale1 * q2.z + q1.z * scale0);
 }
 
-ROCKETGPU_HD bool CarToiClosestPoints(
-    const bullet_port::btConvexShape& shape_a, const bullet_port::btTransform& trans_a,
-    const bullet_port::btConvexShape& shape_b, const bullet_port::btTransform& trans_b,
-    float& out_distance, Vec3& out_normal, Vec3& out_point) {
+ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool RunCarToiGjkSimplex(
+    const bullet_port::btConvexShape& shape_a,
+    const bullet_port::btTransform& local_trans_a,
+    const bullet_port::btConvexShape& shape_b,
+    const bullet_port::btTransform& local_trans_b,
+    Vec3& cached_axis,
+    float& squared_distance,
+    int& degenerate_simplex,
+    Vec3& point_on_a,
+    Vec3& point_on_b) {
     constexpr float kRelError2 = 1.0e-6f;
     constexpr int kGjkMaxIter = 1000;
     constexpr float kMaximumDistanceSquared = 1.0e18f;
-    const float margin_a = shape_a.getMarginNonVirtual();
-    const float margin_b = shape_b.getMarginNonVirtual();
-
-    bullet_port::btTransform local_trans_a = trans_a;
-    bullet_port::btTransform local_trans_b = trans_b;
-    const bullet_port::btVector3 position_offset = (local_trans_a.getOrigin() + local_trans_b.getOrigin()) * 0.5f;
-    local_trans_a.getOrigin() -= position_offset;
-    local_trans_b.getOrigin() -= position_offset;
-
     GjkSimplexSolver simplex;
     simplex.reset();
-    Vec3 cached_axis(0.0f, 1.0f, 0.0f);
-    float squared_distance = 1.0e30f;
     bool check_simplex = false;
-    bool is_valid = false;
-    int degenerate_simplex = 0;
     int cur_iter = 0;
-    float distance = 0.0f;
-    Vec3 normal(0.0f, 0.0f, 0.0f);
 
     while (true) {
         const bullet_port::btVector3 axis_bt = ToBulletPortVec3(cached_axis);
         const bullet_port::btVector3 p_in_a =
-            shape_a.localGetSupportVertexWithoutMarginNonVirtual((-axis_bt) * trans_a.getBasis());
+            shape_a.localGetSupportVertexWithoutMarginNonVirtual((-axis_bt) * local_trans_a.getBasis());
         const bullet_port::btVector3 q_in_b =
-            shape_b.localGetSupportVertexWithoutMarginNonVirtual(axis_bt * trans_b.getBasis());
+            shape_b.localGetSupportVertexWithoutMarginNonVirtual(axis_bt * local_trans_b.getBasis());
         const Vec3 p_world = FromBulletPortVec3(local_trans_a(p_in_a));
         const Vec3 q_world = FromBulletPortVec3(local_trans_b(q_in_b));
         const Vec3 w = p_world - q_world;
@@ -2536,10 +2553,40 @@ ROCKETGPU_HD bool CarToiClosestPoints(
     if (!check_simplex) {
         return false;
     }
+    simplex.compute_points(point_on_a, point_on_b);
+    return true;
+}
 
+template <bool kRequireScratch = false>
+ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool CarToiClosestPoints(
+    const bullet_port::btConvexShape& shape_a, const CarToiTransform& ca,
+    const bullet_port::btConvexShape& shape_b, const CarToiTransform& cb,
+    float& out_distance, Vec3& out_normal, Vec3& out_point,
+    bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr) {
+    constexpr float kMaximumDistanceSquared = 1.0e18f;
+    const float margin_a = shape_a.getMarginNonVirtual();
+    const float margin_b = shape_b.getMarginNonVirtual();
+
+    bullet_port::btTransform local_trans_a = CarToiBt(ca);
+    bullet_port::btTransform local_trans_b = CarToiBt(cb);
+    const bullet_port::btVector3 position_offset = (local_trans_a.getOrigin() + local_trans_b.getOrigin()) * 0.5f;
+    local_trans_a.getOrigin() -= position_offset;
+    local_trans_b.getOrigin() -= position_offset;
+
+    Vec3 cached_axis(0.0f, 1.0f, 0.0f);
+    float squared_distance = 1.0e30f;
+    bool is_valid = false;
+    int degenerate_simplex = 0;
+    float distance = 0.0f;
+    Vec3 normal(0.0f, 0.0f, 0.0f);
     Vec3 point_on_a(0.0f, 0.0f, 0.0f);
     Vec3 point_on_b(0.0f, 0.0f, 0.0f);
-    simplex.compute_points(point_on_a, point_on_b);
+
+    if (!RunCarToiGjkSimplex(
+            shape_a, local_trans_a, shape_b, local_trans_b,
+            cached_axis, squared_distance, degenerate_simplex, point_on_a, point_on_b)) {
+        return false;
+    }
     const float len_sqr = LengthSq(cached_axis);
     if (len_sqr <= 0.0001f) {
         degenerate_simplex = 5;
@@ -2560,8 +2607,15 @@ ROCKETGPU_HD bool CarToiClosestPoints(
         bullet_port::btVector3 sep_axis(0.0f, 0.0f, 0.0f);
         bullet_port::btVector3 tmp_a(0.0f, 0.0f, 0.0f);
         bullet_port::btVector3 tmp_b(0.0f, 0.0f, 0.0f);
-        bullet_port::btGjkEpaScratch scratch = {};
-        if (BulletPortCalcPenDepth(shape_a, local_trans_a, shape_b, local_trans_b, sep_axis, tmp_a, tmp_b, &scratch)) {
+        bool pen_ok = false;
+        if constexpr (kRequireScratch) {
+            pen_ok = BulletPortCalcPenDepth(shape_a, local_trans_a, shape_b, local_trans_b, sep_axis, tmp_a, tmp_b, gjk_epa_scratch);
+        } else {
+            pen_ok = gjk_epa_scratch != nullptr
+                ? BulletPortCalcPenDepth(shape_a, local_trans_a, shape_b, local_trans_b, sep_axis, tmp_a, tmp_b, gjk_epa_scratch)
+                : BulletPortCalcPenDepthLocalScratch(shape_a, local_trans_a, shape_b, local_trans_b, sep_axis, tmp_a, tmp_b);
+        }
+        if (pen_ok) {
             bullet_port::btVector3 tmp_normal = tmp_b - tmp_a;
             float len_sqr_pen = tmp_normal.length2();
             if (len_sqr_pen <= 1.1920929e-7f * 1.1920929e-7f) {
@@ -2599,8 +2653,11 @@ ROCKETGPU_HD bool CarToiClosestPoints(
     return distance < 1.0e18f;
 }
 
-ROCKETGPU_HD void CarCarTimeOfImpact(CarState& a, const CarConfig& a_cfg, const Vec3& a_vel,
-                                   CarState& v, const CarConfig& v_cfg, const Vec3& v_vel, float tick_dt) {
+template <bool kRequireScratch = false>
+ROCKETGPU_HD void CarCarTimeOfImpact(const CarState& a, const CarConfig& a_cfg, const Vec3& a_vel,
+                                   const CarState& v, const CarConfig& v_cfg, const Vec3& v_vel, float tick_dt,
+                                   Vec3& pos_a, Quat& rot_a, Vec3& pos_v, Quat& rot_v,
+                                   bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr) {
     constexpr float kAllowedPenetration = 0.04f;
     constexpr float kEpsilon = 1.1920929e-7f;
     constexpr float kUUToBT = 1.0f / 50.0f;
@@ -2612,24 +2669,28 @@ ROCKETGPU_HD void CarCarTimeOfImpact(CarState& a, const CarConfig& a_cfg, const 
         from = CarToiIntegrate(t0, Vec3(-lin.x, -lin.y, -lin.z), Vec3(-s.ang_vel.x, -s.ang_vel.y, -s.ang_vel.z), tick_dt);
         to = CarToiIntegrate(t0, lin, s.ang_vel, tick_dt);
     };
-    CarToiTransform from_a, to_a, from_b, to_b;
-    sweep(a, a_vel, from_a, to_a);
-    sweep(v, v_vel, from_b, to_b);
-
     auto child = [](const CarToiTransform& t, const CarConfig& cfg) {
         CarToiTransform c = t;
         c.origin = FromBulletPortVec3(CarToiBt(t)(ToBulletPortVec3(cfg.hitbox_offset * kUUToBT)));
         return c;
     };
-    const CarToiTransform ca0 = child(from_a, a_cfg), ca1 = child(to_a, a_cfg);
-    const CarToiTransform cb0 = child(from_b, v_cfg), cb1 = child(to_b, v_cfg);
     const bullet_port::btConvexShape box_a = MakeBulletPortBoxShape((BulletHitboxSize(a_cfg) * 0.5f) * kUUToBT, 0.04f);
     const bullet_port::btConvexShape box_b = MakeBulletPortBoxShape((BulletHitboxSize(v_cfg) * 0.5f) * kUUToBT, 0.04f);
-
-    const Vec3 lin_a(ca1.origin.x - ca0.origin.x, ca1.origin.y - ca0.origin.y, ca1.origin.z - ca0.origin.z);
-    const Vec3 lin_b(cb1.origin.x - cb0.origin.x, cb1.origin.y - cb0.origin.y, cb1.origin.z - cb0.origin.z);
-    const Vec3 ang_a = CarToiAngularVelocity(ca0, ca1);
-    const Vec3 ang_b = CarToiAngularVelocity(cb0, cb1);
+    CarToiTransform ca0, cb0;
+    Vec3 lin_a, lin_b, ang_a, ang_b;
+    {
+        CarToiTransform from_a, to_a, from_b, to_b;
+        sweep(a, a_vel, from_a, to_a);
+        sweep(v, v_vel, from_b, to_b);
+        ca0 = child(from_a, a_cfg);
+        const CarToiTransform ca1 = child(to_a, a_cfg);
+        cb0 = child(from_b, v_cfg);
+        const CarToiTransform cb1 = child(to_b, v_cfg);
+        lin_a = Vec3(ca1.origin.x - ca0.origin.x, ca1.origin.y - ca0.origin.y, ca1.origin.z - ca0.origin.z);
+        lin_b = Vec3(cb1.origin.x - cb0.origin.x, cb1.origin.y - cb0.origin.y, cb1.origin.z - cb0.origin.z);
+        ang_a = CarToiAngularVelocity(ca0, ca1);
+        ang_b = CarToiAngularVelocity(cb0, cb1);
+    }
     const float max_ang = sqrtf((ang_a.x * ang_a.x + ang_a.y * ang_a.y) + ang_a.z * ang_a.z) * CarToiAngularMotionDisc(box_a) +
                           sqrtf((ang_b.x * ang_b.x + ang_b.y * ang_b.y) + ang_b.z * ang_b.z) * CarToiAngularMotionDisc(box_b);
     const Vec3 rel(lin_b.x - lin_a.x, lin_b.y - lin_a.y, lin_b.z - lin_a.z);
@@ -2638,7 +2699,7 @@ ROCKETGPU_HD void CarCarTimeOfImpact(CarState& a, const CarConfig& a_cfg, const 
     }
     float d = 0.0f;
     Vec3 n(0.0f, 0.0f, 0.0f), c(0.0f, 0.0f, 0.0f);
-    if (!CarToiClosestPoints(box_a, CarToiBt(ca0), box_b, CarToiBt(cb0), d, n, c)) {
+    if (!CarToiClosestPoints<kRequireScratch>(box_a, ca0, box_b, cb0, d, n, c, gjk_epa_scratch)) {
         return;
     }
     float dist = d + kAllowedPenetration;
@@ -2658,7 +2719,7 @@ ROCKETGPU_HD void CarCarTimeOfImpact(CarState& a, const CarConfig& a_cfg, const 
         }
         const CarToiTransform ia = CarToiIntegrate(ca0, lin_a, ang_a, fraction);
         const CarToiTransform ib = CarToiIntegrate(cb0, lin_b, ang_b, fraction);
-        if (!CarToiClosestPoints(box_a, CarToiBt(ia), box_b, CarToiBt(ib), d, n, c)) {
+        if (!CarToiClosestPoints<kRequireScratch>(box_a, ia, box_b, ib, d, n, c, gjk_epa_scratch)) {
             return;
         }
         dist = d + kAllowedPenetration;
@@ -2671,23 +2732,27 @@ ROCKETGPU_HD void CarCarTimeOfImpact(CarState& a, const CarConfig& a_cfg, const 
         return;
     }
 
-    auto pose = [fraction](CarState& s, const CarToiTransform& from, const CarToiTransform& to) {
-        s.pos = Vec3((to.origin.x * 50.0f - from.origin.x * 50.0f) * fraction + from.origin.x * 50.0f,
-                     (to.origin.y * 50.0f - from.origin.y * 50.0f) * fraction + from.origin.y * 50.0f,
-                     (to.origin.z * 50.0f - from.origin.z * 50.0f) * fraction + from.origin.z * 50.0f);
-        s.rot = GameQuatNormalizeScalar(
+    auto pose = [&](Vec3& pos, Quat& rot, const CarState& s, const Vec3& vel) {
+        CarToiTransform from, to;
+        sweep(s, vel, from, to);
+        pos = Vec3((to.origin.x * 50.0f - from.origin.x * 50.0f) * fraction + from.origin.x * 50.0f,
+                   (to.origin.y * 50.0f - from.origin.y * 50.0f) * fraction + from.origin.y * 50.0f,
+                   (to.origin.z * 50.0f - from.origin.z * 50.0f) * fraction + from.origin.z * 50.0f);
+        rot = GameQuatNormalizeScalar(
             GameUeQuatSlerp(GameGetRotationScalar(from.fwd, from.right, from.up),
                             GameGetRotationScalar(to.fwd, to.right, to.up), fraction),
             1e-8f);
     };
-    pose(a, from_a, to_a);
-    pose(v, from_b, to_b);
+    pose(pos_a, rot_a, a, a_vel);
+    pose(pos_v, rot_v, v, v_vel);
 }
 
-ROCKETGPU_HD bool ShouldDemolish(
+template <bool kRequireScratch = false>
+ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool ShouldDemolish(
     const CarState& a, const CarConfig& a_cfg, const Vec3& a_start_vel,
     const CarState& v, const CarConfig& v_cfg, const MutatorConfig& mutator,
-    const Vec3* v_start_vel = nullptr, float tick_dt = 0.0f) {
+    const Vec3* v_start_vel = nullptr, float tick_dt = 0.0f,
+    bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr) {
     if (!a.is_supersonic) {
         return false;
     }
@@ -2698,21 +2763,24 @@ ROCKETGPU_HD bool ShouldDemolish(
         return false;
     }
     if (v_start_vel != nullptr) {
-        CarState ai = a, vi = v;
-        CarCarTimeOfImpact(ai, a_cfg, a_start_vel, vi, v_cfg, *v_start_vel, tick_dt);
-        return InForwardCone(ai, a_cfg, vi, v_cfg, reverse, 45.5729942f);
+        Vec3 pos_a = a.pos, pos_v = v.pos;
+        Quat rot_a = a.rot, rot_v = v.rot;
+        CarCarTimeOfImpact<kRequireScratch>(a, a_cfg, a_start_vel, v, v_cfg, *v_start_vel, tick_dt, pos_a, rot_a, pos_v, rot_v, gjk_epa_scratch);
+        return InForwardConePose(pos_a, rot_a, a_cfg, pos_v, rot_v, v_cfg, reverse, 45.5729942f);
     }
-    return InForwardCone(a, a_cfg, v, v_cfg, reverse, 45.5729942f);
+    return InForwardConePose(a.pos, a.rot, a_cfg, v.pos, v.rot, v_cfg, reverse, 45.5729942f);
 }
 
-ROCKETGPU_HD bool InForwardCone(
-    const CarState& a, const CarConfig& a_cfg, const CarState& v, const CarConfig& v_cfg, bool reverse, float max_yaw_deg) {
+ROCKETGPU_HD bool InForwardConePose(
+    const Vec3& a_pos, const Quat& a_rot, const CarConfig& a_cfg,
+    const Vec3& v_pos, const Quat& v_rot, const CarConfig& v_cfg,
+    bool reverse, float max_yaw_deg) {
     Vec3 fwd, right, up, v_x, v_y, v_z;
-    Ue3RotatorAxes(Ue3QuatToRotator(a.rot), fwd, right, up);
-    Ue3RotatorAxes(Ue3QuatToRotator(v.rot), v_x, v_y, v_z);
+    Ue3RotatorAxes(Ue3QuatToRotator(a_rot), fwd, right, up);
+    Ue3RotatorAxes(Ue3QuatToRotator(v_rot), v_x, v_y, v_z);
     const Vec3 a_off = a_cfg.hitbox_offset, v_off = v_cfg.hitbox_offset;
-    const Vec3 pa = a.pos + Vec3(Dot(fwd, a_off), Dot(right, a_off), Dot(up, a_off));
-    const Vec3 pv = v.pos + Vec3(Dot(v_x, v_off), Dot(v_y, v_off), Dot(v_z, v_off));
+    const Vec3 pa = a_pos + Vec3(Dot(fwd, a_off), Dot(right, a_off), Dot(up, a_off));
+    const Vec3 pv = v_pos + Vec3(Dot(v_x, v_off), Dot(v_y, v_off), Dot(v_z, v_off));
     Vec3 d = pv - pa;
     const float d2 = LengthSq(d);
     if (d2 != 1.0f) {
@@ -2735,6 +2803,11 @@ ROCKETGPU_HD bool InForwardCone(
         return false;
     }
     return angle_deg(up) <= max_yaw_deg;
+}
+
+ROCKETGPU_HD bool InForwardCone(
+    const CarState& a, const CarConfig& a_cfg, const CarState& v, const CarConfig& v_cfg, bool reverse, float max_yaw_deg) {
+    return InForwardConePose(a.pos, a.rot, a_cfg, v.pos, v.rot, v_cfg, reverse, max_yaw_deg);
 }
 
 ROCKETGPU_HD bool BumpCone(
@@ -2814,18 +2887,15 @@ ROCKETGPU_HD bool BumpCone(
     return is_demo;
 }
 
-ROCKETGPU_HD bool ResolveCarCarDirectionalContact(
+template <bool kRequireScratch = false>
+ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool ResolveCarCarDirectionalContact(
     CarState& hitter,
-    const CarState& hitter_probe,
     uint32_t hitter_id,
     Team hitter_team,
-    const ObbData& hitter_obb,
     const CarConfig& hitter_cfg,
     CarState& victim,
-    const CarState& victim_probe,
     uint32_t victim_id,
     Team victim_team,
-    const ObbData& victim_obb,
     const MutatorConfig& mutator,
     uint8_t enable_demos,
     const Vec3& fallback_dir,
@@ -2835,10 +2905,9 @@ ROCKETGPU_HD bool ResolveCarCarDirectionalContact(
     const CarConfig* victim_cfg = nullptr,
     bool demo_only = false,
     const Vec3* victim_start_vel = nullptr,
-    float tick_dt = 0.0f) {
+    float tick_dt = 0.0f,
+    bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr) {
     (void)hitter_id;
-    (void)hitter_obb;
-    (void)victim_obb;
 
     const bool cal_demo = true;
     if ((hitter.is_demoed && !(cal_demo && demo_only)) || victim.is_demoed || hitter.just_respawned || victim.just_respawned) {
@@ -2863,7 +2932,7 @@ ROCKETGPU_HD bool ResolveCarCarDirectionalContact(
         }
         if (cal_demo) {
             bool cal_is_demo = enable_demos &&
-                ShouldDemolish(hitter, hitter_cfg, vel, victim, *victim_cfg, mutator, victim_start_vel, tick_dt);
+                ShouldDemolish<kRequireScratch>(hitter, hitter_cfg, vel, victim, *victim_cfg, mutator, victim_start_vel, tick_dt, gjk_epa_scratch);
             if (cal_is_demo && !mutator.enable_team_demos) {
                 cal_is_demo = hitter_team != victim_team;
             }
@@ -2902,8 +2971,6 @@ ROCKETGPU_HD bool ResolveCarCarDirectionalContact(
         return false;
     }
 
-    (void)hitter_probe;
-    (void)victim_probe;
     const Vec3 delta_pos = victim.pos - hitter.pos;
     if (Dot(hitter.vel, delta_pos) <= 0.0f) {
         return false;
@@ -2919,7 +2986,7 @@ ROCKETGPU_HD bool ResolveCarCarDirectionalContact(
 
     if (cal_demo) {
         bool cal_is_demo = enable_demos && victim_cfg != nullptr && hitter_start_vel != nullptr &&
-            ShouldDemolish(hitter, hitter_cfg, *hitter_start_vel, victim, *victim_cfg, mutator, victim_start_vel, tick_dt);
+            ShouldDemolish<kRequireScratch>(hitter, hitter_cfg, *hitter_start_vel, victim, *victim_cfg, mutator, victim_start_vel, tick_dt, gjk_epa_scratch);
         if (cal_is_demo && !mutator.enable_team_demos) {
             cal_is_demo = hitter_team != victim_team;
         }
@@ -3032,13 +3099,13 @@ ROCKETGPU_HD bool ResolveCarCarDirectionalContact(
     return is_demo;
 }
 
-ROCKETGPU_HD int ComputeApproxCarCarContactAnchorPairs(
+ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE int ComputeApproxCarCarContactAnchorPairsWithBtObb(
     const CarState& a,
     const CarConfig& cfg_a,
-    const ObbData& obb_a,
+    const ObbData& obb_a_bt,
     const CarState& b,
     const CarConfig& cfg_b,
-    const ObbData& obb_b,
+    const ObbData& obb_b_bt,
     const Vec3& normal,
     const ObbContactFeature& feature,
     Vec3* out_points_a,
@@ -3061,23 +3128,20 @@ ROCKETGPU_HD int ComputeApproxCarCarContactAnchorPairs(
 
     constexpr float kUUToBT = 1.0f / 50.0f;
     constexpr float kBTToUU = 50.0f;
-    (void)obb_a;
-    (void)obb_b;
-    const ObbData obb_a_bt = MakeCarObbBulletTransformBt(a, cfg_a);
-    const ObbData obb_b_bt = MakeCarObbBulletTransformBt(b, cfg_b);
 
-    if (feature.kind == OBB_CONTACT_FEATURE_FACE_A) {
+    if (feature.kind == OBB_CONTACT_FEATURE_FACE_A || feature.kind == OBB_CONTACT_FEATURE_FACE_B) {
+        const bool is_face_a = (feature.kind == OBB_CONTACT_FEATURE_FACE_A);
         Vec3 ref_points_bt[kMaxApproxCarCarContactPoints];
         Vec3 inc_points_bt[kMaxApproxCarCarContactPoints];
         const int pair_count_bt = ComputeFaceClippedCarCarContactAnchorPairs(
-            obb_a_bt,
-            feature.axis_a,
-            obb_b_bt,
-            normal,
+            is_face_a ? obb_a_bt : obb_b_bt,
+            is_face_a ? feature.axis_a : feature.axis_b,
+            is_face_a ? obb_b_bt : obb_a_bt,
+            is_face_a ? normal : -normal,
             ref_points_bt,
             inc_points_bt,
             max_points,
-            1,
+            is_face_a ? 1 : 0,
             out_game_points_a_bt,
             out_game_depths_bt);
         if (pair_count_bt > 0) {
@@ -3088,43 +3152,8 @@ ROCKETGPU_HD int ComputeApproxCarCarContactAnchorPairs(
                 *out_game_normal_bt = normal;
             }
             for (int i = 0; i < pair_count_bt; ++i) {
-                const Vec3 point_a_bt = CarBodyManifoldWorldPointBt(a, ref_points_bt[i]);
-                const Vec3 point_b_bt = CarBodyManifoldWorldPointBt(b, inc_points_bt[i]);
-                if (out_points_a_bt) {
-                    out_points_a_bt[i] = point_a_bt;
-                }
-                if (out_points_b_bt) {
-                    out_points_b_bt[i] = point_b_bt;
-                }
-                out_points_a[i] = point_a_bt * kBTToUU;
-                out_points_b[i] = point_b_bt * kBTToUU;
-            }
-            return pair_count_bt;
-        }
-    } else if (feature.kind == OBB_CONTACT_FEATURE_FACE_B) {
-        Vec3 ref_points_bt[kMaxApproxCarCarContactPoints];
-        Vec3 inc_points_bt[kMaxApproxCarCarContactPoints];
-        const int pair_count_bt = ComputeFaceClippedCarCarContactAnchorPairs(
-            obb_b_bt,
-            feature.axis_b,
-            obb_a_bt,
-            -normal,
-            ref_points_bt,
-            inc_points_bt,
-            max_points,
-            0,
-            out_game_points_a_bt,
-            out_game_depths_bt);
-        if (pair_count_bt > 0) {
-            if (out_game_points_valid) {
-                *out_game_points_valid = out_game_points_a_bt && out_game_depths_bt && out_game_normal_bt;
-            }
-            if (out_game_normal_bt) {
-                *out_game_normal_bt = normal;
-            }
-            for (int i = 0; i < pair_count_bt; ++i) {
-                const Vec3 point_a_bt = CarBodyManifoldWorldPointBt(a, inc_points_bt[i]);
-                const Vec3 point_b_bt = CarBodyManifoldWorldPointBt(b, ref_points_bt[i]);
+                const Vec3 point_a_bt = CarBodyManifoldWorldPointBt(a, is_face_a ? ref_points_bt[i] : inc_points_bt[i]);
+                const Vec3 point_b_bt = CarBodyManifoldWorldPointBt(b, is_face_a ? inc_points_bt[i] : ref_points_bt[i]);
                 if (out_points_a_bt) {
                     out_points_a_bt[i] = point_a_bt;
                 }
@@ -3201,6 +3230,50 @@ ROCKETGPU_HD int ComputeApproxCarCarContactAnchorPairs(
         out_points_b_bt[0] = out_points_b[0] * kUUToBT;
     }
     return 1;
+}
+
+ROCKETGPU_HD int ComputeApproxCarCarContactAnchorPairs(
+    const CarState& a,
+    const CarConfig& cfg_a,
+    const ObbData& obb_a,
+    const CarState& b,
+    const CarConfig& cfg_b,
+    const ObbData& obb_b,
+    const Vec3& normal,
+    const ObbContactFeature& feature,
+    Vec3* out_points_a,
+    Vec3* out_points_b,
+    int max_points,
+    float contact_overlap_uu = 0.0f,
+    Vec3* out_points_a_bt = nullptr,
+    Vec3* out_points_b_bt = nullptr,
+    bool game_face_contacts = false,
+    Vec3* out_game_points_a_bt = nullptr,
+    float* out_game_depths_bt = nullptr,
+    bool* out_game_points_valid = nullptr,
+    Vec3* out_game_normal_bt = nullptr) {
+    (void)obb_a;
+    (void)obb_b;
+    return ComputeApproxCarCarContactAnchorPairsWithBtObb(
+        a,
+        cfg_a,
+        MakeCarObbBulletTransformBt(a, cfg_a),
+        b,
+        cfg_b,
+        MakeCarObbBulletTransformBt(b, cfg_b),
+        normal,
+        feature,
+        out_points_a,
+        out_points_b,
+        max_points,
+        contact_overlap_uu,
+        out_points_a_bt,
+        out_points_b_bt,
+        game_face_contacts,
+        out_game_points_a_bt,
+        out_game_depths_bt,
+        out_game_points_valid,
+        out_game_normal_bt);
 }
 
 ROCKETGPU_HD void ComputeApproxCarCarContactAnchors(

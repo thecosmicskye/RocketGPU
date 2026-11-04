@@ -53,16 +53,28 @@ find_package(Threads REQUIRED)
 target_link_libraries(rocketgpu PUBLIC Threads::Threads)
 
 target_compile_options(rocketgpu PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic -ffp-contract=off>
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -ffp-contract=off>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU,Clang,AppleClang>>:-Wpedantic>
 )
-if (NOT ROCKETGPU_USE_CUDA AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"
-    AND NOT CMAKE_CXX_FLAGS MATCHES "-march=")
+set(_rocketgpu_cxx_flags "${CMAKE_CXX_FLAGS}")
+foreach(_rocketgpu_config ${CMAKE_BUILD_TYPE} ${CMAKE_CONFIGURATION_TYPES})
+    string(TOUPPER "${_rocketgpu_config}" _rocketgpu_config_upper)
+    string(APPEND _rocketgpu_cxx_flags " ${CMAKE_CXX_FLAGS_${_rocketgpu_config_upper}}")
+endforeach()
+if (NOT ROCKETGPU_USE_CUDA AND NOT CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64"
+    AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT _rocketgpu_cxx_flags MATCHES "-march=|-mcpu=")
     target_compile_options(rocketgpu PRIVATE -march=native)
+elseif (NOT ROCKETGPU_USE_CUDA AND NOT CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64"
+    AND NOT CMAKE_OSX_ARCHITECTURES MATCHES ";|x86_64"
+    AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang" AND NOT _rocketgpu_cxx_flags MATCHES "-mcpu=|-march=")
+    target_compile_options(rocketgpu PRIVATE -mcpu=native)
 endif()
 if (NOT ROCKETGPU_USE_CUDA AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(rocketgpu PRIVATE -fno-semantic-interposition
         --param=max-inline-insns-single=2000 --param=max-inline-insns-auto=300
         --param=large-function-growth=800 --param=inline-unit-growth=400)
+elseif (NOT ROCKETGPU_USE_CUDA AND NOT APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    target_compile_options(rocketgpu PRIVATE -fno-semantic-interposition)
 endif()
 
 if (ROCKETGPU_USE_CUDA)
