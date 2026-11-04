@@ -208,7 +208,8 @@ ROCKETGPU_GLOBAL void CanonicalizeImportedCarsKernel(CarState* cars, int32_t cou
     cars[idx].ReReportFields(kept);
 }
 
-ROCKETGPU_GLOBAL void CanonicalizeImportedBallsKernel(BallState* balls, int32_t count) {
+ROCKETGPU_GLOBAL void CanonicalizeImportedBallsKernel(BallState* balls, int32_t count, WorldSolverScratch* solver_scratch,
+                                                      MutatorConfig mutator, float dt) {
     const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (idx >= count) {
         return;
@@ -220,6 +221,7 @@ ROCKETGPU_GLOBAL void CanonicalizeImportedBallsKernel(BallState* balls, int32_t 
     balls[idx].vel = balls[idx].vel_bt * kBTToUU;
     balls[idx].sleeping = 2;
     balls[idx].deactivation_time = 0.0f;
+    PrimeImportedBallWorldPlanes(balls[idx], mutator, dt, solver_scratch[idx]);
 }
 
 __device__ __forceinline__ void PreTickBlock(
@@ -3191,13 +3193,16 @@ void LaunchCanonicalizeImportedCars(
 void LaunchCanonicalizeImportedBalls(
     BallState* balls,
     int32_t count,
+    WorldSolverScratch* solver_scratch,
+    const MutatorConfig& mutator,
+    float dt,
     cudaStream_t stream) {
     if (count <= 0) {
         return;
     }
     constexpr int kBlockSize = 256;
     const int blocks = (count + kBlockSize - 1) / kBlockSize;
-    CanonicalizeImportedBallsKernel<<<blocks, kBlockSize, 0, stream>>>(balls, count);
+    CanonicalizeImportedBallsKernel<<<blocks, kBlockSize, 0, stream>>>(balls, count, solver_scratch, mutator, dt);
     CheckCuda(cudaGetLastError(), "CanonicalizeImportedBallsKernel launch");
 }
 

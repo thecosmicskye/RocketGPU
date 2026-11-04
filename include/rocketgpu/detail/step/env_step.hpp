@@ -2679,7 +2679,8 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCarPrePhysics(
         WheelRuntimeState& jw = *wheel_runtime_state;
         if (start_tick_count_since_update == 0 && !jw.cal_restored) {
             jw.cal_game_jumped = start_has_jumped ? 1 : 0;
-            jw.cal_game_double_jumped = (start_has_double_jumped || start_has_flipped) ? 1 : 0;
+            // landing clears the game's double-jumped flag, so a car set on the ground mid-dodge holds 0
+            jw.cal_game_double_jumped = (start_has_double_jumped || start_has_flipped) && !cal_jump_g ? 1 : 0;
             jw.cal_cached_ground = cal_jump_g ? 1 : 0;
             jw.cal_jump_inactive_time = start_is_jumping ? 0.0f : start_internal_jump_time;
             jw.cal_frame_open = 0;

@@ -1770,9 +1770,14 @@ void BatchSim::upload_ball_states(const BallState* host_states, size_t count, cu
     impl_->ball_states.copy_from_host(host_states, count, stream);
     if (mode == StateUploadMode::PublicState) {
 #if defined(ROCKETGPU_USE_CUDA)
-    detail::LaunchCanonicalizeImportedBalls(impl_->ball_states.data(), static_cast<int32_t>(count), stream);
+    detail::LaunchCanonicalizeImportedBalls(impl_->ball_states.data(), static_cast<int32_t>(count),
+                                            impl_->solver_scratch.data(), impl_->cfg.mutator, impl_->cfg.tick_dt, stream);
 #else
     CanonicalizeImportedBallStatesInPlace(impl_->ball_states.data(), count);
+    for (size_t idx = 0; idx < count; ++idx) {
+        detail::PrimeImportedBallWorldPlanes(impl_->ball_states.data()[idx], impl_->cfg.mutator, impl_->cfg.tick_dt,
+                                             impl_->solver_scratch.data()[idx]);
+    }
 #endif
     }
     impl_->mark_exact_host_dirty();

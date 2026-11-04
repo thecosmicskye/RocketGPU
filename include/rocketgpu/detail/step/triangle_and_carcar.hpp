@@ -2669,7 +2669,7 @@ ROCKETGPU_HD void CarCarTimeOfImpact(const CarState& a, const CarConfig& a_cfg, 
         from = CarToiIntegrate(t0, Vec3(-lin.x, -lin.y, -lin.z), Vec3(-s.ang_vel.x, -s.ang_vel.y, -s.ang_vel.z), tick_dt);
         to = CarToiIntegrate(t0, lin, s.ang_vel, tick_dt);
     };
-    auto child = [](const CarToiTransform& t, const CarConfig& cfg) {
+    auto child = [&](const CarToiTransform& t, const CarConfig& cfg) {
         CarToiTransform c = t;
         c.origin = FromBulletPortVec3(CarToiBt(t)(ToBulletPortVec3(cfg.hitbox_offset * kUUToBT)));
         return c;

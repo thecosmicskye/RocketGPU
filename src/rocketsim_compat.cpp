@@ -478,7 +478,7 @@ void Arena::Step(int ticks_to_simulate) {
     }
 }
 
-void Arena::ResetToRandomKickoff(int seed) {
+void Arena::ResetToRandomKickoff(int seed, bool game_countdown) {
     const bool has_holes = cars.size() != static_cast<size_t>(car_count_);
     const int32_t active_count = static_cast<int32_t>(cars.size());
     const int32_t slot_count = car_count_;
@@ -520,6 +520,7 @@ void Arena::ResetToRandomKickoff(int seed) {
     command.reset_tick_count = 1;
     command.kickoff_seed_mode = seed == -1 ? 2 : 1;
     command.kickoff_seed = static_cast<uint64_t>(static_cast<uint32_t>(seed));
+    command.kickoff_countdown_ticks = game_countdown ? kKickoffCountdownGameTimers : 0;
     sim_->apply_env_commands(&command, 1);
     sim_->download_env_states(env_states_.data(), env_states_.size());
     env_states_[0].tick = static_cast<uint32_t>(tick_count_);

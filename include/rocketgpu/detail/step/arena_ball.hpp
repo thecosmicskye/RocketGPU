@@ -1553,6 +1553,68 @@ ROCKETGPU_HD const BallWorldStage* ConsumableBallWorldStage(
 #endif
 }
 
+// A ball set from public state has no retained plane points, while the game's ball holds the points its previous
+// tick's detection made (a resting, sleeping ball keeps its floor point through the tick a car wakes it). Prime each
+// empty plane slot with the point the step's detection makes at the pose one tick back.
+ROCKETGPU_HD void PrimeImportedBallWorldPlanes(BallState ball, const MutatorConfig& mutator, float dt,
+                                               WorldSolverScratch& scratch) {
+    if (!mutator.arena_collision) {
+        return;
+    }
+    ball.pos_bt = ball.pos_bt - ball.vel_bt * dt;
+    ball.pos = ball.pos_bt * 50.0f;
+    const float collision_r = mutator.ball_radius;
+    const float ball_radius_bt = collision_r * (1.0f / 50.0f);
+    const float arena_margin = BallArenaMeshCollisionMargin();
+    const float plane_detection_r = collision_r * 0.02f + 50.0f * 0.08f * 0.02f;
+    const float plane_breaking_threshold_bt = (ball_radius_bt + 0.08f) * 0.02f;
+    const bool soccar = mutator.game_mode == static_cast<uint8_t>(Mode::Soccar);
+    const int plane_slot_count = BallWorldPlaneSlotCount(mutator);
+    for (int plane_slot = 0; plane_slot < plane_slot_count; ++plane_slot) {
+        BallMeshPersistentManifold& m = scratch.ball_world_plane_manifolds[plane_slot];
+        if (m.count != 0) {
+            continue;
+        }
+        Vec3 axis_normal;
+        float boundary;
+        Vec3 plane_pos_uu;
+        BallWorldPlane(plane_slot, arena_margin, axis_normal, boundary, plane_pos_uu);
+        const float margin = Dot(ball.pos, axis_normal) - boundary;
+        if (!(margin < collision_r + plane_detection_r && (plane_slot < 4 || BallNearGoalFloor(ball, plane_slot)))) {
+            continue;
+        }
+        const GamePlaneXfBt plane_xf = GameSoccarPlaneXfBt(axis_normal, plane_pos_uu * (1.0f / 50.0f));
+        const GamePlaneXfBt* const xf = soccar ? &plane_xf : nullptr;
+        const Vec3 inward_normal = soccar ? GamePlaneNormalBt(plane_xf) : axis_normal;
+        Vec3 rel_bt(0.0f, 0.0f, 0.0f);
+        float distance_bt = 0.0f;
+        Vec3 local_a_bt(0.0f, 0.0f, 0.0f);
+        Vec3 point_b_bt(0.0f, 0.0f, 0.0f);
+        Vec3 in_plane_bt(0.0f, 0.0f, 0.0f);
+        float depth_bt = 0.0f;
+        const float rel_len = BallPlaneRelLen(ball, ball_radius_bt, inward_normal, plane_pos_uu, &rel_bt, &distance_bt,
+                                              &local_a_bt, &point_b_bt, xf, &in_plane_bt, &depth_bt);
+        const bool within_extent =
+            !soccar || (plane_slot >= 4 ? GoalFloorExtentContainsBt(in_plane_bt, plane_breaking_threshold_bt)
+                                        : SoccarPlaneExtentContainsInPlaneBt(inward_normal, in_plane_bt,
+                                                                             plane_breaking_threshold_bt));
+        if (!(depth_bt < plane_breaking_threshold_bt && within_extent)) {
+            continue;
+        }
+        BallMeshManifoldPoint& p = m.points[0];
+        p = BallMeshManifoldPoint{};
+        p.normal = inward_normal;
+        p.pen_uu = -depth_bt * 50.0f;
+        p.local_point_a_bt = local_a_bt;
+        p.local_point_b_bt = point_b_bt;
+        p.triangle_index = -1;
+        p.rel_pos1_length_bt = rel_len;
+        p.rel_pos1_bt = rel_bt;
+        p.distance_bt = distance_bt;
+        m.count = 1;
+    }
+}
+
 ROCKETGPU_HD ROCKETGPU_NOINLINE void AppendBallWorldSpecialContactRows(
     const BallState& ball,
     const MutatorConfig& mutator,

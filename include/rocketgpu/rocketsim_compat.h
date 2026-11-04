@@ -235,7 +235,8 @@ public:
 
     Car* AddCar(Team team, const CarConfig& config = CarConfig{});
     void Step(int ticks_to_simulate = 1);
-    void ResetToRandomKickoff(int seed = -1);
+    // game_countdown: the game's round countdown (cars held about 4 s); by default the kickoff starts at once.
+    void ResetToRandomKickoff(int seed = -1, bool game_countdown = false);
     // The bodies' side of a goal reset alone (EnvCommand::new_round_bodies), e.g. replaying a recorded goal.
     void StartNewRoundBodies();
 

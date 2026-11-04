@@ -627,12 +627,12 @@ struct EnvCommand {
     // With reset_to_kickoff: keep the pads and their timers, as the game does at a goal's kickoff (it never resets
     // them). 0 (the default) starts every pad active, a fresh episode.
     uint8_t keep_boost_pads = 0;
-    // With reset_to_kickoff: the round countdown. kKickoffCountdownGameTimers (the default) runs the game's countdown
-    // timers on the render frames (EnvState.countdown_phase); a tick count holds that many ticks. Either way the reset
-    // is the game's: the ball re-created high and falling under the 2D constraint, the cars one tick later, held
-    // (bDriving off) until the countdown ends. 0 starts the kickoff at once: the ball asleep at 92.75 and the cars
-    // spawned and driving on the reset.
-    uint16_t kickoff_countdown_ticks = kKickoffCountdownGameTimers;
+    // With reset_to_kickoff: the round countdown. 0 (the default) starts the kickoff at once, as RocketSim does: the
+    // ball asleep at 92.75 and the cars spawned and driving on the reset. kKickoffCountdownGameTimers runs the game's
+    // countdown timers on the render frames (EnvState.countdown_phase); a tick count holds that many ticks. With
+    // either, the reset is the game's: the ball re-created high and falling under the 2D constraint, the cars one tick
+    // later, held (bDriving off) until the countdown ends.
+    uint16_t kickoff_countdown_ticks = 0;
     uint64_t kickoff_seed = 0;
 };
 

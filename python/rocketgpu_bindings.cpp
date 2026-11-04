@@ -1033,7 +1033,8 @@ PYBIND11_MODULE(rocketgpu_py, m) {
             .def("get_cars", [](rc::Arena& a) { return a.GetCars(); }, py::return_value_policy::reference_internal)
             .def_property_readonly("ball", [](rc::Arena& a) { return a.ball; }, py::return_value_policy::reference_internal)
             .def("step", &rc::Arena::Step, py::arg("ticks") = 1)
-            .def("reset_to_random_kickoff", &rc::Arena::ResetToRandomKickoff, py::arg("seed") = -1)
+            .def("reset_to_random_kickoff", &rc::Arena::ResetToRandomKickoff, py::arg("seed") = -1,
+                 py::arg("game_countdown") = false)
             .def("start_new_round_bodies", &rc::Arena::StartNewRoundBodies)
             .def("set_respawn_rng_seed", &rc::Arena::SetRespawnRngSeed, py::arg("seed"))
             .def("set_respawn_slot_override", &rc::Arena::SetRespawnSlotOverride, py::arg("car_id"), py::arg("slot"))

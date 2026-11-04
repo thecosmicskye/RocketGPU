@@ -4019,9 +4019,8 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             }
         }
     };
-    // The game adds the bodies, removes the round's bodies and adds them again. With empty caches and no body
-    // handles, the first add and removal leave only each valid body's fresh handle on the free list, in body order;
-    // the edges and pairs come back. Any other (set) state takes the full round.
+    // At a match start the game adds the bodies once, in body order (the ball's handle lowest); a goal's round reset
+    // re-adds them from the free list (BulletSweepNewRound). Any other (set) state takes the full round.
     bool round_cached = false;
     if (sweep_fresh) {
         bool empty = bp.bp_pair_count == 0 && bp.bp_manifold_count == 0 && h.sap_obj_count == 0;
@@ -4029,11 +4028,6 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             empty = h.sap_body_handle[body] == 0;
         }
         round_cached = !empty;
-        for (int body = 0; empty && body < body_count; ++body) {
-            if (proxies[body].valid && h.sap_handle_count + h.sap_free_count < kAxisSweepMaxHandles - 1) {
-                h.sap_free[h.sap_free_count++] = h.sap_next_fresh++;
-            }
-        }
     }
     if (statics_whole != nullptr && !round_cached) {
         add_bodies_merged(*statics_whole);
@@ -4144,7 +4138,12 @@ ROCKETGPU_HD int BuildBulletManifoldList(
         if (want && at < 0 && (key.kind == 1 || key.kind == 3) && !local_overlap(key)) {
             continue;
         }
-        if (want && at < 0 && key.kind == 0 && ball_static_pairs_skipped) {
+        // A sleeping ball makes no static manifold, except for a plane its public-state upload primed: the game's
+        // resting ball keeps the manifold it made awake (PrimeImportedBallWorldPlanes).
+        constexpr int kPlaneSlot[6] = {0, 1, 3, 2, 4, 5};
+        if (want && at < 0 && key.kind == 0 && ball_static_pairs_skipped &&
+            !(key.static_id >= 100 && key.static_id <= 105 &&
+              bp_history->ball_world_plane_manifolds[kPlaneSlot[key.static_id - 100]].count > 0)) {
             continue;
         }
         if (want && at < 0) {

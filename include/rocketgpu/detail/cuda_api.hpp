@@ -58,6 +58,9 @@ void LaunchCanonicalizeImportedCars(
 void LaunchCanonicalizeImportedBalls(
     BallState* balls,
     int32_t count,
+    WorldSolverScratch* solver_scratch,
+    const MutatorConfig& mutator,
+    float dt,
     cudaStream_t stream);
 
 void LaunchStep(

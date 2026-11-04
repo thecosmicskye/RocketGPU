@@ -3,6 +3,7 @@ project(RocketGPU LANGUAGES CXX)
 
 option(ROCKETGPU_USE_CUDA "Build CUDA kernels" OFF)
 option(ROCKETGPU_BUILD_PYTHON "Build Python bindings" OFF)
+option(ROCKETGPU_NATIVE_ARCH "CPU builds: tune for this machine (-march=native / -mcpu=native); OFF for binaries that run on other machines" ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -61,10 +62,12 @@ foreach(_rocketgpu_config ${CMAKE_BUILD_TYPE} ${CMAKE_CONFIGURATION_TYPES})
     string(TOUPPER "${_rocketgpu_config}" _rocketgpu_config_upper)
     string(APPEND _rocketgpu_cxx_flags " ${CMAKE_CXX_FLAGS_${_rocketgpu_config_upper}}")
 endforeach()
-if (NOT ROCKETGPU_USE_CUDA AND NOT CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64"
+if (ROCKETGPU_NATIVE_ARCH AND NOT ROCKETGPU_USE_CUDA AND NOT CMAKE_CROSSCOMPILING
+    AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64"
     AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT _rocketgpu_cxx_flags MATCHES "-march=|-mcpu=")
     target_compile_options(rocketgpu PRIVATE -march=native)
-elseif (NOT ROCKETGPU_USE_CUDA AND NOT CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64"
+elseif (ROCKETGPU_NATIVE_ARCH AND NOT ROCKETGPU_USE_CUDA AND NOT CMAKE_CROSSCOMPILING
+    AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64"
     AND NOT CMAKE_OSX_ARCHITECTURES MATCHES ";|x86_64"
     AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang" AND NOT _rocketgpu_cxx_flags MATCHES "-mcpu=|-march=")
     target_compile_options(rocketgpu PRIVATE -mcpu=native)

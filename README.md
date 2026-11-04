@@ -15,7 +15,8 @@ cmake --build build -j
 ```
 
 The Python module `rocketgpu_py` ends up in `build/python`, along with a RocketSim-style `rocketsim` package.
-Without `-DROCKETGPU_USE_CUDA=ON` you get a CPU build.
+Without `-DROCKETGPU_USE_CUDA=ON` you get a CPU build, tuned for the machine that builds it; add
+`-DROCKETGPU_NATIVE_ARCH=OFF` for a binary that runs on other machines.
 
 ## Collision meshes
 
