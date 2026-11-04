@@ -85,10 +85,10 @@ Arena-ticks/s. RocketGPU on an RTX 5090; RocketSim v3 0.3.5 on a Ryzen 7 9800X3D
 
 | Arenas | RocketGPU | RocketSim v3 |
 |---|---|---|
-| 1,024 | 3.87M | 4.10M |
-| 4,096 | 10.50M | 4.38M |
-| 8,192 | 13.18M | 4.72M |
-| 16,384 | 14.50M | 5.49M |
+| 1,024 | 3.91M | 4.10M |
+| 4,096 | 10.43M | 4.38M |
+| 8,192 | 13.36M | 4.72M |
+| 16,384 | 14.52M | 5.49M |
 
 ## Accuracy
 
