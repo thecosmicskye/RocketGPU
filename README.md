@@ -65,7 +65,7 @@ For RocketSim v3's own conventions, use `get_state_v3` / `set_state_v3` (C++ `Ca
 - velocities before the caps
 - the step's own flags and `jump_ticks`
 - `is_supersonic` with v3's grace timer
-- `bump_cooldown_victim` (a car id) and `last_extra_hit_tick` (`None` when unset)
+- `bump_cooldown_victim` (a car id) and `last_extra_hit_tick` (`None`: no earlier hit)
 
 `jump_hold_broken` is stored, but RocketGPU's jump does not read it.
 
@@ -73,13 +73,6 @@ For RocketSim v3's own conventions, use `get_state_v3` / `set_state_v3` (C++ `Ca
 `{"array.field": bytes}`. `set_full_state` writes the fields it is given and keeps the rest.
 
 ## Speed
-
-For CPU builds, `ROCKETGPU_CPU_THREADS` sets the worker count, including the calling thread; set it before creating a
-batch. Unset or 0 uses the available hardware threads (on Linux, those in the creating thread's CPU affinity), at most
-one per 4 environments.
-
-CUDA builds use one GPU per process. CUDA graphs that capture RocketGPU steps share scratch with all other RocketGPU
-steps: serialize steps and graph replays, and recapture the graphs after creating another batch or changing a config.
 
 Arena-ticks/s. RocketGPU on an RTX 5090; RocketSim v3 0.3.5 on a Ryzen 7 9800X3D with 16 threads. Random controls,
 55% 1v1, 27% 2v2 and 18% 3v3 arenas:

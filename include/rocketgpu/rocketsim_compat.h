@@ -149,12 +149,15 @@ struct CarStateV3 {
     float bumpCooldownTimer = 0.0f;
     uint32_t bumpCooldownVictim = 0;  // victim's car id; 0 is None
     uint64_t lastExtraHitTick = ~0ULL;  // ~0 is None
+    // false: not passed; the next step guesses it (the car's hitbox within 2 uu of the ball, the two separating)
+    bool hasLastExtraHitTick = false;
     bool isDemoed = false;
     float demoRespawnTimer = 0.0f;
     bool isOnGround = true;
     bool wheelsWithContact[4] = {true, true, true, true};
     bool hasWorldContact = false;  // world_contact_normal is Some
     Vec3 worldContactNormal{};
+    bool hasPrevControls = false;  // unset: prevControls = controls
     CarControls prevControls{};
     // Optional (SetStateV3 only, not v3 state): the game's contact normal per wheel for the wheels in wheelsWithContact,
     // i.e. the previous tick's wheel contacts, which the next step's sticky force and auto-roll read.
@@ -342,6 +345,17 @@ private:
     CarBumpEventFn bump_callback_;
     void* bump_user_info_ = nullptr;
     std::vector<uint64_t> bump_event_seen_tick_;
+    // Per car slot: whether last_extra_hit_tick is known (a step, or a set that passed it), and a pending guess for a
+    // set that did not pass it, made at the next step from the set car and the ball then.
+    struct ExtraHitGuess {
+        bool known = false;
+        bool pending = false;
+        Vec3 pos{};
+        Vec3 vel{};
+        RotMat rot{};
+    };
+    std::vector<ExtraHitGuess> extra_hit_guess_;
+    void GuessExtraHits();
     void DrainBumpEvents();
     mutable std::vector<BoostPadState> pad_states_;
     std::vector<BoostPad*> boost_pads_;

@@ -194,6 +194,8 @@ Car* Arena::AddCar(Team team, const CarConfig& config) {
     car_states_[static_cast<size_t>(slot)] = CarState{};
     controls_[static_cast<size_t>(slot)] = CarControls{};
     if (!bump_event_seen_tick_.empty()) bump_event_seen_tick_[static_cast<size_t>(slot)] = 0;
+    if (extra_hit_guess_.empty()) extra_hit_guess_.assign(sim_->car_capacity(), ExtraHitGuess{});
+    extra_hit_guess_[static_cast<size_t>(slot)] = ExtraHitGuess{};
     for (int w = 0; w < 4; ++w) car_states_[static_cast<size_t>(slot)].wheels_with_contact[w] = 0;
     PushCarState(slot);
     teams_[slot] = team;
@@ -353,6 +355,7 @@ Arena* Arena::Clone(bool copy_callbacks) const {
         a->bump_user_info_ = bump_user_info_;
         a->bump_event_seen_tick_ = bump_event_seen_tick_;
     }
+    a->extra_hit_guess_ = extra_hit_guess_;
     a->dirty_ = true;
     return a;
 }
@@ -453,6 +456,45 @@ void Arena::DrainBumpEvents() {
     }
 }
 
+void Arena::GuessExtraHits() {
+    bool any = false;
+    for (const ExtraHitGuess& g : extra_hit_guess_) any = any || g.pending;
+    if (!any) return;
+    PullStates();
+    const BallState& b = ball_states_[0];
+    const float ball_radius = sim_->config().mutator.ball_radius;
+    for (size_t i = 0; i < extra_hit_guess_.size(); ++i) {
+        ExtraHitGuess& g = extra_hit_guess_[i];
+        if (!g.pending) continue;
+        g.pending = false;
+        const CarConfig& cfg = configs_[i];
+        const Vec3* axes[3] = {&g.rot.forward, &g.rot.right, &g.rot.up};
+        const float off[3] = {cfg.hitbox_offset.x, cfg.hitbox_offset.y, cfg.hitbox_offset.z};
+        const float half[3] = {cfg.hitbox_size.x * 0.5f, cfg.hitbox_size.y * 0.5f, cfg.hitbox_size.z * 0.5f};
+        float c[3] = {g.pos.x, g.pos.y, g.pos.z};
+        for (int a = 0; a < 3; ++a) {
+            c[0] += axes[a]->x * off[a]; c[1] += axes[a]->y * off[a]; c[2] += axes[a]->z * off[a];
+        }
+        const float d[3] = {b.pos.x - c[0], b.pos.y - c[1], b.pos.z - c[2]};
+        float n[3] = {d[0], d[1], d[2]};  // ball center minus the hitbox's closest point
+        for (int a = 0; a < 3; ++a) {
+            const float t = axes[a]->x * d[0] + axes[a]->y * d[1] + axes[a]->z * d[2];
+            const float out = t - std::clamp(t, -half[a], half[a]);
+            n[0] -= axes[a]->x * (t - out); n[1] -= axes[a]->y * (t - out); n[2] -= axes[a]->z * (t - out);
+        }
+        const float dist = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        const float sep = (b.vel.x - g.vel.x) * n[0] + (b.vel.y - g.vel.y) * n[1] + (b.vel.z - g.vel.z) * n[2];
+        // the hit that produced this state: touching (within 2 uu) and already separating
+        if (dist - ball_radius <= 2.0f && dist > 0.0f && sep > 0.0f) {
+            BallHitInfo& hit = car_states_[i].ball_hit_info;
+            hit.is_valid = 1;
+            hit.tick_count_when_extra_impulse_applied = tick_count_;
+            hit.extra_tick_is_previous = 1;
+            PushCarState(static_cast<int>(i));
+        }
+    }
+}
+
 void Arena::Step(int ticks_to_simulate) {
     if ((goal_callback_ || bump_callback_) && ticks_to_simulate > 1) {
         for (int i = 0; i < ticks_to_simulate; ++i) {
@@ -460,9 +502,11 @@ void Arena::Step(int ticks_to_simulate) {
         }
         return;
     }
+    GuessExtraHits();
     sim_->upload_controls(controls_.data(), controls_.size());
     sim_->step(ticks_to_simulate);
     tick_count_ += static_cast<uint64_t>(ticks_to_simulate);
+    for (ExtraHitGuess& g : extra_hit_guess_) g.known = true;
     dirty_ = true;
     DrainBumpEvents();
 
@@ -732,6 +776,9 @@ void Car::SetState(const CarStateCompat& state) {
     s.ball_hit_info.extra_hit_vel = state.ballHitInfo.extraHitVel;
     s.ball_hit_info.tick_count_when_hit = state.ballHitInfo.tickCountWhenHit;
     s.ball_hit_info.tick_count_when_extra_impulse_applied = state.ballHitInfo.tickCountWhenExtraImpulseApplied;
+    s.ball_hit_info.extra_tick_is_previous = 0;
+    arena_->extra_hit_guess_[static_cast<size_t>(slot_)].known = true;
+    arena_->extra_hit_guess_[static_cast<size_t>(slot_)].pending = false;
     s.latest_touch_tick = state.latestTouch.tick;
     s.latest_touch_location = state.latestTouch.location;
     s.latest_touch_normal = state.latestTouch.normal;
@@ -808,6 +855,8 @@ CarStateV3 Car::GetStateV3() const {
     out.hasWorldContact = s.world_contact.has_contact != 0;
     out.worldContactNormal = s.world_contact.contact_normal;
     out.prevControls = s.last_controls;
+    out.hasPrevControls = true;
+    out.hasLastExtraHitTick = arena_->extra_hit_guess_[static_cast<size_t>(slot_)].known;
     out.hasWheelContactNormals = s.set_wheel_normals_mask != 0;
     for (int w = 0; w < 4; ++w) out.wheelContactNormals[w] = s.set_wheel_normals[w ^ 1];
     return out;
@@ -817,13 +866,17 @@ void Car::SetStateV3(const CarStateV3& state) {
     arena_->PullStates();
     CarState& s = arena_->car_states_[slot_];
     const float dt = arena_->GetTickTime();
+    // The game's state for a jump or dodge this tick's input starts: active with no time on it yet. A step never
+    // leaves that (it advances the timer it starts), so the step starts it from the input, as a fresh press.
+    const bool jump_starts = state.isJumping && state.jumpTicks == 0 && state.controls.jump;
+    const bool flip_starts = state.isFlipping && state.flipTime == 0.0f && state.controls.jump;
     s.pos = state.pos;
     SeedCarBasisFromRotMat(s, state.rotMat);
     s.vel = state.vel;
     s.ang_vel = state.angVel;
-    s.has_jumped = state.hasJumped ? 1 : 0;
-    s.has_double_jumped = state.hasDoubleJumped ? 1 : 0;
-    s.has_flipped = state.hasFlipped ? 1 : 0;
+    s.has_jumped = state.hasJumped && !jump_starts ? 1 : 0;
+    s.has_double_jumped = state.hasDoubleJumped && !flip_starts ? 1 : 0;
+    s.has_flipped = state.hasFlipped && !flip_starts ? 1 : 0;
     s.flip_rel_torque = state.flipRelTorque;
     float jump_time = 0.0f;
     if (state.jumpTicks > 1024) {
@@ -834,8 +887,8 @@ void Car::SetStateV3(const CarStateV3& state) {
     s.jump_time = jump_time;
     s.flip_time = state.flipTime;
     s.flip_timer_live = 0;
-    s.is_flipping = state.isFlipping ? 1 : 0;
-    s.is_jumping = state.isJumping ? 1 : 0;
+    s.is_flipping = state.isFlipping && !flip_starts ? 1 : 0;
+    s.is_jumping = state.isJumping && !jump_starts ? 1 : 0;
     s.jump_hold_broken = state.jumpHoldBroken ? 1 : 0;
     s.air_time = state.airTime;
     s.air_time_since_jump = state.airTimeSinceJump;
@@ -858,13 +911,24 @@ void Car::SetStateV3(const CarStateV3& state) {
         s.ball_hit_info.is_valid = 1;
         s.ball_hit_info.tick_count_when_extra_impulse_applied = state.lastExtraHitTick;
     }
+    // v3 never reports the current tick (a hit is stamped before the tick count advances), so a set to it means the
+    // tick that produced this state, which a fresh arena's tick 0 cannot otherwise express
+    s.ball_hit_info.extra_tick_is_previous = state.lastExtraHitTick == arena_->tick_count_ ? 1 : 0;
+    Arena::ExtraHitGuess& guess = arena_->extra_hit_guess_[static_cast<size_t>(slot_)];
+    guess.known = state.hasLastExtraHitTick;
+    guess.pending = !state.hasLastExtraHitTick;
+    guess.pos = state.pos;
+    guess.vel = state.vel;
+    guess.rot = state.rotMat;
     s.is_demoed = state.isDemoed ? 1 : 0;
     s.demo_respawn_timer = state.demoRespawnTimer;
     s.is_on_ground = state.isOnGround ? 1 : 0;
     for (int w = 0; w < 4; ++w) s.wheels_with_contact[w ^ 1] = state.wheelsWithContact[w] ? 1 : 0;
     s.world_contact.has_contact = state.hasWorldContact ? 1 : 0;
     s.world_contact.contact_normal = state.hasWorldContact ? state.worldContactNormal : Vec3(0.0f, 0.0f, 0.0f);
-    s.last_controls = state.prevControls;
+    // unset: this tick's controls (v3's own setter), with jump released before a press that starts a jump or dodge
+    s.last_controls = state.hasPrevControls ? state.prevControls : state.controls;
+    if (!state.hasPrevControls && (jump_starts || flip_starts)) s.last_controls.jump = false;
     s.set_wheel_normals_mask = 0;
     if (state.hasWheelContactNormals) {
         s.set_wheel_normals_mask = 0x10;

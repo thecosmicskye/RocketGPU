@@ -956,7 +956,10 @@ PYBIND11_MODULE(rocketgpu_py, m) {
                 [](const rc::CarStateV3& st) -> py::object {
                     return st.lastExtraHitTick != ~0ULL ? py::object(py::int_(st.lastExtraHitTick)) : py::object(py::none());
                 },
-                [](rc::CarStateV3& st, py::object v) { st.lastExtraHitTick = v.is_none() ? ~0ULL : v.cast<uint64_t>(); })
+                [](rc::CarStateV3& st, py::object v) {
+                    st.lastExtraHitTick = v.is_none() ? ~0ULL : v.cast<uint64_t>();
+                    st.hasLastExtraHitTick = true;
+                })
             .def_readwrite("is_demoed", &rc::CarStateV3::isDemoed)
             .def_readwrite("demo_respawn_timer", &rc::CarStateV3::demoRespawnTimer)
             .def_readwrite("is_on_ground", &rc::CarStateV3::isOnGround)
@@ -971,7 +974,14 @@ PYBIND11_MODULE(rocketgpu_py, m) {
                     st.hasWorldContact = !v.is_none();
                     st.worldContactNormal = v.is_none() ? rocketgpu::Vec3(0.0f, 0.0f, 0.0f) : v.cast<rocketgpu::Vec3>();
                 })
-            .def_readwrite("prev_controls", &rc::CarStateV3::prevControls)
+            .def_property("prev_controls",
+                [](const rc::CarStateV3& st) -> py::object {
+                    return st.hasPrevControls ? py::cast(st.prevControls) : py::object(py::none());
+                },
+                [](rc::CarStateV3& st, py::object v) {
+                    st.hasPrevControls = !v.is_none();
+                    st.prevControls = v.is_none() ? rocketgpu::CarControls{} : v.cast<rocketgpu::CarControls>();
+                })
             .def_property("wheel_contact_normals",
                 [](const rc::CarStateV3& st) -> py::object {
                     if (!st.hasWheelContactNormals) return py::none();

@@ -153,7 +153,7 @@ std::vector<Arena::DevField> Arena::DevLayouts() {
     RG_DEV_F(CarState, set_wheel_normals_mask); RG_DEV_F(CarState, cal_tick_start_ang_vel);
     RG_DEV_F(CarState, restored_inv_inertia_bt); RG_DEV_F(CarState, restored_inv_inertia_valid);
     RG_DEV_F(CarState, ball_hit_info.is_valid); RG_DEV_F(CarState, ball_hit_info.tick_count_when_hit);
-    RG_DEV_F(CarState, ball_hit_info.tick_count_when_extra_impulse_applied);
+    RG_DEV_F(CarState, ball_hit_info.tick_count_when_extra_impulse_applied); RG_DEV_F(CarState, ball_hit_info.extra_tick_is_previous);
     RG_DEV_F(CarState, ball_hit_info.hit_car_id); RG_DEV_F(CarState, latest_touch_tick);
     RG_DEV_F(CarState, driving_disabled); RG_DEV_F(CarState, boost_pad_touching);
     RG_DEV_F(CarState, pad_frame_pos_bt); RG_DEV_F(CarState, pad_frame_pos_valid);

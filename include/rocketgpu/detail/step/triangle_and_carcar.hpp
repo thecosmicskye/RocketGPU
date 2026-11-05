@@ -1225,8 +1225,8 @@ ROCKETGPU_HD void CommitBallCarHit(
     }
 
     const bool can_apply_extra = (!had_prior_ball_hit) ||
-        (prev_extra_impulse_tick > env_tick) ||
-        ((prev_extra_impulse_tick + 1ull) < env_tick);
+        (car_mut.ball_hit_info.extra_tick_is_previous ? prev_extra_impulse_tick != env_tick
+            : (prev_extra_impulse_tick > env_tick) || ((prev_extra_impulse_tick + 1ull) < env_tick));
 
     if (can_apply_extra) {
         const Vec3 rel_pos_for_extra = ball_pos - car_pos;
@@ -1250,6 +1250,7 @@ ROCKETGPU_HD void CommitBallCarHit(
             car_mut.ball_hit_info.extra_pending = 1;
             ball_mut.tick_count_when_extra_impulse_applied = env_tick;
             car_mut.ball_hit_info.tick_count_when_extra_impulse_applied = env_tick;
+            car_mut.ball_hit_info.extra_tick_is_previous = 0;
             car_mut.ball_hit_info.extra_hit_vel = added_vel;
         }
     }

@@ -161,7 +161,9 @@ struct CarConfig {
 struct BallHitInfo {
     uint8_t is_valid = 0;
     uint8_t extra_pending = 0;  // this tick's extra hit is not applied to the ball yet
-    uint8_t reserved1 = 0;
+    // 1: a public state set tick_count_when_extra_impulse_applied to the tick it was set on, standing for the tick
+    // before (the hit that produced the state), so only the next tick is blocked
+    uint8_t extra_tick_is_previous = 0;
     uint8_t reserved2 = 0;
     uint64_t tick_count_when_hit = 0;
     uint64_t tick_count_when_extra_impulse_applied = 0;
