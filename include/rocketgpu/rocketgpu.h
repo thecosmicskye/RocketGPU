@@ -16,6 +16,7 @@ struct ArenaMeshLeafEntry;
 struct ArenaMeshBvhMeshInfo;
 struct BulletSweepHistory;
 struct WheelRuntimeState;
+struct KickoffSettledRow;
 struct WorldSolverScratch;
 struct WorldSolverScratchRowPoolHost;
 struct RespawnRngState;
@@ -622,6 +623,7 @@ struct EnvCommand {
     uint8_t reset_scoreboard = 0;
     uint8_t reset_tick_count = 0;
 
+    // 3: no shuffle, a team's nth car takes kickoff spot n.
     uint8_t kickoff_seed_mode = 0;
     // The bodies' side of a round reset alone (a reset_to_kickoff without reset_scoreboard implies it): every body
     // leaves the world and is re-added the way the game respawns them after a goal (BulletSweepNewRound).
@@ -756,6 +758,12 @@ struct MutatorConfig {
 
     uint8_t cal_ball_world = 0;
 
+    // A kickoff reset without the countdown (kickoff_countdown_ticks 0, reset_to_kickoff) puts the cars and the ball
+    // where the game's countdown leaves them: settled on their wheels, the ball at rest. BatchSim records those
+    // states from a countdown run for every car config, team and spawn spot in use, again whenever this config,
+    // the car configs or the teams change. 0: the cars stay where they spawn, as in RocketSim.
+    uint8_t kickoff_settled = 1;
+
     // Bumped by BatchSim::set_mutator_config. The settled-ball fast path (WorldStepSoccar) only reuses a
     // fixed point verified under the same epoch, since the mutator feeds the ball's static-world step.
     uint32_t ball_settle_epoch = 0;
@@ -824,6 +832,14 @@ struct SimConfig {
     uint8_t use_custom_boost_pads = 0;
     int32_t boost_pad_count = 0;
     BoostPadConfig boost_pads[kMaxBoostPads] = {};
+    // Set by BatchSim with mutator.kickoff_settled: the states a countdown-free kickoff reset copies. Rows are
+    // [entry * kickoff_settled_spawns + spawn] (spawn: the kickoff spot, or the team slot from 5 on); each car
+    // slot's entry (its config and team); the ball; the wheel states the reset writes.
+    const detail::KickoffSettledRow* kickoff_settled_rows = nullptr;
+    const int64_t* kickoff_settled_entry = nullptr;
+    const BallState* kickoff_settled_ball = nullptr;
+    detail::WheelRuntimeState* kickoff_settled_wheels = nullptr;
+    int32_t kickoff_settled_spawns = 0;
 };
 
 struct DeviceView {

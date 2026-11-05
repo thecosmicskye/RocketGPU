@@ -1965,8 +1965,9 @@ ROCKETGPU_HD bool BoostPadSweepEnterBt(
     const float b = ax * dx + ay * dy;
     const float c = ax * ax + ay * ay - rad_bt * rad_bt;
     if (a < 1e-12f) {
+        // a car that has not moved since the last frame end (placed by a spawn or reset) makes no touch
         enter = s0;
-        return c < 0.0f && s0 < s1;
+        return false;
     }
     const float disc = b * b - a * c;
     if (disc <= 0.0f) {
@@ -3344,23 +3345,6 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE bool PredictiveContactRayForBody(
         cur = Vec3(car.pos_bt.x + (ax.x * child.x + ay.x * child.y + az.x * child.z),
                    car.pos_bt.y + (ax.y * child.x + ay.y * child.y + az.y * child.z),
                    car.pos_bt.z + (ax.z * child.x + ay.z * child.y + az.z * child.z));
-        if (have_bvh_free_box && car.basis_authoritative) {
-            const float margin = kRayBackoffBt + 1e-3f;
-            const float fx = Min(mesh_bvh_meshes[0].free_half_x, 81.8f) - margin;
-            const float fy = Min(mesh_bvh_meshes[0].free_half_y, 199.9f) - margin;
-            const float ang_l1 = (Abs(car.ang_vel.x) + Abs(car.ang_vel.y) + Abs(car.ang_vel.z)) * dt;
-            if (ang_l1 <= 0.5f && cur.x > -fx && cur.x < fx && cur.y > -fy && cur.y < fy &&
-                cur.z > margin && cur.z < 40.75f) {
-                const float child_l1 = Abs(child.x) + Abs(child.y) + Abs(child.z);
-                const float rb = (ang_l1 + 1e-3f) * child_l1 + 1e-3f;
-                const Vec3 to_approx = cur + car.vel_bt * dt;
-                if (to_approx.x > -fx + rb && to_approx.x < fx - rb &&
-                    to_approx.y > -fy + rb && to_approx.y < fy - rb &&
-                    to_approx.z > rb && to_approx.z < 40.8f - rb) {
-                    return false;
-                }
-            }
-        }
         Quat rot = car.rot;
         Vec3 fwd = car.basis_forward, right = car.basis_right, up = car.basis_up;
         if (car.basis_authoritative && !native_sse_math) {

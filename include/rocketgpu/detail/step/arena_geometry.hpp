@@ -1069,6 +1069,11 @@ struct WheelRuntimeState {
     uint8_t cal_restored = 0;
 };
 
+struct KickoffSettledRow {
+    CarState car;
+    WheelRuntimeState wheels;
+};
+
 #if !defined(__CUDA_ARCH__)
 
 struct WorldSolverScratchRowPoolHost {

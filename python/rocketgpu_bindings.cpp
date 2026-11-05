@@ -339,6 +339,7 @@ PYBIND11_MODULE(rocketgpu_py, m) {
         .def_readwrite("boost_pad_frame_frac", &rocketgpu::MutatorConfig::boost_pad_frame_frac)
         .def_readwrite("countdown_on_frame_start", &rocketgpu::MutatorConfig::countdown_on_frame_start)
         .def_readwrite("frame_start_dt", &rocketgpu::MutatorConfig::frame_start_dt)
+        .def_readwrite("kickoff_settled", &rocketgpu::MutatorConfig::kickoff_settled)
         .def_readwrite("car_air_control_pitch", &rocketgpu::MutatorConfig::car_air_control_pitch)
         .def_readwrite("car_air_control_yaw", &rocketgpu::MutatorConfig::car_air_control_yaw)
         .def_readwrite("car_air_control_roll", &rocketgpu::MutatorConfig::car_air_control_roll)

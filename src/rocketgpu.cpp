@@ -464,7 +464,7 @@ const ArenaMeshHost& CachedArenaMeshHost(bool soccar_arena) {
 }
 
 struct BatchSim::Impl {
-    explicit Impl(const SimConfig& in_cfg) : cfg(in_cfg) {
+    explicit Impl(const SimConfig& in_cfg) : cfg(in_cfg), user_cfg(in_cfg) {
         cfg.mutator.physics_events = {};
         cfg.mutator.native_sphere_rsqrt_table = nullptr;
         cfg.mutator.native_sphere_rsqrt_shift = 0;
@@ -669,7 +669,147 @@ struct BatchSim::Impl {
     }
 
     SimConfig cfg;
+    // The config as given (mutator: the last set_mutator_config), for the kickoff_settled countdown run.
+    SimConfig user_cfg;
     uint64_t seed = 0;
+    bool kickoff_settled_dirty = true;
+    detail::Buffer<detail::KickoffSettledRow> kickoff_settled_rows;
+    detail::Buffer<int64_t> kickoff_settled_entry;
+    detail::Buffer<BallState> kickoff_settled_ball;
+    // Every (car config, team) recorded so far with its rows (one per spawn) and the ball; cleared when the mutator
+    // changes.
+    struct KickoffSettledPair {
+        CarConfig config;
+        Team team;
+    };
+    std::vector<KickoffSettledPair> kickoff_settled_pairs;
+    std::vector<detail::KickoffSettledRow> kickoff_settled_pair_rows;
+    std::vector<BallState> kickoff_settled_pair_ball;
+
+    // mutator.kickoff_settled: run the countdown for every car config and team in use that is not recorded yet (an
+    // env per pair, every spawn filled with that car, the nth at kickoff spot n) and keep what it leaves, for
+    // SettleKickoffCar.
+    void ensure_kickoff_settled(cudaStream_t stream) {
+        if (!cfg.mutator.kickoff_settled) {
+            cfg.kickoff_settled_rows = nullptr;
+            cfg.kickoff_settled_entry = nullptr;
+            cfg.kickoff_settled_ball = nullptr;
+            cfg.kickoff_settled_wheels = nullptr;
+            return;
+        }
+        cfg.kickoff_settled_wheels = wheel_runtime_states.data();
+        if (!kickoff_settled_dirty) {
+            return;
+        }
+        const size_t n = static_cast<size_t>(cfg.env_count) * static_cast<size_t>(cfg.max_cars_per_env);
+        std::vector<CarConfig> configs(n);
+        std::vector<Team> host_teams(n);
+        car_configs.copy_to_host(configs.data(), n, stream);
+        teams.copy_to_host(host_teams.data(), n, stream);
+#if defined(ROCKETGPU_USE_CUDA)
+        CheckCuda(cudaStreamSynchronize(stream), "kickoff_settled configs");
+#endif
+        std::vector<KickoffSettledPair>& pairs = kickoff_settled_pairs;
+        std::vector<size_t> first;   // a car slot per pair not recorded yet
+        std::vector<int64_t> entry(n);
+        for (size_t i = 0; i < n; ++i) {
+            size_t e = 0;
+            while (e < pairs.size() && !(pairs[e].team == host_teams[i] &&
+                                         std::memcmp(&pairs[e].config, &configs[i], sizeof(CarConfig)) == 0)) {
+                ++e;
+            }
+            if (e == pairs.size()) {
+                pairs.push_back({configs[i], host_teams[i]});
+                first.push_back(i);
+            }
+            entry[i] = static_cast<int64_t>(e);
+        }
+        const int spawns = std::max(cfg.max_cars_per_env, 5);
+        if (!first.empty()) {
+            record_kickoff_settled(first, configs, host_teams, spawns);
+        }
+        const size_t m = kickoff_settled_pair_rows.size();
+        kickoff_settled_rows.resize(m);
+        kickoff_settled_rows.copy_from_host(kickoff_settled_pair_rows.data(), m, stream);
+        kickoff_settled_entry.resize(n);
+        kickoff_settled_entry.copy_from_host(entry.data(), n, stream);
+        kickoff_settled_ball.resize(1);
+        kickoff_settled_ball.copy_from_host(kickoff_settled_pair_ball.data(), 1, stream);
+        cfg.kickoff_settled_rows = kickoff_settled_rows.data();
+        cfg.kickoff_settled_entry = kickoff_settled_entry.data();
+        cfg.kickoff_settled_ball = kickoff_settled_ball.data();
+        cfg.kickoff_settled_spawns = spawns;
+        kickoff_settled_dirty = false;
+    }
+
+    // The countdown for the pairs of these car slots; appends their rows (and the ball, the first time).
+    void record_kickoff_settled(const std::vector<size_t>& first, const std::vector<CarConfig>& configs,
+                                const std::vector<Team>& host_teams, int spawns) {
+        const size_t envs = first.size();
+        SimConfig run_cfg = user_cfg;
+        run_cfg.env_count = static_cast<int32_t>(envs);
+        run_cfg.max_cars_per_env = spawns;
+        run_cfg.mirror_official_respawn_rng = 0;
+        run_cfg.mutator.kickoff_settled = 0;
+        // The countdown needs render frames: per-env frame schedules don't carry over, and a mutator without frames
+        // takes the default ones.
+        run_cfg.env_frame_frac = nullptr;
+        run_cfg.env_frame_start_dt = nullptr;
+        run_cfg.env_step_order = nullptr;
+        const MutatorConfig frames_default{};
+        if (run_cfg.mutator.countdown_on_frame_start ? run_cfg.mutator.frame_start_dt < 0.0f
+                                                     : run_cfg.mutator.boost_pad_frame_frac < 0.0f) {
+            run_cfg.mutator.countdown_on_frame_start = frames_default.countdown_on_frame_start;
+            run_cfg.mutator.frame_start_dt = frames_default.frame_start_dt;
+            run_cfg.mutator.boost_pad_frame_frac = frames_default.boost_pad_frame_frac;
+        }
+        BatchSim run(run_cfg);
+        const size_t m = envs * static_cast<size_t>(spawns);
+        std::vector<int32_t> counts(envs, spawns);
+        std::vector<CarConfig> run_configs(m);
+        std::vector<Team> run_teams(m);
+        for (size_t i = 0; i < m; ++i) {
+            run_configs[i] = configs[first[i / spawns]];
+            run_teams[i] = host_teams[first[i / spawns]];
+        }
+        run.set_env_car_count(counts.data(), envs);
+        run.set_teams(run_teams.data(), m);
+        run.set_car_configs(run_configs.data(), m);
+        EnvCommand cmd;
+        cmd.reset_to_kickoff = 1;
+        cmd.reset_scoreboard = 1;
+        cmd.kickoff_seed_mode = 3;
+        cmd.kickoff_countdown_ticks = kKickoffCountdownGameTimers;
+        std::vector<EnvCommand> cmds(envs, cmd);
+        run.apply_env_commands(cmds.data(), envs);
+        run.step(kKickoffCountdownTicks);
+        std::vector<EnvState> env_out(envs);
+        for (int k = 0;; ++k) {
+            run.download_env_states(env_out.data(), envs);
+            if (std::all_of(env_out.begin(), env_out.end(), [](const EnvState& e) { return e.countdown_phase == 0; })) {
+                break;
+            }
+            if (k == 16) {
+                throw std::runtime_error("kickoff_settled: the countdown did not end");
+            }
+            run.step(1);
+        }
+        std::vector<CarState> cars(m);
+        std::vector<detail::WheelRuntimeState> wheels(m);
+        BallState ball;
+        run.download_car_states(cars.data(), m);
+        run.download_wheel_runtime_states(wheels.data(), m);
+        run.download_ball_states(&ball, 1);
+        const size_t base = kickoff_settled_pair_rows.size();
+        kickoff_settled_pair_rows.resize(base + m);   // value-initialized, so the padding stays zero
+        for (size_t i = 0; i < m; ++i) {
+            kickoff_settled_pair_rows[base + i].car = cars[i];
+            kickoff_settled_pair_rows[base + i].wheels = wheels[i];
+        }
+        if (kickoff_settled_pair_ball.empty()) {
+            kickoff_settled_pair_ball.push_back(ball);
+        }
+    }
 
     detail::Buffer<detail::ArenaMeshTriangle> arena_mesh_triangles;
     detail::Buffer<detail::ArenaMeshTriangle> arena_mesh_local_triangles;
@@ -834,7 +974,7 @@ struct BatchSim::Impl {
 #if !defined(ROCKETGPU_USE_CUDA)
 
     bool host_kickoff_order(int env_idx, uint64_t kickoff_seed, uint8_t kickoff_seed_mode, int* order) {
-        if (!cfg.mirror_official_respawn_rng || static_cast<size_t>(env_idx) >= respawn_rng_env.size()) {
+        if (kickoff_seed_mode == 3 || !cfg.mirror_official_respawn_rng || static_cast<size_t>(env_idx) >= respawn_rng_env.size()) {
             return false;
         }
         for (int i = 0; i < 5; ++i) order[i] = i;
@@ -1044,6 +1184,7 @@ struct BatchSim::Impl {
 
     void reset_to_kickoff(uint64_t new_seed, cudaStream_t stream) {
         seed = new_seed;
+        ensure_kickoff_settled(stream);
 #if defined(ROCKETGPU_USE_CUDA)
         solver_scratch.memset_zero(stream);
         memset_zero_solver_rows(stream);
@@ -1097,13 +1238,18 @@ struct BatchSim::Impl {
             throw std::out_of_range("apply_env_commands_host count exceeds env_count");
         }
         size_t active_cmds = 0;
+        bool settled_reset = false;
         for (size_t i = 0; i < count; ++i) {
             const EnvCommand& c = host_commands[i];
             active_cmds += static_cast<size_t>((c.reset_to_kickoff | c.reset_scoreboard | c.reset_tick_count | c.new_round_bodies) != 0);
+            settled_reset = settled_reset || (c.reset_to_kickoff && c.kickoff_countdown_ticks == 0);
         }
         if (active_cmds == 0) {
             (void)stream;
             return;
+        }
+        if (settled_reset) {
+            ensure_kickoff_settled(stream);
         }
 #if defined(ROCKETGPU_USE_CUDA)
         env_command_scratch.copy_from_host(host_commands, count, stream);
@@ -1175,6 +1321,7 @@ struct BatchSim::Impl {
         if (count > static_cast<size_t>(cfg.env_count)) {
             throw std::out_of_range("apply_env_commands_device count exceeds env_count");
         }
+        ensure_kickoff_settled(stream);
 #if defined(ROCKETGPU_USE_CUDA)
         detail::LaunchApplyEnvCommands(
             cfg,
@@ -1474,6 +1621,7 @@ struct BatchSim::Impl {
         if (device_env_commands_by_tick == nullptr) {
             throw std::invalid_argument("device_env_commands_by_tick must not be null");
         }
+        ensure_kickoff_settled(stream);
         if (control_stride < cfg.max_cars_per_env * cfg.env_count) {
             throw std::invalid_argument("control_stride must be at least the total car capacity");
         }
@@ -1660,6 +1808,11 @@ void BatchSim::set_mutator_config(const MutatorConfig& mutator) {
     cfg.mutator.ball_no_rot = cfg.no_ball_rot;
     cfg.mutator.cal_ball_world = cfg.mode != Mode::Snowday ? 1 : 0;
     CacheBallDamping(cfg.mutator, cfg.tick_dt, cfg.mode);
+    impl_->user_cfg.mutator = mutator;
+    impl_->kickoff_settled_dirty = true;
+    impl_->kickoff_settled_pairs.clear();
+    impl_->kickoff_settled_pair_rows.clear();
+    impl_->kickoff_settled_pair_ball.clear();
 }
 
 void BatchSim::set_env_frame_frac(const float* host_values, size_t count, cudaStream_t stream) {
@@ -1736,6 +1889,7 @@ void BatchSim::set_teams(const Team* host_teams, size_t count, cudaStream_t stre
     }
     impl_->teams.copy_from_host(host_teams, count, stream);
     impl_->mark_exact_host_dirty();
+    impl_->kickoff_settled_dirty = true;
 }
 
 void BatchSim::set_car_configs(const CarConfig* host_configs, size_t count, cudaStream_t stream) {
@@ -1744,6 +1898,7 @@ void BatchSim::set_car_configs(const CarConfig* host_configs, size_t count, cuda
     }
     impl_->car_configs.copy_from_host(host_configs, count, stream);
     impl_->mark_exact_host_dirty();
+    impl_->kickoff_settled_dirty = true;
 }
 
 void BatchSim::upload_car_states(const CarState* host_states, size_t count, cudaStream_t stream,

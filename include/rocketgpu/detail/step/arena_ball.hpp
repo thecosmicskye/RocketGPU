@@ -2333,6 +2333,78 @@ ROCKETGPU_HD int PlaceNthTeamCarAtKickoff(
     return -1;
 }
 
+// A word loop: a plain struct assignment of these large states inlines into hundreds of registers on the GPU.
+template <typename T>
+ROCKETGPU_HD void CopyStateWords(T& dst, const T& src) {
+    static_assert(sizeof(T) % 4 == 0, "word copy");
+    uint32_t* d = reinterpret_cast<uint32_t*>(&dst);
+    const uint32_t* s = reinterpret_cast<const uint32_t*>(&src);
+#pragma unroll 1
+    for (size_t i = 0; i < sizeof(T) / 4; ++i) d[i] = s[i];
+}
+
+// mutator.kickoff_settled: car idx as the game's countdown leaves it at this spawn (SimConfig.kickoff_settled_rows).
+ROCKETGPU_HD void SettleKickoffCar(const SimConfig& cfg, int idx, int spawn, CarState* cars) {
+    if (cfg.kickoff_settled_rows == nullptr || spawn >= cfg.kickoff_settled_spawns || cfg.kickoff_settled_entry[idx] < 0) {
+        return;
+    }
+    const KickoffSettledRow& row = cfg.kickoff_settled_rows[static_cast<size_t>(cfg.kickoff_settled_entry[idx]) * cfg.kickoff_settled_spawns + spawn];
+    // The car's own history (bumps, touches, contact and flip stamps) stays as the reset left it.
+    CarState& car = cars[idx];
+    const auto bump_event_tick = car.bump_event_tick;
+    const auto bump_event_other_id = car.bump_event_other_id;
+    const auto bump_event_is_demo = car.bump_event_is_demo;
+    const auto bump_event_was_bumper = car.bump_event_was_bumper;
+    const auto previous_ball_contact_start = car.previous_ball_contact_start;
+    const auto last_ball_contact_start = car.last_ball_contact_start;
+    const auto last_world_surface_contact = car.last_world_surface_contact;
+    const auto first_world_after_previous_ball = car.first_world_after_previous_ball;
+    const auto first_world_after_last_ball = car.first_world_after_last_ball;
+    const auto last_flip_or_jump_start = car.last_flip_or_jump_start;
+    const auto last_directional_flip_start = car.last_directional_flip_start;
+    const auto last_ball_started_with_world = car.last_ball_started_with_world;
+    const auto flip_or_jump_last_tick = car.flip_or_jump_last_tick;
+    const auto latest_touch_tick = car.latest_touch_tick;
+    const auto latest_touch_location = car.latest_touch_location;
+    const auto latest_touch_normal = car.latest_touch_normal;
+    CopyStateWords(car, row.car);
+    car.bump_event_tick = bump_event_tick;
+    car.bump_event_other_id = bump_event_other_id;
+    car.bump_event_is_demo = bump_event_is_demo;
+    car.bump_event_was_bumper = bump_event_was_bumper;
+    car.previous_ball_contact_start = previous_ball_contact_start;
+    car.last_ball_contact_start = last_ball_contact_start;
+    car.last_world_surface_contact = last_world_surface_contact;
+    car.first_world_after_previous_ball = first_world_after_previous_ball;
+    car.first_world_after_last_ball = first_world_after_last_ball;
+    car.last_flip_or_jump_start = last_flip_or_jump_start;
+    car.last_directional_flip_start = last_directional_flip_start;
+    car.last_ball_started_with_world = last_ball_started_with_world;
+    car.flip_or_jump_last_tick = flip_or_jump_last_tick;
+    car.latest_touch_tick = latest_touch_tick;
+    car.latest_touch_location = latest_touch_location;
+    car.latest_touch_normal = latest_touch_normal;
+    CopyStateWords(cfg.kickoff_settled_wheels[idx], row.wheels);
+}
+
+// After a kickoff placement without the countdown: every car and the ball as the countdown leaves them. A team's
+// nth car (visit order, as PlaceNthTeamCarAtKickoff counts) took spawn kickoff_order[n] (n < 5), else respawn n.
+// order_bits: kickoff_order, 3 bits per slot.
+ROCKETGPU_HD ROCKETGPU_NOINLINE void SettleKickoffEnv(
+    const SimConfig& cfg, int env_idx, int base, int count, const Team* teams, CarState* cars, BallState* balls,
+    const EnvState& env_state, uint32_t order_bits) {
+    int seen[2] = {0, 0};
+    for (int k = 0; k < count; ++k) {
+        const int idx = base + CarVisitSlot(env_state, k, count);
+        const int t = teams[idx] == Team::Blue ? 0 : 1;
+        const int nth = seen[t]++;
+        SettleKickoffCar(cfg, idx, nth < 5 ? static_cast<int>((order_bits >> (3 * nth)) & 7u) : nth, cars);
+    }
+    if (cfg.mutator.game_mode != static_cast<uint8_t>(Mode::Heatseeker) && cfg.kickoff_settled_ball != nullptr) {
+        CopyStateWords(balls[env_idx], *cfg.kickoff_settled_ball);
+    }
+}
+
 ROCKETGPU_HD void PendKickoffSpawn(CarState& car, int spot, float tick_dt) {
     car.is_demoed = 1;
     car.demo_respawn_timer = 1.5f * tick_dt;
@@ -2467,6 +2539,7 @@ ROCKETGPU_HD void ResetEnvToKickoff(
     int kickoff_order[5] = {0, 1, 2, 3, 4};
     if (kickoff_order_override != nullptr) {
         for (int i = 0; i < 5; ++i) kickoff_order[i] = kickoff_order_override[i];
+    } else if (kickoff_seed_mode == 3) {   // slot order
     } else if (respawn_rng != nullptr) {
         const uint32_t engine_seed = kickoff_seed_mode == 1
             ? static_cast<uint32_t>(seed)
@@ -2504,6 +2577,11 @@ ROCKETGPU_HD void ResetEnvToKickoff(
                                                      env_states[env_idx], car_configs);
             if (game_spawn && idx >= 0 && slot < 5) PendKickoffSpawn(cars[idx], kickoff_order[slot], cfg.tick_dt);
         }
+    }
+    if (!game_spawn && cfg.kickoff_settled_rows != nullptr) {
+        uint32_t order_bits = 0;
+        for (int i = 0; i < 5; ++i) order_bits |= static_cast<uint32_t>(kickoff_order[i]) << (3 * i);
+        SettleKickoffEnv(cfg, env_idx, base, count, teams, cars, balls, env_states[env_idx], order_bits);
     }
 }
 
