@@ -78,24 +78,27 @@ ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorld(const CarInvInertiaRowsUu& r, con
     return Vec3(Dot(r.row0, torque_world), Dot(r.row1, torque_world), Dot(r.row2, torque_world));
 }
 
-ROCKETGPU_HD CarInvInertiaRowsUu MakeCarInvInertiaRowsUu(const CarState& car, const CarConfig& cfg, float mass) {
+ROCKETGPU_HD Vec3 CarInvInertiaLocalUu(const CarConfig& cfg, float mass) {
+    const Vec3 inertia = BoxBodyInertiaDiag(cfg, mass);
+    return Vec3(
+        inertia.x != 0.0f ? 1.0f / inertia.x : 0.0f,
+        inertia.y != 0.0f ? 1.0f / inertia.y : 0.0f,
+        inertia.z != 0.0f ? 1.0f / inertia.z : 0.0f);
+}
+
+// MakeCarInvInertiaRowsUu with the local inverse inertia given (CarInvInertiaLocalUu of the car's config and mass).
+ROCKETGPU_HD CarInvInertiaRowsUu MakeCarInvInertiaRowsUuWithLocal(const CarState& car, const Vec3& inv_inertia_local) {
     if (car.restored_inv_inertia_valid) {
         return CarInvInertiaRowsUu{car.restored_inv_inertia_bt[0] * 0.0004f,
                                   car.restored_inv_inertia_bt[1] * 0.0004f,
                                   car.restored_inv_inertia_bt[2] * 0.0004f};
     }
-    const Vec3 inertia = BoxBodyInertiaDiag(cfg, mass);
-
     const Vec3& forward_m = car.tick_start_basis_forward;
     const Vec3& right_m = car.tick_start_basis_right;
     const Vec3& up_m = car.tick_start_basis_up;
     const Vec3 row0(forward_m.x, right_m.x, up_m.x);
     const Vec3 row1(forward_m.y, right_m.y, up_m.y);
     const Vec3 row2(forward_m.z, right_m.z, up_m.z);
-    const Vec3 inv_inertia_local(
-        inertia.x != 0.0f ? 1.0f / inertia.x : 0.0f,
-        inertia.y != 0.0f ? 1.0f / inertia.y : 0.0f,
-        inertia.z != 0.0f ? 1.0f / inertia.z : 0.0f);
     const float s00 = row0.x * inv_inertia_local.x;
     const float s01 = row0.y * inv_inertia_local.y;
     const float s02 = row0.z * inv_inertia_local.z;
@@ -118,6 +121,13 @@ ROCKETGPU_HD CarInvInertiaRowsUu MakeCarInvInertiaRowsUu(const CarState& car, co
         s20 * row1.x + s21 * row1.y + s22 * row1.z,
         s20 * row2.x + s21 * row2.y + s22 * row2.z);
     return CarInvInertiaRowsUu{inv_inertia_world_row0, inv_inertia_world_row1, inv_inertia_world_row2};
+}
+
+ROCKETGPU_HD CarInvInertiaRowsUu MakeCarInvInertiaRowsUu(const CarState& car, const CarConfig& cfg, float mass) {
+    if (car.restored_inv_inertia_valid) {
+        return MakeCarInvInertiaRowsUuWithLocal(car, Vec3(0.0f, 0.0f, 0.0f));
+    }
+    return MakeCarInvInertiaRowsUuWithLocal(car, CarInvInertiaLocalUu(cfg, mass));
 }
 
 ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorld(const CarState& car, const CarConfig& cfg, float mass, const Vec3& torque_world) {
@@ -163,6 +173,16 @@ ROCKETGPU_HD Vec3 BoxBodyInertiaDiagBt(const CarConfig& cfg, float mass) {
     return Vec3(scale * (y2 + z2), scale * (x2 + z2), scale * (x2 + y2));
 }
 
+#if !defined(ROCKETGPU_USE_CUDA)
+// PreTickCarControls result for one car's raw controls; reused while the raw controls stay bitwise equal.
+struct CarControlsMemo {
+    CarControls in;
+    CarControls out;
+    float raw_pitch = 2.0f;
+    bool valid = false;
+};
+#endif
+
 struct CarFrame {
     Vec3 fwd, right, up;
     Vec3 inv_inertia_local_bt;
@@ -170,8 +190,21 @@ struct CarFrame {
 #if !defined(__CUDA_ARCH__)
     mutable bool has_inertia_world_bt = false;
     mutable bool has_inertia_world_uu = false;
+#if !defined(ROCKETGPU_USE_CUDA)
+    // CPU build: read only after has_inertia_world_* is set, so left uninitialized (no per-frame zeroing).
+    mutable UninitArray<Vec3, 3> inertia_world_bt_rows;
+    mutable UninitArray<Vec3, 3> inertia_world_uu_rows;
+#else
     mutable Vec3 inertia_world_bt_row0, inertia_world_bt_row1, inertia_world_bt_row2;
     mutable Vec3 inertia_world_uu_row0, inertia_world_uu_row1, inertia_world_uu_row2;
+#endif
+#endif
+#if !defined(ROCKETGPU_USE_CUDA)
+    mutable const CarRbSnapMemo* rb_snap = nullptr;
+    mutable const CarShapeCacheEntry* shape = nullptr;
+    mutable CarControlsMemo* ctl_memo = nullptr;
+    mutable bool wheels_pre_inited = false;  // WheelRayPhase: wheels already built by InitWheelStepStates4
+    alignas(16) mutable float wheel_src_bt[3][4] = {};  // InitWheelStepStates4 ray sources, x / y / z per wheel
 #endif
     mutable bool queue_forces = false;
     mutable Vec3 queued_force = Vec3(0.0f, 0.0f, 0.0f);
@@ -182,8 +215,14 @@ struct CarFrame {
     static constexpr int kQueueItems = 4;
     mutable int n_force_items = 0;
     mutable int n_torque_items = 0;
+#if !defined(ROCKETGPU_USE_CUDA)
+    // CPU build: item k is read only while k < n_*_items, after it was written.
+    mutable UninitArray<Vec3, kQueueItems> force_items;
+    mutable UninitArray<Vec3, kQueueItems> torque_items;
+#else
     mutable Vec3 force_items[kQueueItems];
     mutable Vec3 torque_items[kQueueItems];
+#endif
 };
 
 ROCKETGPU_HD void BuildInvInertiaTensorWorldBt(
@@ -215,17 +254,35 @@ ROCKETGPU_HD void BuildInvInertiaTensorWorldBtFromColumnsWithLocalInv(
                     s20 * b20 + s21 * b21 + s22 * b22);
 }
 
-ROCKETGPU_HD CarFrame MakeCarFrame(const CarState& car, const CarConfig& cfg, float mass) {
+#if !defined(ROCKETGPU_USE_CUDA)
+ROCKETGPU_HD Vec3 CarInvInertiaLocalBt(const CarConfig& cfg, float mass) {
+    const Vec3 inertia_bt = BoxBodyInertiaDiagBt(cfg, mass);
+    return Vec3(
+        inertia_bt.x != 0.0f ? 1.0f / inertia_bt.x : 0.0f,
+        inertia_bt.y != 0.0f ? 1.0f / inertia_bt.y : 0.0f,
+        inertia_bt.z != 0.0f ? 1.0f / inertia_bt.z : 0.0f);
+}
+#endif
+
+ROCKETGPU_HD CarFrame MakeCarFrame(const CarState& car, const CarConfig& cfg, float mass
+#if !defined(ROCKETGPU_USE_CUDA)
+                                   , const CarShapeCacheEntry* shape = nullptr
+#endif
+                                   ) {
     CarFrame f;
     f.fwd = Vec3(1.0f, 0.0f, 0.0f);
     f.right = Vec3(0.0f, 1.0f, 0.0f);
     f.up = Vec3(0.0f, 0.0f, 1.0f);
     CarBasisColumns(car, f.fwd, f.right, f.up);
+#if !defined(ROCKETGPU_USE_CUDA)
+    f.inv_inertia_local_bt = shape != nullptr ? shape->inv_inertia_local_bt : CarInvInertiaLocalBt(cfg, mass);
+#else
     const Vec3 inertia_bt = BoxBodyInertiaDiagBt(cfg, mass);
     f.inv_inertia_local_bt = Vec3(
         inertia_bt.x != 0.0f ? 1.0f / inertia_bt.x : 0.0f,
         inertia_bt.y != 0.0f ? 1.0f / inertia_bt.y : 0.0f,
         inertia_bt.z != 0.0f ? 1.0f / inertia_bt.z : 0.0f);
+#endif
     if (car.restored_inv_inertia_valid) {
         f.inv_world_row0_bt = car.restored_inv_inertia_bt[0];
         f.inv_world_row1_bt = car.restored_inv_inertia_bt[1];
@@ -603,6 +660,23 @@ ROCKETGPU_HD Vec3 ComputeBulletStyleExternalTorqueInput(
     const CarFrame* frame = nullptr) {
 #if !defined(__CUDA_ARCH__)
     if (frame) {
+#if !defined(ROCKETGPU_USE_CUDA)
+        Vec3* const rows = frame->inertia_world_uu_rows;
+        if (!frame->has_inertia_world_uu) {
+            Vec3 inv_r0, inv_r1, inv_r2;
+            if (frame->shape != nullptr) {
+                const CarInvInertiaRowsUu r = MakeCarInvInertiaRowsUuWithLocal(car, frame->shape->inv_inertia_local_uu);
+                inv_r0 = r.row0;
+                inv_r1 = r.row1;
+                inv_r2 = r.row2;
+            } else {
+                BuildInvInertiaTensorWorld(car, cfg, mass, inv_r0, inv_r1, inv_r2, frame);
+            }
+            InverseMatrix3x3BulletStyle(inv_r0, inv_r1, inv_r2, rows[0], rows[1], rows[2]);
+            frame->has_inertia_world_uu = true;
+        }
+        return Mul3x3Vec(rows[0], rows[1], rows[2], ang_accel_world);
+#else
         if (!frame->has_inertia_world_uu) {
             Vec3 inv_r0, inv_r1, inv_r2;
             BuildInvInertiaTensorWorld(car, cfg, mass, inv_r0, inv_r1, inv_r2, frame);
@@ -612,6 +686,7 @@ ROCKETGPU_HD Vec3 ComputeBulletStyleExternalTorqueInput(
         }
         return Mul3x3Vec(frame->inertia_world_uu_row0, frame->inertia_world_uu_row1, frame->inertia_world_uu_row2,
                          ang_accel_world);
+#endif
     }
 #else
     (void)frame;
@@ -738,6 +813,17 @@ ROCKETGPU_HD void BuildInertiaTensorWorldBtInverse(
                                     out_row0, out_row1, out_row2);
         return;
 #else
+#if !defined(ROCKETGPU_USE_CUDA)
+        Vec3* const rows = frame->inertia_world_bt_rows;
+        if (!frame->has_inertia_world_bt) {
+            InverseMatrix3x3BulletStyle(frame->inv_world_row0_bt, frame->inv_world_row1_bt, frame->inv_world_row2_bt,
+                                        rows[0], rows[1], rows[2]);
+            frame->has_inertia_world_bt = true;
+        }
+        out_row0 = rows[0];
+        out_row1 = rows[1];
+        out_row2 = rows[2];
+#else
         if (!frame->has_inertia_world_bt) {
             InverseMatrix3x3BulletStyle(frame->inv_world_row0_bt, frame->inv_world_row1_bt, frame->inv_world_row2_bt,
                                         frame->inertia_world_bt_row0, frame->inertia_world_bt_row1,
@@ -747,6 +833,7 @@ ROCKETGPU_HD void BuildInertiaTensorWorldBtInverse(
         out_row0 = frame->inertia_world_bt_row0;
         out_row1 = frame->inertia_world_bt_row1;
         out_row2 = frame->inertia_world_bt_row2;
+#endif
         return;
 #endif
     }
@@ -786,7 +873,8 @@ ROCKETGPU_HD Vec3 ComputeDeferredAngularVelocityDelta(
     const CarConfig& cfg,
     float mass,
     const WheelRuntimeState* wheel_runtime_state,
-    float dt) {
+    float dt,
+    const Vec3* inv_inertia_local_uu = nullptr) {
     if (car.is_demoed || car.just_respawned || !wheel_runtime_state) {
         return Vec3(0.0f, 0.0f, 0.0f);
     }
@@ -794,8 +882,31 @@ ROCKETGPU_HD Vec3 ComputeDeferredAngularVelocityDelta(
     if (acc.x == 0.0f && acc.y == 0.0f && acc.z == 0.0f) {
         return Vec3(0.0f, 0.0f, 0.0f);
     }
+#if defined(ROCKETGPU_HOST_LANES)
+    if (inv_inertia_local_uu != nullptr && !car.restored_inv_inertia_valid) {
+        // MakeCarInvInertiaRowsUuWithLocal and VecMul3x3 in lanes: world row i, lane k =
+        // (s_i0 * fwd[k] + s_i1 * right[k]) + s_i2 * up[k], s_i = (fwd[i] * il.x, right[i] * il.y, up[i] * il.z).
+        using namespace lanes;
+        const Vec3& f = car.tick_start_basis_forward;
+        const Vec3& r = car.tick_start_basis_right;
+        const Vec3& u = car.tick_start_basis_up;
+        const Vec3& il = *inv_inertia_local_uu;
+        const F4 F = Load(f), R = Load(r), U = Load(u);
+        const F4 row0 = (F * Splat(f.x * il.x) + R * Splat(r.x * il.y)) + U * Splat(u.x * il.z);
+        const F4 row1 = (F * Splat(f.y * il.x) + R * Splat(r.y * il.y)) + U * Splat(u.y * il.z);
+        const F4 row2 = (F * Splat(f.z * il.x) + R * Splat(r.z * il.y)) + U * Splat(u.z * il.z);
+        return ToVec3(((row0 * Splat(acc.x) + row1 * Splat(acc.y)) + row2 * Splat(acc.z)) * Splat(dt));
+    }
+#endif
     Vec3 inv_r0, inv_r1, inv_r2;
-    BuildInvInertiaTensorWorld(car, cfg, mass, inv_r0, inv_r1, inv_r2);
+    if (inv_inertia_local_uu != nullptr) {
+        const CarInvInertiaRowsUu rows = MakeCarInvInertiaRowsUuWithLocal(car, *inv_inertia_local_uu);
+        inv_r0 = rows.row0;
+        inv_r1 = rows.row1;
+        inv_r2 = rows.row2;
+    } else {
+        BuildInvInertiaTensorWorld(car, cfg, mass, inv_r0, inv_r1, inv_r2);
+    }
 
     const Vec3 angular_accel = VecMul3x3(acc, inv_r0, inv_r1, inv_r2);
     return angular_accel * dt;
@@ -1298,11 +1409,34 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
     const int ray_pos_first = split_headers ? 0 : mesh_first;
     const int ray_pos_step = split_headers ? 1 : mesh_step;
     int next_ray_info = ray_pos_first < mesh_bvh_mesh_count ? mesh_bvh_meshes[ray_pos_first].ray_order : -1;
+#if !defined(ROCKETGPU_USE_CUDA)
+    const HostStepTables* host_tables = leaf_grid != nullptr ? leaf_grid->host_tables : nullptr;
+    const bool host_tabled = !split_headers && mesh_first == 0 && mesh_step == 1 && host_tables != nullptr &&
+                             host_tables->meshes == mesh_bvh_meshes && host_tables->mesh_count == mesh_bvh_mesh_count;
+    const uint32_t host_meshes = host_tabled ? host_tables->MeshCandidates(ray_min_bt, ray_max_bt) : ~0u;
+    const ArenaMeshLeafGrid* ray_grid =
+        host_tabled && host_tables->ray_grid.infos != nullptr ? &host_tables->ray_grid : nullptr;
+#endif
+#if !defined(ROCKETGPU_USE_CUDA)
+    (void)next_ray_info;
+    // The first candidate at or after pos (positions from 32 on are always visited).
+    const auto host_next = [host_meshes](int pos) {
+        if (pos >= 32) {
+            return pos;
+        }
+        const uint32_t rest = host_meshes & (~0u << pos);
+        return rest != 0u ? CountTrailingZeros64(rest) : 32;
+    };
+    for (int ray_pos = host_next(ray_pos_first); ray_pos < mesh_bvh_mesh_count;
+         ray_pos = host_next(ray_pos + ray_pos_step)) {
+        const int ray_info = mesh_bvh_meshes[ray_pos].ray_order;
+#else
     for (int ray_pos = ray_pos_first; ray_pos < mesh_bvh_mesh_count; ray_pos += ray_pos_step) {
         const int ray_info = next_ray_info;
         if (ray_pos + ray_pos_step < mesh_bvh_mesh_count) {
             next_ray_info = mesh_bvh_meshes[ray_pos + ray_pos_step].ray_order;
         }
+#endif
         const ArenaMeshBvhMeshInfo& mesh_info = mesh_bvh_meshes[ray_info >= 0 ? ray_info : ray_pos];
         if (mesh_info.aabb_max.x < ray_min_bt.x || mesh_info.aabb_min.x > ray_max_bt.x ||
             mesh_info.aabb_max.y < ray_min_bt.y || mesh_info.aabb_min.y > ray_max_bt.y ||
@@ -1430,6 +1564,12 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
         const float fraction_before = best_fraction;
         const uint8_t hit_before = best.hit;
 
+#if !defined(ROCKETGPU_USE_CUDA)
+        if (ray_grid != nullptr && WalkArenaMeshLeafGrid(ray_grid, ray_info >= 0 ? ray_info : ray_pos,
+                                                         quantized_query_aabb_min, quantized_query_aabb_max, leaf,
+                                                         ray_leaf)) {
+        } else
+#endif
         if (!WalkArenaMeshLeafGrid(leaf_grid, ray_info >= 0 ? ray_info : ray_pos, quantized_query_aabb_min,
                                    quantized_query_aabb_max, leaf, ray_leaf)) {
             WalkArenaMeshBvhStacklessQuantizedTreeCacheFriendly(

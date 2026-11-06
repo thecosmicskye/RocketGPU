@@ -20,6 +20,9 @@ struct KickoffSettledRow;
 struct WorldSolverScratch;
 struct WorldSolverScratchRowPoolHost;
 struct RespawnRngState;
+#if !defined(ROCKETGPU_USE_CUDA)
+struct HostStepTables;
+#endif
 }
 
 struct Vec3 {
@@ -582,6 +585,14 @@ ROCKETGPU_HD uint32_t PackCarVisitOrder(const int* slots, int count) {
 // pre-tick, so before that tick's demolitions), then removes the cars demolished last tick, in slot order.
 ROCKETGPU_HD void UpdateGameCarVisitOrder(EnvState& env, const CarState* env_cars, int count) {
     if (env.car_visit_order_mode != 3) return;
+#if !defined(ROCKETGPU_USE_CUDA)
+    // No car to append (absent and not demolished) or remove (present and demolished): order and mask stay.
+    bool change = false;
+    for (int s = 0; s < count && s < 8; ++s) {
+        change |= (((env.car_visit_present_mask >> s) & 1u) != 0u) == (env_cars[s].is_demoed != 0);
+    }
+    if (!change) return;
+#endif
     int order[8];
     for (int k = 0; k < 8; ++k) order[k] = static_cast<int>((env.car_visit_order_packed >> (4 * k)) & 0xFu);
     uint32_t present = env.car_visit_present_mask;
@@ -840,6 +851,10 @@ struct SimConfig {
     const BallState* kickoff_settled_ball = nullptr;
     detail::WheelRuntimeState* kickoff_settled_wheels = nullptr;
     int32_t kickoff_settled_spawns = 0;
+#if !defined(ROCKETGPU_USE_CUDA)
+    // CPU build: culling tables (set by BatchSim; used only while owner == this config).
+    const detail::HostStepTables* host_tables = nullptr;
+#endif
 };
 
 struct DeviceView {

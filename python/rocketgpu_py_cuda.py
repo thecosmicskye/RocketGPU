@@ -2,7 +2,8 @@ import rocketgpu_py as _rs
 
 
 class DeviceArray:
-    def __init__(self, name, entry):
+    def __init__(self, name, entry, owner=None):
+        self._owner = owner
         self.name = name
         self.__cuda_array_interface__ = entry["__cuda_array_interface__"]
         self.itemsize = entry["itemsize"]
@@ -21,7 +22,7 @@ class DeviceArray:
 
 
 def device_arrays(sim):
-    return {name: DeviceArray(name, entry) for name, entry in sim.device_arrays().items()}
+    return {name: DeviceArray(name, entry, sim) for name, entry in sim.device_arrays().items()}
 
 
 _TYPESTR_TO_NUMPY = None
@@ -47,17 +48,18 @@ def state_dtype(name):
 class DeviceFieldArray:
 
 
-    def __init__(self, array_name, field, typestr, base_ptr, count, itemsize, offset, shape):
+    def __init__(self, array_name, field, typestr, base_ptr, count, itemsize, offset, shape, owner=None):
         import numpy as np
 
         elem = np.dtype(typestr)
         strides = [itemsize]
+        stride = elem.itemsize
         for dim in reversed(tuple(shape)):
-            strides.insert(1, elem.itemsize)
-            if len(strides) > 2:
-                strides[1] = strides[2] * dim
+            strides.insert(1, stride)
+            stride *= dim
         full_shape = (count,) + tuple(shape)
         full_strides = tuple(strides[: len(full_shape)])
+        self._owner = owner
         self.name = f"{array_name}.{field}"
         self.dtype = elem
         self.shape = full_shape
@@ -82,12 +84,14 @@ def field_arrays(sim, array_name):
     itemsize = layout["itemsize"]
     assert itemsize == entry["itemsize"], (array_name, itemsize, entry["itemsize"])
     return {
-        field: DeviceFieldArray(array_name, field, typestr, base_ptr, count, itemsize, offset, shape)
+        field: DeviceFieldArray(array_name, field, typestr, base_ptr, count, itemsize, offset, shape, sim)
         for field, typestr, offset, shape in layout["fields"]
     }
 
 
 def host_struct_array(sim, array_name):
+    if _rs.is_cuda_build:
+        raise RuntimeError("host_struct_array requires a CPU build")
 
     import ctypes
 
@@ -97,4 +101,5 @@ def host_struct_array(sim, array_name):
     ptr = entry["__cuda_array_interface__"]["data"][0]
     nbytes = entry["itemsize"] * entry["count"]
     buf = (ctypes.c_char * nbytes).from_address(ptr)
-    return np.frombuffer(buf, dtype=state_dtype(array_name))
+    buf._owner = sim
+    return np.frombuffer(memoryview(buf).toreadonly(), dtype=state_dtype(array_name))

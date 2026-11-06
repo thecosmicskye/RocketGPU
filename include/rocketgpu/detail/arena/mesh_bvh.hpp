@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 #include "rocketgpu/detail/constants.hpp"
 
@@ -63,6 +64,9 @@ struct ArenaMeshLeafGridInfo {
     int32_t cell_offset = -1;
     int32_t cells[3] = {0, 0, 0};
     int32_t cell_width[3] = {1, 1, 1};
+#if !defined(ROCKETGPU_USE_CUDA)
+    uint64_t cell_magic[3] = {0, 0, 0};
+#endif
 };
 
 struct alignas(16) ArenaMeshLeafEntry {
@@ -72,10 +76,15 @@ struct alignas(16) ArenaMeshLeafEntry {
 };
 static_assert(sizeof(ArenaMeshLeafEntry) == 16, "ArenaMeshLeafEntry must stay one 128-bit load");
 
+struct HostStepTables;
+
 struct ArenaMeshLeafGrid {
     const ArenaMeshLeafGridInfo* infos = nullptr;
     const int32_t* cell_start = nullptr;
     const ArenaMeshLeafEntry* entries = nullptr;
+#if !defined(ROCKETGPU_USE_CUDA)
+    const HostStepTables* host_tables = nullptr;
+#endif
 };
 
 struct BulletSweepHistory;
@@ -144,6 +153,92 @@ struct ArenaMeshBvhMeshInfo {
     int32_t ray_order = -1;
     int32_t ray_neg_x_plane_pos = 0;
 };
+
+#if !defined(ROCKETGPU_USE_CUDA)
+// Per voxel, a lower bound on the distance from any point of the voxel to every arena mesh triangle, less that
+// triangle's ray-test tolerance. Guarantee: a segment whose points all lie within R of a point p, with
+// R < Clearance(p), gets no hit from RayCastArenaMeshTriangleBtSource on any arena mesh triangle (world or goal-local
+// form). Why it holds is spelled out at BuildArenaMeshClearance.
+struct ArenaMeshClearance {
+    const ArenaMeshTriangle* mesh = nullptr;  // the triangle array it was built from
+    const uint8_t* lb = nullptr;
+    Vec3 lo = Vec3(0.0f, 0.0f, 0.0f);
+    float inv_cell = 0.0f;
+    float unit = 0.0f;
+    int32_t nx = 0;
+    int32_t ny = 0;
+    int32_t nz = 0;
+
+    // 0 outside the grid and for NaN.
+    float Clearance(const Vec3& p) const {
+        const float fx = (p.x - lo.x) * inv_cell;
+        const float fy = (p.y - lo.y) * inv_cell;
+        const float fz = (p.z - lo.z) * inv_cell;
+        if (!(fx >= 0.0f && fy >= 0.0f && fz >= 0.0f && fx < static_cast<float>(nx) && fy < static_cast<float>(ny) &&
+              fz < static_cast<float>(nz))) {
+            return 0.0f;
+        }
+        const int ix = static_cast<int>(fx);
+        const int iy = static_cast<int>(fy);
+        const int iz = static_cast<int>(fz);
+        return static_cast<float>(lb[(static_cast<size_t>(iz) * ny + iy) * nx + ix]) * unit;
+    }
+};
+
+// CPU build: per-axis bin masks built once per BatchSim. Every mask is a superset of the exact AABB test it guards:
+// binning is monotone, so a value inside a range lands in a bin between the range ends' bins.
+struct HostStepTables {
+    static constexpr int kBins = 32;
+    struct Axis {
+        float lo = 0.0f;
+        float inv = 0.0f;
+        // NaN maps to the outermost bin of each end, so it never narrows a range.
+        int Lo(float v) const {
+            const float t = (v - lo) * inv;
+            return t > 0.0f ? (t < kBins - 1 ? static_cast<int>(t) : kBins - 1) : 0;
+        }
+        int Hi(float v) const {
+            const float t = (v - lo) * inv;
+            return t < kBins - 1 ? (t > 0.0f ? static_cast<int>(t) : 0) : kBins - 1;
+        }
+    };
+    // Item i is in start_le[b] when its range starts in a bin <= b, and in end_ge[b] when it ends in a bin >= b.
+    template <typename Mask>
+    struct AxisMasks {
+        Axis axis;
+        Mask start_le[kBins] = {};
+        Mask end_ge[kBins] = {};
+        Mask Overlapping(float lo_v, float hi_v) const { return start_le[axis.Hi(hi_v)] & end_ge[axis.Lo(lo_v)]; }
+        void Add(int i, float lo_v, float hi_v) {
+            const int b0 = axis.Lo(lo_v), b1 = axis.Hi(hi_v);
+            for (int b = b0; b < kBins; ++b) start_le[b] |= Mask{1} << i;
+            for (int b = 0; b <= b1; ++b) end_ge[b] |= Mask{1} << i;
+        }
+    };
+
+    const void* owner = nullptr;  // the SimConfig the tables were built from
+
+    // Boost pads (bit = pad index), at pad_pos * (1 / 50).
+    int pad_count = -1;
+    float pad_min_z_bt = 0.0f;
+    float pad_max_z_bt = 0.0f;
+    AxisMasks<uint64_t> pad_x;
+    AxisMasks<uint64_t> pad_y;
+
+    // Arena meshes in ray loop order (bit = ray_pos), for this mesh array only.
+    const ArenaMeshBvhMeshInfo* meshes = nullptr;
+    int mesh_count = -1;
+    AxisMasks<uint32_t> mesh_axis[3];
+
+    ArenaMeshLeafGrid ray_grid;
+    ArenaMeshClearance clearance;
+
+    uint32_t MeshCandidates(const Vec3& lo, const Vec3& hi) const {
+        return mesh_axis[0].Overlapping(lo.x, hi.x) & mesh_axis[1].Overlapping(lo.y, hi.y) &
+               mesh_axis[2].Overlapping(lo.z, hi.z);
+    }
+};
+#endif
 
 constexpr float kArenaSweepHalfExtentBt = 10485.740234375f;
 ROCKETGPU_HD uint16_t ArenaSweepQuantize(float v, int is_max) {
@@ -590,7 +685,13 @@ ROCKETGPU_HD bool WalkArenaMeshLeafGrid(
         if (quantized_query_aabb_max[a] - quantized_query_aabb_min[a] > info.cell_width[a]) {
             return false;
         }
+#if !defined(ROCKETGPU_USE_CUDA)
+        cell[a] = info.cell_magic[a] != 0
+            ? static_cast<int>((static_cast<uint64_t>(quantized_query_aabb_min[a]) * info.cell_magic[a]) >> 32)
+            : quantized_query_aabb_min[a] / info.cell_width[a];
+#else
         cell[a] = quantized_query_aabb_min[a] / info.cell_width[a];
+#endif
         cell[a] = cell[a] < info.cells[a] ? cell[a] : info.cells[a] - 1;
     }
     const int cell_idx = info.cell_offset + (cell[2] * info.cells[1] + cell[1]) * info.cells[0] + cell[0];
@@ -627,6 +728,57 @@ ROCKETGPU_HD bool WalkArenaMeshLeafGrid(
                 triangle = k == hit ? triangles[k] : triangle;
             }
             callback(triangle);
+        }
+    }
+#endif
+#if !defined(__CUDA_ARCH__) && (defined(__GNUC__) || defined(__clang__))
+    // Host: the quantized AABB test as one branchless 8 x u16 compare per entry (min lanes against the query max,
+    // max lanes against the query min; the triangle index lanes always pass).
+    typedef uint16_t U16x8 __attribute__((vector_size(16)));
+    typedef uint64_t U64x2 __attribute__((vector_size(16)));
+    // The caller has just stored the query as u16s: load each one on its own (a merged 4-byte load spans two stores
+    // and misses store forwarding), then build the vectors from registers.
+    uint32_t q[6] = {quantized_query_aabb_max[0], quantized_query_aabb_max[1], quantized_query_aabb_max[2],
+                     quantized_query_aabb_min[0], quantized_query_aabb_min[1], quantized_query_aabb_min[2]};
+    for (int a = 0; a < 6; ++a) {
+        __asm__("" : "+r"(q[a]));
+    }
+    const U16x8 hi = {static_cast<uint16_t>(q[0]), static_cast<uint16_t>(q[1]), static_cast<uint16_t>(q[2]),
+                      0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+    const U16x8 lo = {0, 0, 0, static_cast<uint16_t>(q[3]), static_cast<uint16_t>(q[4]), static_cast<uint16_t>(q[5]),
+                      0, 0};
+#if !defined(ROCKETGPU_USE_CUDA)
+    if constexpr (std::is_same<LeafTest, ArenaMeshBvhRayLeaf>::value) {
+        for (; end - e >= 4; e += 4) {
+            unsigned hits = 0;
+            for (int k = 0; k < 4; ++k) {
+                U16x8 a;
+                memcpy(&a, &grid->entries[e + k], sizeof(a));
+                const U64x2 ok = reinterpret_cast<U64x2>((a <= hi) & (a >= lo));
+                hits |= static_cast<unsigned>((ok[0] & ok[1]) == ~0ull) << k;
+            }
+            while (hits != 0) {
+                const int k = CountTrailingZeros32(hits);
+                hits &= hits - 1;
+                const ArenaMeshLeafEntry& entry = grid->entries[e + k];
+                if (leaf_test(entry.quantized_aabb_min, entry.quantized_aabb_max)) {
+                    callback(entry.triangle_index);
+                }
+            }
+        }
+    }
+#endif
+    for (; e < end; ++e) {
+        static_assert(sizeof(ArenaMeshLeafEntry) == 16, "leaf entry is 8 u16 lanes");
+        U16x8 a;
+        memcpy(&a, &grid->entries[e], sizeof(a));
+        const U64x2 ok = reinterpret_cast<U64x2>((a <= hi) & (a >= lo));
+        if ((ok[0] & ok[1]) != ~0ull) {
+            continue;
+        }
+        const ArenaMeshLeafEntry& entry = grid->entries[e];
+        if (leaf_test(entry.quantized_aabb_min, entry.quantized_aabb_max)) {
+            callback(entry.triangle_index);
         }
     }
 #endif

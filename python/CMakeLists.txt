@@ -1,4 +1,7 @@
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
+if (ROCKETGPU_PGO STREQUAL "GENERATE")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/pgo-python.txt" "${Python_EXECUTABLE}\n${CMAKE_CXX_COMPILER_ID}\n${CMAKE_CXX_COMPILER}\n")
+endif()
 if (NOT DEFINED pybind11_DIR)
     execute_process(
         COMMAND "${Python_EXECUTABLE}" -m pybind11 --cmakedir

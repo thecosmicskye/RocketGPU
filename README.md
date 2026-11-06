@@ -4,7 +4,8 @@ Rocket League physics on a GPU.
 
 ## Build
 
-Needs CMake 3.21+, a C++17 compiler, the CUDA toolkit and pybind11.
+Needs CMake 3.21+ and a C++17 compiler. CUDA builds also need the CUDA toolkit; Python bindings need Python
+development files and pybind11.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DROCKETGPU_USE_CUDA=ON -DROCKETGPU_BUILD_PYTHON=ON
@@ -16,7 +17,14 @@ cmake --build build -j
 
 The Python module `rocketgpu_py` ends up in `build/python`, along with a RocketSim-style `rocketsim` package.
 Without `-DROCKETGPU_USE_CUDA=ON` you get a CPU build, tuned for the machine that builds it; add
-`-DROCKETGPU_NATIVE_ARCH=OFF` for a binary that runs on other machines.
+`-DROCKETGPU_NATIVE_ARCH=OFF` for a binary that runs on other machines. `ROCKETGPU_CPU_THREADS`, set before the first
+CPU call, fixes the thread count.
+
+The fastest CPU build is profile-guided (needs `ROCKETGPU_COLLISION_MESH_DIR` and numpy):
+
+```bash
+tools/pgo_build.sh build -DROCKETGPU_USE_CUDA=OFF -DCMAKE_CXX_COMPILER=clang++
+```
 
 ## Collision meshes
 
@@ -47,6 +55,31 @@ sim.step(1)
 cars = sim.download_car_states(sim.car_capacity())
 ```
 
+When controls for several ticks are known in advance, batch them in one call. For a CPU build:
+
+```python
+import numpy as np
+import rocketgpu_py_cuda as views
+
+controls_by_tick = np.zeros((4, sim.car_capacity()), dtype=views.state_dtype('controls'))
+controls_by_tick['throttle'][2:] = 1.0
+sim.step_with_device_controls(controls_by_tick.ctypes.data, 4, sim.car_capacity())
+```
+
+Each row holds one `CarControls` per car slot; the stride is in records and must be at least `sim.car_capacity()`.
+On CUDA builds, pass a device pointer and keep its allocation alive until the chosen stream completes. Use separate
+steps when controls or callbacks depend on intermediate physics states.
+
+On CPU builds, a live NumPy view reads car state without per-car Python objects:
+
+```python
+cars = views.host_struct_array(sim, 'car_states')
+positions = cars['pos'].copy()
+```
+
+Rows are `env * max_cars_per_env + slot`; the first `env_car_count` slots of each arena are active. The view is
+read-only and changes as the simulator steps, so copy what you keep and set state through the state API.
+
 ## Car state
 
 `CarState` fields that RLBot v5 exposes hold RLBot's value for the tick:
@@ -74,21 +107,24 @@ For RocketSim v3's own conventions, use `get_state_v3` / `set_state_v3` (C++ `Ca
 
 ## Speed
 
-Arena-ticks/s. RocketGPU on an RTX 5090; RocketSim v3 0.3.5 on a Ryzen 7 9800X3D with 16 threads. Random controls,
-55% 1v1, 27% 2v2 and 18% 3v3 arenas:
+Arena-ticks/s. RocketGPU CUDA on an RTX 5090; RocketGPU CPU (profile-guided build) and RocketSim v3 0.3.5 on a
+Ryzen 7 9800X3D with 16 threads. Random controls, 55% 1v1, 27% 2v2 and 18% 3v3 arenas:
 
-| Arenas | RocketGPU | RocketSim v3 |
-|---|---|---|
-| 1,024 | 3.91M | 4.10M |
-| 4,096 | 10.43M | 4.38M |
-| 8,192 | 13.36M | 4.72M |
-| 16,384 | 14.52M | 5.49M |
+| Arenas | RocketGPU CUDA | RocketGPU CPU | RocketSim v3 |
+|---|---|---|---|
+| 100 | 0.54M | 1.55M | 1.19M |
+| 500 | 2.13M | 3.25M | 3.19M |
+| 1,024 | 4.04M | 3.63M | 4.10M |
+| 4,096 | 10.30M | 3.53M | 4.38M |
+| 8,192 | 13.15M | 3.49M | 4.72M |
+| 16,384 | 14.15M | 3.68M | 5.49M |
 
 ## Accuracy
 
-[121 real-game recordings](https://github.com/thecosmicskye/RocketGPU-fullstate-suite): 1v1 to 3v3 matches, every
-car body, and scripted scenarios. Each 120-tick segment starts from the game's state and replays the game's inputs;
-22,557 segments, 12,038,088 body-ticks. v3 takes no hidden state, so it starts from the public state.
+[144 real-game recordings](https://github.com/thecosmicskye/RocketGPU-fullstate-suite): 1v1 to 3v3 matches, uneven
+teams, every car body, boost pad tests and scripted scenarios. Each 120-tick segment starts from the game's state and
+replays the game's inputs; 26,378 segments, 14,678,660 body-ticks. v3 takes no hidden state, so it starts from the
+public state.
 
 | | RocketGPU | v3 0.3.5 |
 |---|---|---|

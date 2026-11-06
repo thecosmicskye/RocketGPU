@@ -605,6 +605,27 @@ ROCKETGPU_HD constexpr Vec3 operator+(const Vec3& a, const Vec3& b) {
     return Vec3(a.x + b.x, a.y + b.y, a.z + b.z);
 }
 
+#if !defined(ROCKETGPU_USE_CUDA) && defined(__GNUC__)
+// CPU build: Vec3 math in one 4-float register. Each lane does the scalar code's operations in the same order (no
+// contraction), so results are bit-identical; lane 3 is unused. Abs/Min/Max keep the scalar helpers' -0 and NaN rules.
+#define ROCKETGPU_HOST_LANES 1
+namespace lanes {
+typedef float F4 __attribute__((vector_size(16)));
+typedef int32_t I4 __attribute__((vector_size(16)));
+inline F4 Load(const Vec3& v) { return F4{v.x, v.y, v.z, 0.0f}; }
+inline F4 Splat(float s) { return F4{s, s, s, s}; }
+inline Vec3 ToVec3(F4 v) { return Vec3(v[0], v[1], v[2]); }
+// 16-byte load / store of a Vec3 member that the same object follows with at least 4 more bytes (a store's 4th lane
+// lands there, so the caller writes that field afterwards).
+inline F4 LoadPadded(const Vec3& v) { F4 r; memcpy(&r, &v, sizeof(r)); return r; }
+inline void StorePadded(Vec3& v, F4 x) { memcpy(&v, &x, sizeof(x)); }
+inline F4 Select(I4 m, F4 a, F4 b) { return reinterpret_cast<F4>((reinterpret_cast<I4>(a) & m) | (reinterpret_cast<I4>(b) & ~m)); }
+inline F4 Abs(F4 v) { return Select(v >= Splat(0.0f), v, -v); }
+inline F4 Min(F4 a, F4 b) { return Select(a < b, a, b); }
+inline F4 Max(F4 a, F4 b) { return Select(a > b, a, b); }
+}  // namespace lanes
+#endif
+
 ROCKETGPU_HD constexpr Vec3 operator-(const Vec3& a, const Vec3& b) {
     return Vec3(a.x - b.x, a.y - b.y, a.z - b.z);
 }
@@ -1173,8 +1194,10 @@ ROCKETGPU_HD Quat GameQuantizeBasisColumns(Vec3& fwd, Vec3& right, Vec3& up) {
     return q;
 }
 
+// basis_rot, when given, is GameGetRotationScalar(fwd, right, up) computed earlier for this same basis.
 ROCKETGPU_HD void GameIntegrateOrientationBasisColumns(
-    Vec3& fwd, Vec3& right, Vec3& up, Quat& q_mirror, const Vec3& ang_vel_world, float dt) {
+    Vec3& fwd, Vec3& right, Vec3& up, Quat& q_mirror, const Vec3& ang_vel_world, float dt,
+    const Quat* basis_rot = nullptr) {
     constexpr float kAngularMotionThreshold = 0.5f * Pi() * 0.5f;
     float angle = sqrtf((ang_vel_world.x * ang_vel_world.x + ang_vel_world.y * ang_vel_world.y) +
                         ang_vel_world.z * ang_vel_world.z);
@@ -1190,7 +1213,7 @@ ROCKETGPU_HD void GameIntegrateOrientationBasisColumns(
     }
     const float ax = ang_vel_world.x * f, ay = ang_vel_world.y * f, az = ang_vel_world.z * f;
     const float c = RocketGpuCosf((angle * dt) * 0.5f);
-    const Quat o = GameGetRotationScalar(fwd, right, up);
+    const Quat o = basis_rot != nullptr ? *basis_rot : GameGetRotationScalar(fwd, right, up);
     const Quat p(
         ((c * o.w - ax * o.x) - ay * o.y) - az * o.z,
         ((ax * o.w + c * o.x) + ay * o.z) - az * o.y,
@@ -1231,14 +1254,15 @@ ROCKETGPU_HD bool IntegrateOrientationBasisColumns(
     return true;
 }
 
-ROCKETGPU_HD void IntegrateCarOrientation(CarState& car, const Vec3& ang_vel_world, float dt, bool native_sse_math = false) {
+ROCKETGPU_HD void IntegrateCarOrientation(CarState& car, const Vec3& ang_vel_world, float dt, bool native_sse_math = false,
+                                          const Quat* basis_rot = nullptr) {
     if (!car.basis_authoritative) {
         IntegrateOrientation(car.rot, ang_vel_world, dt);
         return;
     }
     if (!native_sse_math) {
         GameIntegrateOrientationBasisColumns(
-            car.basis_forward, car.basis_right, car.basis_up, car.rot, ang_vel_world, dt);
+            car.basis_forward, car.basis_right, car.basis_up, car.rot, ang_vel_world, dt, basis_rot);
         return;
     }
     IntegrateOrientationBasisColumns(

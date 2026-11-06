@@ -224,7 +224,7 @@ ROCKETGPU_HD void ApplyGameCarWorldContactNormal(
 }
 
 template <bool kMeshesOutOfReach = false, int kPart = 0>
-ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
+ROCKETGPU_HD ROCKETGPU_HOST_INLINE ContactAccumulator SolveCarWorldStaticContacts(
     CarState& car,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
@@ -261,7 +261,10 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     bool defer_world_surface = false,
     CarWorldRowsPart* part_out = nullptr,
     const Vec3* predict_vel = nullptr,
-    const Vec3* predict_ang_vel = nullptr) {
+    const Vec3* predict_ang_vel = nullptr,
+    const BulletBroadphaseProxy* fresh_car_proxy = nullptr,
+    const CarShapeCacheEntry* shape = nullptr,
+    const CarListManifolds* list_manifolds = nullptr) {
     ContactAccumulator acc;
     acc.history_car = defer_world_surface ? nullptr : &car;
 
@@ -272,11 +275,27 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     constexpr bool kEarlyOut = kPart == 0;
     constexpr bool kUsePlaneOutOfReach = (kPart != 1);
 #endif
+#if !defined(__CUDA_ARCH__)
+    // No static manifold in this tick's list and nothing retained: the game has no car-static pair to process.
+    if (kEarlyOut && list_manifolds != nullptr && (list_manifolds->meshes | list_manifolds->planes) == 0u &&
+        mutator.arena_collision && !mutator.physics_events.HasNonGoalEvents()) {
+        bool retained = false;
+        for (int k = 0; retained_mesh_manifolds != nullptr && k < kCarWorldMeshRetainedManifoldsPerCar; ++k) {
+            retained |= retained_mesh_manifolds[k].count > 0;
+        }
+        for (int k = 0; retained_plane_manifolds != nullptr && k < kCarWorldPlaneRetainedManifoldsPerCar; ++k) {
+            retained |= retained_plane_manifolds[k].count > 0;
+        }
+        if (!retained) {
+            return acc;
+        }
+    }
+#endif
     float plane_d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float plane_threshold_bt = 0.0f;
     float plane_window_bt = 0.0f;
     if (kUsePlaneOutOfReach && mutator.arena_collision) {
-        CarWorldPlaneSupportDistances(car, cfg, plane_d, plane_threshold_bt, plane_window_bt);
+        CarWorldPlaneSupportDistances(car, cfg, plane_d, plane_threshold_bt, plane_window_bt, shape);
     }
     if (kEarlyOut && mutator.arena_collision && !mutator.physics_events.HasNonGoalEvents() && mesh_triangles != nullptr &&
         mesh_triangle_count > 0 && mesh_bvh_quantization != nullptr && mesh_bvh_meshes != nullptr &&
@@ -285,7 +304,8 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
         float early_plane_threshold_bt = plane_threshold_bt;
         float early_plane_window_bt = plane_window_bt;
         if (!kUsePlaneOutOfReach) {
-            CarWorldPlaneSupportDistances(car, cfg, early_plane_d, early_plane_threshold_bt, early_plane_window_bt);
+            CarWorldPlaneSupportDistances(car, cfg, early_plane_d, early_plane_threshold_bt, early_plane_window_bt,
+                                          shape);
         } else {
             early_plane_d[0] = plane_d[0];
             early_plane_d[1] = plane_d[1];
@@ -315,7 +335,8 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
         if (plane_groups >= 0 && (plane_groups & 4) != 0 && mutator.game_mode == static_cast<uint8_t>(Mode::Soccar)) {
             const bool gf_held = retained_plane_manifolds != nullptr &&
                                  (retained_plane_manifolds[4].count > 0 || retained_plane_manifolds[5].count > 0);
-            const float gf_reach_bt = BoundingSphereRadius(cfg) * (1.0f / 50.0f) + 0.1f;
+            const float gf_reach_bt =
+                (shape != nullptr ? shape->bounding_sphere_radius : BoundingSphereRadius(cfg)) * (1.0f / 50.0f) + 0.1f;
             const Vec3 gf_center_bt = (car.pos + RotateCarBasis(car, cfg.hitbox_offset)) * (1.0f / 50.0f);
             if (gf_held || (!(Abs(gf_center_bt.x) > kGoalFloorHalfXBt + gf_reach_bt) &&
                             (!(Abs(gf_center_bt.y - GoalFloorOriginBt(0).y) > kGoalFloorHalfYBt + gf_reach_bt) ||
@@ -324,9 +345,13 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
             }
         }
         if (plane_groups >= 0 &&
-            (kMeshesOutOfReach || CarWorldMeshesOutOfReach(
-                car, cfg, mesh_bvh_meshes, mesh_bvh_mesh_count, dt,
-                broadphase_grid != nullptr && mesh_reach_hint == 0u ? &mesh_reach_hint : nullptr))) {
+            (kMeshesOutOfReach ||
+             (list_manifolds != nullptr
+                  ? list_manifolds->meshes == 0u
+                  : CarWorldMeshesOutOfReach(car, cfg, mesh_bvh_meshes, mesh_bvh_mesh_count, dt,
+                                             broadphase_grid != nullptr && mesh_reach_hint == 0u ? &mesh_reach_hint
+                                                                                                : nullptr,
+                                             shape)))) {
             if (retained_plane_manifolds != nullptr) {
                 for (int plane_idx = 0; plane_idx < kCarWorldPlaneRetainedManifoldsPerCar; ++plane_idx) {
                     retained_plane_manifolds[plane_idx].count = 0;
@@ -361,6 +386,9 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     }
     if (mutator.physics_events.windows && env_idx >= 0 && car_idx >= 0) {
         acc.event_stream = mutator.physics_events;
+#if !defined(ROCKETGPU_USE_CUDA)
+        acc.event = PhysicsEvent{};
+#endif
         acc.event.type = PhysicsEventType::CarWorldContact;
         acc.event.car_id = env_idx * mutator.physics_events.cars_per_env + car_idx + 1;
         acc.event.position = car.pos;
@@ -415,7 +443,7 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
     };
     const float precomputed_plane_threshold_bt = kUsePlaneOutOfReach ? plane_threshold_bt : -1.0f;
 
-    const float support_radius = BoundingSphereRadius(cfg);
+    const float support_radius = shape != nullptr ? shape->bounding_sphere_radius : BoundingSphereRadius(cfg);
     const bool in_goal_window_pos_y = InGoalWindow(center.x, center.z, support_radius) && center.y > 0.0f;
     const bool in_goal_window_neg_y = InGoalWindow(center.x, center.z, support_radius) && center.y < 0.0f;
     const bool past_pos_y_wall2 = center.y > ArenaExtentY();
@@ -501,7 +529,8 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
                 retained_plane_manifolds ? &retained_plane_manifolds[2] : nullptr,
                 false,
                 -1,
-                precomputed_plane_threshold_bt);
+                precomputed_plane_threshold_bt,
+                shape);
         }
         if (!plane_out_of_reach(1, Vec3(-1.0f, 0.0f, 0.0f), -ArenaExtentX(),
                                 retained_plane_manifolds ? &retained_plane_manifolds[3] : nullptr)) {
@@ -528,7 +557,8 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
                 retained_plane_manifolds ? &retained_plane_manifolds[3] : nullptr,
                 false,
                 -1,
-                precomputed_plane_threshold_bt);
+                precomputed_plane_threshold_bt,
+                shape);
         }
     }
     if (kPart == 2) {
@@ -590,7 +620,10 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
             retained_mesh_manifolds,
             mesh_reach_hint,
             predict_vel,
-            predict_ang_vel);
+            predict_ang_vel,
+            fresh_car_proxy,
+            shape,
+            list_manifolds);
     }
 
     if (kPart != 1) {
@@ -619,7 +652,8 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
                 retained_plane_manifolds ? &retained_plane_manifolds[0] : nullptr,
                 kPart == 2,
                 -1,
-                precomputed_plane_threshold_bt);
+                precomputed_plane_threshold_bt,
+                shape);
         }
         for (int gf = 0; mutator.game_mode == static_cast<uint8_t>(Mode::Soccar) && gf < 2; ++gf) {
             CarWorldPlaneRetainedManifold* const gf_retained =
@@ -654,7 +688,8 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
                 gf_retained,
                 false,
                 gf,
-                precomputed_plane_threshold_bt);
+                precomputed_plane_threshold_bt,
+                shape);
         }
         if (!plane_out_of_reach(3, Vec3(0.0f, 0.0f, -1.0f), -ArenaHeight(),
                                 retained_plane_manifolds ? &retained_plane_manifolds[1] : nullptr)) {
@@ -681,7 +716,8 @@ ROCKETGPU_HD ContactAccumulator SolveCarWorldStaticContacts(
                 retained_plane_manifolds ? &retained_plane_manifolds[1] : nullptr,
                 kPart == 2,
                 -1,
-                precomputed_plane_threshold_bt);
+                precomputed_plane_threshold_bt,
+                shape);
         }
     }
 
@@ -2337,10 +2373,14 @@ ROCKETGPU_HD int PlaceNthTeamCarAtKickoff(
 template <typename T>
 ROCKETGPU_HD void CopyStateWords(T& dst, const T& src) {
     static_assert(sizeof(T) % 4 == 0, "word copy");
-    uint32_t* d = reinterpret_cast<uint32_t*>(&dst);
-    const uint32_t* s = reinterpret_cast<const uint32_t*>(&src);
+    unsigned char* d = reinterpret_cast<unsigned char*>(&dst);
+    const unsigned char* s = reinterpret_cast<const unsigned char*>(&src);
 #pragma unroll 1
-    for (size_t i = 0; i < sizeof(T) / 4; ++i) d[i] = s[i];
+    for (size_t i = 0; i < sizeof(T) / 4; ++i) {
+        uint32_t word;
+        memcpy(&word, s + i * 4, sizeof(word));
+        memcpy(d + i * 4, &word, sizeof(word));
+    }
 }
 
 // mutator.kickoff_settled: car idx as the game's countdown leaves it at this spawn (SimConfig.kickoff_settled_rows).

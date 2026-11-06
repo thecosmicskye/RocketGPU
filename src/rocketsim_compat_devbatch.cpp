@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <rocketgpu/rocketsim_compat_devbatch.h>
 
 #include <cstring>
@@ -30,6 +31,8 @@ DevBatch::DevBatch(const Arena& tmpl, int n_envs) {
     cfg.env_step_order = nullptr;
     cfg.mutator.cal_arena_local_tris = nullptr;
     cfg.mutator.native_sphere_rsqrt_table = nullptr;
+    // ROCKETGPU_DEVBATCH_NO_MIRROR=1: the native respawn path, so CPU builds step in blocks (scores the block kernels)
+    if (std::getenv("ROCKETGPU_DEVBATCH_NO_MIRROR") != nullptr) cfg.mirror_official_respawn_rng = 0;
     sim_ =std::make_unique<BatchSim>(cfg);
     n_ = static_cast<size_t>(n_envs);
     pads_ = sim_->boost_pad_capacity() / n_;

@@ -8,6 +8,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace rocketgpu {
@@ -817,6 +818,258 @@ std::vector<uint16_t> BuildArenaBroadphaseCellMask(
     return mask;
 }
 
+// Why ArenaMeshClearance is conservative under float rounding:
+//
+// 1. Where a hit can be. RayCastArenaMeshTriangleBtSource accepts a hit only when dist_a * dist_b < 0. With opposite
+//    signs |dist_a| <= |dist_a - dist_b| holds in float too, so the fraction lies in [0, 1] and the hit point is on the
+//    segment from..to, up to the rounding of the interpolation (< 1e-5 bt at arena coordinates). Its three edge tests
+//    accept barycentric coordinates >= -1e-4 (the tolerance is -1e-4 * |n|^2 against edge functions that equal the
+//    coordinate times |n|^2 for any point, on the plane or not). Each computed coordinate is off by at most
+//    ~1e-6 * max_edge^2 / |n| from the products and 3e-5 * max_edge / |n| from the vertex-minus-point differences
+//    (each component rounded at arena coordinates, < 1.5e-5 bt, so < 2.6e-5 bt as a vector). Clamping coordinates
+//    >= -beta to 0 moves the point at most 2 * beta * max_edge. With beta = 1e-4 + both errors, a hit point is within
+//    2e-4 * max_edge + 2e-6 * max_edge^3 / |n| + 6e-5 * max_edge^2 / |n|
+//    <= tol = max_edge * 5e-4 + (1e-5 * max_edge + 6e-5) * max_edge^2 / |n| of the triangle. A triangle whose float
+//    normal is zero never hits.
+// 2. What a voxel stores. lb <= min over triangles of dist(c, T) - tol_T - half_diag - kSlop, with c the voxel centre,
+//    computed in double and floored to whole units. A point p that the lookup's float index puts in a voxel lies within
+//    half_diag + 1e-5 of c (the index rounds at most a hair past a voxel face).
+// 3. The bound. For any segment point q within R of p: dist(q, T) >= dist(c, T) - |c - p| - R
+//    >= lb + tol_T + kSlop - 1e-5 - R. So lb > R gives dist(q, T) > tol_T + kSlop - 1e-5, which leaves room for the
+//    interpolation rounding of point 1: no hit.
+// 4. Capping. Distances are capped at kMax. A triangle visits every voxel whose centre is within its box grown by
+//    kMax + tol. Any other voxel is farther than kMax + tol from it, so the far code kMax - kSlop - half_diag is still a
+//    valid bound there. Box voxels farther than kMax + tol from its plane or bounding sphere take the capped code
+//    without the exact distance, which gives the same bytes.
+// 5. Goal meshes. The ray test may run on the goal-local triangle with the ray shifted by its origin (rounding < 1e-5 bt).
+//    Both forms are in the grid (local form shifted in double), so either test is covered.
+// Callers pass R = back-off + |to - cur| + 2e-3: every segment point is within max(|from - cur|, |to - cur|) of cur,
+// and the 2e-3 covers the float error of those lengths.
+void BuildArenaMeshClearance(
+    const std::vector<ArenaMeshTriangle>& mesh,
+    const std::vector<ArenaMeshTriangle>& local_mesh,
+    std::vector<uint8_t>& out,
+    Vec3& out_lo,
+    float& out_inv_cell,
+    float& out_unit,
+    int32_t out_dims[3],
+    int threads) {
+    constexpr double kCell = 0.5;    // bt
+    constexpr double kMax = 3.0;     // distances are capped here (bt)
+    constexpr double kSlop = 0.01;   // float rounding of ray points, voxel lookup and the build (bt)
+    out.clear();
+    struct Tri {
+        double v[3][3];
+    };
+    std::vector<Tri> tris;
+    const auto add = [&](const ArenaMeshTriangle& t, double oy) {
+        Tri r;
+        const Vec3* p[3] = {&t.a, &t.b, &t.c};
+        for (int k = 0; k < 3; ++k) {
+            r.v[k][0] = p[k]->x;
+            r.v[k][1] = static_cast<double>(p[k]->y) + oy;
+            r.v[k][2] = p[k]->z;
+        }
+        tris.push_back(r);
+    };
+    for (size_t i = 0; i < mesh.size(); ++i) {
+        add(mesh[i], 0.0);
+        if (i < local_mesh.size() && local_mesh[i].cal_origin_sign != 0) {
+            add(local_mesh[i], static_cast<double>(static_cast<float>(local_mesh[i].cal_origin_sign) * kGoalMeshOriginYBt));
+        }
+    }
+    double lo[3] = {1e30, 1e30, 1e30}, hi[3] = {-1e30, -1e30, -1e30};
+    for (const Tri& t : tris) {
+        for (int k = 0; k < 3; ++k) {
+            for (int a = 0; a < 3; ++a) {
+                if (!std::isfinite(t.v[k][a]) || std::abs(t.v[k][a]) > 256.0) {
+                    return;
+                }
+                lo[a] = std::min(lo[a], t.v[k][a]);
+                hi[a] = std::max(hi[a], t.v[k][a]);
+            }
+        }
+    }
+    if (tris.empty()) {
+        return;
+    }
+    int dims[3];
+    for (int a = 0; a < 3; ++a) {
+        lo[a] = std::floor((lo[a] - kMax) / kCell) * kCell;
+        const double count = std::ceil((hi[a] + kMax - lo[a]) / kCell);
+        if (!(count > 0.0 && count <= 4096.0)) {
+            return;
+        }
+        dims[a] = static_cast<int>(count);
+    }
+    const double unit = kMax / 255.0;
+    const double half_diag = 0.5 * kCell * std::sqrt(3.0);
+    out.assign(static_cast<size_t>(dims[0]) * dims[1] * dims[2], 255);
+    const auto sub = [](const double* a, const double* b, double* o) {
+        o[0] = a[0] - b[0];
+        o[1] = a[1] - b[1];
+        o[2] = a[2] - b[2];
+    };
+    const auto dot = [](const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    // Each voxel keeps a min over triangles, so z-slabs filled on separate threads give the same bytes.
+    const auto fill_slab = [&](int z_begin, int z_end) {
+        for (const Tri& t : tris) {
+            const double* a = t.v[0];
+            const double* b = t.v[1];
+            const double* c = t.v[2];
+            double ab[3], ac[3], bc[3];
+            sub(b, a, ab);
+            sub(c, a, ac);
+            sub(c, b, bc);
+            const double n[3] = {
+                ab[1] * ac[2] - ab[2] * ac[1], ab[2] * ac[0] - ab[0] * ac[2], ab[0] * ac[1] - ab[1] * ac[0]};
+            const double n_len = std::sqrt(dot(n, n));
+            const double max_edge = std::sqrt(std::max(dot(ab, ab), std::max(dot(ac, ac), dot(bc, bc))));
+            // Point 1 above.
+            const double tol =
+                n_len > 0.0 ? max_edge * 5e-4 + (1e-5 * max_edge + 6e-5) * max_edge * max_edge / n_len : kMax;
+            const double pad = kSlop + tol + half_diag;
+            // Voxels outside this reach are farther than kMax + tol from the triangle, which the far code below covers.
+            const double reach = kMax + tol;
+            int i0[3], i1[3];
+            for (int ax = 0; ax < 3; ++ax) {
+                const double tmin = std::min(a[ax], std::min(b[ax], c[ax])) - reach;
+                const double tmax = std::max(a[ax], std::max(b[ax], c[ax])) + reach;
+                i0[ax] = std::max(0, static_cast<int>(std::floor((tmin - lo[ax]) / kCell - 0.5)));
+                i1[ax] = std::min(dims[ax] - 1, static_cast<int>(std::ceil((tmax - lo[ax]) / kCell - 0.5)));
+            }
+            // Each row also skips the voxels whose centre is farther than reach from the triangle's plane (so farther
+            // than reach from the triangle), with one voxel of slack at each end.
+            const double plane_reach = reach * n_len * (1.0 + 1e-9) + 1e-9;
+            // Bounding sphere (centroid, farthest vertex): a voxel centre farther than sphere_reach from the centroid is
+            // farther than reach from the triangle.
+            const double cen[3] = {(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0};
+            double r2 = 0.0;
+            for (const double* v : {a, b, c}) {
+                double dv[3];
+                sub(v, cen, dv);
+                r2 = std::max(r2, dot(dv, dv));
+            }
+            const double sphere_reach = (std::sqrt(r2) + reach) * (1.0 + 1e-9) + 1e-9;
+            // Every box voxel past reach has min(d, kMax) = kMax, so it takes this code exactly as the exact test gives.
+            const double cap_lb = kMax - pad;
+            const int cap_code =
+                !(cap_lb > 0.0) ? 0 : cap_lb >= kMax ? 255 : static_cast<int>(std::floor(cap_lb / unit));
+            for (int iz = std::max(i0[2], z_begin); iz <= std::min(i1[2], z_end - 1); ++iz) {
+                for (int iy = i0[1]; iy <= i1[1]; ++iy) {
+                    uint8_t* const row = &out[(static_cast<size_t>(iz) * dims[1] + iy) * dims[0]];
+                    for (int ix = i0[0]; ix <= i1[0]; ++ix) {
+                        row[ix] = static_cast<uint8_t>(std::min<int>(row[ix], cap_code));
+                    }
+                    int x_begin = i0[0], x_end = i1[0];
+                    {
+                        const double dy = lo[1] + (iy + 0.5) * kCell - cen[1];
+                        const double dz = lo[2] + (iz + 0.5) * kCell - cen[2];
+                        const double rem = sphere_reach * sphere_reach - dy * dy - dz * dz;
+                        if (rem < 0.0) {
+                            continue;
+                        }
+                        const double hw = std::sqrt(rem);
+                        const double sb0 = std::floor((cen[0] - hw - lo[0]) / kCell - 0.5) - 1.0;
+                        const double sb1 = std::ceil((cen[0] + hw - lo[0]) / kCell - 0.5) + 1.0;
+                        x_begin = std::max(x_begin, static_cast<int>(std::min(std::max(sb0, -1.0), 4097.0)));
+                        x_end = std::min(x_end, static_cast<int>(std::min(std::max(sb1, -1.0), 4097.0)));
+                    }
+                    double k = 0.0;
+                    if (n_len > 0.0) {
+                        k = n[1] * (lo[1] + (iy + 0.5) * kCell - a[1]) + n[2] * (lo[2] + (iz + 0.5) * kCell - a[2]) -
+                            n[0] * a[0];
+                        if (std::abs(n[0]) > 1e-12 * n_len) {
+                            const double xa = (-plane_reach - k) / n[0], xb = (plane_reach - k) / n[0];
+                            const double x_lo = std::min(xa, xb), x_hi = std::max(xa, xb);
+                            // Clamped in double first: a near-zero n[0] gives huge bounds.
+                            const double xb0 = std::floor((x_lo - lo[0]) / kCell - 0.5) - 1.0;
+                            const double xb1 = std::ceil((x_hi - lo[0]) / kCell - 0.5) + 1.0;
+                            x_begin = std::max(x_begin, static_cast<int>(std::min(std::max(xb0, -1.0), 4097.0)));
+                            x_end = std::min(x_end, static_cast<int>(std::min(std::max(xb1, -1.0), 4097.0)));
+                        } else if (std::abs(k) > plane_reach) {
+                            continue;
+                        }
+                    }
+                    for (int ix = x_begin; ix <= x_end; ++ix) {
+                        const double p[3] = {
+                            lo[0] + (ix + 0.5) * kCell, lo[1] + (iy + 0.5) * kCell, lo[2] + (iz + 0.5) * kCell};
+                        if (n_len > 0.0) {
+                            // The plane distance is a lower bound on the triangle distance and the code is monotone in
+                            // it, so a plane code at or above the voxel's value cannot lower it. The 1e-9 covers the
+                            // rounding of the plane distance against the exact distance below.
+                            const double plane_lb = std::min(std::abs(n[0] * p[0] + k) / n_len - 1e-9, kMax) - pad;
+                            const int plane_code = !(plane_lb > 0.0) ? 0
+                                : plane_lb >= kMax ? 255 : static_cast<int>(std::floor(plane_lb / unit));
+                            if (plane_code >= row[ix]) {
+                                continue;
+                            }
+                        }
+                        // Closest point on the triangle (Ericson, Real-Time Collision Detection 5.1.5).
+                        double ap[3], bp[3], cp[3], q[3];
+                        sub(p, a, ap);
+                        sub(p, b, bp);
+                        sub(p, c, cp);
+                        const double d1 = dot(ab, ap), d2 = dot(ac, ap), d3 = dot(ab, bp), d4 = dot(ac, bp);
+                        const double d5 = dot(ab, cp), d6 = dot(ac, cp);
+                        const double vc = d1 * d4 - d3 * d2, vb = d5 * d2 - d1 * d6, va = d3 * d6 - d5 * d4;
+                        double u = 0.0, v = 0.0;  // q = a + ab * u + ac * v
+                        if (d1 <= 0.0 && d2 <= 0.0) {
+                        } else if (d3 >= 0.0 && d4 <= d3) {
+                            u = 1.0;
+                        } else if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {
+                            u = d1 / (d1 - d3);
+                        } else if (d6 >= 0.0 && d5 <= d6) {
+                            v = 1.0;
+                        } else if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) {
+                            v = d2 / (d2 - d6);
+                        } else if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0) {
+                            const double w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+                            u = 1.0 - w;
+                            v = w;
+                        } else {
+                            const double den = 1.0 / (va + vb + vc);
+                            u = vb * den;
+                            v = vc * den;
+                        }
+                        for (int k = 0; k < 3; ++k) {
+                            q[k] = a[k] + ab[k] * u + ac[k] * v - p[k];
+                        }
+                        const double lb = std::min(std::sqrt(dot(q, q)), kMax) - pad;
+                        const int code = !(lb > 0.0) ? 0 : lb >= kMax ? 255 : static_cast<int>(std::floor(lb / unit));
+                        row[ix] = static_cast<uint8_t>(std::min<int>(row[ix], code));
+                    }
+                }
+            }
+        }
+    };
+    const int n_threads = std::max(1, std::min(threads, dims[2]));
+    std::vector<std::thread> workers;
+    try {
+        for (int k = 1; k < n_threads; ++k) {
+            workers.emplace_back(fill_slab, dims[2] * k / n_threads, dims[2] * (k + 1) / n_threads);
+        }
+        fill_slab(0, dims[2] / n_threads);
+    } catch (...) {
+        for (std::thread& w : workers) w.join();
+        throw;
+    }
+    for (std::thread& w : workers) {
+        w.join();
+    }
+    // A voxel no triangle reached is farther than kMax + tol from each triangle, so kMax - kSlop - half_diag bounds it.
+    const int far_code = static_cast<int>(std::floor((kMax - kSlop - half_diag) / unit));
+    for (uint8_t& cell : out) {
+        cell = static_cast<uint8_t>(std::min<int>(cell, far_code));
+    }
+    out_lo = Vec3(static_cast<float>(lo[0]), static_cast<float>(lo[1]), static_cast<float>(lo[2]));
+    out_inv_cell = static_cast<float>(1.0 / kCell);
+    out_unit = static_cast<float>(unit);
+    out_dims[0] = dims[0];
+    out_dims[1] = dims[1];
+    out_dims[2] = dims[2];
+}
+
 void SetArenaMeshFreeBox(std::vector<ArenaMeshBvhMeshInfo>& mesh_infos) {
     const auto gap = [](float lo, float hi) { return lo > 0.0f ? lo : (hi < 0.0f ? -hi : 0.0f); };
     constexpr float kUnbounded = 1.0e4f;
@@ -871,8 +1124,9 @@ void BuildArenaMeshLeafGrid(
     const std::vector<ArenaMeshBvhSubtreeInfo>& subtrees,
     std::vector<ArenaMeshLeafGridInfo>& out_infos,
     std::vector<int32_t>& out_cell_start,
-    std::vector<ArenaMeshLeafEntry>& out_entries) {
-    constexpr float kCellBt = 4.0f;
+    std::vector<ArenaMeshLeafEntry>& out_entries,
+    float cell_bt) {
+    const float kCellBt = cell_bt;
     const auto contains = [](const uint16_t* outer_min, const uint16_t* outer_max,
                              const uint16_t* inner_min, const uint16_t* inner_max) {
         for (int a = 0; a < 3; ++a) {
@@ -947,6 +1201,9 @@ void BuildArenaMeshLeafGrid(
         for (int a = 0; a < 3; ++a) {
             info.cell_width[a] = std::max(1, static_cast<int>(std::ceil(kCellBt * scale[a])));
             info.cells[a] = max_q[a] / info.cell_width[a] + 1;
+#if !defined(ROCKETGPU_USE_CUDA)
+            info.cell_magic[a] = (uint64_t{1} << 32) / static_cast<uint32_t>(info.cell_width[a]) + 1u;
+#endif
         }
         const size_t cell_count = static_cast<size_t>(info.cells[0]) * info.cells[1] * info.cells[2];
         std::vector<std::vector<ArenaMeshLeafEntry>> cells(cell_count);

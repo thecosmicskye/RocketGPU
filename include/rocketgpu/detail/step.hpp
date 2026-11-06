@@ -21,6 +21,10 @@
 #include <vector>
 #endif
 
+#if !defined(ROCKETGPU_USE_CUDA) && defined(__AVX512F__)
+#include <immintrin.h>
+#endif
+
 #include "rocketgpu/detail/arena/mesh_bvh.hpp"
 #include "rocketgpu/detail/constants.hpp"
 #include "rocketgpu/detail/bullet_gjk_epa2_port.hpp"
