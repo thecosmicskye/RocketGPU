@@ -164,9 +164,7 @@ struct CarConfig {
 
 struct BallHitInfo {
     uint8_t is_valid = 0;
-    uint8_t extra_pending = 0;  // this tick's extra hit is not applied to the ball yet
-    // 1: a public state set tick_count_when_extra_impulse_applied to the tick it was set on, standing for the tick
-    // before (the hit that produced the state), so only the next tick is blocked
+    uint8_t extra_pending = 0;
     uint8_t extra_tick_is_previous = 0;
     uint8_t reserved2 = 0;
     uint64_t tick_count_when_hit = 0;
@@ -278,16 +276,12 @@ struct CarState {
 
     Vec3 pos_bt = Vec3(0.0f, 0.0f, 17.0f * (1.0f / 50.0f));
     Vec3 vel_bt = Vec3(0.0f, 0.0f, 0.0f);
-    // pos_bt at the start of this tick (set by the tick's pre-tick, read by its boost pad test).
     Vec3 tick_start_pos_bt = Vec3(0.0f, 0.0f, 17.0f * (1.0f / 50.0f));
-    // The car actor's Location at the last render frame's end, where the next frame end's boost pad sweep starts
-    // (when pad_frame_pos_valid). A state set moves only the body, so that sweep covers the set's whole move.
     Vec3 pad_frame_pos_bt = Vec3(0.0f, 0.0f, 17.0f * (1.0f / 50.0f));
 
     uint8_t vel_touched_solve_stage = 1;
     uint8_t basis_authoritative = 0;
     uint8_t ext_force_impulse_bt_valid = 0;
-    // pad_frame_pos_bt holds a frame end's Location: set at each frame end, cleared for a new, demoed or (re)spawned car.
     uint8_t pad_frame_pos_valid = 0;
 
     Vec3 basis_forward = Vec3(1.0f, 0.0f, 0.0f);
@@ -351,38 +345,24 @@ struct CarState {
     uint8_t internal_has_jumped = 0;
     uint8_t internal_has_double_jumped = 0;
     uint8_t internal_has_flipped = 0;
-    uint8_t internal_is_supersonic = 0;  // the game's supersonic flag, which holds through supersonic_time
-    uint8_t reported_flags = 0;  // kReported* bits of the reported flags; kReportedValid once reported
-    uint8_t game_has_jumped = 0;  // the game's has_jumped, reported as has_jumped
-    uint8_t double_jump_ticks = 255;  // ticks since has_double_jumped was set; 255 when unknown or not set
+    uint8_t internal_is_supersonic = 0;
+    uint8_t reported_flags = 0;
+    uint8_t game_has_jumped = 0;
+    uint8_t double_jump_ticks = 255;
     // v3's jump_hold_broken (car/base.rs update_jump): the jump's hold was released; set only while jumping.
     uint8_t jump_hold_broken = 0;
-    // Set by compat SetStateV3, whose supersonic flag already reflects the state's velocity (v3 updates it at the end of
-    // a tick, the step at the start of the next): the next step skips its tick-start update once.
     uint8_t supersonic_set_v3 = 0;
-    // Set by compat SetStateV3 when the state carries the game's per-wheel contact normals (RocketGPU wheel order):
-    // the previous tick's wheel contacts, which the first step's sticky force and auto-roll read instead of a raycast
-    // at the set pose. Bit w of set_wheel_normals_mask marks wheel w in contact, bit 4 that the normals were supplied,
-    // bit 5 that the contacts are the game's world contacts as recorded (taken as they are); cleared by that step.
     Vec3 set_wheel_normals[4] = {};
     uint8_t set_wheel_normals_mask = 0;
-    // What this tick's pre-physics (PreTickCarPrePhysics, in the tick-start pass) leaves for the vehicle update
-    // (PreTickCar): kCalPre* bits, the tick-start snapshot forward speed and the pitch-lock restart time.
     uint8_t cal_pre_flags = 0;
     float cal_pre_forward_speed_uu = 0.0f;
     float cal_pre_pitchlock_restart_time = -1.0f;
-    // The car's ang_vel after the tick-start quantize, before its pre-physics impulses, the body damping clamp and any
-    // wheel push: air control damps this snapshot.
     Vec3 cal_tick_start_ang_vel = Vec3(0.0f, 0.0f, 0.0f);
-    // The body basis before this tick's tick-start quantize. The game's quantize write-back sets the rotation without
-    // updateInertiaTensor, so the body keeps this basis's inverse inertia tensor through the tick.
     Vec3 tick_start_basis_forward = Vec3(1.0f, 0.0f, 0.0f);
     Vec3 tick_start_basis_right = Vec3(0.0f, 1.0f, 0.0f);
     Vec3 tick_start_basis_up = Vec3(0.0f, 0.0f, 1.0f);
     Vec3 restored_inv_inertia_bt[3] = {};
     uint8_t restored_inv_inertia_valid = 0;
-    // This tick's bumps on the car (BumpCone) in hitter id order, which FinishCarTick adds to vel_bt one at a time.
-    // Car-car contacts cover 8 cars, so a car takes at most 7.
     static constexpr int kMaxPendingBumps = 7;
     Vec3 pending_bump_bt[kMaxPendingBumps] = {};
     uint32_t pending_bump_hitter[kMaxPendingBumps] = {};
@@ -391,8 +371,6 @@ struct CarState {
     static constexpr uint8_t kReportedVel = 1, kReportedAngVel = 2, kReportedHasJumped = 4,
         kReportedHasDoubleJumped = 8, kReportedHasFlipped = 16, kReportedIsSupersonic = 32, kReportedValid = 128;
 
-    // Puts the internal values back into the reported fields that still hold what the last step reported, and returns
-    // the kReported* bits of those fields (kReportedValid if the state had been reported at all).
     ROCKETGPU_HD uint8_t RestoreWorkingFields() {
         if (!(reported_flags & kReportedValid)) {
             return 0;
@@ -412,8 +390,6 @@ struct CarState {
         RestoreWorkingFlag(is_supersonic, internal_is_supersonic, kReportedIsSupersonic, kept);
         return kept;
     }
-    // After RestoreWorkingFields (kept = its result) and an edit of the working values: the working values become the
-    // internal ones and the fields that were kept show their reported values again.
     ROCKETGPU_HD void ReReportFields(uint8_t kept) {
         if (!(kept & kReportedValid)) {
             return;
@@ -482,17 +458,10 @@ struct BallState {
     Vec3 basis_right = Vec3(0.0f, 1.0f, 0.0f);
     Vec3 basis_up = Vec3(0.0f, 0.0f, 1.0f);
     uint32_t basis_authoritative = 0;
-    // The basis Bullet's world inverse inertia tensor was last built from (updateInertiaTensor, at the previous
-    // tick's transform integration). The game's tick-start state quantize sets the ball's basis from the quantized
-    // quaternion without rebuilding the tensor, so the solver reads the tensor of the pre-quantize basis all tick.
-    // Valid from the tick-start quantize to the end of the tick; otherwise the current basis is used.
     Vec3 inertia_basis_forward = Vec3(1.0f, 0.0f, 0.0f);
     Vec3 inertia_basis_right = Vec3(0.0f, 1.0f, 0.0f);
     Vec3 inertia_basis_up = Vec3(0.0f, 0.0f, 1.0f);
     uint32_t inertia_basis_valid = 0;
-    // Bullet's world inverse inertia tensor (rows, bt) when it is not one built from a basis we hold: the game moves a
-    // sleeping ball (state set) without rebuilding it, so it stays the tensor of the ball's last awake integration
-    // until the ball next integrates awake. Only the dev state setter loads it; used over inertia_basis while valid.
     Vec3 restored_inv_inertia_bt[3] = {};
     uint32_t restored_inv_inertia_valid = 0;
 
@@ -515,7 +484,7 @@ struct BoostPadState {
     float cooldown = 0.0f;
     uint8_t is_active = 1;
     uint8_t is_big = 0;
-    uint16_t pickup_frac_q = 32768;  // the pickup frame's boost_pad_frame_frac, in 1 / 65535 (respawn timing)
+    uint16_t pickup_frac_q = 32768;
     uint32_t prev_locked_car_id = 0;
     uint32_t cur_locked_car_id = 0;
 };
@@ -544,20 +513,16 @@ struct EnvState {
     // the game's vehicle order (UpdateGameCarVisitOrder); for comparisons, 0 slot order, 1 car_visit_order_packed as
     // set, 2 reverse slot order.
     uint8_t car_visit_order_mode = 3;
-    // Mode 3: the slots whose cars were in the world (not demolished) at the last order update, a bit per slot.
     uint8_t car_visit_present_mask = 0xFFu;
-    uint8_t reserved2 = 0;
+    // Resets so far (wraps at 256); picks the kickoff shuffle when the reset's kickoff_seed is 0.
+    uint8_t kickoff_resets = 0;
 
+    // Slot k visited k-th, 4 bits each. In modes 1 and 3, a step needs the env's present slots (< its car count)
+    // listed first; stepping any other order is undefined.
     uint32_t car_visit_order_packed = 0x76543210u;
 
-    // The game's round countdown (Countdown.BeginState): a 1 s one-shot timer, then a 1 s looping timer whose third
-    // firing starts the round (driving on, ball released). AActor::UpdateTimers runs once per render frame after the
-    // frame's physics ticks, adds the frame's DeltaSeconds and fires on Count > Rate (a loop keeps the remainder, a
-    // one-shot drops it). countdown_phase: 0 off, 1 one-shot, 2 loop; countdown_count in seconds.
     uint8_t countdown_phase = 0;
     uint8_t countdown_fires = 0;
-    // Render frames, from MutatorConfig.boost_pad_frame_frac (f >= 0 ends a frame): ticks since the last frame end and
-    // that frame's f, so a frame's DeltaSeconds is (ticks + f - f_prev) / 120. Kept across round resets.
     uint16_t frame_ticks = 0;
     float countdown_count = 0.0f;
     float frame_frac_prev = 0.5f;
@@ -579,14 +544,9 @@ ROCKETGPU_HD uint32_t PackCarVisitOrder(const int* slots, int count) {
     return packed;
 }
 
-// Mode 3: the game updates the vehicles in its physics world's action order. A demolished car's vehicle leaves the
-// list by swap-with-last (the last vehicle takes its place), and a respawned car's is appended. Absent cars sit after
-// the present ones. Runs once per tick before the cars' pre-ticks: it appends the cars respawned last tick (their
-// pre-tick, so before that tick's demolitions), then removes the cars demolished last tick, in slot order.
 ROCKETGPU_HD void UpdateGameCarVisitOrder(EnvState& env, const CarState* env_cars, int count) {
     if (env.car_visit_order_mode != 3) return;
 #if !defined(ROCKETGPU_USE_CUDA)
-    // No car to append (absent and not demolished) or remove (present and demolished): order and mask stay.
     bool change = false;
     for (int s = 0; s < count && s < 8; ++s) {
         change |= (((env.car_visit_present_mask >> s) & 1u) != 0u) == (env_cars[s].is_demoed != 0);
@@ -634,7 +594,7 @@ struct EnvCommand {
     uint8_t reset_scoreboard = 0;
     uint8_t reset_tick_count = 0;
 
-    // 3: no shuffle, a team's nth car takes kickoff spot n.
+    // 2: a new shuffle on every reset, whatever kickoff_seed is. 3: no shuffle, a team's nth car takes kickoff spot n.
     uint8_t kickoff_seed_mode = 0;
     // The bodies' side of a round reset alone (a reset_to_kickoff without reset_scoreboard implies it): every body
     // leaves the world and is re-added the way the game respawns them after a goal (BulletSweepNewRound).
@@ -648,6 +608,7 @@ struct EnvCommand {
     // either, the reset is the game's: the ball re-created high and falling under the 2D constraint, the cars one tick
     // later, held (bDriving off) until the countdown ends.
     uint16_t kickoff_countdown_ticks = 0;
+    // Seeds the kickoff spot shuffle. 0 (the default): each env takes a new shuffle on every reset.
     uint64_t kickoff_seed = 0;
 };
 
@@ -775,8 +736,6 @@ struct MutatorConfig {
     // the car configs or the teams change. 0: the cars stay where they spawn, as in RocketSim.
     uint8_t kickoff_settled = 1;
 
-    // Bumped by BatchSim::set_mutator_config. The settled-ball fast path (WorldStepSoccar) only reuses a
-    // fixed point verified under the same epoch, since the mutator feeds the ball's static-world step.
     uint32_t ball_settle_epoch = 0;
 
     const detail::ArenaMeshTriangle* cal_arena_local_tris = nullptr;
@@ -813,7 +772,6 @@ struct SimConfig {
     int32_t arena_mesh_bvh_node_count = 0;
     const detail::ArenaMeshBvhSubtreeInfo* arena_mesh_bvh_subtrees = nullptr;
     int32_t arena_mesh_bvh_subtree_count = 0;
-    // Per-mesh leaf grids (ArenaMeshLeafGrid); null walks the BVH.
     const detail::ArenaMeshLeafGridInfo* arena_mesh_leaf_grid_infos = nullptr;
     const int32_t* arena_mesh_leaf_cell_start = nullptr;
     const detail::ArenaMeshLeafEntry* arena_mesh_leaf_entries = nullptr;
@@ -826,16 +784,10 @@ struct SimConfig {
     int32_t arena_broadphase_cells_x = 0;
     int32_t arena_broadphase_cells_y = 0;
     int32_t arena_broadphase_cells_z = 0;
-    // A fresh broadphase sweep holding only the arena's static handles, without and with goal floors (set by BatchSim).
     const detail::BulletSweepHistory* arena_sweep_statics = nullptr;
-    // CUDA step kernels: thread i simulates env env_step_order[i] (envs grouped by car count; set by BatchSim).
     const int32_t* env_step_order = nullptr;
-    // The cars in all envs when BatchSim set env_step_order (0: unknown); the staged step sizes its env groups by it.
     int64_t env_car_total = 0;
-    // Per-env render frame fraction (BatchSim::set_env_frame_frac), or null: every env uses
-    // mutator.boost_pad_frame_frac. Read through detail::FrameFrac.
     const float* env_frame_frac = nullptr;
-    // Per-env frame_start_dt (BatchSim::set_env_frame_start_dt), or null: every env uses mutator.frame_start_dt.
     const float* env_frame_start_dt = nullptr;
     CarConfig default_car = {};
     MutatorConfig mutator = {};
@@ -843,16 +795,12 @@ struct SimConfig {
     uint8_t use_custom_boost_pads = 0;
     int32_t boost_pad_count = 0;
     BoostPadConfig boost_pads[kMaxBoostPads] = {};
-    // Set by BatchSim with mutator.kickoff_settled: the states a countdown-free kickoff reset copies. Rows are
-    // [entry * kickoff_settled_spawns + spawn] (spawn: the kickoff spot, or the team slot from 5 on); each car
-    // slot's entry (its config and team); the ball; the wheel states the reset writes.
     const detail::KickoffSettledRow* kickoff_settled_rows = nullptr;
     const int64_t* kickoff_settled_entry = nullptr;
     const BallState* kickoff_settled_ball = nullptr;
     detail::WheelRuntimeState* kickoff_settled_wheels = nullptr;
     int32_t kickoff_settled_spawns = 0;
 #if !defined(ROCKETGPU_USE_CUDA)
-    // CPU build: culling tables (set by BatchSim; used only while owner == this config).
     const detail::HostStepTables* host_tables = nullptr;
 #endif
 };
@@ -899,6 +847,8 @@ public:
     size_t env_count() const noexcept;
     size_t boost_pad_capacity() const noexcept;
 
+    // A lower count leaves mode 1/3 visit orders as they are: before the next step, upload an order that lists the
+    // present slots first (stepping one that does not is undefined).
     void set_env_car_count(const int32_t* host_counts, size_t count, cudaStream_t stream = nullptr);
     void set_teams(const Team* host_teams, size_t count, cudaStream_t stream = nullptr);
     void set_car_configs(const CarConfig* host_configs, size_t count, cudaStream_t stream = nullptr);
@@ -935,8 +885,6 @@ public:
     void download_solver_scratch_range(detail::WorldSolverScratch* host_states, size_t first, size_t count, cudaStream_t stream = nullptr) const;
 
     void download_solver_scratch_rows(detail::WorldSolverScratchRowPoolHost& out, size_t first, size_t count, cudaStream_t stream = nullptr) const;
-    // Dev only (full-state restore): write envs [first, first + count) of the solver scratch, and of the retained
-    // manifolds (the row pool's cross-tick arrays) from a host pool of count envs.
     void upload_solver_scratch_range_dev(const detail::WorldSolverScratch* host_states, size_t first, size_t count, cudaStream_t stream = nullptr);
     void upload_solver_retained_rows_dev(const detail::WorldSolverScratchRowPoolHost& in, size_t first, size_t count, cudaStream_t stream = nullptr);
 

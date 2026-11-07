@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.21)
-project(RocketGPU LANGUAGES CXX)
+project(RocketGPU VERSION 1.0.0 LANGUAGES CXX)
 
 option(ROCKETGPU_USE_CUDA "Build CUDA kernels" OFF)
 option(ROCKETGPU_BUILD_PYTHON "Build Python bindings" OFF)
+option(ROCKETGPU_BUILD_BENCH "Build tools/bench_cpp (throughput benchmark)" OFF)
 option(ROCKETGPU_NATIVE_ARCH "CPU builds: tune for this machine (-march=native / -mcpu=native); OFF for binaries that run on other machines" ON)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -48,8 +49,6 @@ if (ROCKETGPU_PGO AND NOT ROCKETGPU_PGO STREQUAL "OFF")
         message(FATAL_ERROR "ROCKETGPU_PGO needs a CPU build with GCC or Clang and ROCKETGPU_PGO_PROFILE")
     endif()
     if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        # Profile files are named by object path relative to the build directory, so a profile from one build
-        # directory applies to another. GCC's profile-driven unrolling, peeling and tracing made the step slower.
         set(_rocketgpu_pgo_common -fprofile-prefix-path=${CMAKE_BINARY_DIR})
         if (ROCKETGPU_PGO STREQUAL "GENERATE")
             set(_rocketgpu_pgo -fprofile-generate=${ROCKETGPU_PGO_PROFILE} -fprofile-update=atomic)
@@ -67,7 +66,6 @@ endif()
 
 add_library(rocketgpu STATIC)
 if (_rocketgpu_pgo)
-    # Library only: the bindings' pointer-keyed hash tables would make the profile vary with ASLR.
     target_compile_options(rocketgpu PRIVATE ${_rocketgpu_pgo_common} ${_rocketgpu_pgo})
 endif()
 if (APPLE AND NOT ROCKETGPU_USE_CUDA AND NOT CMAKE_CROSSCOMPILING
@@ -94,7 +92,6 @@ target_compile_options(rocketgpu PRIVATE
     $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU,Clang,AppleClang>>:-Wpedantic>
 )
 if (NOT ROCKETGPU_USE_CUDA AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    # sqrtf stays exact; this only drops the errno call on negative inputs.
     target_compile_options(rocketgpu PRIVATE -fno-math-errno)
 endif()
 set(_rocketgpu_cxx_flags "${CMAKE_CXX_FLAGS}")
@@ -123,11 +120,7 @@ endif()
 if (NOT ROCKETGPU_USE_CUDA)
     find_program(ROCKETGPU_ISPC_EXECUTABLE ispc)
 endif()
-set(_rocketgpu_cpu_ispc_default ON)
-if (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
-    set(_rocketgpu_cpu_ispc_default OFF)
-endif()
-option(ROCKETGPU_CPU_ISPC "CPU builds: SIMD kernels across cars (needs ispc)" ${_rocketgpu_cpu_ispc_default})
+option(ROCKETGPU_CPU_ISPC "CPU builds: SIMD kernels across cars (needs ispc)" ON)
 set(_rocketgpu_ispc_portable_x86 OFF)
 if (NOT ROCKETGPU_NATIVE_ARCH AND NOT ROCKETGPU_ISPC_TARGET AND
     (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" OR CMAKE_OSX_ARCHITECTURES MATCHES "x86_64"))
@@ -153,14 +146,26 @@ if (NOT ROCKETGPU_USE_CUDA AND ROCKETGPU_CPU_ISPC AND ROCKETGPU_ISPC_EXECUTABLE 
             set(ROCKETGPU_ISPC_TARGET avx2-i32x8)
         endif()
     endif()
+    file(REAL_PATH "${ROCKETGPU_ISPC_EXECUTABLE}" _rocketgpu_ispc_real)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${ROCKETGPU_ISPC_EXECUTABLE}" "${_rocketgpu_ispc_real}")
+    execute_process(COMMAND "${ROCKETGPU_ISPC_EXECUTABLE}" --help
+                    RESULT_VARIABLE _rocketgpu_ispc_help_result
+                    OUTPUT_VARIABLE _rocketgpu_ispc_help ERROR_VARIABLE _rocketgpu_ispc_help_error)
+    set(_rocketgpu_ispc_export_flag)
+    set(_rocketgpu_ispc_suffix)
+    if(_rocketgpu_ispc_help_result STREQUAL "0" AND
+       "${_rocketgpu_ispc_help}${_rocketgpu_ispc_help_error}" MATCHES "(^|[^A-Za-z0-9_-])--no-internal-export-functions([^A-Za-z0-9_-]|$)")
+        set(_rocketgpu_ispc_export_flag --no-internal-export-functions)
+        set(_rocketgpu_ispc_suffix _external_only)
+    endif()
     set(_rocketgpu_ispc_dir ${CMAKE_CURRENT_SOURCE_DIR}/src/cpu_ispc)
-    set(_rocketgpu_ispc_obj ${CMAKE_CURRENT_BINARY_DIR}/rg_pretick_ispc${CMAKE_CXX_OUTPUT_EXTENSION})
+    set(_rocketgpu_ispc_obj ${CMAKE_CURRENT_BINARY_DIR}/rg_pretick_ispc${_rocketgpu_ispc_suffix}${CMAKE_CXX_OUTPUT_EXTENSION})
     add_custom_command(
         OUTPUT ${_rocketgpu_ispc_obj}
         COMMAND ${ROCKETGPU_ISPC_EXECUTABLE} --target=${ROCKETGPU_ISPC_TARGET} -O2 --opt=disable-fma
-                --enable-llvm-intrinsics --pic -I ${_rocketgpu_ispc_dir} ${_rocketgpu_ispc_dir}/rg_pretick.ispc
+                --enable-llvm-intrinsics ${_rocketgpu_ispc_export_flag} --pic -I ${_rocketgpu_ispc_dir} ${_rocketgpu_ispc_dir}/rg_pretick.ispc
                 -o ${_rocketgpu_ispc_obj}
-        DEPENDS ${_rocketgpu_ispc_dir}/rg_pretick.ispc ${_rocketgpu_ispc_dir}/rg_math.isph ${_rocketgpu_ispc_dir}/rg_types.isph ${_rocketgpu_ispc_dir}/rg_layout.isph
+        DEPENDS "${ROCKETGPU_ISPC_EXECUTABLE}" "${_rocketgpu_ispc_real}" ${_rocketgpu_ispc_dir}/rg_pretick.ispc ${_rocketgpu_ispc_dir}/rg_math.isph ${_rocketgpu_ispc_dir}/rg_types.isph ${_rocketgpu_ispc_dir}/rg_layout.isph
         VERBATIM)
     target_sources(rocketgpu PRIVATE ${_rocketgpu_ispc_obj})
     target_compile_definitions(rocketgpu PUBLIC ROCKETGPU_CPU_ISPC=1)
@@ -181,4 +186,13 @@ endif()
 
 if (ROCKETGPU_BUILD_PYTHON)
     add_subdirectory(python)
+endif()
+
+if (ROCKETGPU_BUILD_BENCH)
+    add_executable(bench_cpp tools/bench_cpp.cpp)
+    target_link_libraries(bench_cpp PRIVATE rocketgpu)
+    set_target_properties(bench_cpp PROPERTIES CXX_STANDARD 20 CUDA_STANDARD 20 CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+    if (ROCKETGPU_USE_CUDA)
+        set_source_files_properties(tools/bench_cpp.cpp PROPERTIES LANGUAGE CUDA)
+    endif()
 endif()

@@ -84,6 +84,8 @@ struct ArenaMeshLeafGrid {
     const ArenaMeshLeafEntry* entries = nullptr;
 #if !defined(ROCKETGPU_USE_CUDA)
     const HostStepTables* host_tables = nullptr;
+    const float* entry_boxes = nullptr;
+    const ArenaMeshBvhQuantization* box_quantization = nullptr;
 #endif
 };
 
@@ -155,12 +157,8 @@ struct ArenaMeshBvhMeshInfo {
 };
 
 #if !defined(ROCKETGPU_USE_CUDA)
-// Per voxel, a lower bound on the distance from any point of the voxel to every arena mesh triangle, less that
-// triangle's ray-test tolerance. Guarantee: a segment whose points all lie within R of a point p, with
-// R < Clearance(p), gets no hit from RayCastArenaMeshTriangleBtSource on any arena mesh triangle (world or goal-local
-// form). Why it holds is spelled out at BuildArenaMeshClearance.
 struct ArenaMeshClearance {
-    const ArenaMeshTriangle* mesh = nullptr;  // the triangle array it was built from
+    const ArenaMeshTriangle* mesh = nullptr;
     const uint8_t* lb = nullptr;
     Vec3 lo = Vec3(0.0f, 0.0f, 0.0f);
     float inv_cell = 0.0f;
@@ -169,7 +167,6 @@ struct ArenaMeshClearance {
     int32_t ny = 0;
     int32_t nz = 0;
 
-    // 0 outside the grid and for NaN.
     float Clearance(const Vec3& p) const {
         const float fx = (p.x - lo.x) * inv_cell;
         const float fy = (p.y - lo.y) * inv_cell;
@@ -185,14 +182,11 @@ struct ArenaMeshClearance {
     }
 };
 
-// CPU build: per-axis bin masks built once per BatchSim. Every mask is a superset of the exact AABB test it guards:
-// binning is monotone, so a value inside a range lands in a bin between the range ends' bins.
 struct HostStepTables {
     static constexpr int kBins = 32;
     struct Axis {
         float lo = 0.0f;
         float inv = 0.0f;
-        // NaN maps to the outermost bin of each end, so it never narrows a range.
         int Lo(float v) const {
             const float t = (v - lo) * inv;
             return t > 0.0f ? (t < kBins - 1 ? static_cast<int>(t) : kBins - 1) : 0;
@@ -202,7 +196,6 @@ struct HostStepTables {
             return t < kBins - 1 ? (t > 0.0f ? static_cast<int>(t) : 0) : kBins - 1;
         }
     };
-    // Item i is in start_le[b] when its range starts in a bin <= b, and in end_ge[b] when it ends in a bin >= b.
     template <typename Mask>
     struct AxisMasks {
         Axis axis;
@@ -216,16 +209,14 @@ struct HostStepTables {
         }
     };
 
-    const void* owner = nullptr;  // the SimConfig the tables were built from
+    const void* owner = nullptr;
 
-    // Boost pads (bit = pad index), at pad_pos * (1 / 50).
     int pad_count = -1;
     float pad_min_z_bt = 0.0f;
     float pad_max_z_bt = 0.0f;
     AxisMasks<uint64_t> pad_x;
     AxisMasks<uint64_t> pad_y;
 
-    // Arena meshes in ray loop order (bit = ray_pos), for this mesh array only.
     const ArenaMeshBvhMeshInfo* meshes = nullptr;
     int mesh_count = -1;
     AxisMasks<uint32_t> mesh_axis[3];
@@ -386,9 +377,34 @@ ROCKETGPU_HD void QuantizeArenaMeshBvhQueryBox(
     float origin_y,
     uint16_t out_min[3],
     uint16_t out_max[3]) {
+#if !defined(ROCKETGPU_USE_CUDA) && (defined(__GNUC__) || defined(__clang__))
+    typedef float F4 __attribute__((vector_size(16)));
+    typedef int32_t I4 __attribute__((vector_size(16)));
+    const auto sel = [](I4 m, F4 a, F4 b) {
+        return reinterpret_cast<F4>((m & reinterpret_cast<I4>(a)) | (~m & reinterpret_cast<I4>(b)));
+    };
+    const Vec3& q_min = quantization.bvh_aabb_min;
+    const Vec3& q_max = quantization.bvh_aabb_max;
+    const Vec3& q_scale = quantization.bvh_quantization;
+    const F4 lo = {q_min.x, q_min.y, q_min.z, 0.0f}, hi = {q_max.x, q_max.y, q_max.z, 0.0f};
+    const F4 scale = {q_scale.x, q_scale.y, q_scale.z, 0.0f};
+    const F4 c = {center.x, center.y - origin_y, center.z, 0.0f}, e = {extent.x, extent.y, extent.z, 0.0f};
+    const auto quantize = [&](F4 p) {
+        p = sel(p > lo, p, lo);
+        p = sel(p < hi, p, hi);
+        return (p - lo) * scale;
+    };
+    const I4 qmin = __builtin_convertvector(quantize(c - e), I4) & 0xfffe;
+    const I4 qmax = __builtin_convertvector(quantize(c + e) + F4{1.0f, 1.0f, 1.0f, 1.0f}, I4) | 1;
+    for (int a = 0; a < 3; ++a) {
+        out_min[a] = static_cast<uint16_t>(qmin[a]);
+        out_max[a] = static_cast<uint16_t>(qmax[a]);
+    }
+#else
     const Vec3 c(center.x, center.y - origin_y, center.z);
     QuantizeArenaMeshBvhPoint(quantization, c - extent, 0, out_min);
     QuantizeArenaMeshBvhPoint(quantization, c + extent, 1, out_max);
+#endif
 }
 
 ROCKETGPU_HD Vec3 UnquantizeArenaMeshBvhPoint(
@@ -464,6 +480,35 @@ struct ArenaMeshBvhRayLeaf {
         }
         return (tzmin <= t0 ? t0 : tzmin) < lambda_max && 0.0f < (t1 <= tzmax ? t1 : tzmax);
     }
+#if !defined(ROCKETGPU_USE_CUDA)
+    bool Box(const float* box) const {
+        if (lambda_max < 0.0f) {
+            const Vec3 d = to - source;
+            const float r = 1.0f / sqrtf(d.y * d.y + d.x * d.x + d.z * d.z);
+            const Vec3 n(d.x * r, d.y * r, d.z * r);
+            lambda_max = n.x * d.x + n.y * d.y + n.z * d.z;
+            inv_dir = Vec3(n.x == 0.0f ? 1e18f : 1.0f / n.x, n.y == 0.0f ? 1e18f : 1.0f / n.y,
+                           n.z == 0.0f ? 1e18f : 1.0f / n.z);
+        }
+        const Vec3 lo(box[0], box[1], box[2]);
+        const Vec3 hi(box[4], box[5], box[6]);
+        const float tmin = ((inv_dir.x < 0.0f ? hi.x : lo.x) - source.x) * inv_dir.x;
+        const float tmax = ((inv_dir.x < 0.0f ? lo.x : hi.x) - source.x) * inv_dir.x;
+        const float tymin = ((inv_dir.y < 0.0f ? hi.y : lo.y) - source.y) * inv_dir.y;
+        const float tymax = ((inv_dir.y < 0.0f ? lo.y : hi.y) - source.y) * inv_dir.y;
+        if (!(tmin <= tymax) || !(tymin <= tmax)) {
+            return false;
+        }
+        const float t0 = tymin <= tmin ? tmin : tymin;
+        const float t1 = tmax <= tymax ? tmax : tymax;
+        const float tzmin = ((inv_dir.z < 0.0f ? hi.z : lo.z) - source.z) * inv_dir.z;
+        const float tzmax = ((inv_dir.z < 0.0f ? lo.z : hi.z) - source.z) * inv_dir.z;
+        if (!(t0 <= tzmax) || !(tzmin <= t1)) {
+            return false;
+        }
+        return (tzmin <= t0 ? t0 : tzmin) < lambda_max && 0.0f < (t1 <= tzmax ? t1 : tzmax);
+    }
+#endif
 };
 
 template <typename Callback, typename LeafTest = ArenaMeshBvhAnyLeaf>
@@ -732,12 +777,8 @@ ROCKETGPU_HD bool WalkArenaMeshLeafGrid(
     }
 #endif
 #if !defined(__CUDA_ARCH__) && (defined(__GNUC__) || defined(__clang__))
-    // Host: the quantized AABB test as one branchless 8 x u16 compare per entry (min lanes against the query max,
-    // max lanes against the query min; the triangle index lanes always pass).
     typedef uint16_t U16x8 __attribute__((vector_size(16)));
     typedef uint64_t U64x2 __attribute__((vector_size(16)));
-    // The caller has just stored the query as u16s: load each one on its own (a merged 4-byte load spans two stores
-    // and misses store forwarding), then build the vectors from registers.
     uint32_t q[6] = {quantized_query_aabb_max[0], quantized_query_aabb_max[1], quantized_query_aabb_max[2],
                      quantized_query_aabb_min[0], quantized_query_aabb_min[1], quantized_query_aabb_min[2]};
     for (int a = 0; a < 6; ++a) {
@@ -749,6 +790,7 @@ ROCKETGPU_HD bool WalkArenaMeshLeafGrid(
                       0, 0};
 #if !defined(ROCKETGPU_USE_CUDA)
     if constexpr (std::is_same<LeafTest, ArenaMeshBvhRayLeaf>::value) {
+        const float* const boxes = grid->entry_boxes;
         for (; end - e >= 4; e += 4) {
             unsigned hits = 0;
             for (int k = 0; k < 4; ++k) {
@@ -761,7 +803,8 @@ ROCKETGPU_HD bool WalkArenaMeshLeafGrid(
                 const int k = CountTrailingZeros32(hits);
                 hits &= hits - 1;
                 const ArenaMeshLeafEntry& entry = grid->entries[e + k];
-                if (leaf_test(entry.quantized_aabb_min, entry.quantized_aabb_max)) {
+                if (boxes != nullptr ? leaf_test.Box(boxes + 8 * (e + k))
+                                     : leaf_test(entry.quantized_aabb_min, entry.quantized_aabb_max)) {
                     callback(entry.triangle_index);
                 }
             }
@@ -777,6 +820,16 @@ ROCKETGPU_HD bool WalkArenaMeshLeafGrid(
             continue;
         }
         const ArenaMeshLeafEntry& entry = grid->entries[e];
+#if !defined(ROCKETGPU_USE_CUDA)
+        if constexpr (std::is_same<LeafTest, ArenaMeshBvhRayLeaf>::value) {
+            if (grid->entry_boxes != nullptr) {
+                if (leaf_test.Box(grid->entry_boxes + 8 * e)) {
+                    callback(entry.triangle_index);
+                }
+                continue;
+            }
+        }
+#endif
         if (leaf_test(entry.quantized_aabb_min, entry.quantized_aabb_max)) {
             callback(entry.triangle_index);
         }

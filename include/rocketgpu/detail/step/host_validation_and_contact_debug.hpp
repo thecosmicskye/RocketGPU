@@ -86,7 +86,6 @@ ROCKETGPU_HD Vec3 CarInvInertiaLocalUu(const CarConfig& cfg, float mass) {
         inertia.z != 0.0f ? 1.0f / inertia.z : 0.0f);
 }
 
-// MakeCarInvInertiaRowsUu with the local inverse inertia given (CarInvInertiaLocalUu of the car's config and mass).
 ROCKETGPU_HD CarInvInertiaRowsUu MakeCarInvInertiaRowsUuWithLocal(const CarState& car, const Vec3& inv_inertia_local) {
     if (car.restored_inv_inertia_valid) {
         return CarInvInertiaRowsUu{car.restored_inv_inertia_bt[0] * 0.0004f,
@@ -174,7 +173,6 @@ ROCKETGPU_HD Vec3 BoxBodyInertiaDiagBt(const CarConfig& cfg, float mass) {
 }
 
 #if !defined(ROCKETGPU_USE_CUDA)
-// PreTickCarControls result for one car's raw controls; reused while the raw controls stay bitwise equal.
 struct CarControlsMemo {
     CarControls in;
     CarControls out;
@@ -191,7 +189,6 @@ struct CarFrame {
     mutable bool has_inertia_world_bt = false;
     mutable bool has_inertia_world_uu = false;
 #if !defined(ROCKETGPU_USE_CUDA)
-    // CPU build: read only after has_inertia_world_* is set, so left uninitialized (no per-frame zeroing).
     mutable UninitArray<Vec3, 3> inertia_world_bt_rows;
     mutable UninitArray<Vec3, 3> inertia_world_uu_rows;
 #else
@@ -203,8 +200,8 @@ struct CarFrame {
     mutable const CarRbSnapMemo* rb_snap = nullptr;
     mutable const CarShapeCacheEntry* shape = nullptr;
     mutable CarControlsMemo* ctl_memo = nullptr;
-    mutable bool wheels_pre_inited = false;  // WheelRayPhase: wheels already built by InitWheelStepStates4
-    alignas(16) mutable float wheel_src_bt[3][4] = {};  // InitWheelStepStates4 ray sources, x / y / z per wheel
+    mutable bool wheels_pre_inited = false;
+    mutable struct WheelsX4* wx = nullptr;
 #endif
     mutable bool queue_forces = false;
     mutable Vec3 queued_force = Vec3(0.0f, 0.0f, 0.0f);
@@ -216,7 +213,6 @@ struct CarFrame {
     mutable int n_force_items = 0;
     mutable int n_torque_items = 0;
 #if !defined(ROCKETGPU_USE_CUDA)
-    // CPU build: item k is read only while k < n_*_items, after it was written.
     mutable UninitArray<Vec3, kQueueItems> force_items;
     mutable UninitArray<Vec3, kQueueItems> torque_items;
 #else
@@ -730,6 +726,9 @@ ROCKETGPU_HD void QueueAngularAccelWorld(
     if (!wheel_runtime_state) {
         return;
     }
+    if (car.basis_authoritative && frame && frame->queue_forces) {
+        return;
+    }
     const Vec3 ang_accel = ComputeBulletStyleExternalTorqueInput(car, cfg, mass, ang_accel_world, frame);
     if (frame && frame->queue_forces) {
         frame->queued_ang_accel += ang_accel;
@@ -884,8 +883,6 @@ ROCKETGPU_HD Vec3 ComputeDeferredAngularVelocityDelta(
     }
 #if defined(ROCKETGPU_HOST_LANES)
     if (inv_inertia_local_uu != nullptr && !car.restored_inv_inertia_valid) {
-        // MakeCarInvInertiaRowsUuWithLocal and VecMul3x3 in lanes: world row i, lane k =
-        // (s_i0 * fwd[k] + s_i1 * right[k]) + s_i2 * up[k], s_i = (fwd[i] * il.x, right[i] * il.y, up[i] * il.z).
         using namespace lanes;
         const Vec3& f = car.tick_start_basis_forward;
         const Vec3& r = car.tick_start_basis_right;
@@ -1415,11 +1412,14 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
                              host_tables->meshes == mesh_bvh_meshes && host_tables->mesh_count == mesh_bvh_mesh_count;
     const uint32_t host_meshes = host_tabled ? host_tables->MeshCandidates(ray_min_bt, ray_max_bt) : ~0u;
     const ArenaMeshLeafGrid* ray_grid =
-        host_tabled && host_tables->ray_grid.infos != nullptr ? &host_tables->ray_grid : nullptr;
+        host_tabled && host_tables->ray_grid.infos != nullptr &&
+                (host_tables->ray_grid.entry_boxes == nullptr ||
+                 host_tables->ray_grid.box_quantization == mesh_bvh_quantization)
+            ? &host_tables->ray_grid
+            : nullptr;
 #endif
 #if !defined(ROCKETGPU_USE_CUDA)
     (void)next_ray_info;
-    // The first candidate at or after pos (positions from 32 on are always visited).
     const auto host_next = [host_meshes](int pos) {
         if (pos >= 32) {
             return pos;

@@ -1,4 +1,3 @@
-// CPU lane kernels for the car pre-tick (lanes = cars, gathered from the AoS CarState array).
 #include "rg_types.isph"
 #include "rg_math.isph"
 #include "rg_layout.isph"
@@ -16,12 +15,9 @@ struct RgPreTickParams {
 
 static const uniform float kUuToBt = 1.0f / 50.0f;
 
-// uint8 fields stay in registers for the whole kernel: their aligned 32-bit words are gathered once at the start and
-// the written ones scattered once at the end. Lanes are distinct cars, so each word belongs to one car.
 #define RG_FIELD_OFF(T, f) ((uniform int32)((uniform int8 * uniform)(&((uniform T * uniform)0)->f) - (uniform int8 * uniform)0))
 #define RG_CAR_WORDS 11
 #define RG_WRS_WORDS 2
-// CarState bytes 120..139, 312..315, 500..503, 600..611 and 660..663; WheelRuntimeState bytes 280..283 and 288..291.
 static const uniform int32 kCarWordOff[RG_CAR_WORDS] = {120, 124, 128, 132, 136, 312, 500, 600, 604, 608, 660};
 static const uniform int32 kWrsWordOff[RG_WRS_WORDS] = {280, 288};
 struct RgFlagWords {
@@ -53,7 +49,6 @@ static inline void LoadFlagWords(uniform CarState cars[], uniform WheelRuntimeSt
         fl.w[k] = *((const uniform uint32 * varying)(wb + ci * (uniform int32)sizeof(uniform WheelRuntimeState) + kWrsWordOff[k]));
     }
 }
-// Words 500, 600 and 604 are only read.
 static const uniform int32 kCarStoreSlots[8] = {0, 1, 2, 3, 4, 5, 9, 10};
 static inline void StoreFlagWords(uniform CarState cars[], uniform WheelRuntimeState wrs[], const int ci, const RgFlagWords& fl) {
     uniform int8 * uniform cb = (uniform int8 * uniform)cars;
@@ -68,7 +63,6 @@ static inline void StoreFlagWords(uniform CarState cars[], uniform WheelRuntimeS
     }
 }
 
-// Car float fields the kernel reads more than once, kept in registers: loaded once, stored once at the end.
 struct RgCarHot {
     Vec3 pos_bt;
     Vec3 vel;
@@ -81,13 +75,11 @@ struct RgCarHot {
     Vec3 basis_up;
 };
 
-// raycast_wheels_and_contact_prep.hpp QuantRoundPosV3
 static inline float QuantRoundPosV3(float x, uniform float scale) {
     const float scaled = x * scale;
     return floor(scaled + 0.5f) * (1.0f / scale);
 }
 
-// raycast_wheels_and_contact_prep.hpp QuantTruncOffsetV3
 static inline float QuantTruncOffsetV3(float x, uniform float scale) {
     const uniform float inv_scale = 1.0f / scale;
     const float k = (float)((int32)(x * scale));
@@ -98,8 +90,6 @@ static inline float QuantTruncOffsetV3(float x, uniform float scale) {
     return rounded + offset;
 }
 
-// CalTickStartLimitAndQuantizeCar for cars that are not demoed, without the native SSE rsqrt table
-// (raycast_wheels_and_contact_prep.hpp), including QuantizeCarState(car, true, &vel_uu, true).
 static inline void TickStartLimitAndQuantize(uniform CarState cars[], const int ci, RgFlagWords& fl, RgCarHot& h, uniform float car_max_speed,
                                              uniform float car_max_ang_speed) {
     {
@@ -109,11 +99,9 @@ static inline void TickStartLimitAndQuantize(uniform CarState cars[], const int 
         if (vel_uu_len_sq > car_max_speed * car_max_speed) {
             const Vec3 vel_uu_normalized = Scale(vel_uu, RsqrtScalar(vel_uu_len_sq));
             vel_uu = Scale(vel_uu_normalized, car_max_speed);
-            // SetCarLinearVelocityBt: overwritten below by the quantized velocity
         }
         const Vec3 ang_vel = ClampLength(h.ang_vel, car_max_ang_speed);
 
-        // QuantizeCarState(v3_exact): SetCarOriginBt then pos = qp; SetCarLinearVelocityBt then vel = q
         const Vec3 p = Scale(h.pos_bt, 50.0f);
         const Vec3 qp = V3(QuantRoundPosV3(p.x, 100.0f), QuantRoundPosV3(p.y, 100.0f), QuantRoundPosV3(p.z, 100.0f));
         h.pos_bt = Scale(qp, kUuToBt);
@@ -145,7 +133,6 @@ static inline void TickStartLimitAndQuantize(uniform CarState cars[], const int 
 
 static inline float Abs(float v) { return v >= 0.0f ? v : -v; }
 
-// raycast_wheels_and_contact_prep.hpp CalFlipRestartTimeOnGround
 static inline float CalFlipRestartTimeOnGround(uniform CarState cars[], int ci, const RgFlagWords& fl, const RgCarHot& h, uniform float flip_torque_time,
                                                uniform float dt) {
     if (CAR_GETB(cars, ci, is_flipping)) {
@@ -174,16 +161,12 @@ static inline float CalFlipRestartTimeOnGround(uniform CarState cars[], int ci, 
 }
 
 
-// StepEnvPreTickCarFinish (env_step.hpp) after the cal_start_vel store, without the predict-velocity stores, on the
-// rg_pretick_cars path: PreTickCarPrePhysics makes no frame, starts no jump or flip and applies no impulse.
 static inline void PreTickFinish(uniform CarState cars[], uniform WheelRuntimeState wrs[], const int ci, RgFlagWords& fl, RgCarHot& h,
                                  const float frame_frac, uniform const RgPreTickParams& p) {
     const uniform float dt = p.dt;
     {
-        // TickStartCarRbSnapshot
         const Quat snap_rot = h.rot;
         const Vec3 snap_vel = h.vel;
-        // CalFlipZDampPrepass
         if (!CAR_GETB(cars, ci, is_on_ground) && CAR_GETB(cars, ci, is_flipping)) {
             const float flip_time = h.internal_flip_time + dt;
             if (flip_time >= 0.15f && flip_time <= p.flip_torque_time) {
@@ -202,7 +185,6 @@ static inline void PreTickFinish(uniform CarState cars[], uniform WheelRuntimeSt
         }
         cars[ci].cal_tick_start_ang_vel = h.ang_vel;
 
-        // PreTickCarPrePhysics
         CAR_SETB(cars, ci, cal_pre_flags, 0);
         const uint8 start_is_flipping = CAR_GETB(cars, ci, is_flipping);
         const uint8 start_has_flipped = CAR_GETB(cars, ci, has_flipped);
@@ -215,7 +197,6 @@ static inline void PreTickFinish(uniform CarState cars[], uniform WheelRuntimeSt
         if (CAR_GETB(cars, ci, supersonic_set_v3)) {
             CAR_SETB(cars, ci, supersonic_set_v3, 0);
         } else {
-            // UpdateSupersonicCalDemo
             const float speed_sq = LengthSq(h.vel);
             if (speed_sq >= (p.supersonic_start_speed * p.supersonic_start_speed)) {
                 CAR_SETB(cars, ci, is_supersonic, 1);
@@ -249,7 +230,6 @@ static inline void PreTickFinish(uniform CarState cars[], uniform WheelRuntimeSt
             WRS_SETB(wrs, ci, cal_cached_ground, 1);
         }
         WRS_SETB(wrs, ci, cal_frame_open, frame_frac < 0.0f ? 1 : 0);
-        // SnapshotForwardSpeed
         const float w2 = snap_rot.w + snap_rot.w;
         const float s = snap_rot.w * snap_rot.w - ((snap_rot.y * snap_rot.y + snap_rot.x * snap_rot.x) + snap_rot.z * snap_rot.z);
         float d = (1.0f * snap_rot.x + 0.0f * snap_rot.y) + 0.0f * snap_rot.z;
@@ -259,7 +239,6 @@ static inline void PreTickFinish(uniform CarState cars[], uniform WheelRuntimeSt
                             ((0.0f * snap_rot.x - 1.0f * snap_rot.y) * w2 + s * 0.0f) + d * snap_rot.z);
         const float forward_speed_uu = (fwd.x * snap_vel.x + fwd.y * snap_vel.y) + fwd.z * snap_vel.z;
         const bool air_jump_used_before = CAR_GETB(cars, ci, has_double_jumped) || CAR_GETB(cars, ci, has_flipped);
-        // UpdateDoubleJumpOrFlipState without a jump press
         if (CAR_GETB(cars, ci, is_on_ground)) {
             CAR_SETB(cars, ci, has_double_jumped, 0);
             h.internal_flip_time = CalFlipRestartTimeOnGround(cars, ci, fl, h, p.flip_torque_time, dt);
@@ -284,8 +263,6 @@ static inline void PreTickFinish(uniform CarState cars[], uniform WheelRuntimeSt
         cars[ci].cal_pre_forward_speed_uu = forward_speed_uu;
         cars[ci].cal_pre_pitchlock_restart_time = cal_pitchlock_restart_time;
 
-        // BodyDampingClampCar(car, mutator, true, true): velocity unchanged by the pre-physics on this path, so a
-        // linear clamp only rewrites vel_bt
         const Vec3 v = h.vel_bt;
         const uniform float max_lin = p.car_max_speed * 0.02f;
         const float vsq = (v.x * v.x + v.y * v.y) + v.z * v.z;
@@ -303,10 +280,8 @@ static inline void PreTickFinish(uniform CarState cars[], uniform WheelRuntimeSt
     }
 }
 
-// StepEnvPreTickCarStart (env_step.hpp) for a car that is not demoed, with tick_count_since_update != 0.
 static inline void PreTickStart(uniform CarState cars[], const int ci, RgFlagWords& fl, RgCarHot& h) {
     CAR_SETB(cars, ci, ball_contact_this_tick, 0);
-    // CarState::RestoreWorkingFields
     const uint8 reported = CAR_GETB(cars, ci, reported_flags);
     if (reported & 128) {
         const Vec3 v = h.vel, rv = cars[ci].reported_vel;
@@ -334,10 +309,6 @@ static inline void PreTickStart(uniform CarState cars[], const int ci, RgFlagWor
     cars[ci].tick_start_pos_bt = h.pos_bt;
 }
 
-// StepEnvPreTickCar (env_step.hpp) without the solver-scratch stores, for cars that are not demoed, have a
-// WheelRuntimeState without cal_restored and tick_count_since_update != 0, press no jump
-// (controls.jump && !driving_disabled && !last_controls.jump), are not auto-flipping and not three-wheeled, with no
-// native SSE rsqrt table. start_vel[j] gets the cal_start_vel value.
 export void rg_pretick_cars(uniform CarState cars[], uniform WheelRuntimeState wrs[], uniform const int32 idx[],
                             uniform const float frame_frac[], uniform int n, uniform const RgPreTickParams& p,
                             uniform Vec3 start_vel[], uniform Quat snap_rot[], uniform Quat snap_raw[]) {
@@ -365,9 +336,120 @@ export void rg_pretick_cars(uniform CarState cars[], uniform WheelRuntimeState w
         cars[ci].basis_forward = h.basis_forward;
         cars[ci].basis_right = h.basis_right;
         cars[ci].basis_up = h.basis_up;
-        // FreshCarRbSnapshot's rotation for the basis the car leaves the kernel with, and its unquantized source.
         const Quat raw = GameGetRotationScalar(h.basis_forward, h.basis_right, h.basis_up);
         snap_raw[j] = raw;
         snap_rot[j] = GameRbStateQuantizeQuat(raw);
+    }
+}
+
+#define RG_BALL_OUT_STRIDE 64
+#define RG_BALL_OUT_POS_BT 0
+#define RG_BALL_OUT_POS 3
+#define RG_BALL_OUT_VEL_BT 6
+#define RG_BALL_OUT_VEL 9
+#define RG_BALL_OUT_ANG_VEL 12
+#define RG_BALL_OUT_ROT 15
+#define RG_BALL_OUT_FWD 19
+#define RG_BALL_OUT_RIGHT 22
+#define RG_BALL_OUT_UP 25
+#define RG_BALL_OUT_INERTIA_FWD 28
+#define RG_BALL_OUT_INERTIA_RIGHT 31
+#define RG_BALL_OUT_INERTIA_UP 34
+#define RG_BALL_OUT_START_VEL 37
+#define RG_BALL_OUT_PREDICT_VEL 40
+#define RG_BALL_OUT_FIELDS 43
+static inline void StoreV3(uniform float out[], const uniform int f, const int j, const Vec3 v) {
+    out[f * RG_BALL_OUT_STRIDE + j] = v.x;
+    out[(f + 1) * RG_BALL_OUT_STRIDE + j] = v.y;
+    out[(f + 2) * RG_BALL_OUT_STRIDE + j] = v.z;
+}
+
+export void rg_pretick_balls(uniform const BallState balls[], uniform int n, uniform float max_speed,
+                             uniform float max_ang_speed, uniform bool heatseeker, uniform bool damp, uniform float damp_scale,
+                             uniform float out[]) {
+    foreach (j = 0 ... n) {
+        Vec3 vel_uu = Scale(balls[j].vel_bt, 50.0f);
+        const float vel_uu_len_sq = LengthSq(vel_uu);
+        if (vel_uu_len_sq > max_speed * max_speed) {
+            vel_uu = Scale(Scale(vel_uu, RsqrtScalar(vel_uu_len_sq)), max_speed);
+        }
+        const Vec3 ang = ClampLength(balls[j].ang_vel, max_ang_speed);
+
+        const Vec3 p = Scale(balls[j].pos_bt, 50.0f);
+        const Vec3 qp = V3(QuantRoundPosV3(p.x, 100.0f), QuantRoundPosV3(p.y, 100.0f), QuantRoundPosV3(p.z, 100.0f));
+        StoreV3(out, RG_BALL_OUT_POS_BT, j, Scale(qp, kUuToBt));
+        StoreV3(out, RG_BALL_OUT_POS, j, qp);
+        const Vec3 qv = V3(QuantTruncOffsetV3(vel_uu.x, 100.0f), QuantTruncOffsetV3(vel_uu.y, 100.0f),
+                           QuantTruncOffsetV3(vel_uu.z, 100.0f));
+        Vec3 vel_bt = Scale(qv, kUuToBt);
+        Vec3 vel = qv;
+        Vec3 w = V3(QuantTruncOffsetV3(ang.x, 10000.0f), QuantTruncOffsetV3(ang.y, 10000.0f),
+                    QuantTruncOffsetV3(ang.z, 10000.0f));
+        Vec3 fwd, right, up;
+        if (balls[j].basis_authoritative != 0) {
+            fwd = balls[j].basis_forward;
+            right = balls[j].basis_right;
+            up = balls[j].basis_up;
+        } else {
+            const Quat q = balls[j].rot;
+            const float len_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+            if (len_sq <= 1e-12f) {
+                fwd = V3(1.0f, 0.0f, 0.0f);
+                right = V3(0.0f, 1.0f, 0.0f);
+                up = V3(0.0f, 0.0f, 1.0f);
+            } else {
+                const float s = 2.0f / len_sq;
+                const float xs = q.x * s;
+                const float ys = q.y * s;
+                const float zs = q.z * s;
+                const float wx = q.w * xs;
+                const float wy = q.w * ys;
+                const float wz = q.w * zs;
+                const float xx = q.x * xs;
+                const float xy = q.x * ys;
+                const float xz = q.x * zs;
+                const float yy = q.y * ys;
+                const float yz = q.y * zs;
+                const float zz = q.z * zs;
+                fwd = V3(1.0f - (yy + zz), xy + wz, xz - wy);
+                right = V3(xy - wz, 1.0f - (xx + zz), yz + wx);
+                up = V3(xz + wy, yz - wx, 1.0f - (xx + yy));
+            }
+        }
+        StoreV3(out, RG_BALL_OUT_INERTIA_FWD, j, fwd);
+        StoreV3(out, RG_BALL_OUT_INERTIA_RIGHT, j, right);
+        StoreV3(out, RG_BALL_OUT_INERTIA_UP, j, up);
+        const Quat rot = GameQuantizeBasisColumns(fwd, right, up);
+        out[RG_BALL_OUT_ROT * RG_BALL_OUT_STRIDE + j] = rot.w;
+        out[(RG_BALL_OUT_ROT + 1) * RG_BALL_OUT_STRIDE + j] = rot.x;
+        out[(RG_BALL_OUT_ROT + 2) * RG_BALL_OUT_STRIDE + j] = rot.y;
+        out[(RG_BALL_OUT_ROT + 3) * RG_BALL_OUT_STRIDE + j] = rot.z;
+        StoreV3(out, RG_BALL_OUT_FWD, j, fwd);
+        StoreV3(out, RG_BALL_OUT_RIGHT, j, right);
+        StoreV3(out, RG_BALL_OUT_UP, j, up);
+        StoreV3(out, RG_BALL_OUT_START_VEL, j, vel);
+
+        if (!heatseeker) {
+            const uniform float max_lin = max_speed * 0.02f;
+            const float vsq = (vel_bt.x * vel_bt.x + vel_bt.y * vel_bt.y) + vel_bt.z * vel_bt.z;
+            if (0.0f < max_lin && max_lin * max_lin < vsq) {
+                const float s = 1.0f / sqrt(vsq);
+                vel_bt = V3((vel_bt.x * s) * max_lin, (vel_bt.y * s) * max_lin, (vel_bt.z * s) * max_lin);
+                vel = Scale(vel_bt, 50.0f);
+            }
+            const float lsq = (w.x * w.x + w.y * w.y) + w.z * w.z;
+            if (0.0f < max_ang_speed && max_ang_speed * max_ang_speed < lsq) {
+                const float s = 1.0f / sqrt(lsq);
+                w = V3((w.x * s) * max_ang_speed, (w.y * s) * max_ang_speed, (w.z * s) * max_ang_speed);
+            }
+            if (damp) {
+                vel_bt = Scale(vel_bt, damp_scale);
+                vel = Scale(vel_bt, 50.0f);
+            }
+            StoreV3(out, RG_BALL_OUT_PREDICT_VEL, j, vel_bt);
+        }
+        StoreV3(out, RG_BALL_OUT_VEL_BT, j, vel_bt);
+        StoreV3(out, RG_BALL_OUT_VEL, j, vel);
+        StoreV3(out, RG_BALL_OUT_ANG_VEL, j, w);
     }
 }

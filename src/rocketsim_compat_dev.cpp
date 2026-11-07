@@ -249,7 +249,6 @@ constexpr std::pair<const char*, const char*> kFullStateArrays[] = {
     {"car_world_plane", "CarWorldPlaneRetainedManifold"}, {"car_world_mesh", "CarWorldMeshRetainedManifold"},
     {"car_car", "CarCarRetainedManifold"}, {"ball_car", "BallCarRetainedManifold"}};
 
-// Fields that hold an array of another listed struct: written field by field, so the inner layout can change too.
 constexpr std::pair<const char*, const char*> kNestedFields[] = {
     {"WorldSolverScratch.ball_world_mesh_manifolds", "BallMeshPersistentManifold"},
     {"WorldSolverScratch.ball_world_plane_manifolds", "BallMeshPersistentManifold"},
@@ -261,11 +260,10 @@ constexpr std::pair<const char*, const char*> kNestedFields[] = {
 
 struct FieldSlice {
     std::string key;
-    std::vector<size_t> starts;   // byte offset of the field in each element, in order
+    std::vector<size_t> starts;
     size_t size;
 };
 
-// Every leaf field of struct `type` in the elements starting at `starts`, named prefix + field path.
 void FullStateFields(const std::string& type, const std::vector<size_t>& starts, const std::string& prefix,
                      std::vector<FieldSlice>& out) {
     const std::vector<Arena::DevField>& layouts = Arena::DevLayouts();

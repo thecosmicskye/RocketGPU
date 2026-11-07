@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-"""PGO training workload for CPU builds: the README training mix (mixed team sizes and car bodies, random actions with
-per-car onset delays, 8 ticks per env step, resets on goals and timeouts). Run it with an ROCKETGPU_PGO=GENERATE build
-on PYTHONPATH; see tools/pgo_build.sh."""
 import argparse, itertools, struct
 
 import numpy as np
@@ -9,10 +6,10 @@ import rocketgpu_py as rs
 import rocketgpu_py_cuda as views
 
 TICK_SKIP, EPISODE_STEPS, GROUND_FRAC = 8, 900, 0.75
-TEAM_SIZE_FRACTIONS = {1: 0.5478515625, 2: 0.271484375}  # rest 3v3
+TEAM_SIZE_FRACTIONS = {1: 0.5478515625, 2: 0.271484375}
 CAR_FIELDS = ('hitbox_size', 'hitbox_offset', 'front_wheels_offset', 'back_wheels_offset', 'front_wheel_radius',
               'back_wheel_radius', 'front_suspension_rest', 'back_suspension_rest')
-CARS = {  # size, offset, front/back wheel offset, front/back radius, front/back suspension rest
+CARS = {
     'OCTANE': ((120.507, 86.6994, 38.6591), (13.8757, 0, 20.755), (51.25, 25.9, 20.755), (-33.75, 29.5, 20.755), 12.5, 15, 38.755, 37.055),
     'DOMINUS': ((130.427, 85.7799, 33.8), (9, 0, 15.75), (50.3, 31.1, 15.75), (-34.75, 33, 15.75), 12, 13.5, 33.95, 33.85),
     'PLANK': ((131.32, 87.1704, 31.8944), (9.00857, 0, 12.0942), (49.97, 27.8, 12.0942), (-35.43, 20.28, 12.0942), 12.5, 17, 31.9242, 27.9242),
@@ -86,7 +83,7 @@ def main():
 
     table = action_table()
     zero = len(table)
-    t24 = np.zeros((zero + 1, 24), dtype=np.uint8)  # each action as 24-byte device controls; last row: no input
+    t24 = np.zeros((zero + 1, 24), dtype=np.uint8)
     t24[:zero].view(np.float32)[:, :5] = table[:, :5]
     t24[:zero, 20:23] = table[:, 5:8]
     t24 = t24.view(np.uint64)

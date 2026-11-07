@@ -953,8 +953,6 @@ ROCKETGPU_HD float CarWorldTriangleBoxAxisGap(
 }
 
 #if !defined(ROCKETGPU_USE_CUDA)
-// True when one of the nine box-edge x triangle-edge axes separates the box (half extents with margin) from the
-// triangle by more than reject_bt.
 inline bool CarWorldTriangleEdgeAxesSeparated(const ArenaMeshTriangle& tri, const CarWorldMeshQueryFrame& f,
                                               float reject_bt) {
     const Vec3 e[3] = {tri.b - tri.a, tri.c - tri.b, tri.a - tri.c};
@@ -1013,9 +1011,6 @@ ROCKETGPU_HD int CarWorldTriangleQueryTest(
         return 1;
     }
 #if !defined(ROCKETGPU_USE_CUDA)
-    // A gap on any axis is a lower bound on the distance from the box with margin (which contains the margin-rounded box
-    // GJK uses; the triangle has no margin) to the triangle. GJK's distance converges from above, so a gap beyond the
-    // threshold plus the same slack means GJK finds no contact. Like a GJK reject, it still counts as a hit (1).
     if (CarWorldTriangleEdgeAxesSeparated(tri, f, box_axis_reject_bt)) {
         return 1;
     }
@@ -1265,8 +1260,6 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
     if (mesh_triangles == nullptr || mesh_triangle_count <= 0) {
         return;
     }
-    // list_manifolds: the car's manifolds in this tick's broadphase manifold list, keyed by mesh-info slot; its mesh mask
-    // replaces the reach mask and the manifold-exists test.
     if (list_manifolds != nullptr) {
         mesh_reach_hint = list_manifolds->meshes;
     }
@@ -1327,7 +1320,6 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
         }
     }
 #if !defined(ROCKETGPU_USE_CUDA)
-    // Built on first use (only callers without this tick's manifold list use it).
     UninitArray<BulletBroadphaseProxy, 1> car_broadphase_proxy_slot;
     BulletBroadphaseProxy& car_broadphase_proxy = car_broadphase_proxy_slot.data()[0];
 #else
@@ -1337,7 +1329,6 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
     auto ensure_car_broadphase_proxy = [&]() {
         if (!car_broadphase_proxy_ready && broadphase_grid != nullptr && any_mesh_in_reach) {
 #if !defined(ROCKETGPU_USE_CUDA)
-            // This tick's broadphase proxy of the car holds the same AABBs (same operations, same predict source).
             if (fresh_car_proxy != nullptr) {
                 car_broadphase_proxy = BulletBroadphaseProxy{};
                 car_broadphase_proxy.aabb_min = fresh_car_proxy->aabb_min;
@@ -1764,7 +1755,6 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
         const int mesh_begin = stage_mesh >= 0 ? stage_mesh : 0;
         const int mesh_end = stage_mesh >= 0 && stage_mesh < mesh_bvh_mesh_count ? stage_mesh + 1 : (stage_mesh >= 0 ? 0 : mesh_bvh_mesh_count);
 #if !defined(ROCKETGPU_USE_CUDA)
-        // Below 32 only meshes whose visit bit is set are visited: step from set bit to set bit.
         const auto next_mesh = [mesh_visit_mask](int idx) {
             if (idx >= 32) {
                 return idx;

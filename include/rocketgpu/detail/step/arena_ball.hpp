@@ -223,6 +223,24 @@ ROCKETGPU_HD void ApplyGameCarWorldContactNormal(
     ApplyGameCarWorldContactNormal<1>(acc, seg_rows, seg_counts);
 }
 
+#if !defined(__CUDA_ARCH__)
+inline bool CarWorldNoStaticPair(const MutatorConfig& mutator, const CarListManifolds* list_manifolds,
+                                 const CarWorldPlaneRetainedManifold* retained_plane_manifolds,
+                                 const CarWorldMeshRetainedManifold* retained_mesh_manifolds) {
+    if (list_manifolds == nullptr || (list_manifolds->meshes | list_manifolds->planes) != 0u ||
+        !mutator.arena_collision || mutator.physics_events.HasNonGoalEvents()) {
+        return false;
+    }
+    for (int k = 0; retained_mesh_manifolds != nullptr && k < kCarWorldMeshRetainedManifoldsPerCar; ++k) {
+        if (retained_mesh_manifolds[k].count > 0) return false;
+    }
+    for (int k = 0; retained_plane_manifolds != nullptr && k < kCarWorldPlaneRetainedManifoldsPerCar; ++k) {
+        if (retained_plane_manifolds[k].count > 0) return false;
+    }
+    return true;
+}
+#endif
+
 template <bool kMeshesOutOfReach = false, int kPart = 0>
 ROCKETGPU_HD ROCKETGPU_HOST_INLINE ContactAccumulator SolveCarWorldStaticContacts(
     CarState& car,
@@ -276,19 +294,9 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE ContactAccumulator SolveCarWorldStaticContact
     constexpr bool kUsePlaneOutOfReach = (kPart != 1);
 #endif
 #if !defined(__CUDA_ARCH__)
-    // No static manifold in this tick's list and nothing retained: the game has no car-static pair to process.
-    if (kEarlyOut && list_manifolds != nullptr && (list_manifolds->meshes | list_manifolds->planes) == 0u &&
-        mutator.arena_collision && !mutator.physics_events.HasNonGoalEvents()) {
-        bool retained = false;
-        for (int k = 0; retained_mesh_manifolds != nullptr && k < kCarWorldMeshRetainedManifoldsPerCar; ++k) {
-            retained |= retained_mesh_manifolds[k].count > 0;
-        }
-        for (int k = 0; retained_plane_manifolds != nullptr && k < kCarWorldPlaneRetainedManifoldsPerCar; ++k) {
-            retained |= retained_plane_manifolds[k].count > 0;
-        }
-        if (!retained) {
-            return acc;
-        }
+    if (kEarlyOut &&
+        CarWorldNoStaticPair(mutator, list_manifolds, retained_plane_manifolds, retained_mesh_manifolds)) {
+        return acc;
     }
 #endif
     float plane_d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1589,9 +1597,6 @@ ROCKETGPU_HD const BallWorldStage* ConsumableBallWorldStage(
 #endif
 }
 
-// A ball set from public state has no retained plane points, while the game's ball holds the points its previous
-// tick's detection made (a resting, sleeping ball keeps its floor point through the tick a car wakes it). Prime each
-// empty plane slot with the point the step's detection makes at the pose one tick back.
 ROCKETGPU_HD void PrimeImportedBallWorldPlanes(BallState ball, const MutatorConfig& mutator, float dt,
                                                WorldSolverScratch& scratch) {
     if (!mutator.arena_collision) {
@@ -2369,7 +2374,6 @@ ROCKETGPU_HD int PlaceNthTeamCarAtKickoff(
     return -1;
 }
 
-// A word loop: a plain struct assignment of these large states inlines into hundreds of registers on the GPU.
 template <typename T>
 ROCKETGPU_HD void CopyStateWords(T& dst, const T& src) {
     static_assert(sizeof(T) % 4 == 0, "word copy");
@@ -2383,13 +2387,11 @@ ROCKETGPU_HD void CopyStateWords(T& dst, const T& src) {
     }
 }
 
-// mutator.kickoff_settled: car idx as the game's countdown leaves it at this spawn (SimConfig.kickoff_settled_rows).
 ROCKETGPU_HD void SettleKickoffCar(const SimConfig& cfg, int idx, int spawn, CarState* cars) {
     if (cfg.kickoff_settled_rows == nullptr || spawn >= cfg.kickoff_settled_spawns || cfg.kickoff_settled_entry[idx] < 0) {
         return;
     }
     const KickoffSettledRow& row = cfg.kickoff_settled_rows[static_cast<size_t>(cfg.kickoff_settled_entry[idx]) * cfg.kickoff_settled_spawns + spawn];
-    // The car's own history (bumps, touches, contact and flip stamps) stays as the reset left it.
     CarState& car = cars[idx];
     const auto bump_event_tick = car.bump_event_tick;
     const auto bump_event_other_id = car.bump_event_other_id;
@@ -2427,9 +2429,6 @@ ROCKETGPU_HD void SettleKickoffCar(const SimConfig& cfg, int idx, int spawn, Car
     CopyStateWords(cfg.kickoff_settled_wheels[idx], row.wheels);
 }
 
-// After a kickoff placement without the countdown: every car and the ball as the countdown leaves them. A team's
-// nth car (visit order, as PlaceNthTeamCarAtKickoff counts) took spawn kickoff_order[n] (n < 5), else respawn n.
-// order_bits: kickoff_order, 3 bits per slot.
 ROCKETGPU_HD ROCKETGPU_NOINLINE void SettleKickoffEnv(
     const SimConfig& cfg, int env_idx, int base, int count, const Team* teams, CarState* cars, BallState* balls,
     const EnvState& env_state, uint32_t order_bits) {
@@ -2528,6 +2527,11 @@ ROCKETGPU_HD void ResetEnvToKickoff(
 
     EnvState saved = env_states[env_idx];
     env_states[env_idx] = EnvState{};
+    env_states[env_idx].kickoff_resets = static_cast<uint8_t>(saved.kickoff_resets + 1);
+    if ((kickoff_seed_mode == 2 || (kickoff_seed_mode == 0 && seed == 0)) && respawn_rng == nullptr &&
+        kickoff_order_override == nullptr) {
+        seed = saved.kickoff_resets * 0x9e3779b97f4a7c15ull;
+    }
 
     env_states[env_idx].car_visit_order_mode = saved.car_visit_order_mode;
     env_states[env_idx].car_visit_order_packed = saved.car_visit_order_packed;
@@ -2579,7 +2583,7 @@ ROCKETGPU_HD void ResetEnvToKickoff(
     int kickoff_order[5] = {0, 1, 2, 3, 4};
     if (kickoff_order_override != nullptr) {
         for (int i = 0; i < 5; ++i) kickoff_order[i] = kickoff_order_override[i];
-    } else if (kickoff_seed_mode == 3) {   // slot order
+    } else if (kickoff_seed_mode == 3) {
     } else if (respawn_rng != nullptr) {
         const uint32_t engine_seed = kickoff_seed_mode == 1
             ? static_cast<uint32_t>(seed)

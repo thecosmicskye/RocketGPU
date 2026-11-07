@@ -16,6 +16,7 @@ find_package(pybind11 CONFIG REQUIRED)
 
 pybind11_add_module(rocketgpu_py NO_EXTRAS rocketgpu_bindings.cpp)
 target_link_libraries(rocketgpu_py PRIVATE rocketgpu)
+target_compile_definitions(rocketgpu_py PRIVATE ROCKETGPU_VERSION="${PROJECT_VERSION}")
 target_include_directories(rocketgpu_py PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 target_compile_features(rocketgpu_py PRIVATE cxx_std_17)
 set_target_properties(rocketgpu_py PROPERTIES

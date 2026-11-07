@@ -1,5 +1,3 @@
-// Exact lane versions of include/rocketgpu/detail/math.hpp helpers. Every expression keeps the C++ operation order
-// (the CPU build compiles with -ffp-contract=off; ISPC with --opt=disable-fma).
 #pragma once
 
 static inline Vec3 V3(float x, float y, float z) { Vec3 v; v.x = x; v.y = y; v.z = z; return v; }
@@ -9,7 +7,6 @@ static inline float Dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b
 static inline float LengthSq(Vec3 v) { return Dot(v, v); }
 static inline float RsqrtScalar(float v) { return 1.0f / sqrt(v); }
 
-// math.hpp ClampLength
 static inline Vec3 ClampLength(Vec3 v, uniform float max_len) {
     const float len_sq = LengthSq(v);
     const uniform float max_sq = max_len * max_len;
@@ -20,7 +17,6 @@ static inline Vec3 ClampLength(Vec3 v, uniform float max_len) {
     return Scale(Scale(v, inv_len), max_len);
 }
 
-// math.hpp GetBasisVectors
 static inline void GetBasisVectors(Quat q, Vec3& forward, Vec3& right, Vec3& up) {
     const float len_sq = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
     if (len_sq <= 1e-12f) {
@@ -47,14 +43,11 @@ static inline void GetBasisVectors(Quat q, Vec3& forward, Vec3& right, Vec3& up)
     up = V3(xz + wy, yz - wx, 1.0f - (xx + yy));
 }
 
-// math.hpp GameGetRotationScalar. The case is picked first and its operands selected, so lanes in different cases share one
-// sqrt and one divide (same operations on the same operands as each case; x - y is x + (-y) exactly).
 static inline Quat GameGetRotationScalar(Vec3 fwd, Vec3 right, Vec3 up) {
     const float m00 = fwd.x, m01 = right.x, m02 = up.x;
     const float m10 = fwd.y, m11 = right.y, m12 = up.y;
     const float m20 = fwd.z, m21 = right.z, m22 = up.z;
     const float trace = (m00 + m11) + m22;
-    // 0: trace > 0; 1: z largest; 2: y largest; 3: x largest
     const int c = trace > 0.0f ? 0 : (m00 < m11 ? m11 < m22 : m00 < m22) ? 1 : (m00 < m11) ? 2 : 3;
     const float a0 = c == 0 ? m00 : c == 1 ? m22 : c == 2 ? m11 : m00;
     const float a1 = c == 0 ? m11 : c == 1 ? -m00 : c == 2 ? -m22 : -m11;
@@ -71,7 +64,6 @@ static inline Quat GameGetRotationScalar(Vec3 fwd, Vec3 right, Vec3 up) {
     return Q4(c == 0 ? half : tw * s, c == 3 ? half : tx * s, c == 2 ? half : ty * s, c == 1 ? half : tz * s);
 }
 
-// math.hpp GameQuatNormalizeScalar
 static inline Quat GameQuatNormalizeScalar(Quat q, uniform float min_len_sq) {
     const float len_sq = ((q.x * q.x + q.y * q.y) + q.z * q.z) + q.w * q.w;
     Quat o;
@@ -84,7 +76,6 @@ static inline Quat GameQuatNormalizeScalar(Quat q, uniform float min_len_sq) {
     return o;
 }
 
-// math.hpp GameQuatQuantizeComponent (rintf: round half to even)
 static inline float GameQuatQuantizeComponent(float c) {
     const uniform int kMax = (1 << 18) - 1;
     const uniform float max_f = (uniform float)kMax;
@@ -97,7 +88,6 @@ static inline float GameQuatQuantizeComponent(float c) {
     return (r + r) * 0.707106769f;
 }
 
-// math.hpp GameRbStateQuantizeQuat
 static inline Quat GameRbStateQuantizeQuat(Quat q_in) {
     const Quat q = GameQuatNormalizeScalar(q_in, 1e-8f);
     const float a0 = abs(q.x), a1 = abs(q.y), a2 = abs(q.z), a3 = abs(q.w);
@@ -118,7 +108,6 @@ static inline Quat GameRbStateQuantizeQuat(Quat q_in) {
     return GameQuatNormalizeScalar(Q4(ow, ox, oy, oz), 1e-8f);
 }
 
-// math.hpp GameSetRotationScalarColumns
 static inline void GameSetRotationScalarColumns(Quat q, Vec3& fwd, Vec3& right, Vec3& up) {
     const float d = ((q.x * q.x + q.y * q.y) + q.z * q.z) + q.w * q.w;
     const float s = 2.0f / d;
@@ -131,7 +120,6 @@ static inline void GameSetRotationScalarColumns(Quat q, Vec3& fwd, Vec3& right, 
     up = V3(xz + wy, yz - wx, 1.0f - (xx + yy));
 }
 
-// math.hpp GameQuantizeBasisColumns
 static inline Quat GameQuantizeBasisColumns(Vec3& fwd, Vec3& right, Vec3& up) {
     const Quat q = GameRbStateQuantizeQuat(GameGetRotationScalar(fwd, right, up));
     GameSetRotationScalarColumns(q, fwd, right, up);

@@ -1,12 +1,4 @@
 #!/bin/bash
-# pgo_build.sh BUILD_DIR [CMAKE_ARGS...]: profile-guided CPU build of the Python module.
-#   1. BUILD_DIR/pgo-gen: -DROCKETGPU_PGO=GENERATE build
-#   2. tools/pgo_train.py on it (PGO_TRAIN_ARGS, default 1024 arenas x 8M arena-ticks), then PGO_TRAIN_EXTRA if set;
-#      one simulation thread (so the profile and the built module are the same on every run) with the block size
-#      of a 16-thread 1k run
-#      (any command; PYTHONPATH points at the instrumented module)
-#   3. BUILD_DIR: -DROCKETGPU_PGO=USE build from that profile
-# Needs ROCKETGPU_COLLISION_MESH_DIR. With Clang, llvm-profdata must match the compiler (LLVM_PROFDATA overrides).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$(mkdir -p "$1" && cd "$1" && pwd); shift

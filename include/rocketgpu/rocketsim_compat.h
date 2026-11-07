@@ -243,6 +243,7 @@ public:
     // The bodies' side of a goal reset alone (EnvCommand::new_round_bodies), e.g. replaying a recorded goal.
     void StartNewRoundBodies();
 
+    // No effect: the Arena uses RocketGPU's own kickoff and respawn draws, not RocketSim's std RNG.
     void SetRespawnRngSeed(uint64_t seed);
     // The respawn slot (0-3) the car's next demo respawn takes instead of the RNG's pick; -1 clears it.
     void SetRespawnSlotOverride(uint32_t car_id, int slot);
@@ -295,12 +296,8 @@ public:
 
     BatchSim& sim() { return *sim_; }
 
-    // Dev only (full-state restore, src/rocketsim_compat_dev.cpp): env 0's state arrays as raw bytes. what:
-    // "car_states", "ball_states", "env_states", "wheel_runtime", "solver_scratch", and the retained manifolds
-    // "car_world_plane", "car_world_mesh", "car_car", "ball_car". DevSetRaw uploads without canonicalizing.
     std::vector<uint8_t> DevGetRaw(const std::string& what) const;
     void DevSetRaw(const std::string& what, const std::vector<uint8_t>& bytes);
-    // Field layouts for those arrays: "Struct.field.path" -> (offset, size); "Struct" -> (0, sizeof).
     struct DevField {
         std::string name;
         size_t offset;
@@ -345,8 +342,6 @@ private:
     CarBumpEventFn bump_callback_;
     void* bump_user_info_ = nullptr;
     std::vector<uint64_t> bump_event_seen_tick_;
-    // Per car slot: whether last_extra_hit_tick is known (a step, or a set that passed it), and a pending guess for a
-    // set that did not pass it, made at the next step from the set car and the ball then.
     struct ExtraHitGuess {
         bool known = false;
         bool pending = false;

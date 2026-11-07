@@ -1,6 +1,39 @@
 # RocketGPU
 
-Rocket League physics on a GPU.
+Faster, bit-accurate Rocket League physics.
+
+## Speed
+
+Arena-ticks/s from `bench_cpp`, which runs RocketSim v3's `arena_scale_v3` training workload: random controls, 55%
+1v1, 27% 2v2 and 18% 3v3 arenas, resets on goals and timeouts. RocketGPU CUDA on an RTX 5090; RocketGPU CPU
+(profile-guided build) and RocketSim v3 0.3.5 (`arena_scale_v3`) on a Ryzen 7 9800X3D with 14 threads:
+
+| Arenas | RocketGPU CUDA | RocketGPU CPU | RocketSim v3 |
+|---|---|---|---|
+| 96 | 0.64M | 3.76M | 1.25M |
+| 256 | 1.46M | 4.56M | 2.35M |
+| 512 | 2.50M | 4.71M | 3.43M |
+| 1,024 | 4.35M | 4.81M | 4.21M |
+| 4,096 | 10.17M | 4.72M | 5.02M |
+| 8,192 | 12.32M | 4.74M | 4.88M |
+| 16,384 | 12.75M | 5.12M | 5.04M |
+
+## Accuracy
+
+[144 real-game recordings](https://github.com/thecosmicskye/RocketGPU-fullstate-suite): 1v1 to 3v3 matches, uneven
+teams, every car body, boost pad tests and scripted scenarios. Each 120-tick segment starts from the game's state and
+replays the game's inputs; 25,622 segments, 13,930,650 body-ticks. v3 takes no hidden state, so it starts from the
+public state.
+
+| | RocketGPU | v3 0.3.5 |
+|---|---|---|
+| Bit-exact body-ticks (pos, vel, ang vel, rotation at 0 ulp) | 100% | 4.32% |
+| Mean error after 1 tick | 0 | 0.80 |
+| Mean error after 30 ticks | 0 | 0.65 |
+| Mean error after 120 ticks | 0 | 1.63 |
+
+Error: rlpr_metric's normalized error per car-tick (position / 2 uu, velocity / 3 uu/s, angular velocity / 0.05
+rad/s, axes / 0.05, car plus ball), capped at 10.
 
 ## Build
 
@@ -24,6 +57,15 @@ The fastest CPU build is profile-guided (needs `ROCKETGPU_COLLISION_MESH_DIR` an
 
 ```bash
 tools/pgo_build.sh build -DROCKETGPU_USE_CUDA=OFF -DCMAKE_CXX_COMPILER=clang++
+```
+
+CPU builds use ISPC kernels when `ispc` is installed; `-DROCKETGPU_CPU_ISPC=OFF` gives a scalar build.
+
+`-DROCKETGPU_BUILD_BENCH=ON` also builds `bench_cpp`, a C++ throughput benchmark (RocketSim v3's `arena_scale_v3`
+workload). It needs a C++20 compiler, and with CUDA, CMake 3.25.2+ and CUDA 12+:
+
+```bash
+build/bench_cpp --arenas 1024
 ```
 
 ## Collision meshes
@@ -67,6 +109,7 @@ sim.step_with_device_controls(controls_by_tick.ctypes.data, 4, sim.car_capacity(
 ```
 
 Each row holds one `CarControls` per car slot; the stride is in records and must be at least `sim.car_capacity()`.
+Pass a control stride of 0 to hold one row of controls for every tick (also in `step_with_device_commands`).
 On CUDA builds, pass a device pointer and keep its allocation alive until the chosen stream completes. Use separate
 steps when controls or callbacks depend on intermediate physics states.
 
@@ -104,37 +147,6 @@ For RocketSim v3's own conventions, use `get_state_v3` / `set_state_v3` (C++ `Ca
 
 `Arena.get_full_state()` returns the whole simulation state, including contact manifolds and timers, as
 `{"array.field": bytes}`. `set_full_state` writes the fields it is given and keeps the rest.
-
-## Speed
-
-Arena-ticks/s. RocketGPU CUDA on an RTX 5090; RocketGPU CPU (profile-guided build) and RocketSim v3 0.3.5 on a
-Ryzen 7 9800X3D with 16 threads. Random controls, 55% 1v1, 27% 2v2 and 18% 3v3 arenas:
-
-| Arenas | RocketGPU CUDA | RocketGPU CPU | RocketSim v3 |
-|---|---|---|---|
-| 100 | 0.54M | 1.55M | 1.19M |
-| 500 | 2.13M | 3.25M | 3.19M |
-| 1,024 | 4.04M | 3.63M | 4.10M |
-| 4,096 | 10.30M | 3.53M | 4.38M |
-| 8,192 | 13.15M | 3.49M | 4.72M |
-| 16,384 | 14.15M | 3.68M | 5.49M |
-
-## Accuracy
-
-[144 real-game recordings](https://github.com/thecosmicskye/RocketGPU-fullstate-suite): 1v1 to 3v3 matches, uneven
-teams, every car body, boost pad tests and scripted scenarios. Each 120-tick segment starts from the game's state and
-replays the game's inputs; 26,378 segments, 14,678,660 body-ticks. v3 takes no hidden state, so it starts from the
-public state.
-
-| | RocketGPU | v3 0.3.5 |
-|---|---|---|
-| Bit-exact body-ticks (pos, vel, ang vel, rotation at 0 ulp) | 100% | 4.49% |
-| Mean error after 1 tick | 0 | 0.80 |
-| Mean error after 30 ticks | 0 | 0.64 |
-| Mean error after 120 ticks | 0 | 1.65 |
-
-Error: rlpr_metric's normalized error per car-tick (position / 2 uu, velocity / 3 uu/s, angular velocity / 0.05
-rad/s, axes / 0.05, car plus ball), capped at 10.
 
 ## License
 

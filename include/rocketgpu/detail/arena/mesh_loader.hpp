@@ -22,8 +22,6 @@ void BuildArenaMeshLeafGrid(
     std::vector<ArenaMeshLeafEntry>& out_entries,
     float cell_bt = 4.0f);
 
-// Fills out (size nx * ny * nz, x fastest) for ArenaMeshClearance over every triangle of mesh and, where
-// cal_origin_sign != 0, of local_mesh shifted by its goal origin. Runs on up to threads threads.
 void BuildArenaMeshClearance(
     const std::vector<ArenaMeshTriangle>& mesh,
     const std::vector<ArenaMeshTriangle>& local_mesh,

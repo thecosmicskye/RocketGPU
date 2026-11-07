@@ -1,7 +1,4 @@
 #pragma once
-// CPU step over a block of envs: each tick, the car pre-tick runs over every car of the block at once, in SIMD lanes
-// across cars (ISPC kernels, src/cpu_ispc). Every env sees the same operations in the same order as StepEnvGeneric
-// (phase kStepEnvPhaseFull, world part kWorldStepWhole); envs never interact, and neither do cars in the pre-tick.
 #if !defined(ROCKETGPU_USE_CUDA)
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +12,8 @@ struct RgPreTickParams {
 extern "C" void rg_pretick_cars(::rocketgpu::CarState* cars, ::rocketgpu::detail::WheelRuntimeState* wrs,
                                 const int32_t* idx, const float* frame_frac, int32_t n, const RgPreTickParams& p,
                                 ::rocketgpu::Vec3* start_vel, ::rocketgpu::Quat* snap_rot, ::rocketgpu::Quat* snap_raw);
+extern "C" void rg_pretick_balls(const ::rocketgpu::BallState* balls, int32_t n, float max_speed, float max_ang_speed,
+                                 bool heatseeker, bool damp, float damp_scale, float* out);
 #endif
 
 namespace rocketgpu {
@@ -22,8 +21,39 @@ namespace detail {
 
 constexpr int kCpuBlockMaxEnvs = 64;
 
-// pool.view(env_idx) for the CPU pool's contiguous layout: the same pointers and counts without the per-array layout
-// tests (the interleaved layout falls back to view). The assert catches a field added to WorldSolverScratchRows.
+#if defined(ROCKETGPU_CPU_ISPC)
+constexpr int kCpuBlockMinEnvs = 4;
+
+constexpr int kBallOutFields = 43;
+constexpr int kBallOutStartVel = 37;
+constexpr int kBallOutPredictVel = 40;
+inline bool SameVec3(const Vec3& a, const Vec3& b) { return std::memcmp(&a, &b, sizeof(Vec3)) == 0; }
+inline Vec3 BallOutV3(const float* o, int f) {
+    return Vec3(o[f * kCpuBlockMaxEnvs], o[(f + 1) * kCpuBlockMaxEnvs], o[(f + 2) * kCpuBlockMaxEnvs]);
+}
+inline void StoreBallPreTickOut(BallState& b, const float* o) {
+    constexpr int s = kCpuBlockMaxEnvs;
+    const auto v3 = [&](int f) { return BallOutV3(o, f); };
+    b.pos_bt = v3(0);
+    b.pos = v3(3);
+    b.vel_bt = v3(6);
+    b.vel = v3(9);
+    b.ang_vel = v3(12);
+    b.rot.w = o[15 * s];
+    b.rot.x = o[16 * s];
+    b.rot.y = o[17 * s];
+    b.rot.z = o[18 * s];
+    b.basis_forward = v3(19);
+    b.basis_right = v3(22);
+    b.basis_up = v3(25);
+    b.basis_authoritative = 1;
+    b.inertia_basis_forward = v3(28);
+    b.inertia_basis_right = v3(31);
+    b.inertia_basis_up = v3(34);
+    b.inertia_basis_valid = 1;
+}
+#endif
+
 static_assert(sizeof(WorldSolverScratchRows) ==
                   11 * sizeof(EnvStridedArray<int>) + sizeof(CarCarPairCacheView) + 5 * sizeof(void*) + 4 * sizeof(int),
               "CpuRowsView must set every WorldSolverScratchRows field");
@@ -60,8 +90,6 @@ inline WorldSolverScratchRows CpuRowsView(const WorldSolverScratchRowPool& p, in
     return r;
 }
 
-// Envs per pool task. Default: ~16 tasks per worker (short last claims), 4..16 envs per block; small batches go below 4
-// so every worker still gets ~2 tasks. ROCKETGPU_CPU_BLOCK overrides.
 inline int CpuBlockEnvs(int env_count, int workers) {
     static const int forced = [] {
         const char* s = std::getenv("ROCKETGPU_CPU_BLOCK");
@@ -78,28 +106,29 @@ inline int CpuBlockEnvs(int env_count, int workers) {
     return b < lo ? lo : (b > 16 ? 16 : b);
 }
 
-// Envs at the end of the batch that run one per pool task, so workers that finish early share the last claims:
-// kCpuTailEnvsPerWorker per worker when blocks hold several envs and the batch is large enough; 0 otherwise.
 constexpr int kCpuTailEnvsPerWorker = 2;
 inline int CpuTailEnvs(int env_count, int workers, int block) {
     const int tail = kCpuTailEnvsPerWorker * workers;
     return workers > 1 && block > 1 && env_count >= 8 * tail ? tail : 0;
 }
 
-// ROCKETGPU_ISPC_OFF=1: run every car through the scalar pre-tick code.
 inline bool CpuIspcOff() {
     static const bool off = std::getenv("ROCKETGPU_ISPC_OFF") != nullptr;
     return off;
 }
 
-// ROCKETGPU_ISPC_CHECK=1: run the scalar code on a copy of every kernel car and report byte mismatches.
 inline bool CpuIspcCheck() {
     static const bool on = std::getenv("ROCKETGPU_ISPC_CHECK") != nullptr;
     return on;
 }
 
-// StepEnvGeneric(env, ..., ticks, phase kStepEnvPhaseFull) for envs [env0, env0 + env_n).
-// controls_for(env_idx) returns that env's controls accessor.
+struct CpuBlockRng {
+    void* context;
+    const uint8_t* (*prepare)(void*, int);
+    bool (*kickoff)(void*, int, uint64_t, uint8_t, int*);
+    bool (*report_each_tick)(void*, int, int);
+};
+
 template <bool kReportEachTick = false, typename ControlsFor>
 inline void StepEnvBlockCpu(
     int env0,
@@ -120,19 +149,21 @@ inline void StepEnvBlockCpu(
     int ticks,
     const EnvCommand* commands_by_tick = nullptr,
     int command_stride = 0,
-    CarControls* controls_for_reset = nullptr) {
+    CarControls* controls_for_reset = nullptr,
+    const CpuBlockRng* mirror_rng = nullptr) {
     constexpr int kMaxCars = kCpuBlockMaxEnvs * 8;
-    // The per-car arrays below hold kMaxCars; envs never interact, so a larger block runs as two halves.
     if (env_n > 1 && env_n * cfg.max_cars_per_env > kMaxCars) {
         const int h = env_n / 2;
         StepEnvBlockCpu<kReportEachTick>(env0, h, cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch,
                                          row_pool, controls_for, car_configs, balls, env_states, pads, seed, ticks,
-                                         commands_by_tick, command_stride, controls_for_reset);
+                                         commands_by_tick, command_stride, controls_for_reset, mirror_rng);
         StepEnvBlockCpu<kReportEachTick>(env0 + h, env_n - h, cfg, teams, env_car_count, cars, wheel_runtime_states,
                                          solver_scratch, row_pool, controls_for, car_configs, balls, env_states, pads,
-                                         seed, ticks, commands_by_tick, command_stride, controls_for_reset);
+                                         seed, ticks, commands_by_tick, command_stride, controls_for_reset, mirror_rng);
         return;
     }
+    bool mirror_reports_each_tick[kCpuBlockMaxEnvs];
+    const uint8_t* respawn_overrides[kCpuBlockMaxEnvs];
     int pre_counts[kCpuBlockMaxEnvs];
     int32_t lane_idx[kMaxCars];
     int32_t lane_env[kMaxCars];
@@ -143,26 +174,21 @@ inline void StepEnvBlockCpu(
     Quat lane_snap_raw[kMaxCars];
     CarFrame snap_frame;
     const ArenaBroadphaseGrid grid = MakeArenaBroadphaseGrid(cfg);
-    // Inverse world inertia rows (BT) that each car's vehicle update built this tick; the world prestep reuses them.
     CarFrame car_frames[8];
-    // Shape values of each env's cars (hitbox and mass only), filled once per call.
     const CarShapeCacheEntry* car_shapes[kCpuBlockMaxEnvs];
-    UninitArray<CarShapeCacheEntry, kCpuBlockMaxEnvs * 8> car_shapes_local;  // only without solver scratch
-    // Each env's solver row view; the pool layout does not change during the call.
+    UninitArray<CarShapeCacheEntry, kCpuBlockMaxEnvs * 8> car_shapes_local;
     UninitArray<WorldSolverScratchRows, kCpuBlockMaxEnvs> env_rows;
-    // Each car's controls for the current tick, read once and used by the pre-tick, vehicle and post-tick steps.
     UninitArray<CarControls, kMaxCars> tick_controls;
-    // Each env's car visit order for the current tick (fixed from the tick-start env update to the env tail).
     int16_t tick_order[kMaxCars];
-    // Prepared (clamped, quantized) controls of each env's cars, reused across this call's ticks. On the stack, not
-    // thread_local: in the shared module every thread_local access is a __tls_get_addr call.
     UninitArray<CarControlsMemo, kCpuBlockMaxEnvs * 8> ctl_memos;
     for (int e = 0; e < env_n; ++e) {
+        mirror_reports_each_tick[e] = mirror_rng && !kReportEachTick &&
+            mirror_rng->report_each_tick(mirror_rng->context, env0 + e, ticks);
         const int count = env_car_count[env0 + e];
         car_shapes[e] = nullptr;
         if (count <= 8) {
             const CarConfig* const env_cfgs = car_configs + (env0 + e) * cfg.max_cars_per_env;
-            if (solver_scratch != nullptr) {
+            if (solver_scratch != nullptr && mirror_rng == nullptr) {
                 car_shapes[e] = CarShapeCacheFor(solver_scratch[env0 + e], env_cfgs, count, cfg.mutator.car_mass);
             } else {
                 FillCarShapeCache(&car_shapes_local[e * 8], env_cfgs, count, cfg.mutator.car_mass);
@@ -182,8 +208,19 @@ inline void StepEnvBlockCpu(
                                      m.car_max_ang_speed};
     const bool lanes = m.native_sphere_rsqrt_table == nullptr && wheel_runtime_states != nullptr &&
                        !CpuIspcOff();
+    const bool ball_lanes = m.native_sphere_rsqrt_table == nullptr && !CpuIspcOff();
+    const bool ball_heatseeker = m.game_mode == static_cast<uint8_t>(Mode::Heatseeker);
+    const bool ball_damp = ball_lanes && !ball_heatseeker ? !(m.ball_drag <= 0.0f) : m.ball_drag > 0.0f;
+    const float ball_damp_scale =
+        !ball_damp ? 1.0f
+        : (m.cached_ball_damping_drag == m.ball_drag && m.cached_ball_damping_dt == cfg.tick_dt &&
+           m.cached_ball_damping_scale >= 0.0f)
+            ? m.cached_ball_damping_scale
+            : RocketGpuUcrtPowf(Max(0.0f, 1.0f - m.ball_drag), cfg.tick_dt);
+    alignas(64) float ball_out[kBallOutFields * kCpuBlockMaxEnvs];
 #else
     const bool lanes = false;
+    const bool ball_lanes = false;
 #endif
     for (int t = 0; t < ticks; ++t) {
         int n = 0;
@@ -191,11 +228,17 @@ inline void StepEnvBlockCpu(
             const int env_idx = env0 + e;
             const int base = env_idx * cfg.max_cars_per_env;
             const auto controls = controls_for(env_idx);
+            respawn_overrides[e] = mirror_rng && (kReportEachTick || mirror_reports_each_tick[e])
+                ? mirror_rng->prepare(mirror_rng->context, env_idx) : nullptr;
             if constexpr (kReportEachTick) {
                 const EnvCommand& command = commands_by_tick[static_cast<size_t>(t) * command_stride + env_idx];
                 if (command.reset_to_kickoff || command.new_round_bodies) {
+                    int kickoff_order[5];
+                    const bool have_order = mirror_rng && command.reset_to_kickoff &&
+                        mirror_rng->kickoff(mirror_rng->context, env_idx, command.kickoff_seed,
+                                            command.kickoff_seed_mode, kickoff_order);
                     StepEnvPreTickEnv(env_idx, cfg, teams, env_car_count, cars, solver_scratch, controls_for_reset,
-                                      balls, env_states, pads, command, nullptr, car_configs);
+                                      balls, env_states, pads, command, have_order ? kickoff_order : nullptr, car_configs);
                 } else {
                     StepEnvPreTickEnvState(env_idx, cfg, env_car_count, cars, balls, env_states);
                 }
@@ -225,7 +268,7 @@ inline void StepEnvBlockCpu(
                     lane_frac[n++] = env_frac;
                     continue;
                 }
-                StepEnvPreTickCar(env_idx, slot, cfg, teams, cars, solver_scratch, env_states[env_idx], nullptr, seed, c,
+                StepEnvPreTickCar(env_idx, slot, cfg, teams, cars, solver_scratch, env_states[env_idx], respawn_overrides[e], seed, c,
                                   car_configs[base + slot],
                                   wheel_runtime_states ? &wheel_runtime_states[base + slot] : nullptr);
             }
@@ -249,7 +292,7 @@ inline void StepEnvBlockCpu(
                     cars[lane_idx[j]] = start[j];
                     wheel_runtime_states[lane_idx[j]] = start_w[j];
                     const int env_idx = lane_env[j], slot = lane_slot[j];
-                    StepEnvPreTickCar(env_idx, slot, cfg, teams, cars, solver_scratch, env_states[env_idx], nullptr,
+                    StepEnvPreTickCar(env_idx, slot, cfg, teams, cars, solver_scratch, env_states[env_idx], respawn_overrides[env_idx - env0],
                                       seed, controls_for(env_idx).get(slot, t), car_configs[lane_idx[j]],
                                       &wheel_runtime_states[lane_idx[j]]);
                     if (std::memcmp(&got[j], &cars[lane_idx[j]], sizeof(CarState)) != 0 ||
@@ -279,23 +322,72 @@ inline void StepEnvBlockCpu(
                             s.car_predict_vel[slot] = car.vel;
                             s.car_predict_ang_vel[slot] = car.ang_vel;
                             s.car_predict_valid[slot] = 1;
-                            CarRbSnapMemo& snap = s.rb_snap[slot];
-                            snap.fwd = car.basis_forward;
-                            snap.right = car.basis_right;
-                            snap.up = car.basis_up;
-                            snap.rot = lane_snap_rot[j];
-                            snap.raw = lane_snap_raw[j];
-                            snap.valid = 1;
+                            if (mirror_rng == nullptr) {
+                                CarRbSnapMemo& snap = s.rb_snap[slot];
+                                snap.fwd = car.basis_forward;
+                                snap.right = car.basis_right;
+                                snap.up = car.basis_up;
+                                snap.rot = lane_snap_rot[j];
+                                snap.raw = lane_snap_raw[j];
+                                snap.valid = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (ball_lanes) {
+            if (CpuIspcCheck()) {
+                static thread_local BallState start[kCpuBlockMaxEnvs];
+                static thread_local BallState got[kCpuBlockMaxEnvs];
+                std::memcpy(start, balls + env0, sizeof(BallState) * env_n);
+                rg_pretick_balls(balls + env0, env_n, m.ball_max_speed, m.ball_max_ang_speed, ball_heatseeker, ball_damp,
+                                 ball_damp_scale, ball_out);
+                for (int e = 0; e < env_n; ++e) {
+                    StoreBallPreTickOut(balls[env0 + e], ball_out + e);
+                }
+                std::memcpy(got, balls + env0, sizeof(BallState) * env_n);
+                std::memcpy(balls + env0, start, sizeof(BallState) * env_n);
+                for (int e = 0; e < env_n; ++e) {
+                    StepEnvPreTickBall(env0 + e, cfg, solver_scratch, balls);
+                    if (std::memcmp(&got[e], &balls[env0 + e], sizeof(BallState)) != 0 ||
+                        (solver_scratch != nullptr &&
+                         (!SameVec3(BallOutV3(ball_out + e, kBallOutStartVel), solver_scratch[env0 + e].cal_ball_start_vel) ||
+                          (!ball_heatseeker && !SameVec3(BallOutV3(ball_out + e, kBallOutPredictVel),
+                                                       solver_scratch[env0 + e].ball_predict_vel_bt))))) {
+                        std::fprintf(stderr, "ROCKETGPU_ISPC_CHECK ball pre-tick mismatch, env %d\n", env0 + e);
+                    }
+                }
+            } else {
+                rg_pretick_balls(balls + env0, env_n, m.ball_max_speed, m.ball_max_ang_speed, ball_heatseeker, ball_damp,
+                                 ball_damp_scale, ball_out);
+                for (int e = 0; e < env_n; ++e) {
+                    StoreBallPreTickOut(balls[env0 + e], ball_out + e);
+                }
+                if (solver_scratch != nullptr) {
+                    for (int e = 0; e < env_n; ++e) {
+                        solver_scratch[env0 + e].cal_ball_start_vel = BallOutV3(ball_out + e, kBallOutStartVel);
+                        if (!ball_heatseeker) {
+                            solver_scratch[env0 + e].ball_predict_vel_bt = BallOutV3(ball_out + e, kBallOutPredictVel);
                         }
                     }
                 }
             }
         }
 #endif
-        const bool report_fields = kReportEachTick || t + 1 == ticks;
         for (int e = 0; e < env_n; ++e) {
+            const bool report_fields = kReportEachTick || t + 1 == ticks || mirror_reports_each_tick[e];
             const int env_idx = env0 + e;
-            StepEnvPreTickBallAndPads(env_idx, cfg, pre_counts[e], solver_scratch, balls, pads);
+            if (!ball_lanes) {
+                StepEnvPreTickBall(env_idx, cfg, solver_scratch, balls);
+            }
+            BoostPadTickMasks pad_masks;
+            const bool pad_pre = cfg.enable_boost_pads && pre_counts[e] > 0;
+            if (pad_pre) {
+                const int pad_count = BoostPadCount(cfg);
+                PreTickBoostPadsHostMasks(pads + env_idx * pad_count, pad_count, cfg.tick_dt, cfg.tick_dt > 0.0f,
+                                          pad_masks);
+            }
             const int base = env_idx * cfg.max_cars_per_env;
             const CarControls* const env_controls = &tick_controls[e * cfg.max_cars_per_env];
             const int16_t* const env_order = &tick_order[e * cfg.max_cars_per_env];
@@ -306,7 +398,8 @@ inline void StepEnvBlockCpu(
             for (int k = 0; k < count; ++k) {
                 const int i = env_order[k];
                 CarFrame* const frame = i < 8 ? &car_frames[i] : &snap_frame;
-                frame->rb_snap = solver_scratch != nullptr && i < 8 ? &solver_scratch[env_idx].rb_snap[i] : nullptr;
+                frame->rb_snap = mirror_rng == nullptr && solver_scratch != nullptr && i < 8
+                    ? &solver_scratch[env_idx].rb_snap[i] : nullptr;
                 frame->shape = count <= 8 && i < 8 ? &car_shapes[e][i] : nullptr;
                 frame->ctl_memo = i < 8 ? &ctl_memos[e * 8 + i] : nullptr;
                 StepEnvVehicleUpdateCar(env_idx, i, count, cfg, cars, wheel_runtime_states, car_configs, balls,
@@ -326,11 +419,12 @@ inline void StepEnvBlockCpu(
                 StepEnvPostCar(env_idx, i, cfg, cars, wheel_runtime_states, solver_scratch, car_configs,
                                env_controls[i], false, report_fields);
             }
-            StepEnvTail(env_idx, count, cfg, cars, car_configs, ball, env, pads, true);
+            StepEnvTail(env_idx, count, cfg, cars, car_configs, ball, env, pads, true, true,
+                        pad_pre ? &pad_masks : nullptr);
         }
     }
 }
 
-}  // namespace detail
-}  // namespace rocketgpu
+}
+}
 #endif

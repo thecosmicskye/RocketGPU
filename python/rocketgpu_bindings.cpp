@@ -50,6 +50,7 @@ uintptr_t RocketGpuPtrToInt(const void* ptr) {
 
 PYBIND11_MODULE(rocketgpu_py, m) {
     m.doc() = "Python bindings for RocketGPU";
+    m.attr("__version__") = ROCKETGPU_VERSION;
     m.def("physics_event_layout", []() {
         py::dict d;
         d["record_size"] = sizeof(rocketgpu::PhysicsEvent);

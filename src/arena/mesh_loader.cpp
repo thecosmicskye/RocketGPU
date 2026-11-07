@@ -818,33 +818,6 @@ std::vector<uint16_t> BuildArenaBroadphaseCellMask(
     return mask;
 }
 
-// Why ArenaMeshClearance is conservative under float rounding:
-//
-// 1. Where a hit can be. RayCastArenaMeshTriangleBtSource accepts a hit only when dist_a * dist_b < 0. With opposite
-//    signs |dist_a| <= |dist_a - dist_b| holds in float too, so the fraction lies in [0, 1] and the hit point is on the
-//    segment from..to, up to the rounding of the interpolation (< 1e-5 bt at arena coordinates). Its three edge tests
-//    accept barycentric coordinates >= -1e-4 (the tolerance is -1e-4 * |n|^2 against edge functions that equal the
-//    coordinate times |n|^2 for any point, on the plane or not). Each computed coordinate is off by at most
-//    ~1e-6 * max_edge^2 / |n| from the products and 3e-5 * max_edge / |n| from the vertex-minus-point differences
-//    (each component rounded at arena coordinates, < 1.5e-5 bt, so < 2.6e-5 bt as a vector). Clamping coordinates
-//    >= -beta to 0 moves the point at most 2 * beta * max_edge. With beta = 1e-4 + both errors, a hit point is within
-//    2e-4 * max_edge + 2e-6 * max_edge^3 / |n| + 6e-5 * max_edge^2 / |n|
-//    <= tol = max_edge * 5e-4 + (1e-5 * max_edge + 6e-5) * max_edge^2 / |n| of the triangle. A triangle whose float
-//    normal is zero never hits.
-// 2. What a voxel stores. lb <= min over triangles of dist(c, T) - tol_T - half_diag - kSlop, with c the voxel centre,
-//    computed in double and floored to whole units. A point p that the lookup's float index puts in a voxel lies within
-//    half_diag + 1e-5 of c (the index rounds at most a hair past a voxel face).
-// 3. The bound. For any segment point q within R of p: dist(q, T) >= dist(c, T) - |c - p| - R
-//    >= lb + tol_T + kSlop - 1e-5 - R. So lb > R gives dist(q, T) > tol_T + kSlop - 1e-5, which leaves room for the
-//    interpolation rounding of point 1: no hit.
-// 4. Capping. Distances are capped at kMax. A triangle visits every voxel whose centre is within its box grown by
-//    kMax + tol. Any other voxel is farther than kMax + tol from it, so the far code kMax - kSlop - half_diag is still a
-//    valid bound there. Box voxels farther than kMax + tol from its plane or bounding sphere take the capped code
-//    without the exact distance, which gives the same bytes.
-// 5. Goal meshes. The ray test may run on the goal-local triangle with the ray shifted by its origin (rounding < 1e-5 bt).
-//    Both forms are in the grid (local form shifted in double), so either test is covered.
-// Callers pass R = back-off + |to - cur| + 2e-3: every segment point is within max(|from - cur|, |to - cur|) of cur,
-// and the 2e-3 covers the float error of those lengths.
 void BuildArenaMeshClearance(
     const std::vector<ArenaMeshTriangle>& mesh,
     const std::vector<ArenaMeshTriangle>& local_mesh,
@@ -854,9 +827,9 @@ void BuildArenaMeshClearance(
     float& out_unit,
     int32_t out_dims[3],
     int threads) {
-    constexpr double kCell = 0.5;    // bt
-    constexpr double kMax = 3.0;     // distances are capped here (bt)
-    constexpr double kSlop = 0.01;   // float rounding of ray points, voxel lookup and the build (bt)
+    constexpr double kCell = 0.5;
+    constexpr double kMax = 3.0;
+    constexpr double kSlop = 0.01;
     out.clear();
     struct Tri {
         double v[3][3];
@@ -911,7 +884,6 @@ void BuildArenaMeshClearance(
         o[2] = a[2] - b[2];
     };
     const auto dot = [](const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
-    // Each voxel keeps a min over triangles, so z-slabs filled on separate threads give the same bytes.
     const auto fill_slab = [&](int z_begin, int z_end) {
         for (const Tri& t : tris) {
             const double* a = t.v[0];
@@ -925,11 +897,9 @@ void BuildArenaMeshClearance(
                 ab[1] * ac[2] - ab[2] * ac[1], ab[2] * ac[0] - ab[0] * ac[2], ab[0] * ac[1] - ab[1] * ac[0]};
             const double n_len = std::sqrt(dot(n, n));
             const double max_edge = std::sqrt(std::max(dot(ab, ab), std::max(dot(ac, ac), dot(bc, bc))));
-            // Point 1 above.
             const double tol =
                 n_len > 0.0 ? max_edge * 5e-4 + (1e-5 * max_edge + 6e-5) * max_edge * max_edge / n_len : kMax;
             const double pad = kSlop + tol + half_diag;
-            // Voxels outside this reach are farther than kMax + tol from the triangle, which the far code below covers.
             const double reach = kMax + tol;
             int i0[3], i1[3];
             for (int ax = 0; ax < 3; ++ax) {
@@ -938,11 +908,7 @@ void BuildArenaMeshClearance(
                 i0[ax] = std::max(0, static_cast<int>(std::floor((tmin - lo[ax]) / kCell - 0.5)));
                 i1[ax] = std::min(dims[ax] - 1, static_cast<int>(std::ceil((tmax - lo[ax]) / kCell - 0.5)));
             }
-            // Each row also skips the voxels whose centre is farther than reach from the triangle's plane (so farther
-            // than reach from the triangle), with one voxel of slack at each end.
             const double plane_reach = reach * n_len * (1.0 + 1e-9) + 1e-9;
-            // Bounding sphere (centroid, farthest vertex): a voxel centre farther than sphere_reach from the centroid is
-            // farther than reach from the triangle.
             const double cen[3] = {(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0};
             double r2 = 0.0;
             for (const double* v : {a, b, c}) {
@@ -951,7 +917,6 @@ void BuildArenaMeshClearance(
                 r2 = std::max(r2, dot(dv, dv));
             }
             const double sphere_reach = (std::sqrt(r2) + reach) * (1.0 + 1e-9) + 1e-9;
-            // Every box voxel past reach has min(d, kMax) = kMax, so it takes this code exactly as the exact test gives.
             const double cap_lb = kMax - pad;
             const int cap_code =
                 !(cap_lb > 0.0) ? 0 : cap_lb >= kMax ? 255 : static_cast<int>(std::floor(cap_lb / unit));
@@ -982,7 +947,6 @@ void BuildArenaMeshClearance(
                         if (std::abs(n[0]) > 1e-12 * n_len) {
                             const double xa = (-plane_reach - k) / n[0], xb = (plane_reach - k) / n[0];
                             const double x_lo = std::min(xa, xb), x_hi = std::max(xa, xb);
-                            // Clamped in double first: a near-zero n[0] gives huge bounds.
                             const double xb0 = std::floor((x_lo - lo[0]) / kCell - 0.5) - 1.0;
                             const double xb1 = std::ceil((x_hi - lo[0]) / kCell - 0.5) + 1.0;
                             x_begin = std::max(x_begin, static_cast<int>(std::min(std::max(xb0, -1.0), 4097.0)));
@@ -995,9 +959,6 @@ void BuildArenaMeshClearance(
                         const double p[3] = {
                             lo[0] + (ix + 0.5) * kCell, lo[1] + (iy + 0.5) * kCell, lo[2] + (iz + 0.5) * kCell};
                         if (n_len > 0.0) {
-                            // The plane distance is a lower bound on the triangle distance and the code is monotone in
-                            // it, so a plane code at or above the voxel's value cannot lower it. The 1e-9 covers the
-                            // rounding of the plane distance against the exact distance below.
                             const double plane_lb = std::min(std::abs(n[0] * p[0] + k) / n_len - 1e-9, kMax) - pad;
                             const int plane_code = !(plane_lb > 0.0) ? 0
                                 : plane_lb >= kMax ? 255 : static_cast<int>(std::floor(plane_lb / unit));
@@ -1005,7 +966,6 @@ void BuildArenaMeshClearance(
                                 continue;
                             }
                         }
-                        // Closest point on the triangle (Ericson, Real-Time Collision Detection 5.1.5).
                         double ap[3], bp[3], cp[3], q[3];
                         sub(p, a, ap);
                         sub(p, b, bp);
@@ -1013,7 +973,7 @@ void BuildArenaMeshClearance(
                         const double d1 = dot(ab, ap), d2 = dot(ac, ap), d3 = dot(ab, bp), d4 = dot(ac, bp);
                         const double d5 = dot(ab, cp), d6 = dot(ac, cp);
                         const double vc = d1 * d4 - d3 * d2, vb = d5 * d2 - d1 * d6, va = d3 * d6 - d5 * d4;
-                        double u = 0.0, v = 0.0;  // q = a + ab * u + ac * v
+                        double u = 0.0, v = 0.0;
                         if (d1 <= 0.0 && d2 <= 0.0) {
                         } else if (d3 >= 0.0 && d4 <= d3) {
                             u = 1.0;
@@ -1057,7 +1017,6 @@ void BuildArenaMeshClearance(
     for (std::thread& w : workers) {
         w.join();
     }
-    // A voxel no triangle reached is farther than kMax + tol from each triangle, so kMax - kSlop - half_diag bounds it.
     const int far_code = static_cast<int>(std::floor((kMax - kSlop - half_diag) / unit));
     for (uint8_t& cell : out) {
         cell = static_cast<uint8_t>(std::min<int>(cell, far_code));

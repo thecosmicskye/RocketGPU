@@ -35,15 +35,12 @@ using cudaStream_t = void*;
 #define ROCKETGPU_ALWAYS_INLINE
 #endif
 
-// CPU build only: force inlining where the host pays for the call (empty in CUDA builds).
 #if !defined(ROCKETGPU_USE_CUDA) && defined(__GNUC__)
 #define ROCKETGPU_HOST_INLINE __attribute__((always_inline))
 #else
 #define ROCKETGPU_HOST_INLINE
 #endif
 
-// CPU build only: keep a body out of line so hot callers stay small (empty in CUDA builds). COLD also moves it to
-// .text.unlikely; use it only for paths most car-ticks never take.
 #if !defined(ROCKETGPU_USE_CUDA) && defined(__GNUC__)
 #define ROCKETGPU_HOST_NOINLINE __attribute__((noinline))
 #define ROCKETGPU_HOST_COLD __attribute__((noinline, cold))

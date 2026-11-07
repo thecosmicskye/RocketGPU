@@ -25,8 +25,6 @@ struct ContactAccumulator {
 #if defined(ROCKETGPU_USE_CUDA)
     PhysicsEvent event = {};
 #else
-    // Read only while event_stream.windows is set, and whoever sets event_stream writes the whole event first, so the
-    // host leaves it unconstructed rather than zeroing it on every car-world call.
     union {
         PhysicsEvent event;
     };
@@ -659,7 +657,6 @@ struct BulletManifoldEntry {
     int32_t island_id = 0;
 };
 
-// One car's static manifolds in a tick's broadphase manifold list: meshes (bit = mesh index) and planes (bit = static id - 100).
 struct CarListManifolds {
     uint32_t meshes = 0;
     uint32_t planes = 0;
@@ -1210,9 +1207,6 @@ struct CarWorldRowsOut {
 };
 
 #if !defined(ROCKETGPU_USE_CUDA)
-// GameGetRotationScalar(fwd, right, up) (raw) and its GameRbStateQuantizeQuat (rot) for one car's basis, computed by the
-// CPU pre-tick kernel; FreshCarRbSnapshot and the car's orientation integrations take them when their basis matches bit
-// for bit.
 struct CarRbSnapMemo {
     ::rocketgpu::Vec3 fwd, right, up;
     ::rocketgpu::Quat rot;
@@ -1220,28 +1214,26 @@ struct CarRbSnapMemo {
     uint8_t valid = 0;
 };
 #endif
-// Per car slot: values that depend only on the car's hitbox fields and the car mass. The CPU block step fills them for
-// its envs once per call (FillCarShapeCache) and passes them to the world step.
 struct CarShapeCacheEntry {
-    ::rocketgpu::Vec3 half_extent_bt;        // BulletBoxHalfExtentWithMarginBt(cfg)
-    float bounding_sphere_radius = 0.0f;     // BoundingSphereRadius(cfg)
-    ::rocketgpu::Vec3 inv_inertia_local_uu;  // CarInvInertiaLocalUu(cfg, mass)
-    float contact_breaking_threshold_bt = 0.0f;  // CarContactBreakingThresholdBt(cfg)
-    float mesh_reach_bt = 0.0f;                  // CarWorldMeshReachBt(cfg)
-    ::rocketgpu::Vec3 inv_inertia_local_bt;      // CarInvInertiaLocalBt(cfg, mass)
-    float susp_front_scale = 0.0f;               // CalSuspensionForceScales(cfg, mass)
+    ::rocketgpu::Vec3 half_extent_bt;
+    float bounding_sphere_radius = 0.0f;
+    ::rocketgpu::Vec3 inv_inertia_local_uu;
+    float contact_breaking_threshold_bt = 0.0f;
+    float mesh_reach_bt = 0.0f;
+    ::rocketgpu::Vec3 inv_inertia_local_bt;
+    float susp_front_scale = 0.0f;
     float susp_back_scale = 0.0f;
-    float min_wheel_hit_dist_sq_bt = 0.0f;       // CalMinWheelHitDistSqBt(cfg)
-    float front_bone_z = 0.0f;                   // CalWheelBoneZ(cfg)
+    float min_wheel_hit_dist_sq_bt = 0.0f;
+    float front_bone_z = 0.0f;
     float back_bone_z = 0.0f;
-    alignas(16) float wheel_offset_bt_x[4] = {};  // InitWheelStepState offset * kUUToBT, per wheel
+    alignas(16) float wheel_offset_bt_x[4] = {};
     alignas(16) float wheel_offset_bt_y[4] = {};
     alignas(16) float wheel_offset_bt_z[4] = {};
-    float wheel_rest_len[4] = {};                // hitbox_offset.z - bone_z
-    float wheel_ray_reach_bt = 0.0f;             // WheelRayExcludedBodies: car-centred box half size holding every wheel ray
-    alignas(16) float wheel_ray_len_bt[4] = {};  // WheelRaysFloorOnlyHost max_len_bt of the pre-initialised wheels
-    bool wheel_ray_len_positive = false;         // every wheel's UU ray length > 0
-    alignas(16) float wheel_pushback_thresh_bt[4] = {};  // SetWorldWheelPushback ray_pushback_thresh_bt
+    float wheel_rest_len[4] = {};
+    float wheel_ray_reach_bt = 0.0f;
+    alignas(16) float wheel_ray_len_bt[4] = {};
+    bool wheel_ray_len_positive = false;
+    alignas(16) float wheel_pushback_thresh_bt[4] = {};
 };
 
 struct WorldSolverScratch {
@@ -1302,7 +1294,6 @@ struct WorldSolverScratch {
     uint32_t pair_cache_maybe_valid = ~0u;
 #if !defined(ROCKETGPU_USE_CUDA)
     CarRbSnapMemo rb_snap[8] = {};
-    // Each car slot's shape values and the car config and mass they were computed from (CarShapeCacheFor).
     CarShapeCacheEntry car_shape[8] = {};
     ::rocketgpu::CarConfig car_shape_cfg[8] = {};
     float car_shape_mass[8] = {};
@@ -1311,8 +1302,6 @@ struct WorldSolverScratch {
 };
 
 #if !defined(ROCKETGPU_USE_CUDA)
-// The pre-tick's GameGetRotationScalar for car slot `slot` when the car's basis is still the one it was computed for.
-// Compares the two 36-byte basis blocks in place (no stack copies).
 inline const ::rocketgpu::Quat* CarRbSnapRaw(const WorldSolverScratch* s, int slot, const ::rocketgpu::CarState& car) {
     static_assert(offsetof(::rocketgpu::CarState, basis_right) == offsetof(::rocketgpu::CarState, basis_forward) + 12 &&
                       offsetof(::rocketgpu::CarState, basis_up) == offsetof(::rocketgpu::CarState, basis_forward) + 24 &&
@@ -1323,7 +1312,6 @@ inline const ::rocketgpu::Quat* CarRbSnapRaw(const WorldSolverScratch* s, int sl
         return nullptr;
     }
     const CarRbSnapMemo& m = s->rb_snap[slot];
-    // 32 bytes + 4: clang expands a 36-byte memcmp into a 32-byte compare plus a byte-by-byte tail.
     const char* a = reinterpret_cast<const char*>(&car) + offsetof(::rocketgpu::CarState, basis_forward);
     const char* b = reinterpret_cast<const char*>(&m) + offsetof(CarRbSnapMemo, fwd);
     uint32_t a_tail, b_tail;
@@ -3493,7 +3481,6 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE void ComputeBulletBodyProxy(
         const F4 child_min = center_now - extent_now;
         const F4 child_max = center_now + extent_now;
         const F4 thr = Splat(kContactThresholdBt);
-        // Ascending field order: each padded store's 4th lane is overwritten by the next field.
         static_assert(offsetof(BulletBroadphaseProxy, child_axis) == 5 * sizeof(::rocketgpu::Vec3) &&
                           offsetof(::rocketgpu::CarState, pos_bt) + 16 <= sizeof(::rocketgpu::CarState),
                       "padded proxy stores / car position load");
@@ -3563,8 +3550,6 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE void ComputeBulletBodyProxy(
     proxy.is_ball = 0;
 }
 
-// A fresh sweep's sentinels and static handles. Static-static pairs are never cached, so the result depends on the
-// arena alone; SimConfig::arena_sweep_statics holds it built once (BulletSweepCopyStatics).
 ROCKETGPU_HD void BulletSweepAddStatics(BulletSweepHistory& h, bool arena_static, bool goal_floors,
                                        const ArenaMeshBvhMeshInfo* mesh_infos, int mesh_info_count) {
     h.sap_next_fresh = 1;
@@ -3631,7 +3616,6 @@ ROCKETGPU_HD void BulletSweepAddStatics(BulletSweepHistory& h, bool arena_static
     h.sap_static_count = h.sap_handle_count;
 }
 
-// BulletSweepAddStatics on a history with no handles, copied from s: writes the same entries.
 ROCKETGPU_HD void BulletSweepCopyStatics(BulletSweepHistory& h, const BulletSweepHistory& s, bool whole) {
     if (whole) {
         struct alignas(16) Words {
@@ -4139,8 +4123,6 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             }
         }
     };
-    // At a match start the game adds the bodies once, in body order (the ball's handle lowest); a goal's round reset
-    // re-adds them from the free list (BulletSweepNewRound). Any other (set) state takes the full round.
     bool round_cached = false;
     if (sweep_fresh) {
         bool empty = bp.bp_pair_count == 0 && bp.bp_manifold_count == 0 && h.sap_obj_count == 0;
@@ -4177,7 +4159,6 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             uint16_t qmin[3], qmax[3];
 #if defined(ROCKETGPU_HOST_LANES)
             {
-                // ArenaSweepQuantize in lanes (same operations per component).
                 using namespace lanes;
                 const auto quant = [](F4 v, int32_t is_max, uint16_t* out) {
                     constexpr float kQ = 65535.0f / (kArenaSweepHalfExtentBt + kArenaSweepHalfExtentBt);
@@ -4197,8 +4178,6 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             quantize_point(proxy.aabb_max, qmax, 1);
 #endif
 #if defined(ROCKETGPU_HOST_LANES)
-            // An axis's sorts write only that axis's edge arrays and edge indices, so every axis's edge indices and
-            // deltas read here equal what the per-axis loop reads when it reaches that axis.
             int emin_axis[3], emax_axis[3], dmin_axis[3], dmax_axis[3];
             uint32_t moved_axes = 0;
             for (int axis = 0; axis < 3; ++axis) {
@@ -4297,8 +4276,6 @@ ROCKETGPU_HD int BuildBulletManifoldList(
         if (want && at < 0 && (key.kind == 1 || key.kind == 3) && !local_overlap(key)) {
             continue;
         }
-        // A sleeping ball makes no static manifold, except for a plane its public-state upload primed: the game's
-        // resting ball keeps the manifold it made awake (PrimeImportedBallWorldPlanes).
         constexpr int kPlaneSlot[6] = {0, 1, 3, 2, 4, 5};
         if (want && at < 0 && key.kind == 0 && ball_static_pairs_skipped &&
             !(key.static_id >= 100 && key.static_id <= 105 &&
@@ -4940,7 +4917,6 @@ ROCKETGPU_HD ROCKETGPU_NOINLINE ROCKETGPU_HOST_NOINLINE void SolveUnifiedVelocit
             unified_friction_count = 1;
         }
     } else {
-        // Rows follow the Bullet manifold order; rows no manifold claims go last, by bucket.
         EnvStridedArray<const BulletManifoldEntry> entries = sorted_manifolds;
         const int entry_count = sorted_manifolds != nullptr ? sorted_manifold_count : 0;
         {
