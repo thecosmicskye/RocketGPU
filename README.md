@@ -1,6 +1,6 @@
 # RocketGPU
 
-Faster, bit-accurate Rocket League physics.
+Faster, bit-accurate Rocket League physics. Works best with [RocketChad3](https://github.com/thecosmicskye/RocketChad3).
 
 ## Speed
 
