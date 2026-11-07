@@ -35,8 +35,8 @@ public:
         size_ = n;
 #if defined(ROCKETGPU_USE_CUDA)
         CheckCuda(cudaMalloc(&ptr_, n * sizeof(T)), "cudaMalloc buffer");
-
         CheckCuda(cudaMemset(ptr_, 0, n * sizeof(T)), "cudaMemset buffer");
+        CheckCuda(cudaStreamSynchronize(nullptr), "cudaMemset buffer sync");
 #else
         host_.resize(n);
         ptr_ = host_.data();

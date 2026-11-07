@@ -671,6 +671,11 @@ struct BulletBroadphaseProxy {
     ::rocketgpu::Vec3 child_axis[3] = {::rocketgpu::Vec3(1.0f, 0.0f, 0.0f), ::rocketgpu::Vec3(0.0f, 1.0f, 0.0f),
                                        ::rocketgpu::Vec3(0.0f, 0.0f, 1.0f)};
     ::rocketgpu::Vec3 child_half = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+#if !defined(ROCKETGPU_USE_CUDA)
+    ::rocketgpu::Vec3 child_local_min = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    ::rocketgpu::Vec3 child_local_max = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    ::rocketgpu::Vec3 origin = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+#endif
     int32_t cell_i = 0;
     int32_t cell_j = 0;
     int32_t cell_k = 0;
@@ -835,14 +840,25 @@ ROCKETGPU_HD void BulletSweepNewRound(BulletBroadphaseHistory& bp, int car_count
 template <typename T>
 struct EnvStridedArray {
     T* base = nullptr;
+#if defined(ROCKETGPU_USE_CUDA)
     int stride = 1;
+#else
+    static constexpr int stride = 1;
+#endif
 
     EnvStridedArray() = default;
+#if defined(ROCKETGPU_USE_CUDA)
     ROCKETGPU_HD EnvStridedArray(T* p) : base(p), stride(1) {}
     ROCKETGPU_HD EnvStridedArray(T* p, int s) : base(p), stride(s) {}
     ROCKETGPU_HD EnvStridedArray(std::nullptr_t) : base(nullptr), stride(1) {}
     template <typename U, typename = typename std::enable_if<std::is_convertible<U*, T*>::value>::type>
     ROCKETGPU_HD EnvStridedArray(const EnvStridedArray<U>& other) : base(other.base), stride(other.stride) {}
+#else
+    EnvStridedArray(T* p) : base(p) {}
+    EnvStridedArray(std::nullptr_t) : base(nullptr) {}
+    template <typename U, typename = typename std::enable_if<std::is_convertible<U*, T*>::value>::type>
+    EnvStridedArray(const EnvStridedArray<U>& other) : base(other.base) {}
+#endif
 
     ROCKETGPU_HD T& operator[](int i) const {
         return base[static_cast<std::ptrdiff_t>(i) * static_cast<std::ptrdiff_t>(stride)];
@@ -957,10 +973,14 @@ struct WorldSolverScratchRowPool {
         if (base == nullptr) {
             return EnvStridedArray<T>(nullptr);
         }
+#if defined(ROCKETGPU_USE_CUDA)
         if (interleaved) {
             return EnvStridedArray<T>(base + env_idx, env_count);
         }
         return EnvStridedArray<T>(base + static_cast<std::ptrdiff_t>(env_idx) * max_rows, 1);
+#else
+        return EnvStridedArray<T>(base + static_cast<std::ptrdiff_t>(env_idx) * max_rows);
+#endif
     }
 
     ROCKETGPU_HD WorldSolverScratchRows view(int env_idx) const {
@@ -1146,7 +1166,12 @@ struct WorldSolverScratchRowPoolHost {
         pool.ball_car_retained_manifolds = ball_car_retained_manifolds.data();
         pool.car_world_local_rows = car_world_local_rows.data();
         pool.env_count = env_count;
+#if defined(ROCKETGPU_USE_CUDA)
         pool.interleaved = interleaved ? 1 : 0;
+#else
+        (void)interleaved;
+        pool.interleaved = 0;
+#endif
         pool.caps = caps;
     }
 
@@ -1207,6 +1232,11 @@ struct CarWorldRowsOut {
 };
 
 #if !defined(ROCKETGPU_USE_CUDA)
+struct BoostPadBudget {
+    ::rocketgpu::Vec3 pos_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    float budget_bt = 0.0f;
+};
+
 struct CarRbSnapMemo {
     ::rocketgpu::Vec3 fwd, right, up;
     ::rocketgpu::Quat rot;
@@ -1232,6 +1262,9 @@ struct CarShapeCacheEntry {
     float wheel_rest_len[4] = {};
     float wheel_ray_reach_bt = 0.0f;
     alignas(16) float wheel_ray_len_bt[4] = {};
+#if !defined(ROCKETGPU_USE_CUDA)
+    float wheel_ray_len_uu[4] = {};
+#endif
     bool wheel_ray_len_positive = false;
     alignas(16) float wheel_pushback_thresh_bt[4] = {};
 };
@@ -1253,7 +1286,10 @@ struct WorldSolverScratch {
     ::rocketgpu::Quat hit_car_rot[8] = {};
     ::rocketgpu::Vec3 hit_ball_pos = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
     ::rocketgpu::Vec3 ball_predict_vel_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+#if !defined(ROCKETGPU_USE_CUDA)
     ::rocketgpu::Vec3 car_predict_vel[8] = {};
+#endif
+    ::rocketgpu::Vec3 car_predict_vel_bt[8] = {};
     ::rocketgpu::Vec3 car_predict_ang_vel[8] = {};
     uint8_t car_predict_valid[8] = {};
     uint16_t predictive_hit_mask = 0;
@@ -1298,6 +1334,7 @@ struct WorldSolverScratch {
     ::rocketgpu::CarConfig car_shape_cfg[8] = {};
     float car_shape_mass[8] = {};
     uint8_t car_shape_valid = 0;
+    BoostPadBudget pad_budget[8] = {};
 #endif
 };
 
@@ -3197,6 +3234,10 @@ ROCKETGPU_HD ArenaBroadphaseGrid MakeArenaBroadphaseGrid(const ::rocketgpu::SimC
     grid.leaf_grid.entries = cfg.arena_mesh_leaf_entries;
 #if !defined(ROCKETGPU_USE_CUDA)
     grid.leaf_grid.host_tables = cfg.host_tables != nullptr && cfg.host_tables->owner == &cfg ? cfg.host_tables : nullptr;
+#else
+    grid.leaf_grid.ray_infos = cfg.arena_mesh_ray_grid_infos;
+    grid.leaf_grid.ray_cell_start = cfg.arena_mesh_ray_cell_start;
+    grid.leaf_grid.ray_entries = cfg.arena_mesh_ray_entries;
 #endif
     grid.sweep_statics = cfg.arena_sweep_statics;
     return grid;
@@ -3266,13 +3307,13 @@ ROCKETGPU_HD BulletBroadphaseProxy ComputeBulletCarProxyAabb(
     float dt,
     const ArenaBroadphaseGrid& grid,
     bool native_sse_math = false,
-    const ::rocketgpu::Vec3* predict_vel_in = nullptr,
+    const ::rocketgpu::Vec3* predict_vel_bt_in = nullptr,
     const ::rocketgpu::Vec3* predict_ang_vel_in = nullptr) {
     constexpr float kUUToBT = 1.0f / 50.0f;
     constexpr float kContactThresholdBt = 0.02f;
 
     constexpr float kCompoundMarginBt = 0.0f;
-    const ::rocketgpu::Vec3 predict_vel = predict_vel_in != nullptr ? *predict_vel_in : car.vel;
+    const ::rocketgpu::Vec3 predict_vel_bt = predict_vel_bt_in != nullptr ? *predict_vel_bt_in : car.vel_bt;
     const ::rocketgpu::Vec3 predict_ang_vel = predict_ang_vel_in != nullptr ? *predict_ang_vel_in : car.ang_vel;
 
     BulletBroadphaseProxy proxy;
@@ -3296,7 +3337,7 @@ ROCKETGPU_HD BulletBroadphaseProxy ComputeBulletCarProxyAabb(
         IntegrateOrientation(predicted_rot, predict_ang_vel, dt);
     }
     const ::rocketgpu::Vec3 origin_bt = car.pos_bt;
-    const ::rocketgpu::Vec3 predicted_origin_bt = origin_bt + predict_vel * (kUUToBT * dt);
+    const ::rocketgpu::Vec3 predicted_origin_bt = origin_bt + predict_vel_bt * dt;
 
     ::rocketgpu::Vec3 axis_x(1.0f, 0.0f, 0.0f);
     ::rocketgpu::Vec3 axis_y(0.0f, 1.0f, 0.0f);
@@ -3314,29 +3355,39 @@ ROCKETGPU_HD BulletBroadphaseProxy ComputeBulletCarProxyAabb(
     }
 
     const ::rocketgpu::Vec3 center_now(
-        origin_bt.x + axis_x.x * child_origin_bt.x + axis_y.x * child_origin_bt.y + axis_z.x * child_origin_bt.z,
-        origin_bt.y + axis_x.y * child_origin_bt.x + axis_y.y * child_origin_bt.y + axis_z.y * child_origin_bt.z,
-        origin_bt.z + axis_x.z * child_origin_bt.x + axis_y.z * child_origin_bt.y + axis_z.z * child_origin_bt.z);
-    const ::rocketgpu::Vec3 center_pred(
-        predicted_origin_bt.x + pred_axis_x.x * child_origin_bt.x + pred_axis_y.x * child_origin_bt.y + pred_axis_z.x * child_origin_bt.z,
-        predicted_origin_bt.y + pred_axis_x.y * child_origin_bt.x + pred_axis_y.y * child_origin_bt.y + pred_axis_z.y * child_origin_bt.z,
-        predicted_origin_bt.z + pred_axis_x.z * child_origin_bt.x + pred_axis_y.z * child_origin_bt.y + pred_axis_z.z * child_origin_bt.z);
+        (axis_x.x * child_origin_bt.x + axis_y.x * child_origin_bt.y) + axis_z.x * child_origin_bt.z + origin_bt.x,
+        (axis_x.y * child_origin_bt.x + axis_y.y * child_origin_bt.y) + axis_z.y * child_origin_bt.z + origin_bt.y,
+        (axis_x.z * child_origin_bt.x + axis_y.z * child_origin_bt.y) + axis_z.z * child_origin_bt.z + origin_bt.z);
     const ::rocketgpu::Vec3 extent_now(
         Abs(axis_x.x) * compound_half_bt.x + Abs(axis_y.x) * compound_half_bt.y + Abs(axis_z.x) * compound_half_bt.z,
         Abs(axis_x.y) * compound_half_bt.x + Abs(axis_y.y) * compound_half_bt.y + Abs(axis_z.y) * compound_half_bt.z,
         Abs(axis_x.z) * compound_half_bt.x + Abs(axis_y.z) * compound_half_bt.y + Abs(axis_z.z) * compound_half_bt.z);
-    const ::rocketgpu::Vec3 extent_pred(
-        Abs(pred_axis_x.x) * compound_half_bt.x + Abs(pred_axis_y.x) * compound_half_bt.y + Abs(pred_axis_z.x) * compound_half_bt.z,
-        Abs(pred_axis_x.y) * compound_half_bt.x + Abs(pred_axis_y.y) * compound_half_bt.y + Abs(pred_axis_z.y) * compound_half_bt.z,
-        Abs(pred_axis_x.z) * compound_half_bt.x + Abs(pred_axis_y.z) * compound_half_bt.y + Abs(pred_axis_z.z) * compound_half_bt.z);
+    const ::rocketgpu::Vec3 lmin = child_origin_bt - compound_half_bt, lmax = child_origin_bt + compound_half_bt;
+    const ::rocketgpu::Vec3 lc = (lmax + lmin) * 0.5f, lh = (lmax - lmin) * 0.5f;
+    const auto compound_center = [&lc](const ::rocketgpu::Vec3& o, const ::rocketgpu::Vec3& ax,
+                                       const ::rocketgpu::Vec3& ay, const ::rocketgpu::Vec3& az) {
+        return ::rocketgpu::Vec3((ax.x * lc.x + ay.x * lc.y) + az.x * lc.z + o.x,
+                                 (ax.y * lc.x + ay.y * lc.y) + az.y * lc.z + o.y,
+                                 (ax.z * lc.x + ay.z * lc.y) + az.z * lc.z + o.z);
+    };
+    const auto compound_extent = [&lh](const ::rocketgpu::Vec3& ax, const ::rocketgpu::Vec3& ay,
+                                       const ::rocketgpu::Vec3& az) {
+        return ::rocketgpu::Vec3((Abs(ax.x) * lh.x + Abs(ay.x) * lh.y) + Abs(az.x) * lh.z,
+                                 (Abs(ax.y) * lh.x + Abs(ay.y) * lh.y) + Abs(az.y) * lh.z,
+                                 (Abs(ax.z) * lh.x + Abs(ay.z) * lh.y) + Abs(az.z) * lh.z);
+    };
+    const ::rocketgpu::Vec3 outer_now = compound_center(origin_bt, axis_x, axis_y, axis_z);
+    const ::rocketgpu::Vec3 outer_pred = compound_center(predicted_origin_bt, pred_axis_x, pred_axis_y, pred_axis_z);
+    const ::rocketgpu::Vec3 outer_ext_now = compound_extent(axis_x, axis_y, axis_z);
+    const ::rocketgpu::Vec3 outer_ext_pred = compound_extent(pred_axis_x, pred_axis_y, pred_axis_z);
     proxy.aabb_min = ::rocketgpu::Vec3(
-        Min(center_now.x - extent_now.x, center_pred.x - extent_pred.x) - kContactThresholdBt,
-        Min(center_now.y - extent_now.y, center_pred.y - extent_pred.y) - kContactThresholdBt,
-        Min(center_now.z - extent_now.z, center_pred.z - extent_pred.z) - kContactThresholdBt);
+        Min(outer_now.x - outer_ext_now.x, outer_pred.x - outer_ext_pred.x) - kContactThresholdBt,
+        Min(outer_now.y - outer_ext_now.y, outer_pred.y - outer_ext_pred.y) - kContactThresholdBt,
+        Min(outer_now.z - outer_ext_now.z, outer_pred.z - outer_ext_pred.z) - kContactThresholdBt);
     proxy.aabb_max = ::rocketgpu::Vec3(
-        Max(center_now.x + extent_now.x, center_pred.x + extent_pred.x) + kContactThresholdBt,
-        Max(center_now.y + extent_now.y, center_pred.y + extent_pred.y) + kContactThresholdBt,
-        Max(center_now.z + extent_now.z, center_pred.z + extent_pred.z) + kContactThresholdBt);
+        Max(outer_now.x + outer_ext_now.x, outer_pred.x + outer_ext_pred.x) + kContactThresholdBt,
+        Max(outer_now.y + outer_ext_now.y, outer_pred.y + outer_ext_pred.y) + kContactThresholdBt,
+        Max(outer_now.z + outer_ext_now.z, outer_pred.z + outer_ext_pred.z) + kContactThresholdBt);
     proxy.child_aabb_min = ::rocketgpu::Vec3(
         center_now.x - extent_now.x,
         center_now.y - extent_now.y,
@@ -3400,14 +3451,15 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE void ComputeBulletBodyProxy(
         const ::rocketgpu::Vec3 predict_vel_bt = bp_history != nullptr ? bp_history->ball_predict_vel_bt : ball.vel_bt;
         const ::rocketgpu::Vec3 predicted_bt = pos_bt + predict_vel_bt * dt;
         const float extent = ball_radius * kUUToBT + kSphereAabbExtraBt;
+        const float proxy_extent = (ball_radius * kUUToBT + 0.5f * kSphereAabbExtraBt) + 0.5f * kSphereAabbExtraBt;
         proxy.aabb_min = ::rocketgpu::Vec3(
-            Min(pos_bt.x, predicted_bt.x) - extent - kContactThresholdBt,
-            Min(pos_bt.y, predicted_bt.y) - extent - kContactThresholdBt,
-            Min(pos_bt.z, predicted_bt.z) - extent - kContactThresholdBt);
+            Min(pos_bt.x, predicted_bt.x) - proxy_extent - kContactThresholdBt,
+            Min(pos_bt.y, predicted_bt.y) - proxy_extent - kContactThresholdBt,
+            Min(pos_bt.z, predicted_bt.z) - proxy_extent - kContactThresholdBt);
         proxy.aabb_max = ::rocketgpu::Vec3(
-            Max(pos_bt.x, predicted_bt.x) + extent + kContactThresholdBt,
-            Max(pos_bt.y, predicted_bt.y) + extent + kContactThresholdBt,
-            Max(pos_bt.z, predicted_bt.z) + extent + kContactThresholdBt);
+            Max(pos_bt.x, predicted_bt.x) + proxy_extent + kContactThresholdBt,
+            Max(pos_bt.y, predicted_bt.y) + proxy_extent + kContactThresholdBt,
+            Max(pos_bt.z, predicted_bt.z) + proxy_extent + kContactThresholdBt);
         proxy.child_aabb_min = ::rocketgpu::Vec3(pos_bt.x - extent, pos_bt.y - extent, pos_bt.z - extent);
         proxy.child_aabb_max = ::rocketgpu::Vec3(pos_bt.x + extent, pos_bt.y + extent, pos_bt.z + extent);
         proxy.child_center = pos_bt;
@@ -3431,7 +3483,7 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE void ComputeBulletBodyProxy(
     const ::rocketgpu::Vec3 child_origin_bt = cfg.hitbox_offset * kUUToBT;
 
     const bool predict_snap = bp_history != nullptr && car_idx < 8 && bp_history->car_predict_valid[car_idx] != 0;
-    const ::rocketgpu::Vec3 predict_vel = predict_snap ? bp_history->car_predict_vel[car_idx] : car.vel;
+    const ::rocketgpu::Vec3 predict_vel_bt = predict_snap ? bp_history->car_predict_vel_bt[car_idx] : car.vel_bt;
     const ::rocketgpu::Vec3 predict_ang_vel = predict_snap ? bp_history->car_predict_ang_vel[car_idx] : car.ang_vel;
     ::rocketgpu::Vec3 axis_x(1.0f, 0.0f, 0.0f);
     ::rocketgpu::Vec3 axis_y(0.0f, 1.0f, 0.0f);
@@ -3469,23 +3521,29 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE void ComputeBulletBodyProxy(
     {
         using namespace lanes;
         const F4 origin = LoadPadded(car.pos_bt);
-        const F4 pred_origin = origin + Load(predict_vel) * Splat(kUUToBT * dt);
+        const F4 pred_origin = origin + Load(predict_vel_bt) * Splat(dt);
         const F4 lx = Splat(child_origin_bt.x), ly = Splat(child_origin_bt.y), lz = Splat(child_origin_bt.z);
         const F4 hx = Splat(half_extent_bt.x), hy = Splat(half_extent_bt.y), hz = Splat(half_extent_bt.z);
         const F4 ax = Load(axis_x), ay = Load(axis_y), az = Load(axis_z);
         const F4 px = Load(pred_axis_x), py = Load(pred_axis_y), pz = Load(pred_axis_z);
-        const F4 center_now = ((origin + ax * lx) + ay * ly) + az * lz;
-        const F4 center_pred = ((pred_origin + px * lx) + py * ly) + pz * lz;
+        const F4 center_now = ((ax * lx + ay * ly) + az * lz) + origin;
         const F4 extent_now = (Abs(ax) * hx + Abs(ay) * hy) + Abs(az) * hz;
-        const F4 extent_pred = (Abs(px) * hx + Abs(py) * hy) + Abs(pz) * hz;
         const F4 child_min = center_now - extent_now;
         const F4 child_max = center_now + extent_now;
         const F4 thr = Splat(kContactThresholdBt);
+        const ::rocketgpu::Vec3 lmin = child_origin_bt - half_extent_bt, lmax = child_origin_bt + half_extent_bt;
+        const ::rocketgpu::Vec3 lc = (lmax + lmin) * 0.5f, lh = (lmax - lmin) * 0.5f;
+        const F4 cx = Splat(lc.x), cy = Splat(lc.y), cz = Splat(lc.z);
+        const F4 ex = Splat(lh.x), ey = Splat(lh.y), ez = Splat(lh.z);
+        const F4 outer_now = ((ax * cx + ay * cy) + az * cz) + origin;
+        const F4 outer_pred = ((px * cx + py * cy) + pz * cz) + pred_origin;
+        const F4 outer_ext_now = (Abs(ax) * ex + Abs(ay) * ey) + Abs(az) * ez;
+        const F4 outer_ext_pred = (Abs(px) * ex + Abs(py) * ey) + Abs(pz) * ez;
         static_assert(offsetof(BulletBroadphaseProxy, child_axis) == 5 * sizeof(::rocketgpu::Vec3) &&
                           offsetof(::rocketgpu::CarState, pos_bt) + 16 <= sizeof(::rocketgpu::CarState),
                       "padded proxy stores / car position load");
-        StorePadded(proxy.aabb_min, Min(child_min, center_pred - extent_pred) - thr);
-        StorePadded(proxy.aabb_max, Max(child_max, center_pred + extent_pred) + thr);
+        StorePadded(proxy.aabb_min, Min(outer_now - outer_ext_now, outer_pred - outer_ext_pred) - thr);
+        StorePadded(proxy.aabb_max, Max(outer_now + outer_ext_now, outer_pred + outer_ext_pred) + thr);
         StorePadded(proxy.child_aabb_min, child_min);
         StorePadded(proxy.child_aabb_max, child_max);
         StorePadded(proxy.child_center, center_now);
@@ -3493,12 +3551,15 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE void ComputeBulletBodyProxy(
         proxy.child_axis[1] = axis_y;
         proxy.child_axis[2] = axis_z;
         proxy.child_half = half_extent_bt;
+        proxy.child_local_min = lmin;
+        proxy.child_local_max = lmax;
+        proxy.origin = origin_bt;
         proxy.valid = 1;
         proxy.is_ball = 0;
         return;
     }
 #endif
-    const ::rocketgpu::Vec3 predicted_origin_bt = origin_bt + predict_vel * (kUUToBT * dt);
+    const ::rocketgpu::Vec3 predicted_origin_bt = origin_bt + predict_vel_bt * dt;
 
     const auto box_center = [](const ::rocketgpu::Vec3& origin,
                                const ::rocketgpu::Vec3& ax,
@@ -3506,9 +3567,9 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE void ComputeBulletBodyProxy(
                                const ::rocketgpu::Vec3& az,
                                const ::rocketgpu::Vec3& local) {
         return ::rocketgpu::Vec3(
-            origin.x + ax.x * local.x + ay.x * local.y + az.x * local.z,
-            origin.y + ax.y * local.x + ay.y * local.y + az.y * local.z,
-            origin.z + ax.z * local.x + ay.z * local.y + az.z * local.z);
+            (ax.x * local.x + ay.x * local.y) + az.x * local.z + origin.x,
+            (ax.y * local.x + ay.y * local.y) + az.y * local.z + origin.y,
+            (ax.z * local.x + ay.z * local.y) + az.z * local.z + origin.z);
     };
     const auto box_extent = [](const ::rocketgpu::Vec3& ax,
                                const ::rocketgpu::Vec3& ay,
@@ -3521,10 +3582,7 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE void ComputeBulletBodyProxy(
     };
 
     const ::rocketgpu::Vec3 center_now = box_center(origin_bt, axis_x, axis_y, axis_z, child_origin_bt);
-    const ::rocketgpu::Vec3 center_pred =
-        box_center(predicted_origin_bt, pred_axis_x, pred_axis_y, pred_axis_z, child_origin_bt);
     const ::rocketgpu::Vec3 extent_now = box_extent(axis_x, axis_y, axis_z, half_extent_bt);
-    const ::rocketgpu::Vec3 extent_pred = box_extent(pred_axis_x, pred_axis_y, pred_axis_z, half_extent_bt);
     proxy.child_aabb_min = ::rocketgpu::Vec3(
         center_now.x - extent_now.x,
         center_now.y - extent_now.y,
@@ -3533,19 +3591,40 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE void ComputeBulletBodyProxy(
         center_now.x + extent_now.x,
         center_now.y + extent_now.y,
         center_now.z + extent_now.z);
+    const ::rocketgpu::Vec3 lmin = child_origin_bt - half_extent_bt, lmax = child_origin_bt + half_extent_bt;
+    const ::rocketgpu::Vec3 lc = (lmax + lmin) * 0.5f, lh = (lmax - lmin) * 0.5f;
+    const auto compound_center = [](const ::rocketgpu::Vec3& origin,
+                                    const ::rocketgpu::Vec3& ax,
+                                    const ::rocketgpu::Vec3& ay,
+                                    const ::rocketgpu::Vec3& az,
+                                    const ::rocketgpu::Vec3& local) {
+        return ::rocketgpu::Vec3(
+            (ax.x * local.x + ay.x * local.y) + az.x * local.z + origin.x,
+            (ax.y * local.x + ay.y * local.y) + az.y * local.z + origin.y,
+            (ax.z * local.x + ay.z * local.y) + az.z * local.z + origin.z);
+    };
+    const ::rocketgpu::Vec3 outer_now = compound_center(origin_bt, axis_x, axis_y, axis_z, lc);
+    const ::rocketgpu::Vec3 outer_pred = compound_center(predicted_origin_bt, pred_axis_x, pred_axis_y, pred_axis_z, lc);
+    const ::rocketgpu::Vec3 outer_ext_now = box_extent(axis_x, axis_y, axis_z, lh);
+    const ::rocketgpu::Vec3 outer_ext_pred = box_extent(pred_axis_x, pred_axis_y, pred_axis_z, lh);
     proxy.aabb_min = ::rocketgpu::Vec3(
-        Min(proxy.child_aabb_min.x, center_pred.x - extent_pred.x) - kContactThresholdBt,
-        Min(proxy.child_aabb_min.y, center_pred.y - extent_pred.y) - kContactThresholdBt,
-        Min(proxy.child_aabb_min.z, center_pred.z - extent_pred.z) - kContactThresholdBt);
+        Min(outer_now.x - outer_ext_now.x, outer_pred.x - outer_ext_pred.x) - kContactThresholdBt,
+        Min(outer_now.y - outer_ext_now.y, outer_pred.y - outer_ext_pred.y) - kContactThresholdBt,
+        Min(outer_now.z - outer_ext_now.z, outer_pred.z - outer_ext_pred.z) - kContactThresholdBt);
     proxy.aabb_max = ::rocketgpu::Vec3(
-        Max(proxy.child_aabb_max.x, center_pred.x + extent_pred.x) + kContactThresholdBt,
-        Max(proxy.child_aabb_max.y, center_pred.y + extent_pred.y) + kContactThresholdBt,
-        Max(proxy.child_aabb_max.z, center_pred.z + extent_pred.z) + kContactThresholdBt);
+        Max(outer_now.x + outer_ext_now.x, outer_pred.x + outer_ext_pred.x) + kContactThresholdBt,
+        Max(outer_now.y + outer_ext_now.y, outer_pred.y + outer_ext_pred.y) + kContactThresholdBt,
+        Max(outer_now.z + outer_ext_now.z, outer_pred.z + outer_ext_pred.z) + kContactThresholdBt);
     proxy.child_center = center_now;
     proxy.child_axis[0] = axis_x;
     proxy.child_axis[1] = axis_y;
     proxy.child_axis[2] = axis_z;
     proxy.child_half = half_extent_bt;
+#if !defined(ROCKETGPU_USE_CUDA)
+    proxy.child_local_min = lmin;
+    proxy.child_local_max = lmax;
+    proxy.origin = origin_bt;
+#endif
     proxy.valid = 1;
     proxy.is_ball = 0;
 }
@@ -3753,6 +3832,39 @@ ROCKETGPU_HD int BuildBulletManifoldList(
         const ArenaMeshBvhMeshInfo* info = mesh_info_for(key.static_id);
         return info != nullptr &&
                BulletAabbOverlap(pa->child_aabb_min, pa->child_aabb_max, info->aabb_min, info->aabb_max);
+    };
+    const auto compound_tree_overlap = [&](const BulletManifoldEntry& key) {
+        const BulletBroadphaseProxy* pa = body_proxy(key.body_a + 1);
+        const ArenaMeshBvhMeshInfo* info = mesh_info_for(key.static_id);
+        if (pa == nullptr || info == nullptr) {
+            return true;
+        }
+        const ::rocketgpu::Vec3* r = pa->child_axis;
+#if defined(ROCKETGPU_USE_CUDA)
+        const ::rocketgpu::Vec3& origin = cars[key.body_a].pos_bt;
+        const ::rocketgpu::Vec3 child_origin_bt = car_configs[key.body_a].hitbox_offset * (1.0f / 50.0f);
+        const ::rocketgpu::Vec3 child_local_min = child_origin_bt - pa->child_half;
+        const ::rocketgpu::Vec3 child_local_max = child_origin_bt + pa->child_half;
+        const ::rocketgpu::Vec3 no(-origin.x, -origin.y, -origin.z);
+#else
+        const ::rocketgpu::Vec3 no(-pa->origin.x, -pa->origin.y, -pa->origin.z);
+#endif
+        const ::rocketgpu::Vec3 c = (info->aabb_max + info->aabb_min) * 0.5f;
+        const ::rocketgpu::Vec3 hh = (info->aabb_max - info->aabb_min) * 0.5f;
+        for (int k = 0; k < 3; ++k) {
+            const float io = (r[k].x * no.x + r[k].y * no.y) + r[k].z * no.z;
+            const float ctr = (r[k].x * c.x + r[k].y * c.y) + r[k].z * c.z + io;
+            const float ext = (hh.x * Abs(r[k].x) + hh.y * Abs(r[k].y)) + hh.z * Abs(r[k].z);
+#if defined(ROCKETGPU_USE_CUDA)
+            const float lo = (&child_local_min.x)[k], hi = (&child_local_max.x)[k];
+#else
+            const float lo = (&pa->child_local_min.x)[k], hi = (&pa->child_local_max.x)[k];
+#endif
+            if (!(ctr - ext <= hi && ctr + ext >= lo)) {
+                return false;
+            }
+        }
+        return true;
     };
     const auto local_overlap = [&](const BulletManifoldEntry& key) {
         int a = key.body_a + 1;
@@ -4144,6 +4256,83 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             add_body(body);
         }
     }
+#if defined(ROCKETGPU_HOST_LANES)
+    const auto update_aabbs = [&]() {
+        using namespace lanes;
+        const auto quant = [](F4 v, int32_t is_max) {
+            constexpr float kQ = 65535.0f / (kArenaSweepHalfExtentBt + kArenaSweepHalfExtentBt);
+            F4 sc = (v + Splat(kArenaSweepHalfExtentBt)) * Splat(kQ);
+            sc = Select(sc >= Splat(0.0f), Select(sc < Splat(65535.0f), sc, Splat(65535.0f)), Splat(0.0f));
+            return (__builtin_convertvector(sc, I4) & I4{0xfffe, 0xfffe, 0xfffe, 0xfffe}) | I4{is_max, is_max, is_max, is_max};
+        };
+        I4 qmin_of[kBulletSweepMaxBodies], qmax_of[kBulletSweepMaxBodies];
+        uint8_t handle_of[kBulletSweepMaxBodies];
+        uint32_t moved = 0u;
+        for (int obj = 0; obj < h.sap_obj_count; ++obj) {
+            const int body = h.sap_obj[obj];
+            if (body >= body_count) {
+                continue;
+            }
+            const BulletBroadphaseProxy& proxy = proxies[body];
+            const int handle = h.sap_body_handle[body];
+            if (!proxy.valid || handle == 0) {
+                continue;
+            }
+            BulletSweepStoreBodyAabb(h, body, proxy.aabb_min, proxy.aabb_max);
+            const I4 kmin = quant(LoadPadded(proxy.aabb_min), 0);
+            const I4 kmax = quant(LoadPadded(proxy.aabb_max), 1);
+            const uint8_t* mn = h.sap_min_edge[handle];
+            const uint8_t* mx = h.sap_max_edge[handle];
+            const I4 omin{h.sap_edge_pos[0][mn[0]], h.sap_edge_pos[1][mn[1]], h.sap_edge_pos[2][mn[2]], 0};
+            const I4 omax{h.sap_edge_pos[0][mx[0]], h.sap_edge_pos[1][mx[1]], h.sap_edge_pos[2][mx[2]], 0};
+            const I4 ne = (kmin != omin) | (kmax != omax);
+            const uint32_t axes = static_cast<uint32_t>((ne[0] & 1) | (ne[1] & 2) | (ne[2] & 4));
+            qmin_of[obj] = kmin;
+            qmax_of[obj] = kmax;
+            handle_of[obj] = static_cast<uint8_t>(handle);
+            moved |= axes << (3 * obj);
+        }
+        for (; moved != 0u; moved &= moved - 1u) {
+            const int bit = CountTrailingZeros32(moved);
+            const int obj = bit / 3;
+            const int axis = bit - 3 * obj;
+            const int handle = handle_of[obj];
+            {
+                const uint16_t qmin_axis = static_cast<uint16_t>(qmin_of[obj][axis]);
+                const uint16_t qmax_axis = static_cast<uint16_t>(qmax_of[obj][axis]);
+                const int emin = h.sap_min_edge[handle][axis];
+                const int emax = h.sap_max_edge[handle][axis];
+                const int dmin = static_cast<int>(qmin_axis) - static_cast<int>(h.sap_edge_pos[axis][emin]);
+                const int dmax = static_cast<int>(qmax_axis) - static_cast<int>(h.sap_edge_pos[axis][emax]);
+                uint16_t* const pos = h.sap_edge_pos[axis];
+                const uint8_t* const owner = h.sap_edge_handle[axis];
+                const int last = 2 * h.sap_handle_count + 1;
+                pos[emin] = qmin_axis;
+                pos[emax] = qmax_axis;
+                const auto passes_down = [&](int e, int q, int d) {
+                    return ((q - static_cast<int>(pos[e - (e > 0)])) & d) < 0;
+                };
+                const auto passes_up = [&](int e, int q, int d) {
+                    const int next = e < last ? e + 1 : last;
+                    const int next_owner = e < last ? static_cast<int>(owner[next]) : 0;
+                    return ((-d) & (static_cast<int>(pos[next]) - q - 1) & (-next_owner)) < 0;
+                };
+                if (passes_down(emin, qmin_axis, dmin)) {
+                    sort_down(axis, emin, false, true);
+                }
+                if (passes_up(emax, qmax_axis, dmax)) {
+                    sort_up(axis, emax, true, true);
+                }
+                if (passes_up(emin, qmin_axis, dmin)) {
+                    sort_up(axis, emin, false, true);
+                }
+                if (passes_down(emax, qmax_axis, dmax)) {
+                    sort_down(axis, emax, true, true);
+                }
+            }
+        }
+    };
+#else
     const auto update_aabbs = [&]() {
         for (int obj = 0; obj < h.sap_obj_count; ++obj) {
             const int body = h.sap_obj[obj];
@@ -4157,43 +4346,8 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             }
             BulletSweepStoreBodyAabb(h, body, proxy.aabb_min, proxy.aabb_max);
             uint16_t qmin[3], qmax[3];
-#if defined(ROCKETGPU_HOST_LANES)
-            {
-                using namespace lanes;
-                const auto quant = [](F4 v, int32_t is_max, uint16_t* out) {
-                    constexpr float kQ = 65535.0f / (kArenaSweepHalfExtentBt + kArenaSweepHalfExtentBt);
-                    F4 sc = (v + Splat(kArenaSweepHalfExtentBt)) * Splat(kQ);
-                    sc = Select(sc >= Splat(0.0f), Select(sc < Splat(65535.0f), sc, Splat(65535.0f)), Splat(0.0f));
-                    const I4 k = (__builtin_convertvector(sc, I4) & I4{0xfffe, 0xfffe, 0xfffe, 0xfffe}) |
-                                 I4{is_max, is_max, is_max, is_max};
-                    out[0] = static_cast<uint16_t>(k[0]);
-                    out[1] = static_cast<uint16_t>(k[1]);
-                    out[2] = static_cast<uint16_t>(k[2]);
-                };
-                quant(LoadPadded(proxy.aabb_min), 0, qmin);
-                quant(LoadPadded(proxy.aabb_max), 1, qmax);
-            }
-#else
             quantize_point(proxy.aabb_min, qmin, 0);
             quantize_point(proxy.aabb_max, qmax, 1);
-#endif
-#if defined(ROCKETGPU_HOST_LANES)
-            int emin_axis[3], emax_axis[3], dmin_axis[3], dmax_axis[3];
-            uint32_t moved_axes = 0;
-            for (int axis = 0; axis < 3; ++axis) {
-                emin_axis[axis] = h.sap_min_edge[handle][axis];
-                emax_axis[axis] = h.sap_max_edge[handle][axis];
-                dmin_axis[axis] = static_cast<int>(qmin[axis]) - static_cast<int>(h.sap_edge_pos[axis][emin_axis[axis]]);
-                dmax_axis[axis] = static_cast<int>(qmax[axis]) - static_cast<int>(h.sap_edge_pos[axis][emax_axis[axis]]);
-                moved_axes |= static_cast<uint32_t>((dmin_axis[axis] | dmax_axis[axis]) != 0) << axis;
-            }
-            for (; moved_axes != 0u; moved_axes &= moved_axes - 1u) {
-                const int axis = CountTrailingZeros32(moved_axes);
-                const int emin = emin_axis[axis];
-                const int emax = emax_axis[axis];
-                const int dmin = dmin_axis[axis];
-                const int dmax = dmax_axis[axis];
-#else
             for (int axis = 0; axis < 3; ++axis) {
                 const int emin = h.sap_min_edge[handle][axis];
                 const int emax = h.sap_max_edge[handle][axis];
@@ -4202,13 +4356,26 @@ ROCKETGPU_HD int BuildBulletManifoldList(
                 if (dmin == 0 && dmax == 0) {
                     continue;
                 }
-#endif
                 if (dmin != 0) {
                     h.sap_edge_pos[axis][emin] = qmin[axis];
                 }
                 if (dmax != 0) {
                     h.sap_edge_pos[axis][emax] = qmax[axis];
                 }
+#if defined(ROCKETGPU_HOST_LANES)
+                {
+                    const uint16_t* const pos = h.sap_edge_pos[axis];
+                    const uint16_t min_prev = pos[emin > 0 ? emin - 1 : 0];
+                    const uint16_t min_next = pos[emin + 1 < kAxisSweepMaxEdges ? emin + 1 : emin];
+                    const uint16_t max_prev = pos[emax > 0 ? emax - 1 : 0];
+                    const uint16_t max_next = pos[emax + 1 < kAxisSweepMaxEdges ? emax + 1 : emax];
+                    const bool min_moves = ((dmin < 0) & (qmin[axis] < min_prev)) | ((dmin > 0) & (qmin[axis] >= min_next));
+                    const bool max_moves = ((dmax < 0) & (qmax[axis] < max_prev)) | ((dmax > 0) & (qmax[axis] >= max_next));
+                    if (!(min_moves | max_moves)) {
+                        continue;
+                    }
+                }
+#endif
                 if (dmin < 0) {
                     sort_down(axis, emin, false, true);
                 }
@@ -4224,6 +4391,7 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             }
         }
     };
+#endif
     if constexpr (kPhase == 1) {
         update_aabbs();
         return 0;
@@ -4274,6 +4442,9 @@ ROCKETGPU_HD int BuildBulletManifoldList(
         const int at = find(bp.bp_manifolds, bp.bp_manifold_count, packed);
         const bool want = key.kind == 0 ? body_proxy(0) != nullptr : overlap(key);
         if (want && at < 0 && (key.kind == 1 || key.kind == 3) && !local_overlap(key)) {
+            continue;
+        }
+        if (want && at < 0 && key.kind == 2 && key.static_id < 100 && !compound_tree_overlap(key)) {
             continue;
         }
         constexpr int kPlaneSlot[6] = {0, 1, 3, 2, 4, 5};

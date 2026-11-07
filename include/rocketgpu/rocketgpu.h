@@ -802,6 +802,10 @@ struct SimConfig {
     int32_t kickoff_settled_spawns = 0;
 #if !defined(ROCKETGPU_USE_CUDA)
     const detail::HostStepTables* host_tables = nullptr;
+#else
+    const detail::ArenaMeshLeafGridInfo* arena_mesh_ray_grid_infos = nullptr;
+    const int32_t* arena_mesh_ray_cell_start = nullptr;
+    const detail::ArenaMeshLeafEntry* arena_mesh_ray_entries = nullptr;
 #endif
 };
 

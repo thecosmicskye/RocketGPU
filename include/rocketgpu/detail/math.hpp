@@ -619,6 +619,14 @@ inline F4 Select(I4 m, F4 a, F4 b) { return reinterpret_cast<F4>((reinterpret_ca
 inline F4 Abs(F4 v) { return Select(v >= Splat(0.0f), v, -v); }
 inline F4 Min(F4 a, F4 b) { return Select(a < b, a, b); }
 inline F4 Max(F4 a, F4 b) { return Select(a > b, a, b); }
+template <int A, int B, int C>
+inline F4 Turn(F4 v) {
+#if defined(__clang__)
+    return __builtin_shufflevector(v, v, A, B, C, 3);
+#else
+    return __builtin_shuffle(v, I4{A, B, C, 3});
+#endif
+}
 }
 #endif
 

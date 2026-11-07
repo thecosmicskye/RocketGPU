@@ -4,19 +4,21 @@ Faster, bit-accurate Rocket League physics. Works best with [RocketChad3](https:
 
 ## Speed
 
-Arena-ticks/s from `bench_cpp`, which runs RocketSim v3's `arena_scale_v3` training workload: random controls, 55%
-1v1, 27% 2v2 and 18% 3v3 arenas, resets on goals and timeouts. RocketGPU CUDA on an RTX 5090; RocketGPU CPU
-(profile-guided build) and RocketSim v3 0.3.5 (`arena_scale_v3`) on a Ryzen 7 9800X3D with 14 threads:
+Arena-ticks/s from `bench_cpp --replay`: RocketSim v3's `arena_scale_v3` training workload (55% 1v1, 27% 2v2 and 18%
+3v3 arenas, resets on goals and timeouts), with each arena playing the recorded controls of a real match from the
+[fullstate suite](https://github.com/thecosmicskye/RocketGPU-fullstate-suite). RocketGPU CUDA on an RTX 5090; RocketGPU
+CPU (profile-guided build) and RocketSim v3 0.3.5 (`arena_scale_v3`, same recorded controls) on a Ryzen 7 9800X3D with
+14 threads:
 
 | Arenas | RocketGPU CUDA | RocketGPU CPU | RocketSim v3 |
 |---|---|---|---|
-| 96 | 0.64M | 3.76M | 1.25M |
-| 256 | 1.46M | 4.56M | 2.35M |
-| 512 | 2.50M | 4.71M | 3.43M |
-| 1,024 | 4.35M | 4.81M | 4.21M |
-| 4,096 | 10.17M | 4.72M | 5.02M |
-| 8,192 | 12.32M | 4.74M | 4.88M |
-| 16,384 | 12.75M | 5.12M | 5.04M |
+| 96 | 0.59M | 4.17M | 2.63M |
+| 256 | 1.31M | 4.26M | 3.46M |
+| 512 | 2.24M | 4.43M | 3.56M |
+| 1,024 | 3.79M | 4.38M | 3.94M |
+| 4,096 | 9.03M | 3.65M | 3.92M |
+| 8,192 | 11.48M | 3.61M | 3.88M |
+| 16,384 | 12.42M | 3.68M | 3.69M |
 
 ## Accuracy
 
@@ -65,8 +67,11 @@ CPU builds use ISPC kernels when `ispc` is installed; `-DROCKETGPU_CPU_ISPC=OFF`
 workload). It needs a C++20 compiler, and with CUDA, CMake 3.25.2+ and CUDA 12+:
 
 ```bash
-build/bench_cpp --arenas 1024
+python3 tools/replay_controls.py path/to/RocketGPU-fullstate-suite replay.bin
+build/bench_cpp --arenas 1024 --replay replay.bin
 ```
+
+Without `--replay`, controls are random.
 
 ## Collision meshes
 

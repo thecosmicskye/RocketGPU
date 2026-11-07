@@ -488,11 +488,12 @@ struct ArenaMeshHost {
     std::vector<detail::ArenaMeshLeafGridInfo> leaf_grid_infos;
     std::vector<int32_t> leaf_cell_start;
     std::vector<detail::ArenaMeshLeafEntry> leaf_entries;
-#if !defined(ROCKETGPU_USE_CUDA)
     std::vector<detail::ArenaMeshLeafGridInfo> ray_grid_infos;
     std::vector<int32_t> ray_cell_start;
     std::vector<detail::ArenaMeshLeafEntry> ray_entries;
+#if !defined(ROCKETGPU_USE_CUDA)
     std::vector<float> ray_entry_boxes;
+    std::vector<detail::ArenaMeshRayBlock> ray_blocks;
     std::vector<uint8_t> clearance;
     Vec3 clearance_lo;
     float clearance_inv_cell = 0.0f;
@@ -529,9 +530,12 @@ const ArenaMeshHost& CachedArenaMeshHost(bool soccar_arena) {
         detail::SetArenaMeshRayOrder(h->infos, neg_x_max.x);
         detail::BuildArenaMeshLeafGrid(h->quantization, h->infos, h->nodes, h->subtrees, h->leaf_grid_infos,
                                        h->leaf_cell_start, h->leaf_entries);
-#if !defined(ROCKETGPU_USE_CUDA)
+#if defined(ROCKETGPU_USE_CUDA)
         detail::BuildArenaMeshLeafGrid(h->quantization, h->infos, h->nodes, h->subtrees, h->ray_grid_infos,
-                                       h->ray_cell_start, h->ray_entries, 1.4f);
+                                       h->ray_cell_start, h->ray_entries, 1.4f, 1);
+#else
+        detail::BuildArenaMeshLeafGrid(h->quantization, h->infos, h->nodes, h->subtrees, h->ray_grid_infos,
+                                       h->ray_cell_start, h->ray_entries, 1.4f, 4);
         h->ray_entry_boxes.assign(h->ray_entries.size() * 8, 0.0f);
         for (size_t m = 0; m < h->ray_grid_infos.size(); ++m) {
             const detail::ArenaMeshLeafGridInfo& gi = h->ray_grid_infos[m];
@@ -546,6 +550,66 @@ const ArenaMeshHost& CachedArenaMeshHost(bool soccar_arena) {
                 const Vec3 hi = detail::UnquantizeArenaMeshBvhPoint(q, h->ray_entries[e].quantized_aabb_max);
                 float* b = &h->ray_entry_boxes[static_cast<size_t>(e) * 8];
                 b[0] = lo.x; b[1] = lo.y; b[2] = lo.z; b[4] = hi.x; b[5] = hi.y; b[6] = hi.z;
+            }
+        }
+        {
+            const bool local = !h->local_mesh.empty();
+            const std::vector<detail::ArenaMeshTriangle>& tris = local ? h->local_mesh : h->mesh;
+            detail::ArenaMeshRayBlock nan_block;
+            std::fill_n(&nan_block.lo[0][0], (sizeof(nan_block) - offsetof(detail::ArenaMeshRayBlock, lo)) / sizeof(float),
+                        std::numeric_limits<float>::quiet_NaN());
+            std::fill_n(nan_block.tri, 4, -1);
+            std::fill_n(nan_block.mesh_index, 4, -1);
+            h->ray_blocks.assign(h->ray_entries.size() / 4, nan_block);
+            for (size_t e = 0; e < h->ray_entries.size(); ++e) {
+                const detail::ArenaMeshLeafEntry& entry = h->ray_entries[e];
+                detail::ArenaMeshRayBlock& blk = h->ray_blocks[e / 4];
+                const int k = static_cast<int>(e % 4);
+                blk.quant[0][k] = entry.quantized_aabb_min[0];
+                blk.quant[0][4 + k] = entry.quantized_aabb_min[1];
+                blk.quant[1][k] = entry.quantized_aabb_min[2];
+                blk.quant[1][4 + k] = static_cast<uint16_t>(~entry.quantized_aabb_max[0]);
+                blk.quant[2][k] = static_cast<uint16_t>(~entry.quantized_aabb_max[1]);
+                blk.quant[2][4 + k] = static_cast<uint16_t>(~entry.quantized_aabb_max[2]);
+            }
+            for (size_t m = 0; m < h->ray_grid_infos.size(); ++m) {
+                const detail::ArenaMeshLeafGridInfo& gi = h->ray_grid_infos[m];
+                const detail::ArenaMeshBvhMeshInfo& mi = h->infos[m];
+                if (gi.cell_offset < 0) {
+                    continue;
+                }
+                const int cells = gi.cells[0] * gi.cells[1] * gi.cells[2];
+                for (int e = h->ray_cell_start[gi.cell_offset]; e < h->ray_cell_start[gi.cell_offset + cells]; ++e) {
+                    const int idx = h->ray_entries[e].triangle_index;
+                    const int g = mi.triangle_start + idx;
+                    if (idx < 0 || idx >= mi.triangle_count || g < 0 || g >= static_cast<int>(tris.size())) {
+                        continue;
+                    }
+                    detail::ArenaMeshRayBlock& blk = h->ray_blocks[static_cast<size_t>(e) / 4];
+                    const int k = e % 4;
+                    const float* box = &h->ray_entry_boxes[static_cast<size_t>(e) * 8];
+                    const detail::ArenaMeshTriangle& tri = tris[static_cast<size_t>(g)];
+                    const bool hit_local = local && mi.cal_origin_y != 0.0f;
+                    if (!hit_local && g >= static_cast<int>(h->mesh.size())) {
+                        continue;
+                    }
+                    blk.tri[k] = g;
+                    blk.mesh_index[k] =
+                        static_cast<int32_t>((hit_local ? tri : h->mesh[static_cast<size_t>(g)]).mesh_index);
+                    const Vec3 n = detail::Cross(detail::operator-(tri.b, tri.a), detail::operator-(tri.c, tri.a));
+                    const Vec3* v[4] = {&tri.a, &tri.b, &tri.c, &n};
+                    float(*dst[4])[4] = {blk.a, blk.b, blk.c, blk.n};
+                    for (int a = 0; a < 3; ++a) {
+                        blk.lo[a][k] = box[a];
+                        blk.hi[a][k] = box[4 + a];
+                        for (int j = 0; j < 4; ++j) {
+                            dst[j][a][k] = a == 0 ? v[j]->x : a == 1 ? v[j]->y : v[j]->z;
+                        }
+                    }
+                    blk.plane[k] = detail::Dot(tri.a, n);
+                    blk.tol[k] = -0.0001f * detail::LengthSq(n);
+                    blk.origin_y[k] = local ? static_cast<float>(tri.cal_origin_sign) * detail::kGoalMeshOriginYBt : 0.0f;
+                }
             }
         }
         int clearance_threads = 0;
@@ -626,6 +690,9 @@ struct BatchSim::Impl {
 
         car_states.resize(car_capacity);
         wheel_runtime_states.resize(car_capacity);
+#if !defined(ROCKETGPU_USE_CUDA)
+        ray_hints.assign(car_capacity * 8, -1);
+#endif
         solver_scratch.resize(static_cast<size_t>(cfg.env_count));
 #if defined(ROCKETGPU_USE_CUDA)
 
@@ -667,6 +734,9 @@ struct BatchSim::Impl {
         env_step_order.resize(static_cast<size_t>(cfg.env_count));
         rebuild_env_step_order(nullptr);
 
+#if defined(ROCKETGPU_USE_CUDA)
+        cfg.arena_mesh_ray_grid_infos = nullptr;
+#endif
         if (cfg.arena_mesh_tris == nullptr || cfg.arena_mesh_tri_count <= 0) {
             const bool soccar_arena = cfg.mode == Mode::Soccar || cfg.mode == Mode::Snowday || cfg.mode == Mode::Heatseeker;
             const ArenaMeshHost& mh = CachedArenaMeshHost(soccar_arena);
@@ -728,6 +798,19 @@ struct BatchSim::Impl {
                     cfg.arena_mesh_leaf_cell_start = arena_mesh_leaf_cell_start.data();
                     cfg.arena_mesh_leaf_entries = arena_mesh_leaf_entries.data();
                 }
+#if defined(ROCKETGPU_USE_CUDA)
+                if (!mh.ray_entries.empty() && mh.ray_grid_infos.size() == host_mesh_infos.size()) {
+                    arena_mesh_ray_grid_infos.resize(mh.ray_grid_infos.size());
+                    arena_mesh_ray_grid_infos.copy_from_host(mh.ray_grid_infos.data(), mh.ray_grid_infos.size());
+                    arena_mesh_ray_cell_start.resize(mh.ray_cell_start.size());
+                    arena_mesh_ray_cell_start.copy_from_host(mh.ray_cell_start.data(), mh.ray_cell_start.size());
+                    arena_mesh_ray_entries.resize(mh.ray_entries.size());
+                    arena_mesh_ray_entries.copy_from_host(mh.ray_entries.data(), mh.ray_entries.size());
+                    cfg.arena_mesh_ray_grid_infos = arena_mesh_ray_grid_infos.data();
+                    cfg.arena_mesh_ray_cell_start = arena_mesh_ray_cell_start.data();
+                    cfg.arena_mesh_ray_entries = arena_mesh_ray_entries.data();
+                }
+#endif
 
                 const detail::ArenaBroadphaseGrid& host_grid = mh.grid;
                 const std::vector<uint16_t>& host_cell_mask = mh.cell_mask;
@@ -845,6 +928,38 @@ struct BatchSim::Impl {
                                 host_mesh->quantization.size() * sizeof(detail::ArenaMeshBvhQuantization)) == 0) {
                     t.ray_grid.entry_boxes = host_mesh->ray_entry_boxes.data();
                     t.ray_grid.box_quantization = cfg.arena_mesh_bvh_quantization;
+                    const detail::ArenaMeshTriangle* local = cfg.mutator.cal_arena_local_tris;
+                    const std::vector<detail::ArenaMeshTriangle>& built =
+                        host_mesh->local_mesh.empty() ? host_mesh->mesh : host_mesh->local_mesh;
+                    const detail::ArenaMeshTriangle* tris = local != nullptr ? local : cfg.arena_mesh_tris;
+                    bool magic = true;
+                    for (const detail::ArenaMeshLeafGridInfo& gi : host_mesh->ray_grid_infos) {
+                        magic = magic && (gi.cell_offset < 0 ||
+                                          (gi.cell_magic[0] != 0 && gi.cell_magic[1] != 0 && gi.cell_magic[2] != 0));
+                    }
+                    bool same_meshes = host_mesh->infos.size() == static_cast<size_t>(n) && cfg.arena_mesh_tris != nullptr &&
+                                       cfg.arena_mesh_tri_count == static_cast<int32_t>(host_mesh->mesh.size()) &&
+                                       std::memcmp(cfg.arena_mesh_tris, host_mesh->mesh.data(),
+                                                   host_mesh->mesh.size() * sizeof(detail::ArenaMeshTriangle)) == 0;
+                    for (int m = 0; same_meshes && m < n; ++m) {
+                        same_meshes = meshes[m].triangle_start == host_mesh->infos[m].triangle_start &&
+                                      meshes[m].cal_origin_y == host_mesh->infos[m].cal_origin_y;
+                    }
+                    if (magic && same_meshes && host_mesh->ray_blocks.size() * 4 == host_mesh->ray_entries.size() && tris != nullptr &&
+                        (local != nullptr) == !host_mesh->local_mesh.empty() &&
+                        cfg.arena_mesh_tri_count == static_cast<int32_t>(built.size()) &&
+                        std::memcmp(tris, built.data(), built.size() * sizeof(detail::ArenaMeshTriangle)) == 0) {
+                        t.ray_blocks = host_mesh->ray_blocks.data();
+                        t.ray_cell_count = static_cast<int32_t>(host_mesh->ray_cell_start.size()) - 1;
+                        t.ray_block_count = static_cast<int32_t>(host_mesh->ray_blocks.size());
+                        if (ray_hints.size() == wheel_runtime_states.size() * 8) {
+                            t.ray_hints = ray_hints.data();
+                            t.ray_hint_base = wheel_runtime_states.data();
+                            t.ray_hint_cars = static_cast<int32_t>(wheel_runtime_states.size());
+                        }
+                        t.ray_block_tris = local;
+                        t.ray_block_mesh = cfg.arena_mesh_tris;
+                    }
                 }
             }
             if (host_mesh != nullptr && !host_mesh->clearance.empty() && cfg.arena_mesh_tris != nullptr &&
@@ -860,10 +975,26 @@ struct BatchSim::Impl {
                 c.nz = host_mesh->clearance_dims[2];
             }
         }
+        if (cfg.arena_mesh_tris != nullptr && cfg.arena_mesh_tri_count > 0) {
+            host_tri_normals.resize(static_cast<size_t>(cfg.arena_mesh_tri_count) * 4);
+            for (int32_t i = 0; i < cfg.arena_mesh_tri_count; ++i) {
+                const detail::ArenaMeshTriangle& tri = cfg.arena_mesh_tris[i];
+                const Vec3 nrm = detail::Normalize(tri.normal, Vec3(0.0f, 0.0f, 1.0f));
+                float* out = &host_tri_normals[static_cast<size_t>(i) * 4];
+                out[0] = nrm.x;
+                out[1] = nrm.y;
+                out[2] = nrm.z;
+                out[3] = detail::Dot(nrm, tri.a);
+            }
+            t.tri_normals = host_tri_normals.data();
+            t.tri_normals_mesh = cfg.arena_mesh_tris;
+        }
         t.owner = &cfg;
         cfg.host_tables = host_tables.get();
     }
     std::unique_ptr<detail::HostStepTables> host_tables;
+    std::vector<int32_t> ray_hints;
+    std::vector<float> host_tri_normals;
     const ArenaMeshHost* host_mesh = nullptr;
 #endif
 
@@ -1020,6 +1151,11 @@ struct BatchSim::Impl {
     detail::Buffer<detail::ArenaMeshLeafGridInfo> arena_mesh_leaf_grid_infos;
     detail::Buffer<int32_t> arena_mesh_leaf_cell_start;
     detail::Buffer<detail::ArenaMeshLeafEntry> arena_mesh_leaf_entries;
+#if defined(ROCKETGPU_USE_CUDA)
+    detail::Buffer<detail::ArenaMeshLeafGridInfo> arena_mesh_ray_grid_infos;
+    detail::Buffer<int32_t> arena_mesh_ray_cell_start;
+    detail::Buffer<detail::ArenaMeshLeafEntry> arena_mesh_ray_entries;
+#endif
     detail::Buffer<detail::BulletSweepHistory> arena_sweep_statics;
     detail::Buffer<uint16_t> arena_broadphase_cell_mask;
     detail::Buffer<uint32_t> native_sphere_rsqrt;

@@ -1084,7 +1084,8 @@ void BuildArenaMeshLeafGrid(
     std::vector<ArenaMeshLeafGridInfo>& out_infos,
     std::vector<int32_t>& out_cell_start,
     std::vector<ArenaMeshLeafEntry>& out_entries,
-    float cell_bt) {
+    float cell_bt,
+    int pad_cells_to) {
     const float kCellBt = cell_bt;
     const auto contains = [](const uint16_t* outer_min, const uint16_t* outer_max,
                              const uint16_t* inner_min, const uint16_t* inner_max) {
@@ -1190,8 +1191,17 @@ void BuildArenaMeshLeafGrid(
             }
         }
         info.cell_offset = static_cast<int32_t>(out_cell_start.size()) - 1;
+        ArenaMeshLeafEntry pad;
+        for (int a = 0; a < 3; ++a) {
+            pad.quantized_aabb_min[a] = 0xFFFFu;
+            pad.quantized_aabb_max[a] = 0u;
+        }
+        pad.triangle_index = -1;
         for (const std::vector<ArenaMeshLeafEntry>& cell : cells) {
             out_entries.insert(out_entries.end(), cell.begin(), cell.end());
+            while (pad_cells_to > 1 && out_entries.size() % static_cast<size_t>(pad_cells_to) != 0) {
+                out_entries.push_back(pad);
+            }
             out_cell_start.push_back(static_cast<int32_t>(out_entries.size()));
         }
     }

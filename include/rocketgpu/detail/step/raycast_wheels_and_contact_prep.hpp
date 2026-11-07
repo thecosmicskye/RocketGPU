@@ -47,7 +47,8 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE ArenaRayHit CastArenaRayDeltaBt(
     int32_t mesh_bvh_subtree_count,
     const uint32_t* native_table = nullptr, int native_shift = 0,
     const MeshLanes& mesh_lanes = MeshLanes{}, const ArenaMeshLeafGrid* leaf_grid = nullptr,
-    const ArenaMeshTriangle* local_triangles = nullptr, bool meshes_clear = false) {
+    const ArenaMeshTriangle* local_triangles = nullptr, bool meshes_clear = false, int32_t* walk_hint = nullptr) {
+    (void)walk_hint;
     bool mesh_ray_cast_bt = false;
     bool neg_x_wins_mesh_tie = false;
 
@@ -67,6 +68,13 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE ArenaRayHit CastArenaRayDeltaBt(
         if (!skip_meshes && !(max_len > 0.0f && HostRayClearOfMeshes(leaf_grid, mesh_triangles, ray_source_bt, ray_delta_bt))) {
 #else
         if (!skip_meshes) {
+#endif
+#if !defined(ROCKETGPU_USE_CUDA) && (defined(__GNUC__) || defined(__clang__))
+            if (!(!MeshLanes::kSplitHeaders && mesh_lanes.first == 0 && mesh_lanes.step == 1 &&
+                  HostRayCastArenaMeshBlocks(mesh_triangles, mesh_triangle_count, mesh_bvh_quantization,
+                                             mesh_bvh_quantization_count, mesh_bvh_meshes, mesh_bvh_mesh_count,
+                                             mesh_bvh_nodes, mesh_bvh_node_count, ray_source_bt, ray_delta_bt,
+                                             max_len, best, &best_mesh, leaf_grid, local_triangles, walk_hint)))
 #endif
             RayCastArenaMeshBvhBtSource<MeshLanes::kSplitHeaders>(
                 mesh_triangles,
@@ -479,13 +487,23 @@ ROCKETGPU_HD uint32_t WheelRayExcludedBodies(const CarState& car, const CarConfi
     if (wheel_out == nullptr) {
         const float reach = cached_reach_bt != nullptr ? *cached_reach_bt : WheelRayReachBt(cfg);
         const Vec3 p = car.pos_bt;
-        bool all_far = true;
-        for (int body = 0; all_far && body < bodies; ++body) {
+        const float lx = p.x - reach, hx = p.x + reach, ly = p.y - reach, hy = p.y + reach, lz = p.z - reach,
+                    hz = p.z + reach;
+        typedef float F4 __attribute__((vector_size(16)));
+        typedef int32_t I4 __attribute__((vector_size(16)));
+        const float inf = __builtin_inff();
+        const F4 lo4 = {lx, ly, lz, -inf}, hi4 = {hx, hy, hz, inf};
+        uint32_t near = 0u;
+        for (int body = 0; body < bodies; ++body) {
             const float* a = sweep->sap_body_aabb[body];
-            all_far = !((mask >> body) & 1u) || a[3] < p.x - reach || p.x + reach < a[0] || a[4] < p.y - reach ||
-                      p.y + reach < a[1] || a[5] < p.z - reach || p.z + reach < a[2];
+            F4 mn, mx;
+            memcpy(&mn, a, sizeof(F4));
+            memcpy(&mx, a + 3, sizeof(F4));
+            const I4 sep = (mx < lo4) | (hi4 < mn);
+            const bool far = ((sep[0] | sep[1]) | (sep[2] | sep[3])) != 0;
+            near |= static_cast<uint32_t>(!far) << body;
         }
-        if (all_far) {
+        if ((near & mask) == 0u) {
             return mask;
         }
     }
@@ -622,6 +640,68 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE void RayCastWheelAgainstArena(
     const float real_ray_length = wheel.suspension_rest_length + wheel.max_suspension_travel + wheel.wheel_radius - WheelSuspensionSubtraction();
 
     const float real_ray_length_bt = WheelRealRayLengthBt(wheel);
+
+#if !defined(ROCKETGPU_USE_CUDA)
+    if constexpr (std::is_same<MeshLanes, ArenaRayMeshOneLane>::value) {
+        const int active_bits = Min(cars_in_env_count, kBulletSweepMaxBodies - 1);
+        const uint32_t dyn_mask =
+            ((active_bits > 0 ? ((1u << (active_bits + 1)) - 1u) : 1u)) &
+            ~(self_car_idx >= 0 && self_car_idx + 1 < kBulletSweepMaxBodies ? (1u << (self_car_idx + 1)) : 0u);
+        if (arena_static && mesh_bvh_nodes != nullptr && mesh_bvh_node_count > 0 && mesh_triangles != nullptr &&
+            real_ray_length > 0.0f && (excluded_bodies & dyn_mask) == dyn_mask) {
+            const float max_len_bt = real_ray_length_bt > 0.0f ? real_ray_length_bt : real_ray_length * (1.0f / 50.0f);
+            const Vec3 src = wheel.ray_source_bt;
+            const Vec3 delta = wheel.wheel_dir_ws * max_len_bt;
+            const Vec3 to = src + delta;
+            const Vec3 lo(Min(src.x, to.x), Min(src.y, to.y), Min(src.z, to.z));
+            const Vec3 hi(Max(src.x, to.x), Max(src.y, to.y), Max(src.z, to.z));
+            if (lo.x > -81.9f && hi.x < 81.9f && hi.z < 40.8f && lo.y > -200.0f && hi.y < 200.0f && lo.z > -20.0f &&
+                HostRayClearOfMeshes(leaf_grid, mesh_triangles, src, delta)) {
+                bool floor_hit = false;
+                Vec3 point_bt;
+                if (lo.z <= 0.0f) {
+                    constexpr float kFltEpsilon = 1.1920929e-07f;
+                    const Vec3 d = to - src;
+                    const Vec3 off = Vec3(0.0f, 0.0f, 0.0f) - src;
+                    const float denom = -(d.y * 0.0f + d.x * 0.0f + d.z * 1.0f);
+                    const float numer = -(off.y * 0.0f + off.x * 0.0f + off.z * 1.0f);
+                    if (kFltEpsilon < denom && kFltEpsilon < numer && numer <= denom) {
+                        const float fraction = numer / denom;
+                        if (fraction < 1.0f && !(fraction < 0.0f)) {
+                            const float cal_min_fraction_sq = cal_min_hit_dist_sq_bt > 0.0f
+                                ? cal_min_hit_dist_sq_bt / LengthSq((src + delta) - src) : 0.0f;
+                            if (!(cal_min_fraction_sq > 0.0f && fraction * fraction < cal_min_fraction_sq)) {
+                                const float one_minus_fraction = 1.0f - fraction;
+                                point_bt = Vec3(src.x * one_minus_fraction + to.x * fraction,
+                                                src.y * one_minus_fraction + to.y * fraction,
+                                                src.z * one_minus_fraction + to.z * fraction);
+                                floor_hit = true;
+                            }
+                        }
+                    }
+                }
+                if (floor_hit) {
+                    const Vec3 car_up = -wheel.wheel_dir_ws;
+                    wheel.contact_point_bt = point_bt;
+                    wheel.contact_normal_ws = Vec3(0.0f, 0.0f, 1.0f);
+                    wheel.is_in_contact = 1;
+                    wheel.is_in_contact_with_world = 1;
+                    wheel.ground_kind = ROCKETGPU_ARENA_RAY_HIT_STATIC_PLANE;
+                    wheel.ground_car_idx = -1;
+                    wheel.ground_static_id = 100;
+                    const float trace_len_bt = Dot(wheel.ray_source_bt - point_bt, car_up);
+                    const float radius_bt = wheel.wheel_radius * UnitsUUToBT();
+                    wheel.wheel_trace_len_bt = trace_len_bt;
+                    wheel.suspension_len_bt = trace_len_bt - radius_bt;
+                    ComputeWheelRayVelocityTerms(car, car_up, point_bt, wheel);
+                } else {
+                    SetWheelRayMiss(wheel);
+                }
+                return;
+            }
+        }
+    }
+#endif
 
     ArenaRayHit hit = !arena_static ? ArenaRayHit{} : CastArenaRayWithBtSource(
         wheel.hard_point_ws,
@@ -912,10 +992,15 @@ ROCKETGPU_HD void ApplyAutoRollReference(
         const float rf = (1.0f - r_dot) * 80.0f;
         const float ff = (1.0f - f_dot) * 80.0f;
         const Vec3 t_game(ff * r_axis.x + rf * f_axis.x, ff * r_axis.y + rf * f_axis.y, ff * r_axis.z + rf * f_axis.z);
+#if defined(ROCKETGPU_HOST_LANES)
+        QueueFirstForceAndTorqueBt(wheel_runtime_state, autoroll_force_bt,
+                                   MulInertiaWorldBt(frame, car, cfg, mutator.car_mass, t_game), frame);
+#else
         Vec3 ar_i0, ar_i1, ar_i2;
         BuildInertiaTensorWorldBtInverse(frame, car, cfg, mutator.car_mass, ar_i0, ar_i1, ar_i2);
         QueueFirstForceAndTorqueBt(wheel_runtime_state, autoroll_force_bt, Mul3x3Vec(ar_i0, ar_i1, ar_i2, t_game),
                                    frame);
+#endif
     } else {
         const Vec3 autoroll_force = autoroll_force_bt * UnitsBTToUU();
         ApplyCentralForce(car, mutator.car_mass, autoroll_force, dt);
@@ -1120,6 +1205,15 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE WheelF4 WheelF4Splat(float v) {
 
 ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE WheelF4 WheelF4Sel(WheelI4 m, WheelF4 a, WheelF4 b) {
     return (WheelF4)((m & (WheelI4)a) | (~m & (WheelI4)b));
+}
+
+template <int A, int B, int C, int D>
+ROCKETGPU_ALWAYS_INLINE WheelF4 WheelF4Shuffle(WheelF4 a, WheelF4 b) {
+#if defined(__clang__)
+    return __builtin_shufflevector(a, b, A, B, C, D);
+#else
+    return __builtin_shuffle(a, b, WheelI4{A, B, C, D});
+#endif
 }
 
 struct WheelImpulseX4 {
@@ -2114,11 +2208,36 @@ ROCKETGPU_HD WheelContactSummary CombineWheelContacts(
 __attribute__((always_inline)) inline bool WheelRaysFloorOnlyHostX4(
     const CarState& car, const CarConfig& cfg, const MutatorConfig& mutator, WheelsX4& w,
     float cal_front_scale, float cal_back_scale, float cal_min_hit_dist_sq_bt, WheelRuntimeState* wheel_runtime_state,
-    const ArenaMeshTriangle* mesh_triangles, const ArenaMeshBvhMeshInfo* mesh_bvh_meshes, const CarFrame* frame,
-    WheelContactOut* contact_out, const ArenaMeshLeafGrid* leaf_grid) {
+    const ArenaMeshTriangle* mesh_triangles, int32_t mesh_triangle_count,
+    const ArenaMeshBvhQuantization* mesh_bvh_quantization, int32_t mesh_bvh_quantization_count,
+    const ArenaMeshBvhMeshInfo* mesh_bvh_meshes, int32_t mesh_bvh_mesh_count, const ArenaMeshBvhNode* mesh_bvh_nodes,
+    int32_t mesh_bvh_node_count, const ArenaMeshBvhSubtreeInfo* mesh_bvh_subtrees, int32_t mesh_bvh_subtree_count,
+    const CarFrame* frame, WheelContactOut* contact_out, const ArenaMeshLeafGrid* leaf_grid) {
     const CarShapeCacheEntry& shape = *frame->shape;
     if (!shape.wheel_ray_len_positive) {
         return false;
+    }
+    const HostStepTables* hint_tables = leaf_grid != nullptr ? leaf_grid->host_tables : nullptr;
+    int32_t* hints = nullptr;
+    if (hint_tables != nullptr && hint_tables->ray_hints != nullptr && wheel_runtime_state != nullptr) {
+        const uintptr_t off =
+            reinterpret_cast<uintptr_t>(wheel_runtime_state) - reinterpret_cast<uintptr_t>(hint_tables->ray_hint_base);
+        const uintptr_t slot = off / sizeof(WheelRuntimeState);
+        if (off % sizeof(WheelRuntimeState) == 0 && slot < static_cast<uintptr_t>(hint_tables->ray_hint_cars)) {
+            hints = hint_tables->ray_hints + slot * 8;
+            for (int i = 0; i < 4; ++i) {
+                const int32_t cell = hints[2 * i], first = hints[2 * i + 1];
+                if (cell >= 0 && cell < hint_tables->ray_cell_count) {
+                    __builtin_prefetch(&hint_tables->ray_grid.cell_start[cell]);
+                }
+                if (first >= 0 && (first >> 2) < hint_tables->ray_block_count) {
+                    const char* block = reinterpret_cast<const char*>(&hint_tables->ray_blocks[first >> 2]);
+                    for (size_t line = 0; line < sizeof(ArenaMeshRayBlock); line += 64) {
+                        __builtin_prefetch(block + line);
+                    }
+                }
+            }
+        }
     }
     const auto sel = [](WheelI4 m, WheelF4 a, WheelF4 b) { return WheelF4Sel(m, a, b); };
     const auto all = [](WheelI4 m) { return (m[0] & m[1] & m[2] & m[3]) != 0; };
@@ -2130,27 +2249,41 @@ __attribute__((always_inline)) inline bool WheelRaysFloorOnlyHostX4(
     const WheelF4 tx = sx + dx, ty = sy + dy, tz = sz + dz;
     const WheelF4 lox = sel(sx < tx, sx, tx), loy = sel(sy < ty, sy, ty), loz = sel(sz < tz, sz, tz);
     const WheelF4 hix = sel(sx > tx, sx, tx), hiy = sel(sy > ty, sy, ty), hiz = sel(sz > tz, sz, tz);
-    if (!all((lox > WheelF4Splat(-81.9f)) & (hix < WheelF4Splat(81.9f)) & (hiz < WheelF4Splat(40.8f)) &
-             (loy > WheelF4Splat(-200.0f)) & (hiy < WheelF4Splat(200.0f)) & (loz > WheelF4Splat(-20.0f)))) {
-        return false;
-    }
+    WheelI4 floor_ok = (lox > WheelF4Splat(-81.9f)) & (hix < WheelF4Splat(81.9f)) & (hiz < WheelF4Splat(40.8f)) &
+                       (loy > WheelF4Splat(-200.0f)) & (hiy < WheelF4Splat(200.0f)) & (loz > WheelF4Splat(-20.0f));
     const WheelF4 free_x = WheelF4Splat(mesh_bvh_meshes[0].free_half_x);
     const WheelF4 free_y = WheelF4Splat(mesh_bvh_meshes[0].free_half_y);
     const WheelI4 in_free = (hix < free_x) & (lox > -free_x) & (hiy < free_y) & (loy > -free_y);
     if (!all(in_free)) {
         const HostStepTables* tables = leaf_grid != nullptr ? leaf_grid->host_tables : nullptr;
         if (tables == nullptr || tables->clearance.lb == nullptr || tables->clearance.mesh != mesh_triangles) {
-            return false;
-        }
-        const WheelF4 half = WheelF4Splat(0.5f);
-        const WheelF4 hx = dx * half, hy = dy * half, hz = dz * half;
-        const WheelF4 mx = sx + hx, my = sy + hy, mz = sz + hz;
-        const WheelF4 r2 = (hx * hx + hy * hy) + hz * hz;
-        for (int i = 0; i < 4; ++i) {
-            if (!in_free[i] &&
-                !(tables->clearance.Clearance(Vec3(mx[i], my[i], mz[i])) > SqrtScalar(r2[i]) + 2e-3f)) {
-                return false;
+            floor_ok &= in_free;
+        } else {
+            const WheelF4 half = WheelF4Splat(0.5f);
+            const WheelF4 hx = dx * half, hy = dy * half, hz = dz * half;
+            const WheelF4 mx = sx + hx, my = sy + hy, mz = sz + hz;
+            const WheelF4 r2 = (hx * hx + hy * hy) + hz * hz;
+            const ArenaMeshClearance& cl = tables->clearance;
+            const WheelF4 zero = WheelF4Splat(0.0f);
+            const WheelF4 inv = WheelF4Splat(cl.inv_cell);
+            const WheelF4 fx = (mx - WheelF4Splat(cl.lo.x)) * inv;
+            const WheelF4 fy = (my - WheelF4Splat(cl.lo.y)) * inv;
+            const WheelF4 fz = (mz - WheelF4Splat(cl.lo.z)) * inv;
+            const WheelI4 inside = (fx >= zero) & (fy >= zero) & (fz >= zero) &
+                                   (fx < WheelF4Splat(static_cast<float>(cl.nx))) &
+                                   (fy < WheelF4Splat(static_cast<float>(cl.ny))) &
+                                   (fz < WheelF4Splat(static_cast<float>(cl.nz)));
+            const WheelI4 ix = __builtin_convertvector(sel(inside, fx, zero), WheelI4);
+            const WheelI4 iy = __builtin_convertvector(sel(inside, fy, zero), WheelI4);
+            const WheelI4 iz = __builtin_convertvector(sel(inside, fz, zero), WheelI4);
+            WheelF4 clear, dist;
+            for (int i = 0; i < 4; ++i) {
+                clear[i] = static_cast<float>(
+                    cl.lb[(static_cast<size_t>(iz[i]) * cl.ny + iy[i]) * cl.nx + ix[i]]);
+                dist[i] = SqrtScalar(r2[i]);
             }
+            clear = sel(inside, clear * WheelF4Splat(cl.unit), zero);
+            floor_ok &= in_free | (clear > dist + WheelF4Splat(2e-3f));
         }
     }
     const WheelF4 zero = WheelF4Splat(0.0f), one = WheelF4Splat(1.0f);
@@ -2167,34 +2300,70 @@ __attribute__((always_inline)) inline bool WheelRaysFloorOnlyHostX4(
         hit &= ~((cal_min_fraction_sq > zero) & (fraction * fraction < cal_min_fraction_sq));
     }
     const WheelF4 omf = one - fraction;
-    const WheelF4 px = sx * omf + tx * fraction, py = sy * omf + ty * fraction, pz = sz * omf + tz * fraction;
+    WheelF4 px = sx * omf + tx * fraction, py = sy * omf + ty * fraction, pz = sz * omf + tz * fraction;
+    WheelF4 nx = zero, ny = zero, nz = one;
+    WheelI4 static_id = (hit & WheelI4{100, 100, 100, 100}) | ~hit;
+    if (hints != nullptr) {
+        for (int j = 0; j < 8; ++j) {
+            hints[j] = -1;
+        }
+    }
+    if (!all(floor_ok)) {
+        for (int i = 0; i < 4; ++i) {
+            if (floor_ok[i]) {
+                continue;
+            }
+            const Vec3 src(sx[i], sy[i], sz[i]);
+            const Vec3 delta = dir * shape.wheel_ray_len_bt[i];
+            ArenaRayHit best;
+            if (cal_min_hit_dist_sq_bt > 0.0f) {
+                best.cal_min_fraction_sq = cal_min_hit_dist_sq_bt / LengthSq((src + delta) - src);
+            }
+            const ArenaRayHit h = CastArenaRayDeltaBt(
+                best, src, delta, shape.wheel_ray_len_uu[i], mesh_triangles, mesh_triangle_count,
+                mesh_bvh_quantization, mesh_bvh_quantization_count, mesh_bvh_meshes, mesh_bvh_mesh_count,
+                mesh_bvh_nodes, mesh_bvh_node_count, mesh_bvh_subtrees, mesh_bvh_subtree_count,
+                mutator.native_sphere_rsqrt_table, mutator.native_sphere_rsqrt_shift, ArenaRayMeshOneLane{}, leaf_grid,
+                mutator.cal_arena_local_tris, false, hints != nullptr ? hints + 2 * i : nullptr);
+            hit[i] = h.hit ? -1 : 0;
+            px[i] = h.point_bt.x;
+            py[i] = h.point_bt.y;
+            pz[i] = h.point_bt.z;
+            nx[i] = h.normal.x;
+            ny[i] = h.normal.y;
+            nz[i] = h.normal.z;
+            static_id[i] = !h.hit ? -1
+                : h.kind == ROCKETGPU_ARENA_RAY_HIT_ARENA_MESH ? h.mesh_index
+                : (h.normal.z > .5f ? 100 : h.normal.z < -.5f ? 101 : h.normal.x > .5f ? 102 : 103);
+        }
+    }
     const Vec3 car_up = -dir;
-    const WheelF4 trace = ((sx - px) * WheelF4Splat(car_up.x) + (sy - py) * WheelF4Splat(car_up.y)) +
-                          (sz - pz) * WheelF4Splat(car_up.z);
-    const float denominator = (0.0f * car_up.x + 0.0f * car_up.y) + 1.0f * car_up.z;
+    const WheelF4 ux = WheelF4Splat(car_up.x), uy = WheelF4Splat(car_up.y), uz = WheelF4Splat(car_up.z);
+    const WheelF4 trace = ((sx - px) * ux + (sy - py) * uy) + (sz - pz) * uz;
+    const WheelF4 denominator = (nx * ux + ny * uy) + nz * uz;
     const WheelF4 rx = px - WheelF4Splat(car.pos_bt.x), ry = py - WheelF4Splat(car.pos_bt.y),
                   rz = pz - WheelF4Splat(car.pos_bt.z);
     const WheelF4 ax = WheelF4Splat(car.ang_vel.x), ay = WheelF4Splat(car.ang_vel.y), az = WheelF4Splat(car.ang_vel.z);
     const WheelF4 vx = WheelF4Splat(car.vel_bt.x) + (ay * rz - az * ry);
     const WheelF4 vy = WheelF4Splat(car.vel_bt.y) + (az * rx - ax * rz);
     const WheelF4 vz = WheelF4Splat(car.vel_bt.z) + (ax * ry - ay * rx);
-    const WheelF4 proj = (zero * vx + zero * vy) + one * vz;
-    const bool upright = denominator > 0.1f;
-    const float clipped = upright ? 1.0f / denominator : 10.0f;
-    const WheelF4 rel_vel_bt = upright ? proj * WheelF4Splat(clipped) : zero;
-    const WheelF4 rel_vel = upright ? rel_vel_bt * WheelF4Splat(UnitsBTToUU()) : zero;
+    const WheelF4 proj = (nx * vx + ny * vy) + nz * vz;
+    const WheelI4 upright = denominator > WheelF4Splat(0.1f);
+    const WheelF4 clipped = sel(upright, one / denominator, WheelF4Splat(10.0f));
+    const WheelF4 rel_vel_bt = sel(upright, proj * clipped, zero);
+    const WheelF4 rel_vel = sel(upright, rel_vel_bt * WheelF4Splat(UnitsBTToUU()), zero);
     WheelF4 pb_thresh;
     memcpy(&pb_thresh, shape.wheel_pushback_thresh_bt, sizeof(WheelF4));
     const WheelI4 push = hit & (trace < pb_thresh);
     WheelF4 pushback = zero;
     if (push[0] | push[1] | push[2] | push[3]) {
-        const WheelF4 c0x = ry * one - rz * zero, c0y = rz * zero - rx * one, c0z = rx * zero - ry * zero;
+        const WheelF4 c0x = ry * nz - rz * ny, c0y = rz * nx - rx * nz, c0z = rx * ny - ry * nx;
         const Vec3 r0 = frame->inv_world_row0_bt, r1 = frame->inv_world_row1_bt, r2 = frame->inv_world_row2_bt;
         const WheelF4 angx = (WheelF4Splat(r0.x) * c0x + WheelF4Splat(r1.x) * c0y) + WheelF4Splat(r2.x) * c0z;
         const WheelF4 angy = (WheelF4Splat(r0.y) * c0x + WheelF4Splat(r1.y) * c0y) + WheelF4Splat(r2.y) * c0z;
         const WheelF4 angz = (WheelF4Splat(r0.z) * c0x + WheelF4Splat(r1.z) * c0y) + WheelF4Splat(r2.z) * c0z;
         const WheelF4 cvx = angy * rz - angz * ry, cvy = angz * rx - angx * rz, cvz = angx * ry - angy * rx;
-        const WheelF4 angular_dot = (zero * cvx + zero * cvy) + one * cvz;
+        const WheelF4 angular_dot = (nx * cvx + ny * cvy) + nz * cvz;
         const WheelF4 denom_bt = WheelF4Splat(1.0f / mutator.car_mass) + angular_dot;
         const WheelF4 jac = one / denom_bt;
         const float solver_dt = 1.0f / 60.0f;
@@ -2208,24 +2377,32 @@ __attribute__((always_inline)) inline bool WheelRaysFloorOnlyHostX4(
     w.point_x = sel(hit, px, zero);
     w.point_y = sel(hit, py, zero);
     w.point_z = sel(hit, pz, zero);
-    w.normal_x = sel(hit, zero, WheelF4Splat(car_up.x));
-    w.normal_y = sel(hit, zero, WheelF4Splat(car_up.y));
-    w.normal_z = sel(hit, one, WheelF4Splat(car_up.z));
+    w.normal_x = sel(hit, nx, ux);
+    w.normal_y = sel(hit, ny, uy);
+    w.normal_z = sel(hit, nz, uz);
     w.susp_len_bt = sel(hit, trace - radius * WheelF4Splat(UnitsUUToBT()), zero);
     w.rel_vel_bt = sel(hit, rel_vel_bt, zero);
     w.rel_vel = sel(hit, rel_vel, zero);
-    w.clipped = sel(hit, WheelF4Splat(clipped), one);
+    w.clipped = sel(hit, clipped, one);
     w.extra_pushback = pushback;
     w.contact = hit;
     w.world = hit;
-    w.static_id = (hit & WheelI4{100, 100, 100, 100}) | ~hit;
+    w.static_id = static_id;
     if (wheel_runtime_state) {
         memcpy(wheel_runtime_state->extra_pushback, &pushback, sizeof(WheelF4));
     }
-    for (int i = 0; i < 4; ++i) {
-        contact_out[i].normal = Vec3(w.normal_x[i], w.normal_y[i], w.normal_z[i]);
-        contact_out[i].flags = hit[i] ? (kWheelContactInContact | kWheelContactWithWorld) : 0u;
-    }
+    static_assert(sizeof(WheelContactOut) == sizeof(WheelF4), "WheelContactOut is (normal, flags)");
+    const WheelF4 flags = (WheelF4)(hit & WheelI4{static_cast<int32_t>(kWheelContactInContact | kWheelContactWithWorld),
+                                                  static_cast<int32_t>(kWheelContactInContact | kWheelContactWithWorld),
+                                                  static_cast<int32_t>(kWheelContactInContact | kWheelContactWithWorld),
+                                                  static_cast<int32_t>(kWheelContactInContact | kWheelContactWithWorld)});
+    const WheelF4 xy01 = WheelF4Shuffle<0, 4, 1, 5>(w.normal_x, w.normal_y);
+    const WheelF4 xy23 = WheelF4Shuffle<2, 6, 3, 7>(w.normal_x, w.normal_y);
+    const WheelF4 zf01 = WheelF4Shuffle<0, 4, 1, 5>(w.normal_z, flags);
+    const WheelF4 zf23 = WheelF4Shuffle<2, 6, 3, 7>(w.normal_z, flags);
+    const WheelF4 rows[4] = {WheelF4Shuffle<0, 1, 4, 5>(xy01, zf01), WheelF4Shuffle<2, 3, 6, 7>(xy01, zf01),
+                             WheelF4Shuffle<0, 1, 4, 5>(xy23, zf23), WheelF4Shuffle<2, 3, 6, 7>(xy23, zf23)};
+    memcpy(static_cast<void*>(contact_out), rows, sizeof(rows));
     return true;
 }
 #endif
@@ -2236,7 +2413,8 @@ __attribute__((always_inline)) inline bool WheelRaysFloorOnlyHost(
     const ArenaMeshTriangle* mesh_triangles, int32_t mesh_triangle_count, int32_t cars_in_env_count,
     int32_t self_car_idx, const ArenaMeshBvhQuantization* mesh_bvh_quantization, int32_t mesh_bvh_quantization_count,
     const ArenaMeshBvhMeshInfo* mesh_bvh_meshes, int32_t mesh_bvh_mesh_count, const ArenaMeshBvhNode* mesh_bvh_nodes,
-    int32_t mesh_bvh_node_count, const WheelRayStage* staged_rays, const CarFrame* frame, uint32_t excluded_bodies,
+    int32_t mesh_bvh_node_count, const ArenaMeshBvhSubtreeInfo* mesh_bvh_subtrees, int32_t mesh_bvh_subtree_count,
+    const WheelRayStage* staged_rays, const CarFrame* frame, uint32_t excluded_bodies,
     float front_bone_z, float back_bone_z, WheelContactOut* contact_out, const ArenaMeshLeafGrid* leaf_grid
 #if ROCKETGPU_WHEEL_X4
     , WheelsX4* wx
@@ -2261,8 +2439,10 @@ __attribute__((always_inline)) inline bool WheelRaysFloorOnlyHost(
 #if ROCKETGPU_WHEEL_X4
     if (wx != nullptr) {
         return WheelRaysFloorOnlyHostX4(car, cfg, mutator, *wx, cal_front_scale, cal_back_scale,
-                                        cal_min_hit_dist_sq_bt, wheel_runtime_state, mesh_triangles, mesh_bvh_meshes,
-                                        frame, contact_out, leaf_grid);
+                                        cal_min_hit_dist_sq_bt, wheel_runtime_state, mesh_triangles,
+                                        mesh_triangle_count, mesh_bvh_quantization, mesh_bvh_quantization_count,
+                                        mesh_bvh_meshes, mesh_bvh_mesh_count, mesh_bvh_nodes, mesh_bvh_node_count,
+                                        mesh_bvh_subtrees, mesh_bvh_subtree_count, frame, contact_out, leaf_grid);
     }
 #endif
     constexpr float kUUToBT = 1.0f / 50.0f;
@@ -2470,15 +2650,17 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE int PreTickVehicleDynamics(
             car, cfg, mutator, wheels, cal_front_scale, cal_back_scale, cal_min_hit_dist_sq_bt, wheel_runtime_state,
             mesh_triangles, mesh_triangle_count, cars_in_env_count, self_car_idx, mesh_bvh_quantization,
             mesh_bvh_quantization_count, mesh_bvh_meshes, mesh_bvh_mesh_count, mesh_bvh_nodes, mesh_bvh_node_count,
-            staged_rays, frame, active_excluded_bodies, front_bone_z, back_bone_z, contact_out, leaf_grid, wx_rays);
+            mesh_bvh_subtrees, mesh_bvh_subtree_count, staged_rays, frame, active_excluded_bodies, front_bone_z,
+            back_bone_z, contact_out, leaf_grid, wx_rays);
         wx_done = floor_only && wx_rays != nullptr;
         if (!floor_only)
 #elif !defined(ROCKETGPU_USE_CUDA)
         if (!WheelRaysFloorOnlyHost(car, cfg, mutator, wheels, cal_front_scale, cal_back_scale, cal_min_hit_dist_sq_bt,
                                     wheel_runtime_state, mesh_triangles, mesh_triangle_count, cars_in_env_count,
                                     self_car_idx, mesh_bvh_quantization, mesh_bvh_quantization_count, mesh_bvh_meshes,
-                                    mesh_bvh_mesh_count, mesh_bvh_nodes, mesh_bvh_node_count, staged_rays, frame,
-                                    active_excluded_bodies, front_bone_z, back_bone_z, contact_out, leaf_grid))
+                                    mesh_bvh_mesh_count, mesh_bvh_nodes, mesh_bvh_node_count, mesh_bvh_subtrees,
+                                    mesh_bvh_subtree_count, staged_rays, frame, active_excluded_bodies, front_bone_z,
+                                    back_bone_z, contact_out, leaf_grid))
 #endif
         for (int k = 0; k < 4; ++k) {
             const int i = k ^ 1;
@@ -2520,7 +2702,9 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE int PreTickVehicleDynamics(
     float real_throttle = controls.throttle;
     float real_brake = 0.0f;
 
+#if defined(ROCKETGPU_USE_CUDA)
     float drive_speed_scale = EvalDriveTorqueFactor(forward_speed_uu);
+#endif
     float engine_throttle = car.driving_disabled ? 0.0f : real_throttle;
     if (!controls.handbrake && !car.driving_disabled) {
         const float abs_throttle = Abs(real_throttle);
@@ -2538,6 +2722,9 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE int PreTickVehicleDynamics(
         }
     }
 
+#if !defined(ROCKETGPU_USE_CUDA)
+    const float drive_speed_scale = engine_throttle != 0.0f ? EvalDriveTorqueFactor(forward_speed_uu) : 1.0f;
+#endif
     float drive_engine_force_uu = (drive_speed_scale * (engine_throttle * 288000.0f)) * 0.25f;
     if (num_wheels_in_contact < 3) {
         drive_engine_force_uu *= 0.25f;
@@ -2799,6 +2986,85 @@ ROCKETGPU_HOST_NOINLINE ROCKETGPU_HD void ApplyAirControl(
     const bool do_air_control = update_air_control;
     Vec3 ue_f(0.0f, 0.0f, 0.0f);
     bool have_ue_axes = false;
+#if defined(ROCKETGPU_HOST_LANES)
+    if (do_air_control) {
+        float pitch_torque_scale = 1.0f;
+        if (car.is_flipping) {
+            pitch_torque_scale = 0.0f;
+        } else if (car.has_flipped && car.internal_flip_time < (mutator.flip_torque_time + mutator.flip_pitchlock_extra_time)) {
+            pitch_torque_scale = 0.0f;
+        } else if (cal_pitchlock_restart_time >= 0.0f && cal_pitchlock_restart_time < mutator.flip_pitchlock_extra_time) {
+            pitch_torque_scale = 0.0f;
+        }
+
+        const Vec3 damp_ang_vel = cal_damp_ang_vel != nullptr ? *cal_damp_ang_vel : car.ang_vel;
+        if (!wheel_runtime_state || !(car.basis_authoritative && frame && frame->queue_forces)) {
+            Vec3 basis_forward(1.0f, 0.0f, 0.0f);
+            Vec3 basis_right(0.0f, 1.0f, 0.0f);
+            Vec3 basis_up(0.0f, 0.0f, 1.0f);
+            CarBasisColumns(frame, car, basis_forward, basis_right, basis_up);
+            const Vec3 dir_pitch_right(-basis_right.x, -basis_right.y, -basis_right.z);
+            const Vec3 dir_yaw_up = basis_up;
+            const Vec3 dir_roll_forward(-basis_forward.x, -basis_forward.y, -basis_forward.z);
+            Vec3 torque_world(0.0f, 0.0f, 0.0f);
+            if (controls.pitch != 0.0f || controls.yaw != 0.0f || controls.roll != 0.0f) {
+                torque_world =
+                    (controls.pitch * dir_pitch_right * pitch_torque_scale * mutator.car_air_control_pitch) +
+                    (controls.yaw * dir_yaw_up * mutator.car_air_control_yaw) +
+                    (controls.roll * dir_roll_forward * mutator.car_air_control_roll);
+            }
+
+            const float damp_pitch = Dot(dir_pitch_right, damp_ang_vel) * mutator.car_air_damp_pitch *
+                (1.0f - Min(Abs(controls.pitch * pitch_torque_scale), 1.0f));
+            const float damp_yaw = Dot(dir_yaw_up, damp_ang_vel) * mutator.car_air_damp_yaw *
+                (1.0f - Min(Abs(controls.yaw), 1.0f));
+            const float damp_roll = Dot(dir_roll_forward, damp_ang_vel) * mutator.car_air_damp_roll;
+            const Vec3 damping_world =
+                dir_yaw_up * damp_yaw +
+                dir_pitch_right * damp_pitch +
+                dir_roll_forward * damp_roll;
+
+            const Vec3 air_control_torque = (torque_world - damping_world) * CarTorqueScale();
+            if (wheel_runtime_state) {
+                QueueAngularAccelWorld(wheel_runtime_state, car, cfg, mutator.car_mass, air_control_torque, frame);
+            } else {
+                ApplyAngularAccelWorld(car, air_control_torque, dt);
+            }
+        }
+        if (wheel_runtime_state) {
+            using lanes::F4;
+            using lanes::I4;
+            using lanes::Splat;
+            Vec3 ue_r, ue_u;
+            GameUeQuatAxes(car.rot, ue_f, ue_r, ue_u);
+            have_ue_axes = true;
+            constexpr float kRot = 2.0f * Pi() / 65536.0f;
+            constexpr float kGate = 1.0e-4f;
+            const float in_pitch = controls.pitch * pitch_torque_scale;
+            const float a_p = (mutator.car_air_control_pitch * -in_pitch) * kRot;
+            const float a_y = (mutator.car_air_control_yaw * controls.yaw) * kRot;
+            const float a_r = (-mutator.car_air_control_roll * controls.roll) * kRot;
+            const F4 R = lanes::Load(ue_r), U = lanes::Load(ue_u), Fw = lanes::Load(ue_f);
+            const F4 t_in = (((Splat(a_p) * R + Splat(0.0f)) + Splat(a_y) * U) + Splat(a_r) * Fw) * Splat(1000.0f);
+            const float d_p = (1.0f - Abs(in_pitch)) * (Dot(damp_ang_vel, ue_r) * (mutator.car_air_damp_pitch * kRot));
+            const float d_y = (1.0f - Abs(controls.yaw)) * (Dot(damp_ang_vel, ue_u) * (mutator.car_air_damp_yaw * kRot));
+            const float d_r = (1.0f * Dot(damp_ang_vel, ue_f)) * (mutator.car_air_damp_roll * kRot);
+            const F4 t_damp = (((Splat(0.0f) - Splat(d_p) * R) - Splat(d_y) * U) - Splat(d_r) * Fw) * Splat(1000.0f);
+            const I4 g_in = lanes::Abs(t_in) >= Splat(kGate);
+            const I4 g_damp = lanes::Abs(t_damp) >= Splat(kGate);
+            const bool apply_in = (g_in[0] | g_in[1] | g_in[2]) != 0;
+            const bool apply_damp = (g_damp[0] | g_damp[1] | g_damp[2]) != 0;
+            if (apply_in) {
+                QueueOfficialTorqueBt(wheel_runtime_state,
+                                      MulInertiaWorldBt(frame, car, cfg, mutator.car_mass, lanes::ToVec3(t_in)), frame);
+            }
+            if (apply_damp) {
+                QueueOfficialTorqueBt(wheel_runtime_state,
+                                      MulInertiaWorldBt(frame, car, cfg, mutator.car_mass, lanes::ToVec3(t_damp)), frame);
+            }
+        }
+    }
+#else
     if (do_air_control) {
         Vec3 basis_forward(1.0f, 0.0f, 0.0f);
         Vec3 basis_right(0.0f, 1.0f, 0.0f);
@@ -2875,6 +3141,7 @@ ROCKETGPU_HOST_NOINLINE ROCKETGPU_HD void ApplyAirControl(
         }
     }
 
+#endif
     const float air_throttle_input = (car.is_boosting) ? 1.0f : controls.throttle;
     if (air_throttle_input != 0.0f && air_throttle) {
         if (!have_ue_axes) {
@@ -3549,6 +3816,10 @@ ROCKETGPU_HD void FinishBallTick(BallState& ball) {
 #else
 #define ROCKETGPU_NOINLINE
 #endif
+#endif
+#if defined(ROCKETGPU_NOINLINE_DEFAULTED) && !defined(ROCKETGPU_USE_CUDA) && !defined(__CUDACC__) && \
+    (defined(__GNUC__) || defined(__clang__))
+__attribute__((always_inline))
 #endif
 ROCKETGPU_HD ROCKETGPU_NOINLINE void QuantizeCarState(CarState& car, bool v3_exact = false,
                                                       const Vec3* pre_scaled_vel_uu = nullptr,

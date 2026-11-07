@@ -37,29 +37,45 @@ static inline void SetWordByte(uint32& w, const uniform int32 off, const int v) 
 #define CAR_SETB(a, i, f, v) SetWordByte(fl.c[CarWordSlot(RG_FIELD_OFF(CarState, f))], RG_FIELD_OFF(CarState, f), (v))
 #define WRS_GETB(a, i, f) WordByte(fl.w[WrsWordSlot(RG_FIELD_OFF(WheelRuntimeState, f))], RG_FIELD_OFF(WheelRuntimeState, f))
 #define WRS_SETB(a, i, f, v) SetWordByte(fl.w[WrsWordSlot(RG_FIELD_OFF(WheelRuntimeState, f))], RG_FIELD_OFF(WheelRuntimeState, f), (v))
-static inline void LoadFlagWords(uniform CarState cars[], uniform WheelRuntimeState wrs[], const int ci, RgFlagWords& fl) {
-    uniform int8 * uniform cb = (uniform int8 * uniform)cars;
-    uniform int8 * uniform wb = (uniform int8 * uniform)wrs;
+#define RG_IN_STRIDE 64
+#define RG_IN_VEL 0
+#define RG_IN_ANG_VEL 4
+#define RG_IN_AIR_TIME 8
+#define RG_IN_AIR_TIME_SINCE_JUMP 9
+#define RG_IN_SUPERSONIC_TIME 12
+#define RG_IN_POS_BT 16
+#define RG_IN_VEL_BT 20
+#define RG_IN_FWD 25
+#define RG_IN_RIGHT 28
+#define RG_IN_UP 32
+#define RG_IN_INTERNAL_FLIP_TIME 36
+#define RG_IN_CAL_JUMP_INACTIVE 58
+static const uniform int32 kCarWordRow[RG_CAR_WORDS] = {40, 41, 42, 43, 44, 24, 37, 48, 49, 50, 52};
+static const uniform int32 kWrsWordRow[RG_WRS_WORDS] = {57, 59};
+static inline float In1(uniform const float rin[], const uniform int r, const int j) { return rin[r * RG_IN_STRIDE + j]; }
+static inline Vec3 InV3(uniform const float rin[], const uniform int r, const int j) {
+    return V3(In1(rin, r, j), In1(rin, r + 1, j), In1(rin, r + 2, j));
+}
+static inline void LoadFlagWords(uniform const float rin[], const int j, RgFlagWords& fl) {
 #pragma unroll
     for (uniform int k = 0; k < RG_CAR_WORDS; ++k) {
-        fl.c[k] = *((const uniform uint32 * varying)(cb + ci * (uniform int32)sizeof(uniform CarState) + kCarWordOff[k]));
+        fl.c[k] = (uint32)intbits(In1(rin, kCarWordRow[k], j));
     }
 #pragma unroll
     for (uniform int k = 0; k < RG_WRS_WORDS; ++k) {
-        fl.w[k] = *((const uniform uint32 * varying)(wb + ci * (uniform int32)sizeof(uniform WheelRuntimeState) + kWrsWordOff[k]));
+        fl.w[k] = (uint32)intbits(In1(rin, kWrsWordRow[k], j));
     }
 }
+#define RG_CAR_OUT_STRIDE 64
 static const uniform int32 kCarStoreSlots[8] = {0, 1, 2, 3, 4, 5, 9, 10};
-static inline void StoreFlagWords(uniform CarState cars[], uniform WheelRuntimeState wrs[], const int ci, const RgFlagWords& fl) {
-    uniform int8 * uniform cb = (uniform int8 * uniform)cars;
-    uniform int8 * uniform wb = (uniform int8 * uniform)wrs;
+static inline void StoreFlagWords(uniform uint32 wout[], const int j, const RgFlagWords& fl) {
 #pragma unroll
     for (uniform int k = 0; k < 8; ++k) {
-        *((uniform uint32 * varying)(cb + ci * (uniform int32)sizeof(uniform CarState) + kCarWordOff[kCarStoreSlots[k]])) = fl.c[kCarStoreSlots[k]];
+        wout[k * RG_CAR_OUT_STRIDE + j] = fl.c[kCarStoreSlots[k]];
     }
 #pragma unroll
     for (uniform int k = 0; k < RG_WRS_WORDS; ++k) {
-        *((uniform uint32 * varying)(wb + ci * (uniform int32)sizeof(uniform WheelRuntimeState) + kWrsWordOff[k])) = fl.w[k];
+        wout[(8 + k) * RG_CAR_OUT_STRIDE + j] = fl.w[k];
     }
 }
 
@@ -73,6 +89,17 @@ struct RgCarHot {
     Vec3 basis_forward;
     Vec3 basis_right;
     Vec3 basis_up;
+    Vec3 tick_start_pos_bt;
+    Vec3 pos;
+    Vec3 tick_start_basis_forward;
+    Vec3 tick_start_basis_right;
+    Vec3 tick_start_basis_up;
+    Vec3 cal_tick_start_ang_vel;
+    float supersonic_time;
+    float air_time;
+    float air_time_since_jump;
+    float cal_pre_forward_speed_uu;
+    float cal_pre_pitchlock_restart_time;
 };
 
 static inline float QuantRoundPosV3(float x, uniform float scale) {
@@ -90,8 +117,8 @@ static inline float QuantTruncOffsetV3(float x, uniform float scale) {
     return rounded + offset;
 }
 
-static inline void TickStartLimitAndQuantize(uniform CarState cars[], const int ci, RgFlagWords& fl, RgCarHot& h, uniform float car_max_speed,
-                                             uniform float car_max_ang_speed) {
+static inline void TickStartLimitAndQuantize(uniform CarState cars[], uniform const float rin[], const int ci, const int j, RgFlagWords& fl,
+                                             RgCarHot& h, uniform float car_max_speed, uniform float car_max_ang_speed) {
     {
         Vec3 vel_bt = h.vel_bt;
         Vec3 vel_uu = Scale(vel_bt, 50.0f);
@@ -105,7 +132,7 @@ static inline void TickStartLimitAndQuantize(uniform CarState cars[], const int 
         const Vec3 p = Scale(h.pos_bt, 50.0f);
         const Vec3 qp = V3(QuantRoundPosV3(p.x, 100.0f), QuantRoundPosV3(p.y, 100.0f), QuantRoundPosV3(p.z, 100.0f));
         h.pos_bt = Scale(qp, kUuToBt);
-        cars[ci].pos = qp;
+        h.pos = qp;
         const Vec3 q = V3(QuantTruncOffsetV3(vel_uu.x, 100.0f), QuantTruncOffsetV3(vel_uu.y, 100.0f),
                           QuantTruncOffsetV3(vel_uu.z, 100.0f));
         h.vel_bt = Scale(q, kUuToBt);
@@ -114,15 +141,15 @@ static inline void TickStartLimitAndQuantize(uniform CarState cars[], const int 
                               QuantTruncOffsetV3(ang_vel.z, 10000.0f));
         Vec3 fwd, right, up;
         if (CAR_GETB(cars, ci, basis_authoritative)) {
-            fwd = cars[ci].basis_forward;
-            right = cars[ci].basis_right;
-            up = cars[ci].basis_up;
+            fwd = InV3(rin, RG_IN_FWD, j);
+            right = InV3(rin, RG_IN_RIGHT, j);
+            up = InV3(rin, RG_IN_UP, j);
         } else {
             GetBasisVectors(cars[ci].rot, fwd, right, up);
         }
-        cars[ci].tick_start_basis_forward = fwd;
-        cars[ci].tick_start_basis_right = right;
-        cars[ci].tick_start_basis_up = up;
+        h.tick_start_basis_forward = fwd;
+        h.tick_start_basis_right = right;
+        h.tick_start_basis_up = up;
         h.rot = GameQuantizeBasisColumns(fwd, right, up);
         h.basis_forward = fwd;
         h.basis_right = right;
@@ -161,7 +188,7 @@ static inline float CalFlipRestartTimeOnGround(uniform CarState cars[], int ci, 
 }
 
 
-static inline void PreTickFinish(uniform CarState cars[], uniform WheelRuntimeState wrs[], const int ci, RgFlagWords& fl, RgCarHot& h,
+static inline void PreTickFinish(uniform CarState cars[], uniform const float rin[], const int ci, const int j, RgFlagWords& fl, RgCarHot& h,
                                  const float frame_frac, uniform const RgPreTickParams& p) {
     const uniform float dt = p.dt;
     {
@@ -183,7 +210,7 @@ static inline void PreTickFinish(uniform CarState cars[], uniform WheelRuntimeSt
                 }
             }
         }
-        cars[ci].cal_tick_start_ang_vel = h.ang_vel;
+        h.cal_tick_start_ang_vel = h.ang_vel;
 
         CAR_SETB(cars, ci, cal_pre_flags, 0);
         const uint8 start_is_flipping = CAR_GETB(cars, ci, is_flipping);
@@ -200,14 +227,14 @@ static inline void PreTickFinish(uniform CarState cars[], uniform WheelRuntimeSt
             const float speed_sq = LengthSq(h.vel);
             if (speed_sq >= (p.supersonic_start_speed * p.supersonic_start_speed)) {
                 CAR_SETB(cars, ci, is_supersonic, 1);
-                cars[ci].supersonic_time = 0.0f;
+                h.supersonic_time = 0.0f;
             } else if (CAR_GETB(cars, ci, is_supersonic)) {
-                const float st = cars[ci].supersonic_time + dt;
-                cars[ci].supersonic_time = st;
+                const float st = h.supersonic_time + dt;
+                h.supersonic_time = st;
                 if (st >= p.supersonic_maintain_max_time ||
                     speed_sq < (p.supersonic_maintain_min_speed * p.supersonic_maintain_min_speed)) {
                     CAR_SETB(cars, ci, is_supersonic, 0);
-                    cars[ci].supersonic_time = 0.0f;
+                    h.supersonic_time = 0.0f;
                 }
             }
         }
@@ -224,7 +251,7 @@ static inline void PreTickFinish(uniform CarState cars[], uniform WheelRuntimeSt
             }
             WRS_SETB(wrs, ci, cal_cached_ground, cal_jump_g ? 1 : 0);
         }
-        if (WRS_GETB(wrs, ci, cal_game_jumped) && cal_jump_g && !start_is_jumping && wrs[ci].cal_jump_inactive_time >= 0.125f) {
+        if (WRS_GETB(wrs, ci, cal_game_jumped) && cal_jump_g && !start_is_jumping && In1(rin, RG_IN_CAL_JUMP_INACTIVE, j) >= 0.125f) {
             WRS_SETB(wrs, ci, cal_game_jumped, 0);
             WRS_SETB(wrs, ci, cal_game_double_jumped, 0);
             WRS_SETB(wrs, ci, cal_cached_ground, 1);
@@ -243,14 +270,14 @@ static inline void PreTickFinish(uniform CarState cars[], uniform WheelRuntimeSt
             CAR_SETB(cars, ci, has_double_jumped, 0);
             h.internal_flip_time = CalFlipRestartTimeOnGround(cars, ci, fl, h, p.flip_torque_time, dt);
             CAR_SETB(cars, ci, has_flipped, 0);
-            cars[ci].air_time = 0.0f;
-            cars[ci].air_time_since_jump = 0.0f;
+            h.air_time = 0.0f;
+            h.air_time_since_jump = 0.0f;
         } else {
-            cars[ci].air_time = cars[ci].air_time + dt;
+            h.air_time = h.air_time + dt;
             if (CAR_GETB(cars, ci, has_jumped) && !CAR_GETB(cars, ci, is_jumping)) {
-                cars[ci].air_time_since_jump = cars[ci].air_time_since_jump + dt;
+                h.air_time_since_jump = h.air_time_since_jump + dt;
             } else {
-                cars[ci].air_time_since_jump = 0.0f;
+                h.air_time_since_jump = 0.0f;
             }
         }
         if (CAR_GETB(cars, ci, is_flipping)) {
@@ -260,8 +287,8 @@ static inline void PreTickFinish(uniform CarState cars[], uniform WheelRuntimeSt
         }
         CAR_SETB(cars, ci, cal_pre_flags, (uint8)((air_jump_used_before ? 8 : 0) | (start_is_flipping ? 32 : 0) |
                                          (start_is_jumping ? 64 : 0)));
-        cars[ci].cal_pre_forward_speed_uu = forward_speed_uu;
-        cars[ci].cal_pre_pitchlock_restart_time = cal_pitchlock_restart_time;
+        h.cal_pre_forward_speed_uu = forward_speed_uu;
+        h.cal_pre_pitchlock_restart_time = cal_pitchlock_restart_time;
 
         const Vec3 v = h.vel_bt;
         const uniform float max_lin = p.car_max_speed * 0.02f;
@@ -306,39 +333,91 @@ static inline void PreTickStart(uniform CarState cars[], const int ci, RgFlagWor
         }
     }
     CAR_SETB(cars, ci, just_respawned, 0);
-    cars[ci].tick_start_pos_bt = h.pos_bt;
+    h.tick_start_pos_bt = h.pos_bt;
 }
 
-export void rg_pretick_cars(uniform CarState cars[], uniform WheelRuntimeState wrs[], uniform const int32 idx[],
+#define RG_CAR_OUT_TICK_START_POS_BT 0
+#define RG_CAR_OUT_POS 3
+#define RG_CAR_OUT_TICK_START_FWD 6
+#define RG_CAR_OUT_TICK_START_RIGHT 9
+#define RG_CAR_OUT_TICK_START_UP 12
+#define RG_CAR_OUT_CAL_TICK_START_ANG_VEL 15
+#define RG_CAR_OUT_SUPERSONIC_TIME 18
+#define RG_CAR_OUT_AIR_TIME 19
+#define RG_CAR_OUT_AIR_TIME_SINCE_JUMP 20
+#define RG_CAR_OUT_CAL_PRE_FORWARD_SPEED 21
+#define RG_CAR_OUT_CAL_PRE_PITCHLOCK 22
+#define RG_CAR_OUT_POS_BT 23
+#define RG_CAR_OUT_VEL 26
+#define RG_CAR_OUT_VEL_BT 29
+#define RG_CAR_OUT_ANG_VEL 32
+#define RG_CAR_OUT_INTERNAL_FLIP_TIME 35
+#define RG_CAR_OUT_ROT 36
+#define RG_CAR_OUT_FWD 40
+#define RG_CAR_OUT_RIGHT 43
+#define RG_CAR_OUT_UP 46
+#define RG_CAR_OUT_START_VEL 49
+#define RG_CAR_OUT_SNAP_ROT 52
+#define RG_CAR_OUT_SNAP_RAW 56
+#define RG_CAR_OUT_FIELDS 60
+static inline void CarOut1(uniform float out[], const uniform int f, const int j, const float v) {
+    out[f * RG_CAR_OUT_STRIDE + j] = v;
+}
+static inline void CarOutV3(uniform float out[], const uniform int f, const int j, const Vec3 v) {
+    CarOut1(out, f, j, v.x);
+    CarOut1(out, f + 1, j, v.y);
+    CarOut1(out, f + 2, j, v.z);
+}
+static inline void CarOutQ(uniform float out[], const uniform int f, const int j, const Quat q) {
+    CarOut1(out, f, j, q.w);
+    CarOut1(out, f + 1, j, q.x);
+    CarOut1(out, f + 2, j, q.y);
+    CarOut1(out, f + 3, j, q.z);
+}
+export void rg_pretick_cars(uniform CarState cars[], uniform const float rin[], uniform const int32 idx[],
                             uniform const float frame_frac[], uniform int n, uniform const RgPreTickParams& p,
-                            uniform Vec3 start_vel[], uniform Quat snap_rot[], uniform Quat snap_raw[]) {
+                            uniform float out[], uniform uint32 wout[]) {
     foreach (j = 0 ... n) {
         const int ci = idx[j];
         RgFlagWords fl;
-        LoadFlagWords(cars, wrs, ci, fl);
+        LoadFlagWords(rin, j, fl);
         RgCarHot h;
-        h.pos_bt = cars[ci].pos_bt;
-        h.vel = cars[ci].vel;
-        h.vel_bt = cars[ci].vel_bt;
-        h.ang_vel = cars[ci].ang_vel;
-        h.internal_flip_time = cars[ci].internal_flip_time;
+        h.pos_bt = InV3(rin, RG_IN_POS_BT, j);
+        h.vel = InV3(rin, RG_IN_VEL, j);
+        h.vel_bt = InV3(rin, RG_IN_VEL_BT, j);
+        h.ang_vel = InV3(rin, RG_IN_ANG_VEL, j);
+        h.internal_flip_time = In1(rin, RG_IN_INTERNAL_FLIP_TIME, j);
+        h.supersonic_time = In1(rin, RG_IN_SUPERSONIC_TIME, j);
+        h.air_time = In1(rin, RG_IN_AIR_TIME, j);
+        h.air_time_since_jump = In1(rin, RG_IN_AIR_TIME_SINCE_JUMP, j);
         PreTickStart(cars, ci, fl, h);
-        TickStartLimitAndQuantize(cars, ci, fl, h, p.car_max_speed, p.car_max_ang_speed);
-        start_vel[j] = h.vel;
-        PreTickFinish(cars, wrs, ci, fl, h, frame_frac[j], p);
-        StoreFlagWords(cars, wrs, ci, fl);
-        cars[ci].pos_bt = h.pos_bt;
-        cars[ci].vel = h.vel;
-        cars[ci].vel_bt = h.vel_bt;
-        cars[ci].ang_vel = h.ang_vel;
-        cars[ci].internal_flip_time = h.internal_flip_time;
-        cars[ci].rot = h.rot;
-        cars[ci].basis_forward = h.basis_forward;
-        cars[ci].basis_right = h.basis_right;
-        cars[ci].basis_up = h.basis_up;
+        TickStartLimitAndQuantize(cars, rin, ci, j, fl, h, p.car_max_speed, p.car_max_ang_speed);
+        CarOutV3(out, RG_CAR_OUT_START_VEL, j, h.vel);
+        PreTickFinish(cars, rin, ci, j, fl, h, frame_frac[j], p);
+        StoreFlagWords(wout, j, fl);
+        CarOutV3(out, RG_CAR_OUT_TICK_START_POS_BT, j, h.tick_start_pos_bt);
+        CarOutV3(out, RG_CAR_OUT_POS, j, h.pos);
+        CarOutV3(out, RG_CAR_OUT_TICK_START_FWD, j, h.tick_start_basis_forward);
+        CarOutV3(out, RG_CAR_OUT_TICK_START_RIGHT, j, h.tick_start_basis_right);
+        CarOutV3(out, RG_CAR_OUT_TICK_START_UP, j, h.tick_start_basis_up);
+        CarOutV3(out, RG_CAR_OUT_CAL_TICK_START_ANG_VEL, j, h.cal_tick_start_ang_vel);
+        CarOut1(out, RG_CAR_OUT_SUPERSONIC_TIME, j, h.supersonic_time);
+        CarOut1(out, RG_CAR_OUT_AIR_TIME, j, h.air_time);
+        CarOut1(out, RG_CAR_OUT_AIR_TIME_SINCE_JUMP, j, h.air_time_since_jump);
+        CarOut1(out, RG_CAR_OUT_CAL_PRE_FORWARD_SPEED, j, h.cal_pre_forward_speed_uu);
+        CarOut1(out, RG_CAR_OUT_CAL_PRE_PITCHLOCK, j, h.cal_pre_pitchlock_restart_time);
+        CarOutV3(out, RG_CAR_OUT_POS_BT, j, h.pos_bt);
+        CarOutV3(out, RG_CAR_OUT_VEL, j, h.vel);
+        CarOutV3(out, RG_CAR_OUT_VEL_BT, j, h.vel_bt);
+        CarOutV3(out, RG_CAR_OUT_ANG_VEL, j, h.ang_vel);
+        CarOut1(out, RG_CAR_OUT_INTERNAL_FLIP_TIME, j, h.internal_flip_time);
+        CarOutQ(out, RG_CAR_OUT_ROT, j, h.rot);
+        CarOutV3(out, RG_CAR_OUT_FWD, j, h.basis_forward);
+        CarOutV3(out, RG_CAR_OUT_RIGHT, j, h.basis_right);
+        CarOutV3(out, RG_CAR_OUT_UP, j, h.basis_up);
         const Quat raw = GameGetRotationScalar(h.basis_forward, h.basis_right, h.basis_up);
-        snap_raw[j] = raw;
-        snap_rot[j] = GameRbStateQuantizeQuat(raw);
+        CarOutQ(out, RG_CAR_OUT_SNAP_RAW, j, raw);
+        CarOutQ(out, RG_CAR_OUT_SNAP_ROT, j, GameRbStateQuantizeQuat(raw));
     }
 }
 
@@ -364,18 +443,29 @@ static inline void StoreV3(uniform float out[], const uniform int f, const int j
     out[(f + 2) * RG_BALL_OUT_STRIDE + j] = v.z;
 }
 
-export void rg_pretick_balls(uniform const BallState balls[], uniform int n, uniform float max_speed,
+#define RG_BALL_IN_VEL_BT 0
+#define RG_BALL_IN_ANG_VEL 3
+#define RG_BALL_IN_POS_BT 6
+#define RG_BALL_IN_FWD 9
+#define RG_BALL_IN_RIGHT 12
+#define RG_BALL_IN_UP 15
+#define RG_BALL_IN_ROT 18
+#define RG_BALL_IN_AUTHORITATIVE 22
+static inline Vec3 LoadV3(uniform const float bin[], const uniform int f, const int j) {
+    return V3(bin[f * RG_BALL_OUT_STRIDE + j], bin[(f + 1) * RG_BALL_OUT_STRIDE + j], bin[(f + 2) * RG_BALL_OUT_STRIDE + j]);
+}
+export void rg_pretick_balls(uniform const float bin[], uniform int n, uniform float max_speed,
                              uniform float max_ang_speed, uniform bool heatseeker, uniform bool damp, uniform float damp_scale,
                              uniform float out[]) {
     foreach (j = 0 ... n) {
-        Vec3 vel_uu = Scale(balls[j].vel_bt, 50.0f);
+        Vec3 vel_uu = Scale(LoadV3(bin, RG_BALL_IN_VEL_BT, j), 50.0f);
         const float vel_uu_len_sq = LengthSq(vel_uu);
         if (vel_uu_len_sq > max_speed * max_speed) {
             vel_uu = Scale(Scale(vel_uu, RsqrtScalar(vel_uu_len_sq)), max_speed);
         }
-        const Vec3 ang = ClampLength(balls[j].ang_vel, max_ang_speed);
+        const Vec3 ang = ClampLength(LoadV3(bin, RG_BALL_IN_ANG_VEL, j), max_ang_speed);
 
-        const Vec3 p = Scale(balls[j].pos_bt, 50.0f);
+        const Vec3 p = Scale(LoadV3(bin, RG_BALL_IN_POS_BT, j), 50.0f);
         const Vec3 qp = V3(QuantRoundPosV3(p.x, 100.0f), QuantRoundPosV3(p.y, 100.0f), QuantRoundPosV3(p.z, 100.0f));
         StoreV3(out, RG_BALL_OUT_POS_BT, j, Scale(qp, kUuToBt));
         StoreV3(out, RG_BALL_OUT_POS, j, qp);
@@ -386,12 +476,13 @@ export void rg_pretick_balls(uniform const BallState balls[], uniform int n, uni
         Vec3 w = V3(QuantTruncOffsetV3(ang.x, 10000.0f), QuantTruncOffsetV3(ang.y, 10000.0f),
                     QuantTruncOffsetV3(ang.z, 10000.0f));
         Vec3 fwd, right, up;
-        if (balls[j].basis_authoritative != 0) {
-            fwd = balls[j].basis_forward;
-            right = balls[j].basis_right;
-            up = balls[j].basis_up;
+        if (bin[RG_BALL_IN_AUTHORITATIVE * RG_BALL_OUT_STRIDE + j] != 0.0f) {
+            fwd = LoadV3(bin, RG_BALL_IN_FWD, j);
+            right = LoadV3(bin, RG_BALL_IN_RIGHT, j);
+            up = LoadV3(bin, RG_BALL_IN_UP, j);
         } else {
-            const Quat q = balls[j].rot;
+            const Quat q = Q4(bin[RG_BALL_IN_ROT * RG_BALL_OUT_STRIDE + j], bin[(RG_BALL_IN_ROT + 1) * RG_BALL_OUT_STRIDE + j],
+                              bin[(RG_BALL_IN_ROT + 2) * RG_BALL_OUT_STRIDE + j], bin[(RG_BALL_IN_ROT + 3) * RG_BALL_OUT_STRIDE + j]);
             const float len_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
             if (len_sq <= 1e-12f) {
                 fwd = V3(1.0f, 0.0f, 0.0f);

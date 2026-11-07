@@ -20,7 +20,8 @@ void BuildArenaMeshLeafGrid(
     std::vector<ArenaMeshLeafGridInfo>& out_infos,
     std::vector<int32_t>& out_cell_start,
     std::vector<ArenaMeshLeafEntry>& out_entries,
-    float cell_bt = 4.0f);
+    float cell_bt = 4.0f,
+    int pad_cells_to = 1);
 
 void BuildArenaMeshClearance(
     const std::vector<ArenaMeshTriangle>& mesh,

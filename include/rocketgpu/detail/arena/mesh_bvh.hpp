@@ -86,6 +86,10 @@ struct ArenaMeshLeafGrid {
     const HostStepTables* host_tables = nullptr;
     const float* entry_boxes = nullptr;
     const ArenaMeshBvhQuantization* box_quantization = nullptr;
+#else
+    const ArenaMeshLeafGridInfo* ray_infos = nullptr;
+    const int32_t* ray_cell_start = nullptr;
+    const ArenaMeshLeafEntry* ray_entries = nullptr;
 #endif
 };
 
@@ -156,7 +160,6 @@ struct ArenaMeshBvhMeshInfo {
     int32_t ray_neg_x_plane_pos = 0;
 };
 
-#if !defined(ROCKETGPU_USE_CUDA)
 struct ArenaMeshClearance {
     const ArenaMeshTriangle* mesh = nullptr;
     const uint8_t* lb = nullptr;
@@ -167,7 +170,11 @@ struct ArenaMeshClearance {
     int32_t ny = 0;
     int32_t nz = 0;
 
+#if defined(ROCKETGPU_USE_CUDA)
+    ROCKETGPU_HD float Clearance(const Vec3& p) const {
+#else
     float Clearance(const Vec3& p) const {
+#endif
         const float fx = (p.x - lo.x) * inv_cell;
         const float fy = (p.y - lo.y) * inv_cell;
         const float fz = (p.z - lo.z) * inv_cell;
@@ -180,6 +187,22 @@ struct ArenaMeshClearance {
         const int iz = static_cast<int>(fz);
         return static_cast<float>(lb[(static_cast<size_t>(iz) * ny + iy) * nx + ix]) * unit;
     }
+};
+
+#if !defined(ROCKETGPU_USE_CUDA)
+struct alignas(16) ArenaMeshRayBlock {
+    uint16_t quant[3][8];
+    int32_t tri[4];
+    int32_t mesh_index[4];
+    float lo[3][4];
+    float hi[3][4];
+    float a[3][4];
+    float b[3][4];
+    float c[3][4];
+    float n[3][4];
+    float plane[4];
+    float tol[4];
+    float origin_y[4];
 };
 
 struct HostStepTables {
@@ -222,9 +245,19 @@ struct HostStepTables {
     AxisMasks<uint32_t> mesh_axis[3];
 
     ArenaMeshLeafGrid ray_grid;
+    const ArenaMeshRayBlock* ray_blocks = nullptr;
+    int32_t ray_cell_count = 0;
+    int32_t ray_block_count = 0;
+    int32_t* ray_hints = nullptr;
+    const void* ray_hint_base = nullptr;
+    int32_t ray_hint_cars = 0;
+    const ArenaMeshTriangle* ray_block_tris = nullptr;
+    const ArenaMeshTriangle* ray_block_mesh = nullptr;
     ArenaMeshClearance clearance;
+    const float* tri_normals = nullptr;
+    const ArenaMeshTriangle* tri_normals_mesh = nullptr;
 
-    uint32_t MeshCandidates(const Vec3& lo, const Vec3& hi) const {
+    ROCKETGPU_ALWAYS_INLINE uint32_t MeshCandidates(const Vec3& lo, const Vec3& hi) const {
         return mesh_axis[0].Overlapping(lo.x, hi.x) & mesh_axis[1].Overlapping(lo.y, hi.y) &
                mesh_axis[2].Overlapping(lo.z, hi.z);
     }
@@ -407,6 +440,43 @@ ROCKETGPU_HD void QuantizeArenaMeshBvhQueryBox(
 #endif
 }
 
+#if !defined(ROCKETGPU_USE_CUDA)
+ROCKETGPU_ALWAYS_INLINE inline void QuantizeArenaMeshBvhRayBox(
+    const ArenaMeshBvhQuantization& quantization,
+    const Vec3& from,
+    const Vec3& to,
+    uint16_t out_min[3],
+    uint16_t out_max[3]) {
+#if defined(__GNUC__) || defined(__clang__)
+    typedef float F4 __attribute__((vector_size(16)));
+    typedef int32_t I4 __attribute__((vector_size(16)));
+    const auto sel = [](I4 m, F4 a, F4 b) {
+        return reinterpret_cast<F4>((m & reinterpret_cast<I4>(a)) | (~m & reinterpret_cast<I4>(b)));
+    };
+    const Vec3& q_min = quantization.bvh_aabb_min;
+    const Vec3& q_max = quantization.bvh_aabb_max;
+    const Vec3& q_scale = quantization.bvh_quantization;
+    const F4 lo = {q_min.x, q_min.y, q_min.z, 0.0f}, hi = {q_max.x, q_max.y, q_max.z, 0.0f};
+    const F4 scale = {q_scale.x, q_scale.y, q_scale.z, 0.0f};
+    const F4 f = {from.x, from.y, from.z, 0.0f}, t = {to.x, to.y, to.z, 0.0f};
+    const auto quantize = [&](F4 p) {
+        p = sel(p > lo, p, lo);
+        p = sel(p < hi, p, hi);
+        return (p - lo) * scale;
+    };
+    const I4 qmin = __builtin_convertvector(quantize(sel(f < t, f, t)), I4) & 0xfffe;
+    const I4 qmax = __builtin_convertvector(quantize(sel(f > t, f, t)) + F4{1.0f, 1.0f, 1.0f, 1.0f}, I4) | 1;
+    for (int a = 0; a < 3; ++a) {
+        out_min[a] = static_cast<uint16_t>(qmin[a]);
+        out_max[a] = static_cast<uint16_t>(qmax[a]);
+    }
+#else
+    QuantizeArenaMeshBvhPoint(quantization, MinComponents(from, to), 0, out_min);
+    QuantizeArenaMeshBvhPoint(quantization, MaxComponents(from, to), 1, out_max);
+#endif
+}
+#endif
+
 ROCKETGPU_HD Vec3 UnquantizeArenaMeshBvhPoint(
     const ArenaMeshBvhQuantization& quantization,
     const uint16_t in[3]) {
@@ -481,7 +551,7 @@ struct ArenaMeshBvhRayLeaf {
         return (tzmin <= t0 ? t0 : tzmin) < lambda_max && 0.0f < (t1 <= tzmax ? t1 : tzmax);
     }
 #if !defined(ROCKETGPU_USE_CUDA)
-    bool Box(const float* box) const {
+    void Prepare() const {
         if (lambda_max < 0.0f) {
             const Vec3 d = to - source;
             const float r = 1.0f / sqrtf(d.y * d.y + d.x * d.x + d.z * d.z);
@@ -490,6 +560,9 @@ struct ArenaMeshBvhRayLeaf {
             inv_dir = Vec3(n.x == 0.0f ? 1e18f : 1.0f / n.x, n.y == 0.0f ? 1e18f : 1.0f / n.y,
                            n.z == 0.0f ? 1e18f : 1.0f / n.z);
         }
+    }
+    bool Box(const float* box) const {
+        Prepare();
         const Vec3 lo(box[0], box[1], box[2]);
         const Vec3 hi(box[4], box[5], box[6]);
         const float tmin = ((inv_dir.x < 0.0f ? hi.x : lo.x) - source.x) * inv_dir.x;
@@ -789,7 +862,7 @@ ROCKETGPU_HD bool WalkArenaMeshLeafGrid(
     const U16x8 lo = {0, 0, 0, static_cast<uint16_t>(q[3]), static_cast<uint16_t>(q[4]), static_cast<uint16_t>(q[5]),
                       0, 0};
 #if !defined(ROCKETGPU_USE_CUDA)
-    if constexpr (std::is_same<LeafTest, ArenaMeshBvhRayLeaf>::value) {
+    if constexpr (std::is_same<LeafTest, ArenaMeshBvhRayLeaf>::value || std::is_same<LeafTest, ArenaMeshBvhAnyLeaf>::value) {
         const float* const boxes = grid->entry_boxes;
         for (; end - e >= 4; e += 4) {
             unsigned hits = 0;
@@ -803,8 +876,15 @@ ROCKETGPU_HD bool WalkArenaMeshLeafGrid(
                 const int k = CountTrailingZeros32(hits);
                 hits &= hits - 1;
                 const ArenaMeshLeafEntry& entry = grid->entries[e + k];
-                if (boxes != nullptr ? leaf_test.Box(boxes + 8 * (e + k))
-                                     : leaf_test(entry.quantized_aabb_min, entry.quantized_aabb_max)) {
+                bool pass;
+                if constexpr (std::is_same<LeafTest, ArenaMeshBvhRayLeaf>::value) {
+                    pass = boxes != nullptr ? leaf_test.Box(boxes + 8 * (e + k))
+                                            : leaf_test(entry.quantized_aabb_min, entry.quantized_aabb_max);
+                } else {
+                    (void)boxes;
+                    pass = leaf_test(entry.quantized_aabb_min, entry.quantized_aabb_max);
+                }
+                if (pass) {
                     callback(entry.triangle_index);
                 }
             }

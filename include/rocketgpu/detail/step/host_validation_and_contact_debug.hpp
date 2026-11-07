@@ -189,7 +189,11 @@ struct CarFrame {
     mutable bool has_inertia_world_bt = false;
     mutable bool has_inertia_world_uu = false;
 #if !defined(ROCKETGPU_USE_CUDA)
+#if defined(ROCKETGPU_HOST_LANES)
+    mutable UninitArray<lanes::F4, 3> inertia_world_bt_cols;
+#else
     mutable UninitArray<Vec3, 3> inertia_world_bt_rows;
+#endif
     mutable UninitArray<Vec3, 3> inertia_world_uu_rows;
 #else
     mutable Vec3 inertia_world_bt_row0, inertia_world_bt_row1, inertia_world_bt_row2;
@@ -553,6 +557,31 @@ ROCKETGPU_HD Vec3 Mul3x3Vec(const Vec3& row0, const Vec3& row1, const Vec3& row2
     return Vec3(Dot(row0, v), Dot(row1, v), Dot(row2, v));
 }
 
+#if defined(ROCKETGPU_HOST_LANES)
+inline void InverseMatrix3x3BulletStyleColumns(const Vec3& r0, const Vec3& r1, const Vec3& r2, lanes::F4& c0,
+                                               lanes::F4& c1, lanes::F4& c2) {
+    using namespace lanes;
+    const F4 a = Load(r0), b = Load(r1), c = Load(r2);
+    const F4 a_yzx = Turn<1, 2, 0>(a), a_zxy = Turn<2, 0, 1>(a);
+    const F4 b_yzx = Turn<1, 2, 0>(b), b_zxy = Turn<2, 0, 1>(b);
+    const F4 c_yzx = Turn<1, 2, 0>(c), c_zxy = Turn<2, 0, 1>(c);
+    const F4 x0 = b_yzx * c_zxy - b_zxy * c_yzx;
+    const F4 x1 = c_yzx * a_zxy - c_zxy * a_yzx;
+    const F4 x2 = a_yzx * b_zxy - a_zxy * b_yzx;
+    const F4 p = a * x0;
+    const float det = (p[0] + p[1]) + p[2];
+    const F4 s = Splat((det != 0.0f) ? (1.0f / det) : 0.0f);
+    c0 = x0 * s;
+    c1 = x1 * s;
+    c2 = x2 * s;
+}
+
+inline Vec3 Mul3x3ColumnsVec(lanes::F4 c0, lanes::F4 c1, lanes::F4 c2, const Vec3& v) {
+    using namespace lanes;
+    return ToVec3((c0 * Splat(v.x) + c1 * Splat(v.y)) + c2 * Splat(v.z));
+}
+#endif
+
 ROCKETGPU_HD Vec3 VecMul3x3(const Vec3& v, const Vec3& row0, const Vec3& row1, const Vec3& row2) {
     return Vec3(
         row0.x * v.x + row1.x * v.y + row2.x * v.z,
@@ -798,6 +827,18 @@ ROCKETGPU_HD void BuildInertiaTensorWorldBtInverse(
     InverseMatrix3x3BulletStyle(inv_r0, inv_r1, inv_r2, out_row0, out_row1, out_row2);
 }
 
+#if defined(ROCKETGPU_HOST_LANES)
+inline lanes::F4* InertiaWorldBtColumns(const CarFrame* frame) {
+    lanes::F4* const cols = frame->inertia_world_bt_cols;
+    if (!frame->has_inertia_world_bt) {
+        InverseMatrix3x3BulletStyleColumns(frame->inv_world_row0_bt, frame->inv_world_row1_bt, frame->inv_world_row2_bt,
+                                           cols[0], cols[1], cols[2]);
+        frame->has_inertia_world_bt = true;
+    }
+    return cols;
+}
+#endif
+
 ROCKETGPU_HD void BuildInertiaTensorWorldBtInverse(
     const CarFrame* frame,
     const CarState& car,
@@ -812,7 +853,12 @@ ROCKETGPU_HD void BuildInertiaTensorWorldBtInverse(
                                     out_row0, out_row1, out_row2);
         return;
 #else
-#if !defined(ROCKETGPU_USE_CUDA)
+#if defined(ROCKETGPU_HOST_LANES)
+        lanes::F4* const cols = InertiaWorldBtColumns(frame);
+        out_row0 = Vec3(cols[0][0], cols[1][0], cols[2][0]);
+        out_row1 = Vec3(cols[0][1], cols[1][1], cols[2][1]);
+        out_row2 = Vec3(cols[0][2], cols[1][2], cols[2][2]);
+#elif !defined(ROCKETGPU_USE_CUDA)
         Vec3* const rows = frame->inertia_world_bt_rows;
         if (!frame->has_inertia_world_bt) {
             InverseMatrix3x3BulletStyle(frame->inv_world_row0_bt, frame->inv_world_row1_bt, frame->inv_world_row2_bt,
@@ -838,6 +884,19 @@ ROCKETGPU_HD void BuildInertiaTensorWorldBtInverse(
     }
     BuildInertiaTensorWorldBtInverse(car, cfg, mass, out_row0, out_row1, out_row2);
 }
+
+#if defined(ROCKETGPU_HOST_LANES)
+inline Vec3 MulInertiaWorldBt(const CarFrame* frame, const CarState& car, const CarConfig& cfg, float mass,
+                              const Vec3& v) {
+    if (frame != nullptr) {
+        const lanes::F4* const cols = InertiaWorldBtColumns(frame);
+        return Mul3x3ColumnsVec(cols[0], cols[1], cols[2], v);
+    }
+    Vec3 i0, i1, i2;
+    BuildInertiaTensorWorldBtInverse(car, cfg, mass, i0, i1, i2);
+    return Mul3x3Vec(i0, i1, i2, v);
+}
+#endif
 
 ROCKETGPU_HD Vec3 VelocityAtPoint(const CarState& car, const Vec3& rel_point_world) {
     return car.vel + Cross(car.ang_vel, rel_point_world);
@@ -1360,6 +1419,262 @@ ROCKETGPU_HD bool RayCastArenaMeshTrianglesBtSource(
     return best.hit != 0;
 }
 
+#if !defined(ROCKETGPU_USE_CUDA) && (defined(__GNUC__) || defined(__clang__))
+inline bool HostRayCastArenaMeshBlocks(
+    const ArenaMeshTriangle* mesh_triangles,
+    int32_t mesh_triangle_count,
+    const ArenaMeshBvhQuantization* mesh_bvh_quantization,
+    int32_t mesh_bvh_quantization_count,
+    const ArenaMeshBvhMeshInfo* mesh_bvh_meshes,
+    int32_t mesh_bvh_mesh_count,
+    const ArenaMeshBvhNode* mesh_bvh_nodes,
+    int32_t mesh_bvh_node_count,
+    const Vec3& ray_source_bt,
+    const Vec3& ray_delta_bt,
+    float max_len,
+    ArenaRayHit& best,
+    int* best_mesh,
+    const ArenaMeshLeafGrid* leaf_grid,
+    const ArenaMeshTriangle* local_triangles,
+    int32_t* walk_hint = nullptr) {
+    typedef float F4 __attribute__((vector_size(16)));
+    typedef int32_t I4 __attribute__((vector_size(16)));
+    typedef uint16_t U16x8 __attribute__((vector_size(16)));
+    typedef int16_t I16x8 __attribute__((vector_size(16)));
+    typedef int16_t I16x4 __attribute__((vector_size(8)));
+    const HostStepTables* tables = leaf_grid != nullptr ? leaf_grid->host_tables : nullptr;
+    if (tables == nullptr || tables->ray_blocks == nullptr || tables->meshes != mesh_bvh_meshes ||
+        tables->mesh_count != mesh_bvh_mesh_count || tables->ray_block_tris != local_triangles ||
+        tables->ray_block_mesh != mesh_triangles || tables->ray_grid.box_quantization != mesh_bvh_quantization ||
+        mesh_triangles == nullptr || mesh_triangle_count <= 0 || max_len <= 0.0f || mesh_bvh_quantization == nullptr ||
+        mesh_bvh_meshes == nullptr || mesh_bvh_nodes == nullptr || mesh_bvh_quantization_count <= 0 ||
+        mesh_bvh_mesh_count <= 0 || mesh_bvh_node_count <= 0) {
+        return false;
+    }
+    const Vec3 to_bt = ray_source_bt + ray_delta_bt;
+    const Vec3 ray_min_bt(Min(ray_source_bt.x, to_bt.x), Min(ray_source_bt.y, to_bt.y), Min(ray_source_bt.z, to_bt.z));
+    const Vec3 ray_max_bt(Max(ray_source_bt.x, to_bt.x), Max(ray_source_bt.y, to_bt.y), Max(ray_source_bt.z, to_bt.z));
+    if (ray_max_bt.x < mesh_bvh_meshes[0].free_half_x && ray_min_bt.x > -mesh_bvh_meshes[0].free_half_x &&
+        ray_max_bt.y < mesh_bvh_meshes[0].free_half_y && ray_min_bt.y > -mesh_bvh_meshes[0].free_half_y) {
+        return true;
+    }
+    const ArenaMeshLeafGrid& grid = tables->ray_grid;
+    struct Walk {
+        const ArenaMeshBvhMeshInfo* info;
+        int pos;
+        int begin;
+        int end;
+        uint16_t qmin[3];
+        uint16_t qmax[3];
+    };
+    constexpr int kMaxWalks = 4;
+    Walk walks[kMaxWalks];
+    int walk_count = 0;
+    for (uint32_t candidates = tables->MeshCandidates(ray_min_bt, ray_max_bt); candidates != 0u;
+         candidates &= candidates - 1u) {
+        const int pos = CountTrailingZeros32(candidates);
+        if (pos >= mesh_bvh_mesh_count) {
+            break;
+        }
+        const int ray_info = mesh_bvh_meshes[pos].ray_order;
+        const int info_idx = ray_info >= 0 ? ray_info : pos;
+        const ArenaMeshBvhMeshInfo& mesh_info = mesh_bvh_meshes[info_idx];
+        if (mesh_info.aabb_max.x < ray_min_bt.x || mesh_info.aabb_min.x > ray_max_bt.x ||
+            mesh_info.aabb_max.y < ray_min_bt.y || mesh_info.aabb_min.y > ray_max_bt.y ||
+            mesh_info.aabb_max.z < ray_min_bt.z || mesh_info.aabb_min.z > ray_max_bt.z) {
+            continue;
+        }
+        if (mesh_info.mesh_index < 0 || mesh_info.mesh_index >= mesh_bvh_quantization_count ||
+            mesh_info.node_offset < 0 || mesh_info.node_count <= 0 ||
+            mesh_info.node_offset + mesh_info.node_count > mesh_bvh_node_count || mesh_info.triangle_start < 0 ||
+            mesh_info.triangle_count <= 0 || mesh_info.triangle_start + mesh_info.triangle_count > mesh_triangle_count) {
+            continue;
+        }
+        const ArenaMeshLeafGridInfo& cell_info = grid.infos[info_idx];
+        if (walk_count == kMaxWalks || cell_info.cell_offset < 0) {
+            return false;
+        }
+        Walk& walk = walks[walk_count++];
+        walk.info = &mesh_info;
+        walk.pos = pos;
+        const float origin_y = mesh_info.cal_origin_y;
+        QuantizeArenaMeshBvhRayBox(mesh_bvh_quantization[mesh_info.mesh_index],
+                                   Vec3(ray_source_bt.x, ray_source_bt.y - origin_y, ray_source_bt.z),
+                                   Vec3(to_bt.x, to_bt.y - origin_y, to_bt.z), walk.qmin, walk.qmax);
+        int cell[3];
+        for (int a = 0; a < 3; ++a) {
+            if (walk.qmax[a] - walk.qmin[a] > cell_info.cell_width[a]) {
+                return false;
+            }
+            cell[a] = static_cast<int>((static_cast<uint64_t>(walk.qmin[a]) * cell_info.cell_magic[a]) >> 32);
+            cell[a] = cell[a] < cell_info.cells[a] ? cell[a] : cell_info.cells[a] - 1;
+        }
+        const int cell_idx =
+            cell_info.cell_offset + (cell[2] * cell_info.cells[1] + cell[1]) * cell_info.cells[0] + cell[0];
+        walk.begin = grid.cell_start[cell_idx];
+        walk.end = grid.cell_start[cell_idx + 1];
+        if (walk_count == 1 && walk_hint != nullptr) {
+            walk_hint[0] = cell_idx;
+            walk_hint[1] = walk.begin;
+        }
+    }
+
+    const auto sel = [](I4 m, F4 a, F4 b) {
+        return reinterpret_cast<F4>((m & reinterpret_cast<I4>(a)) | (~m & reinterpret_cast<I4>(b)));
+    };
+    const auto load = [](const float* p) {
+        F4 v;
+        memcpy(&v, p, sizeof(v));
+        return v;
+    };
+    const auto splat = [](float v) { return F4{v, v, v, v}; };
+    const auto LaneMask4 = [](I4 m) {
+#if defined(__SSE__)
+        return static_cast<unsigned>(__builtin_ia32_movmskps(reinterpret_cast<F4>(m)));
+#else
+        const I4 bits = m & I4{1, 2, 4, 8};
+        return static_cast<unsigned>(bits[0] + bits[1] + bits[2] + bits[3]);
+#endif
+    };
+
+    const float cal_min_fraction_sq = best.cal_min_fraction_sq;
+    float fraction = best.hit ? best.ray_fraction : 1.0f;
+    bool hit = best.hit != 0;
+    float hit_fraction = best.ray_fraction;
+    int win = -1, win_pos = -1;
+    float win_distance = 0.0f, win_dist_a = 0.0f;
+    const F4 from[3] = {splat(ray_source_bt.x), splat(ray_source_bt.y), splat(ray_source_bt.z)};
+    const F4 to[3] = {splat(to_bt.x), splat(to_bt.y), splat(to_bt.z)};
+    for (int w = 0; w < walk_count; ++w) {
+        const Walk& walk = walks[w];
+        const float fraction_before = fraction;
+        const bool hit_before = hit;
+        const auto splat4 = [](uint16_t a, uint16_t b) { return U16x8{a, a, a, a, b, b, b, b}; };
+        const U16x8 qtest[3] = {
+            splat4(walk.qmax[0], walk.qmax[1]),
+            splat4(walk.qmax[2], static_cast<uint16_t>(~walk.qmin[0])),
+            splat4(static_cast<uint16_t>(~walk.qmin[1]), static_cast<uint16_t>(~walk.qmin[2]))};
+        bool prepared = false;
+        F4 box_src[3], box_inv[3], lambda_max;
+        int near_hi[3];
+        for (int e = walk.begin; e < walk.end; e += 4) {
+            const ArenaMeshRayBlock& blk = tables->ray_blocks[e >> 2];
+            U16x8 qa, qb, qc;
+            memcpy(&qa, blk.quant[0], sizeof(qa));
+            memcpy(&qb, blk.quant[1], sizeof(qb));
+            memcpy(&qc, blk.quant[2], sizeof(qc));
+            const I16x8 m = reinterpret_cast<I16x8>((qa <= qtest[0]) & (qb <= qtest[1]) & (qc <= qtest[2]));
+            const I16x4 pass16 = __builtin_shufflevector(m, m, 0, 1, 2, 3) & __builtin_shufflevector(m, m, 4, 5, 6, 7);
+            unsigned hits = LaneMask4(__builtin_convertvector(pass16, I4));
+            if (hits == 0) {
+                continue;
+            }
+            if (!prepared) {
+                prepared = true;
+                const float origin_y = walk.info->cal_origin_y;
+                const ArenaMeshBvhRayLeaf ray_leaf(mesh_bvh_quantization[walk.info->mesh_index],
+                                                   Vec3(ray_source_bt.x, ray_source_bt.y - origin_y, ray_source_bt.z),
+                                                   Vec3(to_bt.x, to_bt.y - origin_y, to_bt.z));
+                ray_leaf.Prepare();
+                const float src[3] = {ray_leaf.source.x, ray_leaf.source.y, ray_leaf.source.z};
+                const float inv[3] = {ray_leaf.inv_dir.x, ray_leaf.inv_dir.y, ray_leaf.inv_dir.z};
+                for (int a = 0; a < 3; ++a) {
+                    box_src[a] = splat(src[a]);
+                    box_inv[a] = splat(inv[a]);
+                    near_hi[a] = inv[a] < 0.0f;
+                }
+                lambda_max = splat(ray_leaf.lambda_max);
+            }
+            F4 tn[3], tf[3];
+            for (int a = 0; a < 3; ++a) {
+                const F4 lo = load(blk.lo[a]), hi = load(blk.hi[a]);
+                tn[a] = ((near_hi[a] ? hi : lo) - box_src[a]) * box_inv[a];
+                tf[a] = ((near_hi[a] ? lo : hi) - box_src[a]) * box_inv[a];
+            }
+            I4 ok = (tn[0] <= tf[1]) & (tn[1] <= tf[0]);
+            const F4 t0 = sel(tn[1] <= tn[0], tn[0], tn[1]);
+            const F4 t1 = sel(tf[0] <= tf[1], tf[0], tf[1]);
+            ok &= (t0 <= tf[2]) & (tn[2] <= t1);
+            ok &= (sel(tn[2] <= t0, t0, tn[2]) < lambda_max) & (splat(0.0f) < sel(t1 <= tf[2], t1, tf[2]));
+            const F4 oy = load(blk.origin_y);
+            const F4 nx = load(blk.n[0]), ny = load(blk.n[1]), nz = load(blk.n[2]);
+            const F4 plane = load(blk.plane);
+            const F4 fy = from[1] - oy, ty = to[1] - oy;
+            const F4 dist_a = ((nx * from[0] + ny * fy) + nz * from[2]) - plane;
+            const F4 dist_b = ((nx * to[0] + ny * ty) + nz * to[2]) - plane;
+            ok &= ~(dist_a * dist_b >= splat(0.0f));
+            const F4 proj_length = dist_a - dist_b;
+            ok &= ~(proj_length == splat(0.0f));
+            const F4 distance = dist_a / proj_length;
+            const F4 keep = splat(1.0f) - distance;
+            const F4 px = keep * from[0] + distance * to[0];
+            const F4 py = keep * fy + distance * ty;
+            const F4 pz = keep * from[2] + distance * to[2];
+            const F4 tol = load(blk.tol);
+            const F4 v0x = load(blk.a[0]) - px, v0y = load(blk.a[1]) - py, v0z = load(blk.a[2]) - pz;
+            const F4 v1x = load(blk.b[0]) - px, v1y = load(blk.b[1]) - py, v1z = load(blk.b[2]) - pz;
+            const F4 v2x = load(blk.c[0]) - px, v2y = load(blk.c[1]) - py, v2z = load(blk.c[2]) - pz;
+            const auto edge = [&](F4 ux, F4 uy, F4 uz, F4 wx, F4 wy, F4 wz) {
+                const F4 cx = uy * wz - uz * wy, cy = uz * wx - ux * wz, cz = ux * wy - uy * wx;
+                return ~(((cx * nx + cy * ny) + cz * nz) < tol);
+            };
+            ok &= edge(v0x, v0y, v0z, v1x, v1y, v1z);
+            ok &= edge(v1x, v1y, v1z, v2x, v2y, v2z);
+            ok &= edge(v2x, v2y, v2z, v0x, v0y, v0z);
+            hits &= LaneMask4(ok);
+            while (hits != 0) {
+                const int k = CountTrailingZeros32(hits);
+                hits &= hits - 1;
+                const float d = distance[k];
+                if (d >= fraction) {
+                    continue;
+                }
+                if (!(d < 0.0f || d > 1.0f) && !(cal_min_fraction_sq > 0.0f && d * d < cal_min_fraction_sq) &&
+                    (!hit || d < hit_fraction)) {
+                    hit = true;
+                    hit_fraction = d;
+                    win = e + k;
+                    win_distance = d;
+                    win_dist_a = dist_a[k];
+                }
+                fraction = hit ? hit_fraction : 1.0f;
+            }
+        }
+        if (hit && (!hit_before || fraction < fraction_before)) {
+            win_pos = walk.pos;
+        }
+    }
+    if (win >= 0) {
+        constexpr float kBTToUU = 50.0f;
+        const ArenaMeshRayBlock& blk = tables->ray_blocks[win >> 2];
+        const int k = win & 3;
+        const int32_t global_tri_idx = blk.tri[k];
+        const Vec3 n(blk.n[0][k], blk.n[1][k], blk.n[2][k]);
+        const float len_sq = LengthSq(n);
+        Vec3 triangle_normal = len_sq <= 1e-12f
+            ? (local_triangles != nullptr ? local_triangles : mesh_triangles)[global_tri_idx].normal
+            : n * RsqrtScalar(len_sq);
+        if (win_dist_a <= 0.0f) {
+            triangle_normal = -triangle_normal;
+        }
+        const Vec3 world_point_bt = (1.0f - win_distance) * ray_source_bt + win_distance * to_bt;
+        best.hit = 1;
+        best.t = win_distance * max_len;
+        best.point = world_point_bt * kBTToUU;
+        best.point_bt = world_point_bt;
+        best.normal = triangle_normal;
+        best.ray_fraction = win_distance;
+        best.kind = ROCKETGPU_ARENA_RAY_HIT_ARENA_MESH;
+        best.mesh_index = blk.mesh_index[k];
+        best.tri_index = global_tri_idx;
+    }
+    if (best_mesh != nullptr && win_pos >= 0) {
+        *best_mesh = win_pos;
+    }
+    return true;
+}
+#endif
+
 template <bool kSplitHeaders = false>
 ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
     const ArenaMeshTriangle* mesh_triangles,
@@ -1458,8 +1773,12 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
         const float bvh_origin_y = mesh_info.cal_origin_y;
         const Vec3 bvh_from(ray_source_bt.x, ray_source_bt.y - bvh_origin_y, ray_source_bt.z);
         const Vec3 bvh_to(to_bt.x, to_bt.y - bvh_origin_y, to_bt.z);
+#if !defined(ROCKETGPU_USE_CUDA)
+        QuantizeArenaMeshBvhRayBox(quantization, bvh_from, bvh_to, quantized_query_aabb_min, quantized_query_aabb_max);
+#else
         QuantizeArenaMeshBvhPoint(quantization, MinComponents(bvh_from, bvh_to), 0, quantized_query_aabb_min);
         QuantizeArenaMeshBvhPoint(quantization, MaxComponents(bvh_from, bvh_to), 1, quantized_query_aabb_max);
+#endif
         const ArenaMeshBvhRayLeaf ray_leaf(quantization, bvh_from, bvh_to);
 
         const ArenaMeshBvhSubtreeInfo* mesh_subtrees = nullptr;
@@ -1493,25 +1812,54 @@ ROCKETGPU_HD bool RayCastArenaMeshBvhBtSource(
         };
         if constexpr (split_headers) {
             if (leaf_grid != nullptr && leaf_grid->infos != nullptr) {
+#if defined(ROCKETGPU_USE_CUDA)
+                const int grid_mesh = ray_info >= 0 ? ray_info : ray_pos;
+                const auto fits = [&](const ArenaMeshLeafGridInfo& gi) {
+                    return gi.cell_offset >= 0 &&
+                           quantized_query_aabb_max[0] - quantized_query_aabb_min[0] <= gi.cell_width[0] &&
+                           quantized_query_aabb_max[1] - quantized_query_aabb_min[1] <= gi.cell_width[1] &&
+                           quantized_query_aabb_max[2] - quantized_query_aabb_min[2] <= gi.cell_width[2];
+                };
+                const ArenaMeshLeafGridInfo* lg = &leaf_grid->infos[grid_mesh];
+                const int32_t* cell_start = leaf_grid->cell_start;
+                const ArenaMeshLeafEntry* grid_entries = leaf_grid->entries;
+#if defined(ROCKETGPU_USE_CUDA)
+                if (leaf_grid->ray_infos != nullptr && fits(leaf_grid->ray_infos[grid_mesh])) {
+                    lg = &leaf_grid->ray_infos[grid_mesh];
+                    cell_start = leaf_grid->ray_cell_start;
+                    grid_entries = leaf_grid->ray_entries;
+                }
+#endif
+                const ArenaMeshLeafGridInfo& lg_info = *lg;
+                if (fits(lg_info)) {
+#else
                 const ArenaMeshLeafGridInfo& lg_info = leaf_grid->infos[ray_info >= 0 ? ray_info : ray_pos];
                 if (lg_info.cell_offset >= 0 &&
                     quantized_query_aabb_max[0] - quantized_query_aabb_min[0] <= lg_info.cell_width[0] &&
                     quantized_query_aabb_max[1] - quantized_query_aabb_min[1] <= lg_info.cell_width[1] &&
                     quantized_query_aabb_max[2] - quantized_query_aabb_min[2] <= lg_info.cell_width[2]) {
+#endif
                     int cell[3];
                     for (int a = 0; a < 3; ++a) {
                         cell[a] = quantized_query_aabb_min[a] / lg_info.cell_width[a];
                         cell[a] = cell[a] < lg_info.cells[a] ? cell[a] : lg_info.cells[a] - 1;
                     }
                     const int cell_idx = lg_info.cell_offset + (cell[2] * lg_info.cells[1] + cell[1]) * lg_info.cells[0] + cell[0];
+#if defined(ROCKETGPU_USE_CUDA)
+                    const int e = cell_start[cell_idx];
+                    const int end = cell_start[cell_idx + 1];
+#else
                     const int e = leaf_grid->cell_start[cell_idx];
                     const int end = leaf_grid->cell_start[cell_idx + 1];
+#endif
                     if (end - e <= 65536) {
                         for (int idx = e + mesh_first; idx < end; idx += mesh_step) {
                             ArenaMeshLeafEntry entry;
 #if defined(__CUDA_ARCH__)
-                            const uint4 raw = __ldg(reinterpret_cast<const uint4*>(&leaf_grid->entries[idx]));
+                            const uint4 raw = __ldg(reinterpret_cast<const uint4*>(&grid_entries[idx]));
                             memcpy(&entry, &raw, sizeof(entry));
+#elif defined(ROCKETGPU_USE_CUDA)
+                            entry = grid_entries[idx];
 #else
                             entry = leaf_grid->entries[idx];
 #endif

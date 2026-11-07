@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(RocketGPU VERSION 1.0.0 LANGUAGES CXX)
+project(RocketGPU VERSION 1.1.0 LANGUAGES CXX)
 
 option(ROCKETGPU_USE_CUDA "Build CUDA kernels" OFF)
 option(ROCKETGPU_BUILD_PYTHON "Build Python bindings" OFF)

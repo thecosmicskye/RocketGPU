@@ -56,6 +56,7 @@ using cudaStream_t = void*;
 #endif
 
 #ifndef ROCKETGPU_NOINLINE
+#define ROCKETGPU_NOINLINE_DEFAULTED 1
 #if defined(__CUDA_ARCH__)
 #define ROCKETGPU_NOINLINE __noinline__
 #else

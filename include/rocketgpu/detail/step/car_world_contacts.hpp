@@ -894,10 +894,18 @@ ROCKETGPU_HD CarWorldMeshQueryFrame ComputeCarWorldMeshQueryFrame(const CarState
                                                                   const CarShapeCacheEntry* shape = nullptr) {
     constexpr float kUUToBT = 1.0f / 50.0f;
     CarWorldMeshQueryFrame f;
+#if defined(ROCKETGPU_USE_CUDA)
     CarBasisColumns(car, f.axis_x, f.axis_y, f.axis_z);
     const Vec3& axis_x = f.axis_x;
     const Vec3& axis_y = f.axis_y;
     const Vec3& axis_z = f.axis_z;
+#else
+    Vec3 axis_x, axis_y, axis_z;
+    CarBasisColumns(car, axis_x, axis_y, axis_z);
+    f.axis_x = axis_x;
+    f.axis_y = axis_y;
+    f.axis_z = axis_z;
+#endif
     const Vec3 body_row0(axis_x.x, axis_y.x, axis_z.x);
     const Vec3 body_row1(axis_x.y, axis_y.y, axis_z.y);
     const Vec3 body_row2(axis_x.z, axis_y.z, axis_z.z);
@@ -918,6 +926,29 @@ ROCKETGPU_HD CarWorldMeshQueryFrame ComputeCarWorldMeshQueryFrame(const CarState
     f.aabb_max_bt = f.box_center_bt + extent_bt;
     return f;
 }
+
+#if !defined(ROCKETGPU_USE_CUDA)
+inline bool CarWorldBoxClearOfMeshes(const ArenaMeshClearance& clearance, const CarWorldMeshQueryFrame& f,
+                                     float contact_threshold_bt) {
+    const Vec3 h = f.box_half_extent_with_margin_bt;
+    const float pad = contact_threshold_bt + 1.0e-3f;
+    if (clearance.Clearance(f.box_center_bt) > SqrtScalar(h.x * h.x + h.y * h.y + h.z * h.z) + pad) {
+        return true;
+    }
+    const Vec3 s(h.x * (1.0f / 3.0f), h.y * 0.5f, h.z);
+    const float r = SqrtScalar(s.x * s.x + s.y * s.y + s.z * s.z) * 1.0001f + pad;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            const Vec3 p = f.box_center_bt + f.axis_x * (s.x * static_cast<float>(2 * i - 2)) +
+                           f.axis_y * (s.y * static_cast<float>(2 * j - 1));
+            if (!(clearance.Clearance(p) > r)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+#endif
 
 ROCKETGPU_HD bool CarWorldMeshInfoUsable(
     const ArenaMeshBvhMeshInfo& mesh_info,
@@ -952,9 +983,13 @@ ROCKETGPU_HD float CarWorldTriangleBoxAxisGap(
     return Max(Min(pa, Min(pb, pc)) - (c + half_extent_bt), (c - half_extent_bt) - Max(pa, Max(pb, pc)));
 }
 
-#if !defined(ROCKETGPU_USE_CUDA)
+#if defined(ROCKETGPU_USE_CUDA)
+ROCKETGPU_HD bool CarWorldTriangleEdgeAxesSeparated(const ArenaMeshTriangle& tri, const CarWorldMeshQueryFrame& f,
+                                                    float reject_bt) {
+#else
 inline bool CarWorldTriangleEdgeAxesSeparated(const ArenaMeshTriangle& tri, const CarWorldMeshQueryFrame& f,
                                               float reject_bt) {
+#endif
     const Vec3 e[3] = {tri.b - tri.a, tri.c - tri.b, tri.a - tri.c};
     const Vec3 ax[3] = {f.axis_x, f.axis_y, f.axis_z};
     const Vec3& h = f.box_half_extent_with_margin_bt;
@@ -975,11 +1010,16 @@ inline bool CarWorldTriangleEdgeAxesSeparated(const ArenaMeshTriangle& tri, cons
     }
     return false;
 }
-#endif
 
+#if !defined(ROCKETGPU_USE_CUDA)
+ROCKETGPU_HD int CarWorldTriangleQueryTest(
+    const ArenaMeshTriangle& tri, const CarWorldMeshQueryFrame& f, float contact_threshold_bt,
+    const ArenaMeshTriangle* local_tri = nullptr, const float* unit_normal = nullptr) {
+#else
 ROCKETGPU_HD int CarWorldTriangleQueryTest(
     const ArenaMeshTriangle& tri, const CarWorldMeshQueryFrame& f, float contact_threshold_bt,
     const ArenaMeshTriangle* local_tri = nullptr) {
+#endif
     if (local_tri != nullptr && local_tri->cal_origin_sign != 0) {
         const float center_y = f.box_center_bt.y - static_cast<float>(local_tri->cal_origin_sign) * kGoalMeshOriginYBt;
         const Vec3 local_min(f.aabb_min_bt.x, center_y - f.extent_bt.y, f.aabb_min_bt.z);
@@ -990,13 +1030,22 @@ ROCKETGPU_HD int CarWorldTriangleQueryTest(
     } else if (!CarWorldTriangleAgainstAabbBullet(tri, f.aabb_min_bt, f.aabb_max_bt)) {
         return 0;
     }
+#if !defined(ROCKETGPU_USE_CUDA)
+    const Vec3 triangle_normal_world = unit_normal != nullptr ? Vec3(unit_normal[0], unit_normal[1], unit_normal[2])
+                                                              : Normalize(tri.normal, Vec3(0.0f, 0.0f, 1.0f));
+#else
     const Vec3 triangle_normal_world = Normalize(tri.normal, Vec3(0.0f, 0.0f, 1.0f));
+#endif
     const float center_proj = Dot(triangle_normal_world, f.box_center_bt);
     const float support_extent =
         Abs(Dot(triangle_normal_world, f.axis_x)) * f.box_half_extent_with_margin_bt.x +
         Abs(Dot(triangle_normal_world, f.axis_y)) * f.box_half_extent_with_margin_bt.y +
         Abs(Dot(triangle_normal_world, f.axis_z)) * f.box_half_extent_with_margin_bt.z;
+#if !defined(ROCKETGPU_USE_CUDA)
+    const float tri_proj = unit_normal != nullptr ? unit_normal[3] : Dot(triangle_normal_world, tri.a);
+#else
     const float tri_proj = Dot(triangle_normal_world, tri.a);
+#endif
     const float separation_along_normal = tri_proj - (center_proj + support_extent);
     const float separation_against_normal = (center_proj - support_extent) - tri_proj;
     if (separation_along_normal > contact_threshold_bt ||
@@ -1010,11 +1059,9 @@ ROCKETGPU_HD int CarWorldTriangleQueryTest(
         CarWorldTriangleBoxAxisGap(tri, f.axis_z, f.box_center_bt, f.box_half_extent_with_margin_bt.z) > box_axis_reject_bt) {
         return 1;
     }
-#if !defined(ROCKETGPU_USE_CUDA)
     if (CarWorldTriangleEdgeAxesSeparated(tri, f, box_axis_reject_bt)) {
         return 1;
     }
-#endif
     return 2;
 }
 
@@ -1080,6 +1127,7 @@ ROCKETGPU_HD uint32_t CarWorldMeshReachMask(
 #endif
         mask |= static_cast<uint32_t>(in) << m;
     };
+#if defined(ROCKETGPU_USE_CUDA) || defined(__CUDACC__)
     if (mesh_count <= 16) {
 #pragma unroll
         for (int m = 0; m < 16; ++m) {
@@ -1088,6 +1136,9 @@ ROCKETGPU_HD uint32_t CarWorldMeshReachMask(
             }
         }
     } else {
+#else
+    {
+#endif
         for (int m = 0; m < mesh_count && m < 32; ++m) {
             test(m);
         }
@@ -1252,7 +1303,7 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
     int triangle_pairs_pass = kTrianglePairsNone,
     CarWorldMeshRetainedManifold* retained_mesh_manifolds = nullptr,
     uint32_t mesh_reach_hint = 0u,
-    const Vec3* predict_vel = nullptr,
+    const Vec3* predict_vel_bt = nullptr,
     const Vec3* predict_ang_vel = nullptr,
     const BulletBroadphaseProxy* fresh_car_proxy = nullptr,
     const CarShapeCacheEntry* shape = nullptr,
@@ -1314,6 +1365,33 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
         if (have_bvh_traversal && stage_out == nullptr && mesh_visit_mask == 0u) {
             return;
         }
+#if !defined(ROCKETGPU_USE_CUDA)
+        if (list_manifolds != nullptr && stage_in == nullptr && stage_out == nullptr &&
+            triangle_pairs_pass == kTrianglePairsNone && have_bvh_traversal && retained_mesh_manifolds != nullptr &&
+            local_world_order_groups && local_world_order_group_count != nullptr && leaf_grid != nullptr &&
+            leaf_grid->host_tables != nullptr && leaf_grid->host_tables->clearance.lb != nullptr &&
+            leaf_grid->host_tables->clearance.mesh == mesh_triangles) {
+            bool retained_points = false;
+            for (int k = 0; k < kCarWorldMeshRetainedManifoldsPerCar; ++k) {
+                retained_points |= retained_mesh_manifolds[k].count > 0;
+            }
+            if (!retained_points &&
+                CarWorldBoxClearOfMeshes(leaf_grid->host_tables->clearance, query_frame, contact_threshold_bt)) {
+                for (uint32_t rest = mesh_visit_mask; rest != 0u; rest &= rest - 1u) {
+                    const int m = CountTrailingZeros32(rest);
+                    if (m >= mesh_bvh_mesh_count ||
+                        !CarWorldMeshInfoUsable(mesh_bvh_meshes[m], mesh_bvh_quantization_count, mesh_bvh_node_count)) {
+                        continue;
+                    }
+                    AppendSharedContactOrderGroup(local_world_order_groups, *local_world_order_group_count,
+                                                  SharedContactOrderBucket::World, car_idx, -1,
+                                                  100 + Max(mesh_bvh_meshes[m].mesh_index, 0), -1, 0, -1, 0,
+                                                  *local_world_order_group_count);
+                }
+                return;
+            }
+        }
+#endif
     } else {
         for (int m = 0; !any_mesh_in_reach && m < mesh_bvh_mesh_count; ++m) {
             any_mesh_in_reach = CarWorldMeshInReach(mesh_reach, mesh_bvh_meshes[m]);
@@ -1344,7 +1422,7 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
 #endif
             {
                 car_broadphase_proxy = ComputeBulletCarProxyAabb(
-                    car, cfg, broadphase_dt, *broadphase_grid, NativeSseMath(mutator), predict_vel, predict_ang_vel);
+                    car, cfg, broadphase_dt, *broadphase_grid, NativeSseMath(mutator), predict_vel_bt, predict_ang_vel);
             }
             car_broadphase_proxy_ready = true;
         }
@@ -1514,15 +1592,27 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
         }
     };
 
+#if !defined(ROCKETGPU_USE_CUDA)
+    const HostStepTables* const host_tables = leaf_grid != nullptr ? leaf_grid->host_tables : nullptr;
+    const float* const host_tri_normals =
+        host_tables != nullptr && host_tables->tri_normals_mesh == mesh_triangles ? host_tables->tri_normals : nullptr;
+#endif
     UninitArray<int32_t, kAllowTrianglePairsGather ? kCarWorldMeshGatherTriangles : 1> gathered_tris;
     int gathered_count = 0;
     auto consider_triangle = [&](int32_t tri_idx, MeshContactCandidate* candidates, int& candidate_count,
                                  const CarWorldTriangleHit* precomputed = nullptr) {
         const ArenaMeshTriangle& tri = mesh_triangles[tri_idx];
         if (precomputed == nullptr) {
+#if !defined(ROCKETGPU_USE_CUDA)
+            const int query_test = CarWorldTriangleQueryTest(
+                tri, query_frame, contact_threshold_bt,
+                mutator.cal_arena_local_tris != nullptr ? &mutator.cal_arena_local_tris[tri_idx] : nullptr,
+                host_tri_normals != nullptr ? host_tri_normals + 4 * static_cast<size_t>(tri_idx) : nullptr);
+#else
             const int query_test = CarWorldTriangleQueryTest(
                 tri, query_frame, contact_threshold_bt,
                 mutator.cal_arena_local_tris != nullptr ? &mutator.cal_arena_local_tris[tri_idx] : nullptr);
+#endif
             if (query_test == 0) {
                 return;
             }

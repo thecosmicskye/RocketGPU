@@ -200,7 +200,11 @@ std::vector<Arena::DevField> Arena::DevLayouts() {
     RG_DEV_F(WorldSolverScratch, predictive_hit_mask); RG_DEV_F(WorldSolverScratch, predictive_staged);
     RG_DEV_F(WorldSolverScratch, predictive_normal); RG_DEV_F(WorldSolverScratch, predictive_distance_bt);
     RG_DEV_F(WorldSolverScratch, ball_settled); RG_DEV_F(WorldSolverScratch, cal_start_vel);
-    RG_DEV_F(WorldSolverScratch, cal_ball_start_vel); RG_DEV_F(WorldSolverScratch, ball_predict_vel_bt); RG_DEV_F(WorldSolverScratch, car_predict_vel); RG_DEV_F(WorldSolverScratch, car_predict_ang_vel); RG_DEV_F(WorldSolverScratch, car_predict_valid);
+    RG_DEV_F(WorldSolverScratch, cal_ball_start_vel); RG_DEV_F(WorldSolverScratch, ball_predict_vel_bt);
+#if !defined(ROCKETGPU_USE_CUDA)
+    RG_DEV_F(WorldSolverScratch, car_predict_vel);
+#endif
+    RG_DEV_F(WorldSolverScratch, car_predict_ang_vel); RG_DEV_F(WorldSolverScratch, car_predict_valid);
     RG_DEV_F(WorldSolverScratch, w3_prefix_done); RG_DEV_F(WorldSolverScratch, pair_cache_cars);
 
     RG_DEV_S(BallMeshPersistentManifold);
@@ -361,6 +365,12 @@ void Arena::SetFullState(const std::map<std::string, std::vector<uint8_t>>& stat
             ++used;
         }
     }
+#if defined(ROCKETGPU_USE_CUDA)
+    if (state.count("solver_scratch.car_predict_vel") != 0 && !seen.count("solver_scratch.car_predict_vel")) {
+        seen["solver_scratch.car_predict_vel"] = true;
+        ++used;
+    }
+#endif
     if (used != state.size()) {
         for (const auto& kv : state) {
             if (!seen.count(kv.first)) throw std::invalid_argument("SetFullState: unknown field " + kv.first);

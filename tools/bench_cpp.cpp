@@ -81,6 +81,8 @@ struct Env {
     uint32_t age;
     int32_t cars;
     int8_t held[6];
+    uint64_t base;
+    uint32_t len, pos;
 };
 
 HD inline void DrawEnv(Env& v, int e, int n, const CarControls* table, CarControls* ctrl, bool fused) {
@@ -93,6 +95,14 @@ HD inline void DrawEnv(Env& v, int e, int n, const CarControls* table, CarContro
         for (int s = 0; s < kTickSkip; ++s) ctrl[((size_t)s * n + e) * 6 + i] = s >= onset ? table[row] : held;
         v.held[i] = (int8_t)row;
     }
+}
+
+HD inline void DrawReplay(Env& v, int e, int n, const CarControls* rows, const uint16_t* idx, CarControls* ctrl) {
+    for (int s = 0; s < kTickSkip; ++s) {
+        const uint16_t* t = idx + v.base + (size_t)((v.pos + s) % v.len) * v.cars;
+        for (int i = 0; i < v.cars; ++i) ctrl[((size_t)s * n + e) * 6 + i] = rows[t[i]];
+    }
+    v.pos = (v.pos + kTickSkip) % v.len;
 }
 
 HD inline void DoneEnv(Env& v, bool scored, EnvCommand& cmd) {
@@ -109,6 +119,11 @@ HD inline void DoneEnv(Env& v, bool scored, EnvCommand& cmd) {
 __global__ void DrawKernel(Env* envs, int n, const CarControls* table, CarControls* ctrl, bool fused) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e < n) DrawEnv(envs[e], e, n, table, ctrl, fused);
+}
+
+__global__ void ReplayKernel(Env* envs, int n, const CarControls* rows, const uint16_t* idx, CarControls* ctrl) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e < n) DrawReplay(envs[e], e, n, rows, idx, ctrl);
 }
 
 __global__ void DoneKernel(Env* envs, int n, const EnvState* es, EnvCommand* cmds, unsigned long long* goals) {
@@ -184,6 +199,48 @@ private:
     const std::function<void(int)>* fn_ = nullptr;
 };
 
+struct Replay {
+    std::vector<CarControls> rows;
+    std::vector<uint16_t> idx;
+    std::vector<std::pair<uint64_t, uint32_t>> matches[4];
+};
+
+Replay LoadReplay(const char* path) {
+    Replay r;
+    FILE* f = std::fopen(path, "rb");
+    auto u32 = [&] {
+        uint32_t x;
+        if (std::fread(&x, 4, 1, f) != 1) { std::fprintf(stderr, "%s: truncated\n", path); std::exit(1); }
+        return x;
+    };
+    if (!f || u32() != 0x43524752u || u32() != 1) { std::fprintf(stderr, "%s: not a replay file\n", path); std::exit(1); }
+    std::vector<float> v((size_t)u32() * 8);
+    if (std::fread(v.data(), 4, v.size(), f) != v.size()) std::exit(1);
+    for (size_t i = 0; i < v.size(); i += 8) {
+        CarControls c;
+        c.throttle = v[i]; c.steer = v[i + 1]; c.pitch = v[i + 2]; c.yaw = v[i + 3]; c.roll = v[i + 4];
+        c.jump = v[i + 5] != 0; c.boost = v[i + 6] != 0; c.handbrake = v[i + 7] != 0;
+        r.rows.push_back(c);
+    }
+    for (uint32_t m = u32(); m > 0; --m) {
+        const uint32_t k = u32(), ticks = u32();
+        if (k < 1 || k > 3) std::exit(1);
+        r.matches[k].push_back({r.idx.size(), ticks});
+        r.idx.resize(r.idx.size() + (size_t)ticks * 2 * k);
+        if (std::fread(r.idx.data() + r.matches[k].back().first, 2, (size_t)ticks * 2 * k, f) != (size_t)ticks * 2 * k) std::exit(1);
+    }
+    std::fclose(f);
+    for (int k = 1; k <= 3; ++k)
+        if (r.matches[k].empty()) { std::fprintf(stderr, "%s: no %dv%d matches\n", path, k, k); std::exit(1); }
+    return r;
+}
+
+const char* StrArg(int argc, char** argv, const char* name) {
+    for (int i = 1; i + 1 < argc; ++i)
+        if (!std::strcmp(argv[i], name)) return argv[i + 1];
+    return nullptr;
+}
+
 long Arg(int argc, char** argv, const char* name, long def) {
     for (int i = 1; i + 1 < argc; ++i)
         if (!std::strcmp(argv[i], name)) return std::atol(argv[i + 1]);
@@ -237,6 +294,8 @@ int main(int argc, char** argv) {
     const long target = Arg(argc, argv, "--target-arena-ticks", 40000000);
     const long max_steps = Arg(argc, argv, "--max-steps", 6000);
     const bool fused = Flag(argc, argv, "--fused"), stats = Flag(argc, argv, "--stats"), pin = Flag(argc, argv, "--pin");
+    const char* replay_path = StrArg(argc, argv, "--replay");
+    const Replay replay = replay_path ? LoadReplay(replay_path) : Replay{};
     const int steps = (int)std::clamp((target + (long)n * kTickSkip - 1) / ((long)n * kTickSkip), 8L, max_steps);
 
     const std::vector<CarControls> table = ActionTable();
@@ -266,6 +325,13 @@ int main(int argc, char** argv) {
         }
         v.age = v.rng.mod32(kEpisodeSteps);
         std::fill(v.held, v.held + 6, (int8_t)-1);
+        if (replay_path) {
+            const auto& ms = replay.matches[k];
+            const auto& m = ms[v.rng.mod32((uint32_t)ms.size())];
+            v.base = m.first;
+            v.len = m.second;
+            v.pos = v.rng.mod32(m.second);
+        }
     }
 
     SimConfig cfg;
@@ -301,11 +367,20 @@ int main(int argc, char** argv) {
     CK(cudaMemcpy(table_dev, table.data(), kActions * sizeof(CarControls), cudaMemcpyHostToDevice));
     CK(cudaMemset(ctrl, 0, ctrl_count * sizeof(CarControls)));
     CK(cudaMemset(goals_dev, 0, sizeof(unsigned long long)));
+    CarControls* rows_dev = nullptr;
+    uint16_t* idx_dev = nullptr;
+    if (replay_path) {
+        CK(cudaMalloc(&rows_dev, replay.rows.size() * sizeof(CarControls)));
+        CK(cudaMalloc(&idx_dev, replay.idx.size() * sizeof(uint16_t)));
+        CK(cudaMemcpy(rows_dev, replay.rows.data(), replay.rows.size() * sizeof(CarControls), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(idx_dev, replay.idx.data(), replay.idx.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
+    }
     const EnvState* es_dev = sim.device_view().env_states;
     const int blocks = (n + 127) / 128;
     double phase[3] = {};
     auto env_step = [&] {
-        DrawKernel<<<blocks, 128>>>(envs_dev, n, table_dev, ctrl, fused);
+        if (replay_path) ReplayKernel<<<blocks, 128>>>(envs_dev, n, rows_dev, idx_dev, ctrl);
+        else DrawKernel<<<blocks, 128>>>(envs_dev, n, table_dev, ctrl, fused);
         sim.step_with_device_controls(ctrl, kTickSkip, n * 6);
         DoneKernel<<<blocks, 128>>>(envs_dev, n, es_dev, cmds_dev, goals_dev);
         sim.apply_env_commands_device(cmds_dev, n);
@@ -320,7 +395,10 @@ int main(int argc, char** argv) {
     Pool pool(draw_threads);
     const int chunk = (n + draw_threads - 1) / draw_threads;
     const std::function<void(int)> draw = [&](int t) {
-        for (int e = t * chunk; e < std::min(n, (t + 1) * chunk); ++e) DrawEnv(envs[e], e, n, table.data(), ctrl.data(), fused);
+        for (int e = t * chunk; e < std::min(n, (t + 1) * chunk); ++e) {
+            if (replay_path) DrawReplay(envs[e], e, n, replay.rows.data(), replay.idx.data(), ctrl.data());
+            else DrawEnv(envs[e], e, n, table.data(), ctrl.data(), fused);
+        }
     };
     unsigned long long goals_host = 0;
     double phase[3] = {};
@@ -386,7 +464,7 @@ int main(int argc, char** argv) {
     sim.synchronize();
     const char* sim_threads = std::getenv("ROCKETGPU_CPU_THREADS");
     std::printf("arenas %d (1v1 %d, 2v2 %d, 3v3 %d), %s, draw threads %d, ROCKETGPU_CPU_THREADS %s, %d env steps x %d ticks "
-                "per repeat, warmup %d\n", n, mix[1], mix[2], mix[3], fused ? "fused" : "training", draw_threads,
+                "per repeat, warmup %d\n", n, mix[1], mix[2], mix[3], replay_path ? "replay" : fused ? "fused" : "training", draw_threads,
                 sim_threads ? sim_threads : "unset", steps, kTickSkip, warmup);
     if (stats) print_stats("before");
     std::vector<double> rates;
@@ -432,6 +510,8 @@ int main(int argc, char** argv) {
     cudaFree(ctrl);
     cudaFree(cmds_dev);
     cudaFree(goals_dev);
+    cudaFree(rows_dev);
+    cudaFree(idx_dev);
 #endif
     return 0;
 }
