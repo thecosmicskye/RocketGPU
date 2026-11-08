@@ -153,6 +153,14 @@ For RocketSim v3's own conventions, use `get_state_v3` / `set_state_v3` (C++ `Ca
 `Arena.get_full_state()` returns the whole simulation state, including contact manifolds and timers, as
 `{"array.field": bytes}`. `set_full_state` writes the fields it is given and keeps the rest.
 
+## Usage & Legal Notice
+RocketGPU does not contain any code from the Rocket League. This project is not affiliated with Epic Games or Psyonix.
+
+RocketGPU is intended to be used for creating machine learning environments, as well as other hobby projects (provided they don't violate Rocket League's terms of use/service). The use of RocketGPU to create and sell a playable Rocket League clone is heavily discouraged. Please do not do this!
+
+### To Epic Games & Psyonix
+If any of you have an issue with this project, let me know and we can resolve it! I will be happy to make changes if needed.
+
 ## License
 
 MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
@@ -160,4 +168,4 @@ MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 ## Credits
 
 Built on [RocketSim](https://github.com/ZealanL/RocketSim) by ZealanL. Thanks to [VirxEC](https://github.com/VirxEC) for
-guidance and accuracy suite.
+guidance.
