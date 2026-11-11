@@ -79,7 +79,7 @@ Without `--replay`, controls are random.
 
 ## Collision meshes
 
-Meshes are not included. Dump them from your own copy of Rocket League, then set:
+Meshes are not included. [Dump them](https://github.com/ZealanL/RLArenaCollisionDumper) from your own copy of Rocket League, then set:
 
 ```bash
 export ROCKETGPU_COLLISION_MESH_DIR=/path/to/collision_meshes
