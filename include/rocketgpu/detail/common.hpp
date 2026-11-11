@@ -19,6 +19,16 @@
 #define ROCKETGPU_DEVICE __device__ inline
 #define ROCKETGPU_GLOBAL __global__
 #define ROCKETGPU_FORCEINLINE __forceinline__
+#if defined(ROCKETGPU_CUDA_SPLIT_TU)
+#define ROCKETGPU_SPLIT_STATIC static
+#else
+#define ROCKETGPU_SPLIT_STATIC
+#endif
+#if defined(__CUDACC_RDC__)
+#define ROCKETGPU_DEVICE_GLOBAL extern __device__
+#else
+#define ROCKETGPU_DEVICE_GLOBAL ROCKETGPU_SPLIT_STATIC __device__
+#endif
 #else
 using cudaStream_t = void*;
 #define ROCKETGPU_HD inline
@@ -47,6 +57,14 @@ using cudaStream_t = void*;
 #else
 #define ROCKETGPU_HOST_NOINLINE
 #define ROCKETGPU_HOST_COLD
+#endif
+
+#if !defined(ROCKETGPU_USE_CUDA) && defined(__GNUC__)
+#define ROCKETGPU_HOST_LIKELY(x) __builtin_expect(!!(x), 1)
+#define ROCKETGPU_HOST_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define ROCKETGPU_HOST_LIKELY(x) (x)
+#define ROCKETGPU_HOST_UNLIKELY(x) (x)
 #endif
 
 #if defined(__CUDACC__)

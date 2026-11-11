@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rocketgpu/rocketgpu.h"
+#include "rocketgpu/detail/car_ref.hpp"
 
 constexpr unsigned int kRocketGpuUcrtSinfLimit = 0x4b800456u;
 constexpr unsigned int kRocketGpuUcrtCosfLimit = 0x4f490fdbu;
@@ -1257,7 +1258,7 @@ ROCKETGPU_HD bool IntegrateOrientationBasisColumns(
     return true;
 }
 
-ROCKETGPU_HD void IntegrateCarOrientation(CarState& car, const Vec3& ang_vel_world, float dt, bool native_sse_math = false,
+ROCKETGPU_HD void IntegrateCarOrientation(CarRefT car, const Vec3& ang_vel_world, float dt, bool native_sse_math = false,
                                           const Quat* basis_rot = nullptr) {
     if (!car.basis_authoritative) {
         IntegrateOrientation(car.rot, ang_vel_world, dt);
@@ -1272,7 +1273,7 @@ ROCKETGPU_HD void IntegrateCarOrientation(CarState& car, const Vec3& ang_vel_wor
         car.basis_forward, car.basis_right, car.basis_up, car.rot, ang_vel_world, dt, native_sse_math);
 }
 
-ROCKETGPU_HD void CarBasisColumns(const CarState& car, Vec3& fwd, Vec3& right, Vec3& up) {
+ROCKETGPU_HD void CarBasisColumns(CarCRefT car, Vec3& fwd, Vec3& right, Vec3& up) {
     if (car.basis_authoritative) {
         fwd = car.basis_forward;
         right = car.basis_right;
@@ -1282,7 +1283,7 @@ ROCKETGPU_HD void CarBasisColumns(const CarState& car, Vec3& fwd, Vec3& right, V
     GetBasisVectors(car.rot, fwd, right, up);
 }
 
-ROCKETGPU_HD Vec3 RotateCarBasis(const CarState& car, const Vec3& v) {
+ROCKETGPU_HD Vec3 RotateCarBasis(CarCRefT car, const Vec3& v) {
     if (!car.basis_authoritative) return Rotate(car.rot, v);
     return RotateViaBasis(car.basis_forward, car.basis_right, car.basis_up, v);
 }
@@ -1298,12 +1299,12 @@ ROCKETGPU_HD Vec3 BulletPlaneSpace1First(const Vec3& n) {
     const float k = 1.0f / SqrtScalar(a);
     return Vec3(-n.y * k, n.x * k, 0.0f);
 }
-ROCKETGPU_HD Vec3 InverseRotateCarBasis(const CarState& car, const Vec3& v) {
+ROCKETGPU_HD Vec3 InverseRotateCarBasis(CarCRefT car, const Vec3& v) {
     if (!car.basis_authoritative) return InverseRotate(car.rot, v);
     return Vec3(Dot(car.basis_forward, v), Dot(car.basis_right, v), Dot(car.basis_up, v));
 }
 
-ROCKETGPU_HD void CanonicalizeImportedCarOrientation(CarState& car) {
+ROCKETGPU_HD void CanonicalizeImportedCarOrientation(CarRefT car) {
     if (!car.basis_authoritative) {
         GetOfficialUploadBasisVectors(car.rot, car.basis_forward, car.basis_right, car.basis_up);
         car.basis_authoritative = 1;
@@ -1359,7 +1360,7 @@ ROCKETGPU_HD Quat Ue3QuatFromYawRotator(int yaw) {
 
 ROCKETGPU_HD int SpawnYawRotatorUnits(float yaw) { return static_cast<int>(yaw * (32768.0f / 3.14159274f) + 0.5f); }
 
-ROCKETGPU_HD void SeedCarBasisFromSpawnRotator(CarState& car, int blue_yaw, bool orange) {
+ROCKETGPU_HD void SeedCarBasisFromSpawnRotator(CarRefT car, int blue_yaw, bool orange) {
     Quat q = Ue3QuatFromYawRotator(blue_yaw);
     if (orange) {
         const Quat h = Ue3QuatFromYawRotator(32768);

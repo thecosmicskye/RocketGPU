@@ -19,7 +19,7 @@ ROCKETGPU_HD float BtSimdDot3LikeBullet(const ::rocketgpu::Vec3& a, const ::rock
 }
 
 struct ContactAccumulator {
-    CarState* history_car = nullptr;
+    CarPtrT history_car = nullptr;
     PhysicsEventStream event_stream = {};
     uint8_t surface = 0;
 #if defined(ROCKETGPU_USE_CUDA)
@@ -83,18 +83,18 @@ ROCKETGPU_HD void GetBallInertiaBasisColumns(const ::rocketgpu::BallState& ball,
 void ApplyImpulseAtPoint(::rocketgpu::BallState& ball, float mass, float radius, const ::rocketgpu::Vec3& impulse_world, const ::rocketgpu::Vec3& rel_point_world);
 ::rocketgpu::Vec3 SupportPointOnCarHitboxLocal(const ::rocketgpu::CarConfig& cfg, const ::rocketgpu::Vec3& dir_local);
 ::rocketgpu::Vec3 BulletBoxHalfExtentWithMarginBt(const ::rocketgpu::CarConfig& cfg);
-	::rocketgpu::Vec3 VelocityAtPoint(const ::rocketgpu::CarState& car, const ::rocketgpu::Vec3& rel_point_world);
-	::rocketgpu::Vec3 VelocityAtPoint(const ::rocketgpu::CarState& car, const ::rocketgpu::Vec3& rel_point_world, const ::rocketgpu::Vec3& external_linear_delta, const ::rocketgpu::Vec3& external_angular_delta);
-	::rocketgpu::Vec3 ApplyInverseBodyInertiaWorld(const ::rocketgpu::CarState& car, const ::rocketgpu::CarConfig& cfg, float mass, const ::rocketgpu::Vec3& torque_world);
-	::rocketgpu::Vec3 ApplyInverseBodyInertiaWorldBt(const ::rocketgpu::CarState& car, const ::rocketgpu::CarConfig& cfg, float mass, const ::rocketgpu::Vec3& torque_bt);
-	::rocketgpu::Vec3 ApplyCarWorldContactAngularComponent(const ::rocketgpu::CarState& car, const ::rocketgpu::CarConfig& cfg, float mass, const ::rocketgpu::Vec3& rel_contact, const ::rocketgpu::Vec3& normal);
-	::rocketgpu::Vec3 ApplyCarWorldContactAngularComponentBt(const ::rocketgpu::CarState& car, const ::rocketgpu::CarConfig& cfg, float mass, const ::rocketgpu::Vec3& rel_contact_bt, const ::rocketgpu::Vec3& normal);
-	::rocketgpu::Vec3 CarWorldContactAngularComponentBtNative(const ::rocketgpu::CarState& car, const ::rocketgpu::CarConfig& cfg, float mass, const ::rocketgpu::Vec3& rel_contact_bt, const ::rocketgpu::Vec3& normal);
-	void ApplyImpulseAtPoint(::rocketgpu::CarState& car, const ::rocketgpu::CarConfig& cfg, float mass, const ::rocketgpu::Vec3& impulse_world, const ::rocketgpu::Vec3& rel_point_world);
-::rocketgpu::Vec3 CarBodyLocalPointBt(const ::rocketgpu::CarState& car, const ::rocketgpu::Vec3& point_world_bt);
-::rocketgpu::Vec3 CarBodyWorldPointBt(const ::rocketgpu::CarState& car, const ::rocketgpu::Vec3& point_local_bt);
+	::rocketgpu::Vec3 VelocityAtPoint(CarCRefT car, const ::rocketgpu::Vec3& rel_point_world);
+	::rocketgpu::Vec3 VelocityAtPoint(CarCRefT car, const ::rocketgpu::Vec3& rel_point_world, const ::rocketgpu::Vec3& external_linear_delta, const ::rocketgpu::Vec3& external_angular_delta);
+	::rocketgpu::Vec3 ApplyInverseBodyInertiaWorld(CarCRefT car, const ::rocketgpu::CarConfig& cfg, float mass, const ::rocketgpu::Vec3& torque_world);
+	::rocketgpu::Vec3 ApplyInverseBodyInertiaWorldBt(CarCRefT car, const ::rocketgpu::CarConfig& cfg, float mass, const ::rocketgpu::Vec3& torque_bt);
+	::rocketgpu::Vec3 ApplyCarWorldContactAngularComponent(CarCRefT car, const ::rocketgpu::CarConfig& cfg, float mass, const ::rocketgpu::Vec3& rel_contact, const ::rocketgpu::Vec3& normal);
+	::rocketgpu::Vec3 ApplyCarWorldContactAngularComponentBt(CarCRefT car, const ::rocketgpu::CarConfig& cfg, float mass, const ::rocketgpu::Vec3& rel_contact_bt, const ::rocketgpu::Vec3& normal);
+	::rocketgpu::Vec3 CarWorldContactAngularComponentBtNative(CarCRefT car, const ::rocketgpu::CarConfig& cfg, float mass, const ::rocketgpu::Vec3& rel_contact_bt, const ::rocketgpu::Vec3& normal);
+	void ApplyImpulseAtPoint(CarRefT car, const ::rocketgpu::CarConfig& cfg, float mass, const ::rocketgpu::Vec3& impulse_world, const ::rocketgpu::Vec3& rel_point_world);
+::rocketgpu::Vec3 CarBodyLocalPointBt(CarCRefT car, const ::rocketgpu::Vec3& point_world_bt);
+::rocketgpu::Vec3 CarBodyWorldPointBt(CarCRefT car, const ::rocketgpu::Vec3& point_local_bt);
 bool ComputeCarArenaTriangleContact(
-    const ::rocketgpu::CarState& car,
+    CarCRefT car,
     const ::rocketgpu::CarConfig& cfg,
     const ArenaMeshTriangle& tri,
     ::rocketgpu::Vec3& out_normal,
@@ -105,7 +105,7 @@ bool ComputeCarArenaTriangleContact(
     ::rocketgpu::Vec3* io_cached_axis_bt = nullptr,
     float tri_origin_y_bt = 0.0f);
 struct SplitImpulseAccumulator;
-void IntegrateSplitImpulseTransformBt(::rocketgpu::CarState& car, const SplitImpulseAccumulator& split_bt, float dt, bool native_sse_math = false);
+void IntegrateSplitImpulseTransformBt(CarRefT car, const SplitImpulseAccumulator& split_bt, float dt, bool native_sse_math = false);
 
 struct SplitImpulseAccumulator {
     ::rocketgpu::Vec3 push_velocity = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
@@ -824,7 +824,7 @@ ROCKETGPU_HD void BulletSweepRemoveRoundBodies(BulletBroadphaseHistory& bp, int 
     }
 }
 
-ROCKETGPU_HD void BulletSweepNewRound(BulletBroadphaseHistory& bp, int car_count, const ::rocketgpu::CarState* cars) {
+ROCKETGPU_HD void BulletSweepNewRound(BulletBroadphaseHistory& bp, int car_count, CarCSpanT cars) {
     if (bp.sweep.sap_handle_count == 0) {
         return;
     }
@@ -876,24 +876,285 @@ struct CarCarPairCacheView {
     ROCKETGPU_HD int index(int a, int b) const { return a < cars && b < cars ? a * cars + b : -1; }
 };
 
+struct WheelRayStage {
+    ::rocketgpu::Vec3 contact_point_bt;
+    ::rocketgpu::Vec3 contact_normal_ws;
+    float wheel_trace_len_bt;
+    float suspension_len_bt;
+    float suspension_relative_velocity_bt;
+    float suspension_relative_velocity;
+    float clipped_inv_contact_dot_suspension;
+    float extra_pushback;
+    int32_t ground_car_idx;
+    int32_t ground_static_id;
+    uint8_t ground_kind;
+    uint8_t is_in_contact;
+    uint8_t is_in_contact_with_world;
+
+    uint8_t valid;
+};
+constexpr int kWheelRayStageSlots = 32;
+
+struct PreContactCar {
+    ::rocketgpu::Quat rot = ::rocketgpu::Quat(1.0f, 0.0f, 0.0f, 0.0f);
+    ::rocketgpu::Vec3 vel = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    ::rocketgpu::Vec3 vel_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    ::rocketgpu::Vec3 ang_vel = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    uint8_t is_demoed = 0;
+};
+
+struct WorldStepCarry {
+    int pair_split_row_count = 0;
+    int pair_velocity_row_count = 0;
+    int pair_friction_row_count = 0;
+    int split_row_count = 0;
+    int normal_row_count = 0;
+    int friction_row_count = 0;
+    int sorted_manifold_count = 0;
+    ::rocketgpu::Vec3 ball_solver_linear_velocity_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    bool ball_sleeping = false;
+    bool ball_vehicle_woke = false;
+    bool ball_awake_after_contact_rows = false;
+    bool ball_settled_skip = false;
+    bool ball_settled_verify = false;
+#if defined(ROCKETGPU_USE_CUDA)
+    uint16_t predictive_hit_mask = 0;
+#endif
+};
+
+#if defined(ROCKETGPU_USE_CUDA)
+ROCKETGPU_HD uint32_t CarryFloatBits(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    return u;
+}
+ROCKETGPU_HD float CarryBitsFloat(uint32_t u) {
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+ROCKETGPU_HD void StoreWorldStepCarry(uint4* words, int stride, const WorldStepCarry& c) {
+    words[0] = make_uint4(static_cast<uint32_t>(c.pair_split_row_count), static_cast<uint32_t>(c.pair_velocity_row_count),
+                          static_cast<uint32_t>(c.pair_friction_row_count), static_cast<uint32_t>(c.split_row_count));
+    const uint32_t flags = (c.ball_sleeping ? 1u : 0u) | (c.ball_vehicle_woke ? 2u : 0u) |
+                           (c.ball_awake_after_contact_rows ? 4u : 0u) | (c.ball_settled_skip ? 8u : 0u) |
+                           (c.ball_settled_verify ? 16u : 0u);
+    words[stride] = make_uint4(static_cast<uint32_t>(c.normal_row_count), static_cast<uint32_t>(c.friction_row_count),
+                               static_cast<uint32_t>(c.sorted_manifold_count), flags);
+    const ::rocketgpu::Vec3& v = c.ball_solver_linear_velocity_bt;
+    words[2 * stride] = make_uint4(CarryFloatBits(v.x), CarryFloatBits(v.y), CarryFloatBits(v.z), c.predictive_hit_mask);
+}
+ROCKETGPU_HD WorldStepCarry LoadWorldStepCarry(const uint4* words, int stride) {
+    const uint4 a = words[0], b = words[stride], v = words[2 * stride];
+    WorldStepCarry c;
+    c.pair_split_row_count = static_cast<int>(a.x);
+    c.pair_velocity_row_count = static_cast<int>(a.y);
+    c.pair_friction_row_count = static_cast<int>(a.z);
+    c.split_row_count = static_cast<int>(a.w);
+    c.normal_row_count = static_cast<int>(b.x);
+    c.friction_row_count = static_cast<int>(b.y);
+    c.sorted_manifold_count = static_cast<int>(b.z);
+    c.ball_sleeping = (b.w & 1u) != 0;
+    c.ball_vehicle_woke = (b.w & 2u) != 0;
+    c.ball_awake_after_contact_rows = (b.w & 4u) != 0;
+    c.ball_settled_skip = (b.w & 8u) != 0;
+    c.ball_settled_verify = (b.w & 16u) != 0;
+    c.ball_solver_linear_velocity_bt = ::rocketgpu::Vec3(CarryBitsFloat(v.x), CarryBitsFloat(v.y), CarryBitsFloat(v.z));
+    c.predictive_hit_mask = static_cast<uint16_t>(v.w);
+    return c;
+}
+#endif
+
+struct CarWorldRowsOut {
+    int split_row_count = 0;
+    int velocity_row_count = 0;
+    int friction_row_count = 0;
+    int group_count = 0;
+    uint8_t world_surface = 0;
+    SharedContactOrderGroup groups[kMaxCarWorldMeshesPerCar + 4] = {};
+};
+
+#if defined(ROCKETGPU_USE_CUDA)
+ROCKETGPU_HD uint64_t PackRowsOutCounts(int split, int velocity, int friction, int groups, uint8_t world_surface) {
+    return static_cast<uint64_t>(split & 0xff) | static_cast<uint64_t>(velocity & 0xff) << 8 |
+           static_cast<uint64_t>(friction & 0xff) << 16 | static_cast<uint64_t>(groups & 0xff) << 24 |
+           static_cast<uint64_t>(world_surface) << 32;
+}
+#endif
+
+struct TickCars {
+#if defined(ROCKETGPU_USE_CUDA)
+    static constexpr long long kPreContact = 0;
+    static constexpr long long kV = static_cast<long long>(sizeof(::rocketgpu::Vec3));
+    static constexpr long long kVec3 = kPreContact + static_cast<long long>(sizeof(PreContactCar));
+    static constexpr long long kHitRot = kVec3 + 6 * kV;
+    static constexpr long long kWheelRays = kHitRot + static_cast<long long>(sizeof(::rocketgpu::Quat));
+    static constexpr long long kPredictValid = kWheelRays + 4 * static_cast<long long>(sizeof(WheelRayStage));
+    static constexpr long long kRowsOut = kPredictValid + 1;
+    static constexpr long long kBytesPerCar = kRowsOut + static_cast<long long>(sizeof(uint64_t));
+    static constexpr long long kPlaneAlign = 32;
+    static_assert(alignof(PreContactCar) <= kPlaneAlign && alignof(WheelRayStage) <= kPlaneAlign, "plane alignment");
+
+    unsigned char* base = nullptr;
+    long long plane_cars = 0;
+    long long car_base = 0;
+
+    template <typename T>
+    ROCKETGPU_HD T* plane(long long offset, long long per_car = 1) const {
+        return reinterpret_cast<T*>(base + plane_cars * offset) + per_car * car_base;
+    }
+    ROCKETGPU_HD PreContactCar* pre_contact_cars() const { return plane<PreContactCar>(kPreContact); }
+    ROCKETGPU_HD ::rocketgpu::Vec3* deferred_linear_deltas() const { return plane<::rocketgpu::Vec3>(kVec3); }
+    ROCKETGPU_HD ::rocketgpu::Vec3* deferred_angular_deltas() const { return plane<::rocketgpu::Vec3>(kVec3 + 1 * kV); }
+    ROCKETGPU_HD ::rocketgpu::Vec3* cal_start_vel() const { return plane<::rocketgpu::Vec3>(kVec3 + 2 * kV); }
+    ROCKETGPU_HD ::rocketgpu::Vec3* hit_car_pos() const { return plane<::rocketgpu::Vec3>(kVec3 + 3 * kV); }
+    ROCKETGPU_HD ::rocketgpu::Vec3* car_predict_vel_bt() const { return plane<::rocketgpu::Vec3>(kVec3 + 4 * kV); }
+    ROCKETGPU_HD ::rocketgpu::Vec3* car_predict_ang_vel() const { return plane<::rocketgpu::Vec3>(kVec3 + 5 * kV); }
+    ROCKETGPU_HD ::rocketgpu::Quat* hit_car_rot() const { return plane<::rocketgpu::Quat>(kHitRot); }
+    ROCKETGPU_HD WheelRayStage* wheel_ray_stage() const { return plane<WheelRayStage>(kWheelRays, 4); }
+    ROCKETGPU_HD uint8_t* car_predict_valid() const { return plane<uint8_t>(kPredictValid); }
+    ROCKETGPU_HD uint64_t* rows_out_counts() const { return plane<uint64_t>(kRowsOut); }
+
+    ROCKETGPU_HD TickCars at(std::ptrdiff_t first_car) const {
+        TickCars t = *this;
+        if (base != nullptr) t.car_base += first_car;
+        return t;
+    }
+#else
+    PreContactCar* pre_contact_cars_ = nullptr;
+    ::rocketgpu::Vec3* deferred_linear_deltas_ = nullptr;
+    ::rocketgpu::Vec3* deferred_angular_deltas_ = nullptr;
+    ::rocketgpu::Vec3* cal_start_vel_ = nullptr;
+    ::rocketgpu::Vec3* hit_car_pos_ = nullptr;
+    ::rocketgpu::Quat* hit_car_rot_ = nullptr;
+    ::rocketgpu::Vec3* car_predict_vel_bt_ = nullptr;
+    ::rocketgpu::Vec3* car_predict_ang_vel_ = nullptr;
+    uint8_t* car_predict_valid_ = nullptr;
+    WheelRayStage* wheel_ray_stage_ = nullptr;
+
+    PreContactCar* pre_contact_cars() const { return pre_contact_cars_; }
+    ::rocketgpu::Vec3* deferred_linear_deltas() const { return deferred_linear_deltas_; }
+    ::rocketgpu::Vec3* deferred_angular_deltas() const { return deferred_angular_deltas_; }
+    ::rocketgpu::Vec3* cal_start_vel() const { return cal_start_vel_; }
+    ::rocketgpu::Vec3* hit_car_pos() const { return hit_car_pos_; }
+    ::rocketgpu::Quat* hit_car_rot() const { return hit_car_rot_; }
+    ::rocketgpu::Vec3* car_predict_vel_bt() const { return car_predict_vel_bt_; }
+    ::rocketgpu::Vec3* car_predict_ang_vel() const { return car_predict_ang_vel_; }
+    uint8_t* car_predict_valid() const { return car_predict_valid_; }
+    WheelRayStage* wheel_ray_stage() const { return wheel_ray_stage_; }
+
+    TickCars at(std::ptrdiff_t car_base) const {
+        TickCars t;
+        if (pre_contact_cars_ == nullptr) return t;
+        t.pre_contact_cars_ = pre_contact_cars_ + car_base;
+        t.deferred_linear_deltas_ = deferred_linear_deltas_ + car_base;
+        t.deferred_angular_deltas_ = deferred_angular_deltas_ + car_base;
+        t.cal_start_vel_ = cal_start_vel_ + car_base;
+        t.hit_car_pos_ = hit_car_pos_ + car_base;
+        t.hit_car_rot_ = hit_car_rot_ + car_base;
+        t.car_predict_vel_bt_ = car_predict_vel_bt_ + car_base;
+        t.car_predict_ang_vel_ = car_predict_ang_vel_ + car_base;
+        t.car_predict_valid_ = car_predict_valid_ + car_base;
+        t.wheel_ray_stage_ = wheel_ray_stage_ + 4 * car_base;
+        return t;
+    }
+#endif
+};
+
+struct WorldTickScratch {
+    static constexpr int kMaxHeatseekerWorldNormals = 16;
+    ::rocketgpu::Vec3 hs_world_normals[kMaxHeatseekerWorldNormals];
+    int hs_world_normal_count = 0;
+
+    bullet_port::btGjkEpaScratch car_triangle_gjk_epa_scratch = {};
+    bullet_port::btGjkEpaScratch ball_car_gjk_epa_scratch = {};
+
+    ::rocketgpu::Vec3 cal_ball_start_vel = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    ::rocketgpu::Vec3 hit_ball_pos = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    ::rocketgpu::Vec3 ball_predict_vel_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
+    uint16_t predictive_hit_mask = 0;
+    uint8_t predictive_staged = 0;
+    ::rocketgpu::Vec3 predictive_normal[9] = {};
+    float predictive_distance_bt[9] = {};
+
+    uint8_t w3_prefix_done = 0;
+    uint8_t w3_proxies_done = 0;
+    uint8_t w3_info_done = 0;
+    uint8_t w3_removed_count = 0;
+    uint32_t w3_removed[kMaxBulletManifoldEntries] = {};
+    BulletBroadphaseProxy w3_proxies[9];
+    uint8_t vehicle_apart_mask = 0;
+
+    int32_t bullet_manifold_count = 0;
+    int32_t shared_contact_order_group_count = 0;
+
+    alignas(16) uint8_t wheel_ray_ordered[kWheelRayStageSlots] = {};
+    WorldStepCarry world_step_carry = {};
+    CarWorldRowsOut car_world_rows_out[8] = {};
+    uint8_t vehicle_updates_independent = 0;
+};
+
 struct WorldSolverScratchRows {
-    EnvStridedArray<BallSplitContactRow> ball_split_rows;
-    EnvStridedArray<BallVelocityContactRow> ball_velocity_rows;
-    EnvStridedArray<BallFrictionContactRow> ball_friction_rows;
-    EnvStridedArray<CarSharedSplitContactRow> pair_split_rows;
-    EnvStridedArray<CarSharedSplitContactRow> world_split_rows;
-    EnvStridedArray<CarSharedVelocityContactRow> pair_velocity_rows;
-    EnvStridedArray<CarSharedFrictionContactRow> pair_friction_rows;
-    EnvStridedArray<CarSharedVelocityContactRow> world_velocity_rows;
-    EnvStridedArray<CarSharedFrictionContactRow> world_friction_rows;
-    EnvStridedArray<SharedContactOrderGroup> shared_contact_order_groups;
-    EnvStridedArray<BulletManifoldEntry> bullet_manifolds;
+#if defined(ROCKETGPU_USE_CUDA)
+    BallSplitContactRow* ball_split_rows_ = nullptr;
+    BallVelocityContactRow* ball_velocity_rows_ = nullptr;
+    BallFrictionContactRow* ball_friction_rows_ = nullptr;
+    CarSharedSplitContactRow* pair_split_rows_ = nullptr;
+    CarSharedSplitContactRow* world_split_rows_ = nullptr;
+    CarSharedVelocityContactRow* pair_velocity_rows_ = nullptr;
+    CarSharedFrictionContactRow* pair_friction_rows_ = nullptr;
+    CarSharedVelocityContactRow* world_velocity_rows_ = nullptr;
+    CarSharedFrictionContactRow* world_friction_rows_ = nullptr;
+    SharedContactOrderGroup* shared_contact_order_groups_ = nullptr;
+    BulletManifoldEntry* bullet_manifolds_ = nullptr;
+    int row_stride = 1;
+    ROCKETGPU_HD EnvStridedArray<BallSplitContactRow> ball_split_rows() const { return EnvStridedArray<BallSplitContactRow>(ball_split_rows_, row_stride); }
+    ROCKETGPU_HD EnvStridedArray<BallVelocityContactRow> ball_velocity_rows() const { return EnvStridedArray<BallVelocityContactRow>(ball_velocity_rows_, row_stride); }
+    ROCKETGPU_HD EnvStridedArray<BallFrictionContactRow> ball_friction_rows() const { return EnvStridedArray<BallFrictionContactRow>(ball_friction_rows_, row_stride); }
+    ROCKETGPU_HD EnvStridedArray<CarSharedSplitContactRow> pair_split_rows() const { return EnvStridedArray<CarSharedSplitContactRow>(pair_split_rows_, row_stride); }
+    ROCKETGPU_HD EnvStridedArray<CarSharedSplitContactRow> world_split_rows() const { return EnvStridedArray<CarSharedSplitContactRow>(world_split_rows_, row_stride); }
+    ROCKETGPU_HD EnvStridedArray<CarSharedVelocityContactRow> pair_velocity_rows() const { return EnvStridedArray<CarSharedVelocityContactRow>(pair_velocity_rows_, row_stride); }
+    ROCKETGPU_HD EnvStridedArray<CarSharedFrictionContactRow> pair_friction_rows() const { return EnvStridedArray<CarSharedFrictionContactRow>(pair_friction_rows_, row_stride); }
+    ROCKETGPU_HD EnvStridedArray<CarSharedVelocityContactRow> world_velocity_rows() const { return EnvStridedArray<CarSharedVelocityContactRow>(world_velocity_rows_, row_stride); }
+    ROCKETGPU_HD EnvStridedArray<CarSharedFrictionContactRow> world_friction_rows() const { return EnvStridedArray<CarSharedFrictionContactRow>(world_friction_rows_, row_stride); }
+    ROCKETGPU_HD EnvStridedArray<SharedContactOrderGroup> shared_contact_order_groups() const { return EnvStridedArray<SharedContactOrderGroup>(shared_contact_order_groups_, row_stride); }
+    ROCKETGPU_HD EnvStridedArray<BulletManifoldEntry> bullet_manifolds() const { return EnvStridedArray<BulletManifoldEntry>(bullet_manifolds_, row_stride); }
+#else
+    EnvStridedArray<BallSplitContactRow> ball_split_rows_;
+    EnvStridedArray<BallVelocityContactRow> ball_velocity_rows_;
+    EnvStridedArray<BallFrictionContactRow> ball_friction_rows_;
+    EnvStridedArray<CarSharedSplitContactRow> pair_split_rows_;
+    EnvStridedArray<CarSharedSplitContactRow> world_split_rows_;
+    EnvStridedArray<CarSharedVelocityContactRow> pair_velocity_rows_;
+    EnvStridedArray<CarSharedFrictionContactRow> pair_friction_rows_;
+    EnvStridedArray<CarSharedVelocityContactRow> world_velocity_rows_;
+    EnvStridedArray<CarSharedFrictionContactRow> world_friction_rows_;
+    EnvStridedArray<SharedContactOrderGroup> shared_contact_order_groups_;
+    EnvStridedArray<BulletManifoldEntry> bullet_manifolds_;
+    EnvStridedArray<BallSplitContactRow> ball_split_rows() const { return ball_split_rows_; }
+    EnvStridedArray<BallVelocityContactRow> ball_velocity_rows() const { return ball_velocity_rows_; }
+    EnvStridedArray<BallFrictionContactRow> ball_friction_rows() const { return ball_friction_rows_; }
+    EnvStridedArray<CarSharedSplitContactRow> pair_split_rows() const { return pair_split_rows_; }
+    EnvStridedArray<CarSharedSplitContactRow> world_split_rows() const { return world_split_rows_; }
+    EnvStridedArray<CarSharedVelocityContactRow> pair_velocity_rows() const { return pair_velocity_rows_; }
+    EnvStridedArray<CarSharedFrictionContactRow> pair_friction_rows() const { return pair_friction_rows_; }
+    EnvStridedArray<CarSharedVelocityContactRow> world_velocity_rows() const { return world_velocity_rows_; }
+    EnvStridedArray<CarSharedFrictionContactRow> world_friction_rows() const { return world_friction_rows_; }
+    EnvStridedArray<SharedContactOrderGroup> shared_contact_order_groups() const { return shared_contact_order_groups_; }
+    EnvStridedArray<BulletManifoldEntry> bullet_manifolds() const { return bullet_manifolds_; }
+#endif
     CarCarPairCacheView pair_contact_cache;
     CarWorldPlaneRetainedManifold* car_world_plane_manifolds = nullptr;
     CarWorldMeshRetainedManifold* car_world_mesh_manifolds = nullptr;
     CarCarRetainedManifold* car_car_retained_manifolds = nullptr;
     BallCarRetainedManifold* ball_car_retained_manifolds = nullptr;
     CarWorldLocalRows* car_world_local_rows = nullptr;
+    WorldTickScratch* tick = nullptr;
+    TickCars tick_cars;
+#if defined(ROCKETGPU_USE_CUDA)
+    uint4* carry_words = nullptr;
+    int carry_stride = 0;
+#endif
     int car_world_plane_count = 0;
     int car_world_mesh_count = 0;
     int car_car_retained_count = 0;
@@ -946,6 +1207,41 @@ ROCKETGPU_HD WorldSolverScratchRowCaps MakeWorldSolverScratchRowCaps(int max_car
     return caps;
 }
 
+enum TickRowArray : int {
+    kTickBallSplit, kTickBallVelocity, kTickBallFriction, kTickPairSplit, kTickWorldSplit, kTickPairVelocity,
+    kTickPairFriction, kTickWorldVelocity, kTickWorldFriction, kTickOrderGroups, kTickManifolds, kTickPairCache,
+    kTickCarWorldLocal, kTickRowArrays
+};
+constexpr int kRowGroups = 9;
+
+ROCKETGPU_HD int TickRowsPerEnv(const WorldSolverScratchRowCaps& c, int a) {
+    switch (a) {
+        case kTickBallSplit: return c.ball_split;
+        case kTickBallVelocity: return c.ball_velocity;
+        case kTickBallFriction: return c.ball_friction;
+        case kTickPairSplit: return c.pair_split;
+        case kTickWorldSplit: return c.world_split;
+        case kTickPairVelocity: return c.pair_velocity;
+        case kTickPairFriction: return c.pair_friction;
+        case kTickWorldVelocity: return c.world_velocity;
+        case kTickWorldFriction: return c.world_friction;
+        case kTickOrderGroups: return c.order_groups;
+        case kTickManifolds: return c.manifolds;
+        case kTickPairCache: return c.pair_cache_cars * c.pair_cache_cars;
+        default: return c.car_world_local;
+    }
+}
+
+struct WorldSolverRowGroup {
+    int32_t n = 0;
+    WorldSolverScratchRowCaps caps;
+    int64_t first[kTickRowArrays] = {};
+#if defined(ROCKETGPU_USE_CUDA)
+    void* base[kTickRowArrays] = {};
+    int32_t step_bytes[kTickRowArrays] = {};
+#endif
+};
+
 struct WorldSolverScratchRowPool {
     BallSplitContactRow* ball_split_rows = nullptr;
     BallVelocityContactRow* ball_velocity_rows = nullptr;
@@ -964,18 +1260,59 @@ struct WorldSolverScratchRowPool {
     CarCarRetainedManifold* car_car_retained_manifolds = nullptr;
     BallCarRetainedManifold* ball_car_retained_manifolds = nullptr;
     CarWorldLocalRows* car_world_local_rows = nullptr;
+    WorldTickScratch* tick_scratch = nullptr;
+    TickCars car_planes;
+#if defined(ROCKETGPU_USE_CUDA)
+    uint4* carry_words = nullptr;
+#endif
+    int cars_per_env = 0;
+#if !defined(ROCKETGPU_USE_CUDA)
+    std::ptrdiff_t car_tick_env_bytes = 0;
+#endif
+    const uint32_t* env_row_slot = nullptr;
+#if defined(ROCKETGPU_USE_CUDA)
+    WorldSolverRowGroup row_group_table[kRowGroups];
+    uint8_t has_row_groups = 0;
+    ROCKETGPU_HD const WorldSolverRowGroup* groups() const { return has_row_groups ? row_group_table : nullptr; }
+#else
+    const WorldSolverRowGroup* row_groups = nullptr;
+#endif
     int env_count = 0;
     uint8_t interleaved = 0;
     WorldSolverScratchRowCaps caps;
+#if defined(ROCKETGPU_USE_CUDA)
+    uint64_t* pad_work = nullptr;
+#endif
+
+#if defined(ROCKETGPU_USE_CUDA)
+    void* tick_array_at(int a, int64_t first) const {
+        const auto at = [first](auto* p) -> void* { return p == nullptr ? nullptr : p + first; };
+        switch (a) {
+            case kTickBallSplit: return at(ball_split_rows);
+            case kTickBallVelocity: return at(ball_velocity_rows);
+            case kTickBallFriction: return at(ball_friction_rows);
+            case kTickPairSplit: return at(pair_split_rows);
+            case kTickWorldSplit: return at(world_split_rows);
+            case kTickPairVelocity: return at(pair_velocity_rows);
+            case kTickPairFriction: return at(pair_friction_rows);
+            case kTickWorldVelocity: return at(world_velocity_rows);
+            case kTickWorldFriction: return at(world_friction_rows);
+            case kTickOrderGroups: return at(shared_contact_order_groups);
+            case kTickManifolds: return at(bullet_manifolds);
+            case kTickPairCache: return at(pair_contact_cache);
+            default: return at(car_world_local_rows);
+        }
+    }
+#endif
 
     template <typename T>
-    ROCKETGPU_HD EnvStridedArray<T> view_one(T* base, int max_rows, int env_idx) const {
+    ROCKETGPU_HD EnvStridedArray<T> view_one(T* base, int max_rows, int env_idx, int envs = -1) const {
         if (base == nullptr) {
             return EnvStridedArray<T>(nullptr);
         }
 #if defined(ROCKETGPU_USE_CUDA)
         if (interleaved) {
-            return EnvStridedArray<T>(base + env_idx, env_count);
+            return EnvStridedArray<T>(base + env_idx, envs < 0 ? env_count : envs);
         }
         return EnvStridedArray<T>(base + static_cast<std::ptrdiff_t>(env_idx) * max_rows, 1);
 #else
@@ -983,22 +1320,168 @@ struct WorldSolverScratchRowPool {
 #endif
     }
 
+    ROCKETGPU_HD WorldTickScratch* tick_at(int env_idx) const {
+        return tick_scratch == nullptr ? nullptr : tick_scratch + env_idx;
+    }
+
+    ROCKETGPU_HD TickCars tick_cars_at(int env_idx) const {
+#if defined(ROCKETGPU_USE_CUDA)
+        return car_planes.at(static_cast<std::ptrdiff_t>(env_idx) * cars_per_env);
+#else
+        TickCars t;
+        if (car_planes.pre_contact_cars_ == nullptr) return t;
+        const std::ptrdiff_t off = static_cast<std::ptrdiff_t>(env_idx) * car_tick_env_bytes;
+        const auto at = [off](auto* q) { return reinterpret_cast<decltype(q)>(reinterpret_cast<unsigned char*>(q) + off); };
+        t.pre_contact_cars_ = at(car_planes.pre_contact_cars_);
+        t.deferred_linear_deltas_ = at(car_planes.deferred_linear_deltas_);
+        t.deferred_angular_deltas_ = at(car_planes.deferred_angular_deltas_);
+        t.cal_start_vel_ = at(car_planes.cal_start_vel_);
+        t.hit_car_pos_ = at(car_planes.hit_car_pos_);
+        t.hit_car_rot_ = at(car_planes.hit_car_rot_);
+        t.car_predict_vel_bt_ = at(car_planes.car_predict_vel_bt_);
+        t.car_predict_ang_vel_ = at(car_planes.car_predict_ang_vel_);
+        t.car_predict_valid_ = at(car_planes.car_predict_valid_);
+        t.wheel_ray_stage_ = at(car_planes.wheel_ray_stage_);
+        return t;
+#endif
+    }
+
+    ROCKETGPU_HD WorldSolverScratchRowCaps env_caps(int env_idx) const {
+#if defined(ROCKETGPU_USE_CUDA)
+        const WorldSolverRowGroup* const row_groups = groups();
+#endif
+        WorldSolverScratchRowCaps c = caps;
+        if (row_groups != nullptr) {
+            const WorldSolverScratchRowCaps& t = row_groups[env_row_slot[env_idx] >> 24].caps;
+            c.ball_split = t.ball_split;
+            c.ball_velocity = t.ball_velocity;
+            c.ball_friction = t.ball_friction;
+            c.pair_split = t.pair_split;
+            c.world_split = t.world_split;
+            c.pair_velocity = t.pair_velocity;
+            c.pair_friction = t.pair_friction;
+            c.world_velocity = t.world_velocity;
+            c.world_friction = t.world_friction;
+            c.order_groups = t.order_groups;
+            c.manifolds = t.manifolds;
+            c.pair_cache_cars = t.pair_cache_cars;
+            c.car_world_local = t.car_world_local;
+        }
+        return c;
+    }
+
     ROCKETGPU_HD WorldSolverScratchRows view(int env_idx) const {
+#if defined(ROCKETGPU_USE_CUDA)
+        const WorldSolverRowGroup* const row_groups = groups();
+#endif
         WorldSolverScratchRows rows;
-        rows.ball_split_rows = view_one(ball_split_rows, caps.ball_split, env_idx);
-        rows.ball_velocity_rows = view_one(ball_velocity_rows, caps.ball_velocity, env_idx);
-        rows.ball_friction_rows = view_one(ball_friction_rows, caps.ball_friction, env_idx);
-        rows.pair_split_rows = view_one(pair_split_rows, caps.pair_split, env_idx);
-        rows.world_split_rows = view_one(world_split_rows, caps.world_split, env_idx);
-        rows.pair_velocity_rows = view_one(pair_velocity_rows, caps.pair_velocity, env_idx);
-        rows.pair_friction_rows = view_one(pair_friction_rows, caps.pair_friction, env_idx);
-        rows.world_velocity_rows = view_one(world_velocity_rows, caps.world_velocity, env_idx);
-        rows.world_friction_rows = view_one(world_friction_rows, caps.world_friction, env_idx);
-        rows.shared_contact_order_groups = view_one(shared_contact_order_groups, caps.order_groups, env_idx);
-        rows.bullet_manifolds = view_one(bullet_manifolds, caps.manifolds, env_idx);
+        rows.tick = tick_at(env_idx);
+        rows.tick_cars = tick_cars_at(env_idx);
+#if defined(ROCKETGPU_USE_CUDA)
+        rows.carry_words = carry_words == nullptr ? nullptr : carry_words + env_idx;
+        rows.carry_stride = env_count;
+#if defined(__CUDA_ARCH__)
+        (void)row_groups;
+        {
+#else
+        if (row_groups != nullptr) {
+#endif
+            const uint32_t slot = env_row_slot[env_idx];
+            const int k = static_cast<int>(slot >> 24);
+            const int i = static_cast<int>(slot & 0xFFFFFFu);
+            const WorldSolverRowGroup& g = row_group_table[k];
+            const auto at = [&](auto* base, int a) {
+                using T = typename std::remove_pointer<decltype(base)>::type;
+                return reinterpret_cast<T*>(static_cast<char*>(g.base[a]) + static_cast<std::ptrdiff_t>(i) * g.step_bytes[a]);
+            };
+            rows.row_stride = interleaved ? g.n : 1;
+            rows.ball_split_rows_ = at(ball_split_rows, kTickBallSplit);
+            rows.ball_velocity_rows_ = at(ball_velocity_rows, kTickBallVelocity);
+            rows.ball_friction_rows_ = at(ball_friction_rows, kTickBallFriction);
+            rows.pair_split_rows_ = at(pair_split_rows, kTickPairSplit);
+            rows.world_split_rows_ = at(world_split_rows, kTickWorldSplit);
+            rows.pair_velocity_rows_ = at(pair_velocity_rows, kTickPairVelocity);
+            rows.pair_friction_rows_ = at(pair_friction_rows, kTickPairFriction);
+            rows.world_velocity_rows_ = at(world_velocity_rows, kTickWorldVelocity);
+            rows.world_friction_rows_ = at(world_friction_rows, kTickWorldFriction);
+            rows.shared_contact_order_groups_ = at(shared_contact_order_groups, kTickOrderGroups);
+            rows.bullet_manifolds_ = at(bullet_manifolds, kTickManifolds);
+            rows.pair_contact_cache.slots =
+                EnvStridedArray<CarCarPairCachedContact>(at(pair_contact_cache, kTickPairCache), rows.row_stride);
+            rows.pair_contact_cache.cars = g.caps.pair_cache_cars;
+            rows.car_world_local_rows = at(car_world_local_rows, kTickCarWorldLocal);
+            const auto contiguous = [env_idx](auto* base, int per_env) {
+                return base == nullptr ? base : base + static_cast<std::ptrdiff_t>(env_idx) * per_env;
+            };
+            rows.car_world_plane_manifolds = contiguous(car_world_plane_manifolds, caps.car_world_plane);
+            rows.car_world_mesh_manifolds = contiguous(car_world_mesh_manifolds, caps.car_world_mesh);
+            rows.car_car_retained_manifolds = contiguous(car_car_retained_manifolds, caps.car_car_retained);
+            rows.ball_car_retained_manifolds = contiguous(ball_car_retained_manifolds, caps.ball_car_retained);
+            rows.car_world_plane_count = caps.car_world_plane;
+            rows.car_world_mesh_count = caps.car_world_mesh;
+            rows.car_car_retained_count = caps.car_car_retained;
+            rows.ball_car_retained_count = caps.ball_car_retained;
+            return rows;
+        }
+#endif
+        int i = env_idx;
+        int envs = env_count;
+#if defined(ROCKETGPU_USE_CUDA)
+        void* const* first = nullptr;
+#else
+        const int64_t* first = nullptr;
+#endif
+        const WorldSolverScratchRowCaps* tc = &caps;
+        if (row_groups != nullptr) {
+            const uint32_t slot = env_row_slot[env_idx];
+            const WorldSolverRowGroup& g = row_groups[slot >> 24];
+            i = static_cast<int>(slot & 0xFFFFFFu);
+            envs = g.n;
+#if defined(ROCKETGPU_USE_CUDA)
+            first = g.base;
+#else
+            first = g.first;
+#endif
+            tc = &g.caps;
+        }
+#if defined(ROCKETGPU_USE_CUDA)
+        const auto tick_view = [&](auto* base, int a, int rows_per_env) {
+            return view_one(first == nullptr ? base : static_cast<decltype(base)>(first[a]), rows_per_env, i, envs);
+        };
+        const auto tick_one = [&](auto* base, int a, int rows_per_env) { return tick_view(base, a, rows_per_env).base; };
+        rows.row_stride = interleaved ? envs : 1;
+#else
+        const auto tick_one = [&](auto* base, int a, int rows_per_env) {
+            return view_one(base == nullptr || first == nullptr ? base : base + first[a], rows_per_env, i, envs);
+        };
+#endif
+        rows.ball_split_rows_ = tick_one(ball_split_rows, kTickBallSplit, tc->ball_split);
+        rows.ball_velocity_rows_ = tick_one(ball_velocity_rows, kTickBallVelocity, tc->ball_velocity);
+        rows.ball_friction_rows_ = tick_one(ball_friction_rows, kTickBallFriction, tc->ball_friction);
+        rows.pair_split_rows_ = tick_one(pair_split_rows, kTickPairSplit, tc->pair_split);
+        rows.world_split_rows_ = tick_one(world_split_rows, kTickWorldSplit, tc->world_split);
+        rows.pair_velocity_rows_ = tick_one(pair_velocity_rows, kTickPairVelocity, tc->pair_velocity);
+        rows.pair_friction_rows_ = tick_one(pair_friction_rows, kTickPairFriction, tc->pair_friction);
+        rows.world_velocity_rows_ = tick_one(world_velocity_rows, kTickWorldVelocity, tc->world_velocity);
+        rows.world_friction_rows_ = tick_one(world_friction_rows, kTickWorldFriction, tc->world_friction);
+        rows.shared_contact_order_groups_ = tick_one(shared_contact_order_groups, kTickOrderGroups, tc->order_groups);
+        rows.bullet_manifolds_ = tick_one(bullet_manifolds, kTickManifolds, tc->manifolds);
+#if defined(ROCKETGPU_USE_CUDA)
         rows.pair_contact_cache.slots =
-            view_one(pair_contact_cache, caps.pair_cache_cars * caps.pair_cache_cars, env_idx);
-        rows.pair_contact_cache.cars = caps.pair_cache_cars;
+            tick_view(pair_contact_cache, kTickPairCache, tc->pair_cache_cars * tc->pair_cache_cars);
+#else
+        rows.pair_contact_cache.slots =
+            tick_one(pair_contact_cache, kTickPairCache, tc->pair_cache_cars * tc->pair_cache_cars);
+#endif
+        rows.pair_contact_cache.cars = tc->pair_cache_cars;
+#if defined(ROCKETGPU_USE_CUDA)
+        CarWorldLocalRows* const local =
+            first == nullptr ? car_world_local_rows : static_cast<CarWorldLocalRows*>(first[kTickCarWorldLocal]);
+#else
+        CarWorldLocalRows* const local = car_world_local_rows == nullptr || first == nullptr
+                                             ? car_world_local_rows : car_world_local_rows + first[kTickCarWorldLocal];
+#endif
+        rows.car_world_local_rows = local == nullptr ? nullptr : local + static_cast<std::ptrdiff_t>(i) * tc->car_world_local;
         const auto contiguous = [env_idx](auto* base, int per_env) {
             return base == nullptr ? base : base + static_cast<std::ptrdiff_t>(env_idx) * per_env;
         };
@@ -1006,7 +1489,6 @@ struct WorldSolverScratchRowPool {
         rows.car_world_mesh_manifolds = contiguous(car_world_mesh_manifolds, caps.car_world_mesh);
         rows.car_car_retained_manifolds = contiguous(car_car_retained_manifolds, caps.car_car_retained);
         rows.ball_car_retained_manifolds = contiguous(ball_car_retained_manifolds, caps.ball_car_retained);
-        rows.car_world_local_rows = contiguous(car_world_local_rows, caps.car_world_local);
         rows.car_world_plane_count = caps.car_world_plane;
         rows.car_world_mesh_count = caps.car_world_mesh;
         rows.car_car_retained_count = caps.car_car_retained;
@@ -1042,24 +1524,28 @@ ROCKETGPU_HD void ClearRetainedContactManifolds(const WorldSolverScratchRows& ro
     for (int i = 0; rows.ball_car_retained_manifolds && i < rows.ball_car_retained_count; ++i) rows.ball_car_retained_manifolds[i].count = 0;
 }
 
-ROCKETGPU_HD void ZeroWorldSolverScratchRows(const WorldSolverScratchRows& rows, const WorldSolverScratchRowCaps& caps) {
-    if (!rows.ball_split_rows) {
-        return;
-    }
-    for (int i = 0; i < caps.ball_split; ++i) rows.ball_split_rows[i] = BallSplitContactRow{};
-    for (int i = 0; i < caps.ball_velocity; ++i) rows.ball_velocity_rows[i] = BallVelocityContactRow{};
-    for (int i = 0; i < caps.ball_friction; ++i) rows.ball_friction_rows[i] = BallFrictionContactRow{};
-    for (int i = 0; i < caps.pair_split; ++i) rows.pair_split_rows[i] = CarSharedSplitContactRow{};
-    for (int i = 0; i < caps.world_split; ++i) rows.world_split_rows[i] = CarSharedSplitContactRow{};
-    for (int i = 0; i < caps.pair_velocity; ++i) rows.pair_velocity_rows[i] = CarSharedVelocityContactRow{};
-    for (int i = 0; i < caps.pair_friction; ++i) rows.pair_friction_rows[i] = CarSharedFrictionContactRow{};
-    for (int i = 0; i < caps.world_velocity; ++i) rows.world_velocity_rows[i] = CarSharedVelocityContactRow{};
-    for (int i = 0; i < caps.world_friction; ++i) rows.world_friction_rows[i] = CarSharedFrictionContactRow{};
-    for (int i = 0; i < caps.order_groups; ++i) rows.shared_contact_order_groups[i] = SharedContactOrderGroup{};
-    for (int i = 0; i < caps.manifolds; ++i) rows.bullet_manifolds[i] = BulletManifoldEntry{};
+ROCKETGPU_HD void ZeroTickRows(const WorldSolverScratchRows& rows, const WorldSolverScratchRowCaps& caps) {
+    for (int i = 0; i < caps.ball_split; ++i) rows.ball_split_rows()[i] = BallSplitContactRow{};
+    for (int i = 0; i < caps.ball_velocity; ++i) rows.ball_velocity_rows()[i] = BallVelocityContactRow{};
+    for (int i = 0; i < caps.ball_friction; ++i) rows.ball_friction_rows()[i] = BallFrictionContactRow{};
+    for (int i = 0; i < caps.pair_split; ++i) rows.pair_split_rows()[i] = CarSharedSplitContactRow{};
+    for (int i = 0; i < caps.world_split; ++i) rows.world_split_rows()[i] = CarSharedSplitContactRow{};
+    for (int i = 0; i < caps.pair_velocity; ++i) rows.pair_velocity_rows()[i] = CarSharedVelocityContactRow{};
+    for (int i = 0; i < caps.pair_friction; ++i) rows.pair_friction_rows()[i] = CarSharedFrictionContactRow{};
+    for (int i = 0; i < caps.world_velocity; ++i) rows.world_velocity_rows()[i] = CarSharedVelocityContactRow{};
+    for (int i = 0; i < caps.world_friction; ++i) rows.world_friction_rows()[i] = CarSharedFrictionContactRow{};
+    for (int i = 0; i < caps.order_groups; ++i) rows.shared_contact_order_groups()[i] = SharedContactOrderGroup{};
+    for (int i = 0; i < caps.manifolds; ++i) rows.bullet_manifolds()[i] = BulletManifoldEntry{};
     if (rows.pair_contact_cache) {
         for (int i = 0; i < rows.pair_contact_cache.size(); ++i) rows.pair_contact_cache.slots[i] = CarCarPairCachedContact{};
     }
+}
+
+ROCKETGPU_HD void ZeroWorldSolverScratchRows(const WorldSolverScratchRows& rows, const WorldSolverScratchRowCaps& caps) {
+    if (!rows.ball_split_rows()) {
+        return;
+    }
+    ZeroTickRows(rows, caps);
     for (int i = 0; rows.car_world_plane_manifolds && i < caps.car_world_plane; ++i) rows.car_world_plane_manifolds[i] = CarWorldPlaneRetainedManifold{};
     for (int i = 0; rows.car_world_mesh_manifolds && i < caps.car_world_mesh; ++i) rows.car_world_mesh_manifolds[i] = CarWorldMeshRetainedManifold{};
     for (int i = 0; rows.car_car_retained_manifolds && i < caps.car_car_retained; ++i) rows.car_car_retained_manifolds[i] = CarCarRetainedManifold{};
@@ -1179,58 +1665,6 @@ struct WorldSolverScratchRowPoolHost {
 };
 #endif
 
-struct WheelRayStage {
-    ::rocketgpu::Vec3 contact_point_bt;
-    ::rocketgpu::Vec3 contact_normal_ws;
-    float wheel_trace_len_bt;
-    float suspension_len_bt;
-    float suspension_relative_velocity_bt;
-    float suspension_relative_velocity;
-    float clipped_inv_contact_dot_suspension;
-    float extra_pushback;
-    int32_t ground_car_idx;
-    int32_t ground_static_id;
-    uint8_t ground_kind;
-    uint8_t is_in_contact;
-    uint8_t is_in_contact_with_world;
-
-    uint8_t valid;
-};
-constexpr int kWheelRayStageSlots = 32;
-
-struct PreContactCar {
-    ::rocketgpu::Quat rot = ::rocketgpu::Quat(1.0f, 0.0f, 0.0f, 0.0f);
-    ::rocketgpu::Vec3 vel = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-    ::rocketgpu::Vec3 vel_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-    ::rocketgpu::Vec3 ang_vel = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-    uint8_t is_demoed = 0;
-};
-
-struct WorldStepCarry {
-    int pair_split_row_count = 0;
-    int pair_velocity_row_count = 0;
-    int pair_friction_row_count = 0;
-    int split_row_count = 0;
-    int normal_row_count = 0;
-    int friction_row_count = 0;
-    int sorted_manifold_count = 0;
-    ::rocketgpu::Vec3 ball_solver_linear_velocity_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-    bool ball_sleeping = false;
-    bool ball_vehicle_woke = false;
-    bool ball_awake_after_contact_rows = false;
-    bool ball_settled_skip = false;
-    bool ball_settled_verify = false;
-};
-
-struct CarWorldRowsOut {
-    int split_row_count = 0;
-    int velocity_row_count = 0;
-    int friction_row_count = 0;
-    int group_count = 0;
-    uint8_t world_surface = 0;
-    SharedContactOrderGroup groups[kMaxCarWorldMeshesPerCar + 4] = {};
-};
-
 #if !defined(ROCKETGPU_USE_CUDA)
 struct BoostPadBudget {
     ::rocketgpu::Vec3 pos_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
@@ -1270,32 +1704,6 @@ struct CarShapeCacheEntry {
 };
 
 struct WorldSolverScratch {
-    static constexpr int kMaxHeatseekerWorldNormals = 16;
-    ::rocketgpu::Vec3 hs_world_normals[kMaxHeatseekerWorldNormals];
-    int hs_world_normal_count = 0;
-
-    bullet_port::btGjkEpaScratch car_triangle_gjk_epa_scratch = {};
-    bullet_port::btGjkEpaScratch ball_car_gjk_epa_scratch = {};
-    PreContactCar pre_contact_cars[8] = {};
-    ::rocketgpu::Vec3 deferred_linear_deltas[8] = {};
-    ::rocketgpu::Vec3 deferred_angular_deltas[8] = {};
-
-    ::rocketgpu::Vec3 cal_start_vel[8] = {};
-    ::rocketgpu::Vec3 cal_ball_start_vel = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-    ::rocketgpu::Vec3 hit_car_pos[8] = {};
-    ::rocketgpu::Quat hit_car_rot[8] = {};
-    ::rocketgpu::Vec3 hit_ball_pos = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-    ::rocketgpu::Vec3 ball_predict_vel_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-#if !defined(ROCKETGPU_USE_CUDA)
-    ::rocketgpu::Vec3 car_predict_vel[8] = {};
-#endif
-    ::rocketgpu::Vec3 car_predict_vel_bt[8] = {};
-    ::rocketgpu::Vec3 car_predict_ang_vel[8] = {};
-    uint8_t car_predict_valid[8] = {};
-    uint16_t predictive_hit_mask = 0;
-    uint8_t predictive_staged = 0;
-    ::rocketgpu::Vec3 predictive_normal[9] = {};
-    float predictive_distance_bt[9] = {};
     BallMeshPersistentManifold ball_world_mesh_manifolds[kMaxBallWorldMeshPersistentManifolds] = {};
     BallMeshPersistentManifold ball_world_plane_manifolds[kBallWorldPlaneSlots] = {};
     uint8_t ball_settled = 0;
@@ -1307,25 +1715,9 @@ struct WorldSolverScratch {
     ::rocketgpu::BallState ball_settled_state = {};
 
     BulletBroadphaseHistory bp;
-    uint8_t w3_prefix_done = 0;
-    uint8_t w3_proxies_done = 0;
-    uint8_t w3_info_done = 0;
-    uint8_t w3_removed_count = 0;
-    uint32_t w3_removed[kMaxBulletManifoldEntries] = {};
-    BulletBroadphaseProxy w3_proxies[9];
     uint8_t retained_reset_pending = 0;
     uint8_t car_world_reset[8] = {};
-    uint8_t vehicle_apart_mask = 0;
-
-    int32_t bullet_manifold_count = 0;
-    int32_t shared_contact_order_group_count = 0;
-
-    WheelRayStage wheel_ray_stage[kWheelRayStageSlots] = {};
-    alignas(16) uint8_t wheel_ray_ordered[kWheelRayStageSlots] = {};
-    WorldStepCarry world_step_carry = {};
-    CarWorldRowsOut car_world_rows_out[8] = {};
     uint8_t pair_cache_cars = 8;
-    uint8_t vehicle_updates_independent = 0;
     uint16_t ball_mesh_maybe_retained = 0xFFFFu;
     uint32_t pair_cache_maybe_valid = ~0u;
 #if !defined(ROCKETGPU_USE_CUDA)
@@ -1339,7 +1731,7 @@ struct WorldSolverScratch {
 };
 
 #if !defined(ROCKETGPU_USE_CUDA)
-inline const ::rocketgpu::Quat* CarRbSnapRaw(const WorldSolverScratch* s, int slot, const ::rocketgpu::CarState& car) {
+inline const ::rocketgpu::Quat* CarRbSnapRaw(const WorldSolverScratch* s, int slot, CarCRefT car) {
     static_assert(offsetof(::rocketgpu::CarState, basis_right) == offsetof(::rocketgpu::CarState, basis_forward) + 12 &&
                       offsetof(::rocketgpu::CarState, basis_up) == offsetof(::rocketgpu::CarState, basis_forward) + 24 &&
                       offsetof(CarRbSnapMemo, right) == offsetof(CarRbSnapMemo, fwd) + 12 &&
@@ -1414,24 +1806,24 @@ ROCKETGPU_HD void SetBallLinearVelocityBt(::rocketgpu::BallState& ball, const ::
     ball.vel = vel_bt * kUuPerBt;
 }
 
-ROCKETGPU_HD void SetCarOriginBt(::rocketgpu::CarState& car, const ::rocketgpu::Vec3& pos_bt) {
+ROCKETGPU_HD void SetCarOriginBt(CarRefT car, const ::rocketgpu::Vec3& pos_bt) {
     constexpr float kUuPerBt = 50.0f;
     car.pos_bt = pos_bt;
     car.pos = pos_bt * kUuPerBt;
 }
 
-ROCKETGPU_HD void SetCarOriginUu(::rocketgpu::CarState& car, const ::rocketgpu::Vec3& pos_uu) {
+ROCKETGPU_HD void SetCarOriginUu(CarRefT car, const ::rocketgpu::Vec3& pos_uu) {
     constexpr float kUuToBt = 1.0f / 50.0f;
     SetCarOriginBt(car, pos_uu * kUuToBt);
 }
 
-ROCKETGPU_HD void SetCarLinearVelocityBt(::rocketgpu::CarState& car, const ::rocketgpu::Vec3& vel_bt) {
+ROCKETGPU_HD void SetCarLinearVelocityBt(CarRefT car, const ::rocketgpu::Vec3& vel_bt) {
     constexpr float kUuPerBt = 50.0f;
     car.vel_bt = vel_bt;
     car.vel = vel_bt * kUuPerBt;
 }
 
-ROCKETGPU_HD void SetCarLinearVelocityUu(::rocketgpu::CarState& car, const ::rocketgpu::Vec3& vel_uu) {
+ROCKETGPU_HD void SetCarLinearVelocityUu(CarRefT car, const ::rocketgpu::Vec3& vel_uu) {
     constexpr float kUuToBt = 1.0f / 50.0f;
     car.vel = vel_uu;
     car.vel_bt = vel_uu * kUuToBt;
@@ -1460,7 +1852,7 @@ ROCKETGPU_HD int CarWorldPlaneSourceTag(const ::rocketgpu::Vec3& inward_normal, 
 }
 
 ROCKETGPU_HD ::rocketgpu::Vec3 VelocityAtPoint(
-    const ::rocketgpu::CarState& car,
+    CarCRefT car,
     const ::rocketgpu::Vec3& rel_point_world,
     const ::rocketgpu::Vec3& external_linear_delta,
     const ::rocketgpu::Vec3& external_angular_delta,
@@ -2432,7 +2824,7 @@ ROCKETGPU_HD void InitializeCarWorldSplitContactRow(
 }
 
 ROCKETGPU_HD void SolveCarWorldSplitContactRows(
-    ::rocketgpu::CarState& car,
+    CarRefT car,
     CarWorldSplitContactRow* rows,
     int row_count,
     float dt,
@@ -2678,7 +3070,7 @@ ROCKETGPU_HD void ApplySharedCarVelocityImpulse(
 
 ROCKETGPU_HD void WarmstartSharedCarVelocityRows(
     int count,
-    const ::rocketgpu::CarState* cars,
+    CarCSpanT cars,
     const ::rocketgpu::CarConfig* car_configs,
     BallVelocityAccumulator* car_accs,
     EnvStridedArray<CarSharedVelocityContactRow> rows,
@@ -2720,7 +3112,7 @@ ROCKETGPU_HD void WarmstartSharedCarVelocityRows(
 
 ROCKETGPU_HD bool SolveSharedCarVelocityNormalRow(
     int count,
-    ::rocketgpu::CarState* cars,
+    CarSpanT cars,
     const ::rocketgpu::CarConfig* car_configs,
     CarSharedVelocityContactRow& row,
     BallVelocityAccumulator* car_accs,
@@ -2810,7 +3202,7 @@ ROCKETGPU_HD bool SolveSharedCarVelocityNormalRow(
 
 ROCKETGPU_HD bool SolveSharedCarVelocityFrictionRow(
     int count,
-    const ::rocketgpu::CarState* cars,
+    CarCSpanT cars,
     const ::rocketgpu::CarConfig* car_configs,
     EnvStridedArray<const CarSharedVelocityContactRow> normal_rows,
     int normal_row_count,
@@ -3052,7 +3444,7 @@ ROCKETGPU_HD void MarkBtSplitAccumulators(
 
 ROCKETGPU_HD bool SolveSharedCarSplitRow(
     int count,
-    ::rocketgpu::CarState* cars,
+    CarSpanT cars,
     CarSharedSplitContactRow& row,
     int iter,
     int row_idx,
@@ -3238,6 +3630,7 @@ ROCKETGPU_HD ArenaBroadphaseGrid MakeArenaBroadphaseGrid(const ::rocketgpu::SimC
     grid.leaf_grid.ray_infos = cfg.arena_mesh_ray_grid_infos;
     grid.leaf_grid.ray_cell_start = cfg.arena_mesh_ray_cell_start;
     grid.leaf_grid.ray_entries = cfg.arena_mesh_ray_entries;
+    grid.leaf_grid.clearance = cfg.arena_mesh_clearance;
 #endif
     grid.sweep_statics = cfg.arena_sweep_statics;
     return grid;
@@ -3302,7 +3695,7 @@ ROCKETGPU_HD bool BulletAabbOverlap(
 }
 
 ROCKETGPU_HD BulletBroadphaseProxy ComputeBulletCarProxyAabb(
-    const ::rocketgpu::CarState& car,
+    CarCRefT car,
     const ::rocketgpu::CarConfig& cfg,
     float dt,
     const ArenaBroadphaseGrid& grid,
@@ -3434,21 +3827,23 @@ ROCKETGPU_HD bool BulletCarMeshManifoldExists(
 ROCKETGPU_HD ROCKETGPU_HOST_INLINE void ComputeBulletBodyProxy(
     int body,
     const ::rocketgpu::BallState& ball,
-    const ::rocketgpu::CarState* cars,
-    const PreContactCar* pre_contact_cars,
+    CarCSpanT cars,
+    const TickCars& tcars,
     const ::rocketgpu::CarConfig* car_configs,
     float ball_radius,
     float dt,
     const WorldSolverScratch* bp_history,
+    const WorldTickScratch* tick,
     bool native_sse_math,
     BulletBroadphaseProxy& proxy,
     const CarShapeCacheEntry* car_shapes = nullptr) {
+    const PreContactCar* const pre_contact_cars = tcars.pre_contact_cars();
     constexpr float kUUToBT = 1.0f / 50.0f;
     constexpr float kContactThresholdBt = 0.02f;
     constexpr float kSphereAabbExtraBt = 0.08f;
     if (body == 0) {
         const ::rocketgpu::Vec3 pos_bt = ball.pos_bt;
-        const ::rocketgpu::Vec3 predict_vel_bt = bp_history != nullptr ? bp_history->ball_predict_vel_bt : ball.vel_bt;
+        const ::rocketgpu::Vec3 predict_vel_bt = tick != nullptr ? tick->ball_predict_vel_bt : ball.vel_bt;
         const ::rocketgpu::Vec3 predicted_bt = pos_bt + predict_vel_bt * dt;
         const float extent = ball_radius * kUUToBT + kSphereAabbExtraBt;
         const float proxy_extent = (ball_radius * kUUToBT + 0.5f * kSphereAabbExtraBt) + 0.5f * kSphereAabbExtraBt;
@@ -3470,7 +3865,7 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE void ComputeBulletBodyProxy(
     }
     const int car_idx = body - 1;
 
-    const ::rocketgpu::CarState& car = cars[car_idx];
+    CarCRefT car = cars[car_idx];
     const bool demoed_before_contacts =
         pre_contact_cars != nullptr ? pre_contact_cars[car_idx].is_demoed != 0 : car.is_demoed != 0;
     if (demoed_before_contacts) {
@@ -3482,9 +3877,9 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE void ComputeBulletBodyProxy(
         car_shapes != nullptr ? car_shapes[car_idx].half_extent_bt : BulletBoxHalfExtentWithMarginBt(cfg);
     const ::rocketgpu::Vec3 child_origin_bt = cfg.hitbox_offset * kUUToBT;
 
-    const bool predict_snap = bp_history != nullptr && car_idx < 8 && bp_history->car_predict_valid[car_idx] != 0;
-    const ::rocketgpu::Vec3 predict_vel_bt = predict_snap ? bp_history->car_predict_vel_bt[car_idx] : car.vel_bt;
-    const ::rocketgpu::Vec3 predict_ang_vel = predict_snap ? bp_history->car_predict_ang_vel[car_idx] : car.ang_vel;
+    const bool predict_snap = tick != nullptr && car_idx < 8 && tcars.car_predict_valid()[car_idx] != 0;
+    const ::rocketgpu::Vec3 predict_vel_bt = predict_snap ? tcars.car_predict_vel_bt()[car_idx] : car.vel_bt;
+    const ::rocketgpu::Vec3 predict_ang_vel = predict_snap ? tcars.car_predict_ang_vel()[car_idx] : car.ang_vel;
     ::rocketgpu::Vec3 axis_x(1.0f, 0.0f, 0.0f);
     ::rocketgpu::Vec3 axis_y(0.0f, 1.0f, 0.0f);
     ::rocketgpu::Vec3 axis_z(0.0f, 0.0f, 1.0f);
@@ -3630,7 +4025,8 @@ ROCKETGPU_HD ROCKETGPU_HOST_INLINE void ComputeBulletBodyProxy(
 }
 
 ROCKETGPU_HD void BulletSweepAddStatics(BulletSweepHistory& h, bool arena_static, bool goal_floors,
-                                       const ArenaMeshBvhMeshInfo* mesh_infos, int mesh_info_count) {
+                                       const ArenaMeshBvhMeshInfo* mesh_infos, int mesh_info_count,
+                                       bool planes = true) {
     h.sap_next_fresh = 1;
     h.sap_free_count = 0;
     for (int axis = 0; axis < 3; ++axis) {
@@ -3679,7 +4075,7 @@ ROCKETGPU_HD void BulletSweepAddStatics(BulletSweepHistory& h, bool arena_static
             sort_down(axis, h.sap_max_edge[handle][axis], true);
         }
     };
-    for (int k = goal_floors ? 0 : 2; arena_static && k < 6; ++k) {
+    for (int k = goal_floors ? 0 : 2; arena_static && planes && k < 6; ++k) {
         const int plane_rank = k < 2 ? 4 + k : k - 2;
         ::rocketgpu::Vec3 shape_min(0.0f, 0.0f, 0.0f), shape_max(0.0f, 0.0f, 0.0f);
         BulletStaticPlaneShapeAabb(plane_rank, shape_min, shape_max);
@@ -3757,8 +4153,8 @@ template <int kPhase = 0>
 ROCKETGPU_HD int BuildBulletManifoldList(
     const ::rocketgpu::BallState& ball,
     int car_count,
-    const ::rocketgpu::CarState* cars,
-    const PreContactCar* pre_contact_cars,
+    CarCSpanT cars,
+    const TickCars& tcars,
     const ::rocketgpu::CarConfig* car_configs,
     float ball_radius,
     float dt,
@@ -3769,6 +4165,7 @@ ROCKETGPU_HD int BuildBulletManifoldList(
     int max_entries,
     bool arena_static = true,
     WorldSolverScratch* bp_history = nullptr,
+    WorldTickScratch* tick = nullptr,
     bool native_sse_math = false,
     int8_t* body_islands = nullptr,
     bool proxies_ready = false,
@@ -3776,21 +4173,21 @@ ROCKETGPU_HD int BuildBulletManifoldList(
     bool ball_static_pairs_skipped = false,
     const CarShapeCacheEntry* car_shapes = nullptr) {
     if (!out_entries || max_entries <= 0 || !grid.valid() || !mesh_infos || mesh_info_count <= 0 ||
-        bp_history == nullptr) {
+        bp_history == nullptr || tick == nullptr) {
         return 0;
     }
 
     constexpr int kMaxBodies = 9;
-    BulletBroadphaseProxy* const proxies = bp_history->w3_proxies;
+    BulletBroadphaseProxy* const proxies = tick->w3_proxies;
 
     if constexpr (kPhase != 2) {
         if (!proxies_ready) {
-            ComputeBulletBodyProxy(0, ball, cars, pre_contact_cars, car_configs, ball_radius, dt, bp_history, native_sse_math,
+            ComputeBulletBodyProxy(0, ball, cars, tcars, car_configs, ball_radius, dt, bp_history, tick, native_sse_math,
                                    proxies[0]);
 #pragma unroll 1
             for (int car_idx = 0; car_idx < car_count && car_idx < kMaxBodies - 1; ++car_idx) {
-                ComputeBulletBodyProxy(car_idx + 1, ball, cars, pre_contact_cars, car_configs, ball_radius, dt, bp_history,
-                                       native_sse_math, proxies[car_idx + 1], car_shapes);
+                ComputeBulletBodyProxy(car_idx + 1, ball, cars, tcars, car_configs, ball_radius, dt, bp_history,
+                                       tick, native_sse_math, proxies[car_idx + 1], car_shapes);
             }
         }
     }
@@ -3967,8 +4364,8 @@ ROCKETGPU_HD int BuildBulletManifoldList(
             if constexpr (kPhase != 1) {
                 swap_remove(bp.bp_manifolds, bp.bp_manifold_count, find(bp.bp_manifolds, bp.bp_manifold_count, key));
             } else if (find(bp.bp_manifolds, bp.bp_manifold_count, key) >= 0 &&
-                       find(bp_history->w3_removed, bp_history->w3_removed_count, key) < 0) {
-                bp_history->w3_removed[bp_history->w3_removed_count++] = key;
+                       find(tick->w3_removed, tick->w3_removed_count, key) < 0) {
+                tick->w3_removed[tick->w3_removed_count++] = key;
             }
         }
     };
@@ -4112,7 +4509,7 @@ ROCKETGPU_HD int BuildBulletManifoldList(
     if constexpr (kPhase != 2) {
     const bool sweep_fresh = h.sap_handle_count == 0;
     if constexpr (kPhase == 1) {
-        bp_history->w3_removed_count = 0;
+        tick->w3_removed_count = 0;
     }
     const BulletSweepHistory* statics_whole = nullptr;
     if (sweep_fresh) {
@@ -4401,9 +4798,9 @@ ROCKETGPU_HD int BuildBulletManifoldList(
                     find(bp.bp_manifolds, bp.bp_manifold_count, bp.bp_predictive[i]));
     }
     bp.bp_predictive_count = 0;
-    for (int obj = 0; obj < h.sap_obj_count && bp_history->predictive_hit_mask != 0; ++obj) {
+    for (int obj = 0; obj < h.sap_obj_count && tick->predictive_hit_mask != 0; ++obj) {
         const int body = h.sap_obj[obj];
-        if (body >= body_count || ((bp_history->predictive_hit_mask >> body) & 1u) == 0 ||
+        if (body >= body_count || ((tick->predictive_hit_mask >> body) & 1u) == 0 ||
             bp.bp_manifold_count >= kMaxBulletManifoldEntries) {
             continue;
         }
@@ -4419,9 +4816,9 @@ ROCKETGPU_HD int BuildBulletManifoldList(
                     find(bp.bp_manifolds, bp.bp_manifold_count, bp.bp_predictive[i]));
     }
     bp.bp_predictive_count = 0;
-    for (int obj = 0; obj < h.sap_obj_count && bp_history->predictive_hit_mask != 0; ++obj) {
+    for (int obj = 0; obj < h.sap_obj_count && tick->predictive_hit_mask != 0; ++obj) {
         const int body = h.sap_obj[obj];
-        if (body >= body_count || ((bp_history->predictive_hit_mask >> body) & 1u) == 0 ||
+        if (body >= body_count || ((tick->predictive_hit_mask >> body) & 1u) == 0 ||
             bp.bp_manifold_count >= kMaxBulletManifoldEntries) {
             continue;
         }
@@ -4429,9 +4826,9 @@ ROCKETGPU_HD int BuildBulletManifoldList(
         bp.bp_manifolds[bp.bp_manifold_count++] = key;
         bp.bp_predictive[bp.bp_predictive_count++] = key;
     }
-    for (int i = 0; i < bp_history->w3_removed_count; ++i) {
+    for (int i = 0; i < tick->w3_removed_count; ++i) {
         swap_remove(bp.bp_manifolds, bp.bp_manifold_count,
-                    find(bp.bp_manifolds, bp.bp_manifold_count, bp_history->w3_removed[i]));
+                    find(bp.bp_manifolds, bp.bp_manifold_count, tick->w3_removed[i]));
     }
     }
 
@@ -4518,7 +4915,7 @@ ROCKETGPU_HD int BuildBulletManifoldList(
 ROCKETGPU_HD ROCKETGPU_NOINLINE void SolveUnifiedSplitContactRows(
     ::rocketgpu::BallState& ball,
     int count,
-    ::rocketgpu::CarState* cars,
+    CarSpanT cars,
     EnvStridedArray<BallSplitContactRow> ball_rows,
     int ball_row_count,
     EnvStridedArray<CarSharedSplitContactRow> world_rows,
@@ -5010,7 +5407,7 @@ ROCKETGPU_HD void ConvertRowUnits(EnvStridedArray<T> rows, int n) {
 ROCKETGPU_HD ROCKETGPU_NOINLINE ROCKETGPU_HOST_NOINLINE void SolveUnifiedVelocityContactRowsGeneral(
     ::rocketgpu::BallState& ball,
     int count,
-    ::rocketgpu::CarState* cars,
+    CarSpanT cars,
     const ::rocketgpu::CarConfig* car_configs,
     const ::rocketgpu::MutatorConfig& mutator,
     EnvStridedArray<BallVelocityContactRow> ball_normal_rows,
@@ -5351,7 +5748,7 @@ ROCKETGPU_HD ROCKETGPU_NOINLINE ROCKETGPU_HOST_NOINLINE void SolveUnifiedVelocit
 ROCKETGPU_HD ROCKETGPU_NOINLINE bool TrySolveUnifiedVelocityContactRowsReg(
     ::rocketgpu::BallState& ball,
     int count,
-    ::rocketgpu::CarState* cars,
+    CarSpanT cars,
     const ::rocketgpu::MutatorConfig& mutator,
     EnvStridedArray<BallVelocityContactRow> ball_normal_rows,
     int ball_normal_row_count,
@@ -5821,7 +6218,7 @@ ROCKETGPU_HD ROCKETGPU_NOINLINE bool TrySolveUnifiedVelocityContactRowsReg(
 ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
     ::rocketgpu::BallState& ball,
     int count,
-    ::rocketgpu::CarState* cars,
+    CarSpanT cars,
     const ::rocketgpu::CarConfig* car_configs,
     const ::rocketgpu::MutatorConfig& mutator,
     EnvStridedArray<BallVelocityContactRow> ball_normal_rows,
@@ -5881,7 +6278,7 @@ ROCKETGPU_HD void SolveUnifiedVelocityContactRows(
 }
 
 ROCKETGPU_HD void SolveCarWorldVelocityContactRows(
-    ::rocketgpu::CarState& car,
+    CarRefT car,
     CarWorldVelocityContactRow* normal_rows,
     int normal_row_count,
     CarWorldFrictionContactRow* friction_rows,
@@ -6051,7 +6448,7 @@ ROCKETGPU_HD int WorldSolverPasses() {
 }
 
 ROCKETGPU_HD void IntegrateSplitImpulseTransformBt(
-    ::rocketgpu::CarState& car,
+    CarRefT car,
     const SplitImpulseAccumulator& split_bt,
     float dt,
     bool native_sse_math) {
@@ -6204,7 +6601,7 @@ ROCKETGPU_HD void AppendBallCarSplitRow(
     const ::rocketgpu::Vec3& rel_ball_contact,
     const ::rocketgpu::Vec3& rel_car_contact,
     int32_t other_local_idx,
-    const ::rocketgpu::CarState& car,
+    CarCRefT car,
     const ::rocketgpu::CarConfig& cfg,
     const ::rocketgpu::MutatorConfig& mutator,
     float dt,
@@ -6281,7 +6678,7 @@ ROCKETGPU_HD float CarContactBreakingThresholdBt(const ::rocketgpu::CarConfig& c
 }
 
 ROCKETGPU_HD void ResolveObbCornerCylinder(
-    ::rocketgpu::CarState& car,
+    CarRefT car,
     const ::rocketgpu::CarConfig& cfg,
     float restitution,
     float friction,

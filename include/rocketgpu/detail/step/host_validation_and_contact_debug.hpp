@@ -86,7 +86,7 @@ ROCKETGPU_HD Vec3 CarInvInertiaLocalUu(const CarConfig& cfg, float mass) {
         inertia.z != 0.0f ? 1.0f / inertia.z : 0.0f);
 }
 
-ROCKETGPU_HD CarInvInertiaRowsUu MakeCarInvInertiaRowsUuWithLocal(const CarState& car, const Vec3& inv_inertia_local) {
+ROCKETGPU_HD CarInvInertiaRowsUu MakeCarInvInertiaRowsUuWithLocal(CarCRefT car, const Vec3& inv_inertia_local) {
     if (car.restored_inv_inertia_valid) {
         return CarInvInertiaRowsUu{car.restored_inv_inertia_bt[0] * 0.0004f,
                                   car.restored_inv_inertia_bt[1] * 0.0004f,
@@ -122,18 +122,18 @@ ROCKETGPU_HD CarInvInertiaRowsUu MakeCarInvInertiaRowsUuWithLocal(const CarState
     return CarInvInertiaRowsUu{inv_inertia_world_row0, inv_inertia_world_row1, inv_inertia_world_row2};
 }
 
-ROCKETGPU_HD CarInvInertiaRowsUu MakeCarInvInertiaRowsUu(const CarState& car, const CarConfig& cfg, float mass) {
+ROCKETGPU_HD CarInvInertiaRowsUu MakeCarInvInertiaRowsUu(CarCRefT car, const CarConfig& cfg, float mass) {
     if (car.restored_inv_inertia_valid) {
         return MakeCarInvInertiaRowsUuWithLocal(car, Vec3(0.0f, 0.0f, 0.0f));
     }
     return MakeCarInvInertiaRowsUuWithLocal(car, CarInvInertiaLocalUu(cfg, mass));
 }
 
-ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorld(const CarState& car, const CarConfig& cfg, float mass, const Vec3& torque_world) {
+ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorld(CarCRefT car, const CarConfig& cfg, float mass, const Vec3& torque_world) {
     return ApplyInverseBodyInertiaWorld(MakeCarInvInertiaRowsUu(car, cfg, mass), torque_world);
 }
 
-ROCKETGPU_HD void ApplyCentralForce(CarState& car, float mass, const Vec3& force_world, float dt) {
+ROCKETGPU_HD void ApplyCentralForce(CarRefT car, float mass, const Vec3& force_world, float dt) {
     SetCarLinearVelocityUu(car, car.vel + force_world * (dt / mass));
 }
 
@@ -226,7 +226,7 @@ struct CarFrame {
 };
 
 ROCKETGPU_HD void BuildInvInertiaTensorWorldBt(
-    const CarState& car, const CarConfig& cfg, float mass,
+    CarCRefT car, const CarConfig& cfg, float mass,
     Vec3& out_row0, Vec3& out_row1, Vec3& out_row2);
 
 ROCKETGPU_HD void BuildInvInertiaTensorWorldBtFromColumnsWithLocalInv(
@@ -264,7 +264,7 @@ ROCKETGPU_HD Vec3 CarInvInertiaLocalBt(const CarConfig& cfg, float mass) {
 }
 #endif
 
-ROCKETGPU_HD CarFrame MakeCarFrame(const CarState& car, const CarConfig& cfg, float mass
+ROCKETGPU_HD CarFrame MakeCarFrame(CarCRefT car, const CarConfig& cfg, float mass
 #if !defined(ROCKETGPU_USE_CUDA)
                                    , const CarShapeCacheEntry* shape = nullptr
 #endif
@@ -295,7 +295,7 @@ ROCKETGPU_HD CarFrame MakeCarFrame(const CarState& car, const CarConfig& cfg, fl
     return f;
 }
 
-ROCKETGPU_HD void CarBasisColumns(const CarFrame* frame, const CarState& car, Vec3& fwd, Vec3& right, Vec3& up) {
+ROCKETGPU_HD void CarBasisColumns(const CarFrame* frame, CarCRefT car, Vec3& fwd, Vec3& right, Vec3& up) {
     if (frame) {
         fwd = frame->fwd;
         right = frame->right;
@@ -313,7 +313,7 @@ ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorldBtRowDot(const CarFrame& f, const 
 }
 
 ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorldBtRowDot(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     const Vec3& torque_world_bt) {
@@ -323,7 +323,7 @@ ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorldBtRowDot(
 }
 
 ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorldBt(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     const Vec3& torque_world_bt) {
@@ -331,7 +331,7 @@ ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorldBt(
 }
 
 ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorldBtColumnDot(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     const Vec3& v,
@@ -350,7 +350,7 @@ ROCKETGPU_HD Vec3 ApplyInverseBodyInertiaWorldBtColumnDot(
 }
 
 ROCKETGPU_HD Vec3 ApplyCarWorldContactAngularComponentBt(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     const Vec3& rel_contact_bt,
@@ -364,7 +364,7 @@ ROCKETGPU_HD Vec3 ApplyCarWorldContactAngularComponentBt(
 }
 
 ROCKETGPU_HD Vec3 CarWorldContactAngularComponentBtNative(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     const Vec3& rel_contact_bt,
@@ -377,7 +377,7 @@ ROCKETGPU_HD Vec3 CarWorldContactAngularComponentBtNative(
 }
 
 ROCKETGPU_HD Vec3 ApplyCarWorldContactAngularComponent(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     const Vec3& rel_contact,
@@ -392,7 +392,7 @@ ROCKETGPU_HD Vec3 ApplyCarWorldContactAngularComponent(
 }
 
 ROCKETGPU_HD float BodyImpulseDenominatorBt(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     const Vec3& pos_world_bt,
@@ -411,14 +411,14 @@ ROCKETGPU_HD float BodyImpulseDenominatorBt(
 }
 
 ROCKETGPU_HD void ApplyImpulseAtPointBtRoundtripBtInputs(
-    CarState& car,
+    CarRefT car,
     const CarConfig& cfg,
     float mass,
     const Vec3& impulse_world_bt,
     const Vec3& rel_point_world_bt);
 
 ROCKETGPU_HD void ApplyImpulseAtPointBtRoundtripBtInputs(
-    CarState& car,
+    CarRefT car,
     const CarConfig& cfg,
     float mass,
     const Vec3& impulse_world_bt,
@@ -433,7 +433,7 @@ ROCKETGPU_HD void ApplyImpulseAtPointBtRoundtripBtInputs(
 }
 
 ROCKETGPU_HD float ResolveStaticCollisionImpulseMagnitudeBtInputs(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     const Vec3& contact_pos_world_bt,
@@ -459,9 +459,9 @@ ROCKETGPU_HD float ResolveStaticCollisionImpulseMagnitudeBtInputs(
 }
 
 ROCKETGPU_HD float ResolveCarCarWheelPushbackMagnitudeBtInputs(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
-    const CarState& other,
+    CarCRefT other,
     const CarConfig& other_cfg,
     float mass,
     const Vec3& contact_pos_world_bt,
@@ -485,7 +485,7 @@ ROCKETGPU_HD float ResolveCarCarWheelPushbackMagnitudeBtInputs(
     return normal_impulse_bt > 0.0f ? normal_impulse_bt : 0.0f;
 }
 
-ROCKETGPU_HD void ApplyCentralImpulseBt(CarState& car, const Vec3& impulse_bt, float car_mass) {
+ROCKETGPU_HD void ApplyCentralImpulseBt(CarRefT car, const Vec3& impulse_bt, float car_mass) {
     const float inv_mass = 1.0f / car_mass;
     if (!car.vel_touched_solve_stage && !car.is_on_ground) {
         SetCarLinearVelocityBt(car, car.vel_bt + impulse_bt * inv_mass);
@@ -498,22 +498,22 @@ ROCKETGPU_HD void ApplyCentralImpulseBt(CarState& car, const Vec3& impulse_bt, f
     }
 }
 
-ROCKETGPU_HD void ApplyCentralImpulseViaBtRoundtrip(CarState& car, const Vec3& delta_vel_world_uu, float car_mass) {
+ROCKETGPU_HD void ApplyCentralImpulseViaBtRoundtrip(CarRefT car, const Vec3& delta_vel_world_uu, float car_mass) {
     ApplyCentralImpulseBt(car, ToBtLinearVec(delta_vel_world_uu) * car_mass, car_mass);
 }
 
-ROCKETGPU_HD Vec3 GameJumpUpScaledBt(const CarState& car, float scale_uu) {
+ROCKETGPU_HD Vec3 GameJumpUpScaledBt(CarCRefT car, float scale_uu) {
     Vec3 f, r, u;
     GameUeQuatAxes(car.rot, f, r, u);
     return Vec3((scale_uu * u.x) * 0.02f, (scale_uu * u.y) * 0.02f, (scale_uu * u.z) * 0.02f);
 }
 
-ROCKETGPU_HD void ApplyAngularAccelWorld(CarState& car, const Vec3& ang_accel_world, float dt) {
+ROCKETGPU_HD void ApplyAngularAccelWorld(CarRefT car, const Vec3& ang_accel_world, float dt) {
     car.ang_vel += ang_accel_world * dt;
 }
 
 ROCKETGPU_HD void BuildInvInertiaTensorWorld(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     Vec3& out_row0,
@@ -608,7 +608,7 @@ ROCKETGPU_HD void BuildInvInertiaTensorWorldBtFromColumns(
     Vec3& out_row2);
 
 ROCKETGPU_HD void BuildInvInertiaTensorWorldBt(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     Vec3& out_row0,
@@ -626,7 +626,7 @@ ROCKETGPU_HD void BuildInvInertiaTensorWorldBt(
 }
 
 ROCKETGPU_HD void BuildPreSolveInvInertiaTensorWorldBt(
-    const CarState& car,
+    CarCRefT car,
     const WheelRuntimeState& runtime,
     const CarConfig& cfg,
     float mass,
@@ -678,7 +678,7 @@ ROCKETGPU_HD void BuildInvInertiaTensorWorldBtFromQuat(
 }
 
 ROCKETGPU_HD Vec3 ComputeBulletStyleExternalTorqueInput(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     const Vec3& ang_accel_world,
@@ -747,7 +747,7 @@ ROCKETGPU_HD void QueueCentralForce(WheelRuntimeState* wheel_runtime_state, cons
 
 ROCKETGPU_HD void QueueAngularAccelWorld(
     WheelRuntimeState* wheel_runtime_state,
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     const Vec3& ang_accel_world,
@@ -816,7 +816,7 @@ ROCKETGPU_HD void QueueFirstForceAndTorqueBt(WheelRuntimeState* wheel_runtime_st
 }
 
 ROCKETGPU_HD void BuildInertiaTensorWorldBtInverse(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     Vec3& out_row0,
@@ -841,7 +841,7 @@ inline lanes::F4* InertiaWorldBtColumns(const CarFrame* frame) {
 
 ROCKETGPU_HD void BuildInertiaTensorWorldBtInverse(
     const CarFrame* frame,
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     Vec3& out_row0,
@@ -886,7 +886,7 @@ ROCKETGPU_HD void BuildInertiaTensorWorldBtInverse(
 }
 
 #if defined(ROCKETGPU_HOST_LANES)
-inline Vec3 MulInertiaWorldBt(const CarFrame* frame, const CarState& car, const CarConfig& cfg, float mass,
+inline Vec3 MulInertiaWorldBt(const CarFrame* frame, CarCRefT car, const CarConfig& cfg, float mass,
                               const Vec3& v) {
     if (frame != nullptr) {
         const lanes::F4* const cols = InertiaWorldBtColumns(frame);
@@ -898,12 +898,12 @@ inline Vec3 MulInertiaWorldBt(const CarFrame* frame, const CarState& car, const 
 }
 #endif
 
-ROCKETGPU_HD Vec3 VelocityAtPoint(const CarState& car, const Vec3& rel_point_world) {
+ROCKETGPU_HD Vec3 VelocityAtPoint(CarCRefT car, const Vec3& rel_point_world) {
     return car.vel + Cross(car.ang_vel, rel_point_world);
 }
 
 ROCKETGPU_HD Vec3 VelocityAtPoint(
-    const CarState& car,
+    CarCRefT car,
     const Vec3& rel_point_world,
     const Vec3& external_linear_delta,
     const Vec3& external_angular_delta) {
@@ -911,7 +911,7 @@ ROCKETGPU_HD Vec3 VelocityAtPoint(
 }
 
 ROCKETGPU_HD Vec3 ComputeDeferredLinearVelocityDelta(
-    const CarState& car,
+    CarCRefT car,
     const WheelRuntimeState* wheel_runtime_state,
     const MutatorConfig& mutator,
     float dt) {
@@ -927,7 +927,7 @@ ROCKETGPU_HD Vec3 ComputeDeferredLinearVelocityDelta(
 }
 
 ROCKETGPU_HD Vec3 ComputeDeferredAngularVelocityDelta(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     const WheelRuntimeState* wheel_runtime_state,
@@ -984,7 +984,7 @@ ROCKETGPU_HD Vec3 ComputeOfficialExternalForceImpulseBt(
 }
 
 ROCKETGPU_HD void ApplyDeferredVelocityDeltas(
-    CarState& car,
+    CarRefT car,
     const CarConfig& cfg,
     const Vec3& deferred_linear_delta,
     const Vec3& deferred_angular_delta,
@@ -1023,7 +1023,7 @@ ROCKETGPU_HD void ApplyDeferredVelocityDeltas(
     }
 }
 
-ROCKETGPU_HD void ApplyImpulseAtPoint(CarState& car, const CarConfig& cfg, float mass, const Vec3& impulse_world, const Vec3& rel_point_world) {
+ROCKETGPU_HD void ApplyImpulseAtPoint(CarRefT car, const CarConfig& cfg, float mass, const Vec3& impulse_world, const Vec3& rel_point_world) {
     SetCarLinearVelocityUu(car, car.vel + impulse_world / mass);
     const Vec3 torque_impulse = Cross(rel_point_world, impulse_world);
     car.ang_vel += ApplyInverseBodyInertiaWorld(car, cfg, mass, torque_impulse);

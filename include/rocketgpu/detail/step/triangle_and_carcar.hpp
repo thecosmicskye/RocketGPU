@@ -59,7 +59,7 @@ ROCKETGPU_HD bullet_port::btConvexShape MakeBulletPortTriangleShape(const Vec3& 
     return shape;
 }
 
-ROCKETGPU_HD bullet_port::btTransform MakeBulletPortBoxWorldTransform(const CarState& car, const Vec3& box_center_bt) {
+ROCKETGPU_HD bullet_port::btTransform MakeBulletPortBoxWorldTransform(CarCRefT car, const Vec3& box_center_bt) {
     bullet_port::btTransform transform;
     Vec3 fwd;
     Vec3 rgt;
@@ -168,7 +168,7 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool BulletPortCalcPenDepthLoca
         a, transform_a, b, transform_b, io_v, out_witness_on_a, out_witness_on_b, &scratch);
 }
 
-ROCKETGPU_HD Vec3 CarBodyLocalPointBt(const CarState& car, const Vec3& point_world_bt) {
+ROCKETGPU_HD Vec3 CarBodyLocalPointBt(CarCRefT car, const Vec3& point_world_bt) {
     bullet_port::btTransform body_world;
     Vec3 fwd;
     Vec3 rgt;
@@ -183,7 +183,7 @@ ROCKETGPU_HD Vec3 CarBodyLocalPointBt(const CarState& car, const Vec3& point_wor
     return FromBulletPortVec3(local);
 }
 
-ROCKETGPU_HD Vec3 CarBodyWorldPointBt(const CarState& car, const Vec3& point_local_bt) {
+ROCKETGPU_HD Vec3 CarBodyWorldPointBt(CarCRefT car, const Vec3& point_local_bt) {
     bullet_port::btTransform body_world;
     Vec3 fwd;
     Vec3 rgt;
@@ -199,7 +199,7 @@ ROCKETGPU_HD Vec3 CarBodyWorldPointBt(const CarState& car, const Vec3& point_loc
     return FromBulletPortVec3(world);
 }
 
-ROCKETGPU_HD Vec3 CarBodyManifoldWorldPointBt(const CarState& car, const Vec3& point_world_bt) {
+ROCKETGPU_HD Vec3 CarBodyManifoldWorldPointBt(CarCRefT car, const Vec3& point_world_bt) {
     return CarBodyWorldPointBt(car, CarBodyLocalPointBt(car, point_world_bt));
 }
 
@@ -299,7 +299,7 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool RunCarArenaTriangleGjkSimp
 }
 
 ROCKETGPU_HD bool ComputeCarArenaTriangleContact(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     const ArenaMeshTriangle& tri,
     Vec3& out_normal,
@@ -625,7 +625,7 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool RunBallCarGjkSimplex(
 
 ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool ComputeBallCarContactGeometryGjk(
     const BallState& ball,
-    const CarState& car,
+    CarCArgT car_arg,
     const CarConfig& cfg,
     float ball_radius,
     Vec3& out_normal,
@@ -639,6 +639,7 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool ComputeBallCarContactGeome
     Vec3* out_ball_local_bt = nullptr,
     Vec3* out_car_local_bt = nullptr,
     float precomputed_threshold_bt = -1.0f) {
+    CarCRefT car = car_arg;
     constexpr float kUUToBT = 1.0f / 50.0f;
     constexpr float kBTToUU = 50.0f;
     constexpr float kBulletBoxMarginBt = 0.04f;
@@ -881,7 +882,7 @@ ROCKETGPU_HD void ExpandAabbWithPoint(Vec3& out_min, Vec3& out_max, const Vec3& 
 }
 
 ROCKETGPU_HD void ComputeBulletCarCompoundAabbBt(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     Vec3& out_min,
     Vec3& out_max) {
@@ -927,7 +928,7 @@ ROCKETGPU_HD void ComputeBulletBallSphereAabbBt(
 
 ROCKETGPU_HD BallCarRsBroadphaseProbe ComputeBulletRsBroadphaseBallCarProbe(
     const BallState& ball,
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
     float dt) {
@@ -965,7 +966,7 @@ ROCKETGPU_HD BallCarRsBroadphaseProbe ComputeBulletRsBroadphaseBallCarProbe(
 
 ROCKETGPU_HD bool BulletRsBroadphaseAllowsBallCarPair(
     const BallState& ball,
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
     float dt,
@@ -992,7 +993,7 @@ ROCKETGPU_HD bool BulletRsBroadphaseAllowsBallCarPair(
 
 ROCKETGPU_HD bool ComputeBallCarContactGeometrySphereBox(
     const BallState& ball,
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float ball_radius,
     float max_contact_distance_bt,
@@ -1100,7 +1101,7 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometrySphereBox(
 
 ROCKETGPU_HD bool ComputeBallCarContactGeometry(
     const BallState& ball,
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float ball_radius,
     Vec3& out_normal,
@@ -1146,7 +1147,7 @@ ROCKETGPU_HD bool ComputeBallCarContactGeometry(
 }
 
 ROCKETGPU_HD bool BallCarCollisionInfoMayOverlap(
-    const BallState& ball, const CarState& car, const CarConfig& cfg, const MutatorConfig& mutator, float dt,
+    const BallState& ball, CarCRefT car, const CarConfig& cfg, const MutatorConfig& mutator, float dt,
     int env_idx) {
     const uint8_t is_demoed = car.is_demoed;
     const uint8_t just_respawned = car.just_respawned;
@@ -1176,9 +1177,9 @@ struct BallCarHitStart {
 
 ROCKETGPU_HD void CommitBallCarHit(
     const BallState& ball,
-    const CarState& car,
+    CarCRefT car,
     uint32_t car_id,
-    CarState& car_mut,
+    CarRefT car_mut,
     const MutatorConfig& mutator,
     uint64_t env_tick,
     BallState& ball_mut,
@@ -1258,9 +1259,9 @@ ROCKETGPU_HD void CommitBallCarHit(
 
 ROCKETGPU_HD void RecordBallCarCollisionInfoIfOverlapping(
     const BallState& ball,
-    const CarState& car,
+    CarCRefT car,
     uint32_t car_id,
-    CarState& car_mut,
+    CarRefT car_mut,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
     uint64_t env_tick,
@@ -1301,9 +1302,9 @@ ROCKETGPU_HD void RecordBallCarCollisionInfoIfOverlapping(
 
 ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE void CommitBallCarHitFromManifold(
     const BallState& ball,
-    const CarState& car,
+    CarCArgT car_arg,
     uint32_t car_id,
-    CarState& car_mut,
+    CarArgT car_mut_arg,
     const MutatorConfig& mutator,
     uint64_t env_tick,
     BallState& ball_mut,
@@ -1312,6 +1313,8 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE void CommitBallCarHitFromManifo
     const Vec3* cal_car_start_vel,
     const Vec3* cal_ball_start_vel,
     const BallCarHitStart* start) {
+    CarCRefT car = car_arg;
+    CarRefT car_mut = car_mut_arg;
     if (manifold.count == 0) {
         return;
     }
@@ -1338,7 +1341,7 @@ struct BallCarContactOverride {
 
 ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE void AppendBallCarContactRows(
     BallState& ball,
-    CarState& car,
+    CarArgT car_arg,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
     const Vec3& ball_external_linear_delta,
@@ -1357,6 +1360,7 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE void AppendBallCarContactRows(
     bool allow_midtick_demo_contact = false,
     const Vec3* bt_ball_linear_velocity_override = nullptr,
     const BallCarContactOverride* contact_override = nullptr) {
+    CarRefT car = car_arg;
     if ((!allow_midtick_demo_contact && car.is_demoed) || car.just_respawned) {
         return;
     }
@@ -1565,7 +1569,7 @@ ROCKETGPU_HD Vec3 BallCarRetainedBallLocalPointBt(const BallState& ball, const V
 }
 
 ROCKETGPU_HD void RefreshBallCarRetainedManifold(
-    BallCarRetainedManifold& manifold, const BallState& ball, const CarState& car, float threshold_bt) {
+    BallCarRetainedManifold& manifold, const BallState& ball, CarCRefT car, float threshold_bt) {
     const int count = manifold.count;
     for (int i = 0; i < count; ++i) {
         BallCarRetainedPoint& point = manifold.points[i];
@@ -1652,7 +1656,7 @@ ROCKETGPU_HD void AddBallCarRetainedPoint(
 }
 
 ROCKETGPU_HD bool BallCarRetainedPairOverlaps(
-    const BallState& ball, const CarState& car, const CarConfig& cfg, const MutatorConfig& mutator,
+    const BallState& ball, CarCRefT car, const CarConfig& cfg, const MutatorConfig& mutator,
     bool allow_midtick_demo_contact) {
     const uint8_t is_demoed = car.is_demoed;
     const uint8_t just_respawned = car.just_respawned;
@@ -1695,7 +1699,7 @@ ROCKETGPU_HD bool BallCarRetainedPairOverlaps(
 
 ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE void AppendBallCarContactRowsRetained(
     BallState& ball,
-    CarState& car,
+    CarArgT car_arg,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
     const Vec3& ball_external_linear_delta,
@@ -1714,6 +1718,7 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE void AppendBallCarContactRowsRe
     bool allow_midtick_demo_contact,
     const Vec3* bt_ball_linear_velocity_override,
     BallCarRetainedManifold& retained) {
+    CarRefT car = car_arg;
     constexpr float kUUToBT = 1.0f / 50.0f;
     const float threshold_bt = BallCarContactBreakingThresholdBT(cfg, mutator.ball_radius);
 
@@ -1798,7 +1803,7 @@ ROCKETGPU_HD float ObbHalfExtentComponent(const ObbData& obb, int idx) {
     return (&obb.half_extent.x)[idx];
 }
 
-ROCKETGPU_HD ObbData MakeCarObbBulletTransformBt(const CarState& car, const CarConfig& cfg) {
+ROCKETGPU_HD ObbData MakeCarObbBulletTransformBt(CarCRefT car, const CarConfig& cfg) {
     constexpr float kUUToBT = 1.0f / 50.0f;
     ObbData obb;
     CarBasisColumns(car, obb.axis[0], obb.axis[1], obb.axis[2]);
@@ -2196,7 +2201,7 @@ ROCKETGPU_HD bool ComputeEdgeEdgeCarCarContactAnchorsBulletStyle(
     return true;
 }
 
-ROCKETGPU_HD ObbData MakeCarObb(const CarState& car, const CarConfig& cfg) {
+ROCKETGPU_HD ObbData MakeCarObb(CarCRefT car, const CarConfig& cfg) {
     ObbData obb;
     obb.center = car.pos + RotateCarBasis(car, cfg.hitbox_offset);
     CarBasisColumns(car, obb.axis[0], obb.axis[1], obb.axis[2]);
@@ -2392,7 +2397,7 @@ ROCKETGPU_HD bool InForwardConePose(
     bool reverse, float max_yaw_deg);
 
 ROCKETGPU_HD bool InForwardCone(
-    const CarState& a, const CarConfig& a_cfg, const CarState& v, const CarConfig& v_cfg, bool reverse, float max_yaw_deg);
+    CarCRefT a, const CarConfig& a_cfg, CarCRefT v, const CarConfig& v_cfg, bool reverse, float max_yaw_deg);
 
 struct CarToiTransform {
     Vec3 fwd, right, up, origin;
@@ -2655,14 +2660,14 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool CarToiClosestPoints(
 }
 
 template <bool kRequireScratch = false>
-ROCKETGPU_HD void CarCarTimeOfImpact(const CarState& a, const CarConfig& a_cfg, const Vec3& a_vel,
-                                   const CarState& v, const CarConfig& v_cfg, const Vec3& v_vel, float tick_dt,
+ROCKETGPU_HD void CarCarTimeOfImpact(CarCRefT a, const CarConfig& a_cfg, const Vec3& a_vel,
+                                   CarCRefT v, const CarConfig& v_cfg, const Vec3& v_vel, float tick_dt,
                                    Vec3& pos_a, Quat& rot_a, Vec3& pos_v, Quat& rot_v,
                                    bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr) {
     constexpr float kAllowedPenetration = 0.04f;
     constexpr float kEpsilon = 1.1920929e-7f;
     constexpr float kUUToBT = 1.0f / 50.0f;
-    auto sweep = [&](const CarState& s, const Vec3& vel, CarToiTransform& from, CarToiTransform& to) {
+    auto sweep = [&](CarCRefT s, const Vec3& vel, CarToiTransform& from, CarToiTransform& to) {
         CarToiTransform t0;
         GameSetRotationScalarColumns(s.rot, t0.fwd, t0.right, t0.up);
         t0.origin = Vec3(s.pos.x * kUUToBT, s.pos.y * kUUToBT, s.pos.z * kUUToBT);
@@ -2733,7 +2738,7 @@ ROCKETGPU_HD void CarCarTimeOfImpact(const CarState& a, const CarConfig& a_cfg, 
         return;
     }
 
-    auto pose = [&](Vec3& pos, Quat& rot, const CarState& s, const Vec3& vel) {
+    auto pose = [&](Vec3& pos, Quat& rot, CarCRefT s, const Vec3& vel) {
         CarToiTransform from, to;
         sweep(s, vel, from, to);
         pos = Vec3((to.origin.x * 50.0f - from.origin.x * 50.0f) * fraction + from.origin.x * 50.0f,
@@ -2750,10 +2755,12 @@ ROCKETGPU_HD void CarCarTimeOfImpact(const CarState& a, const CarConfig& a_cfg, 
 
 template <bool kRequireScratch = false>
 ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool ShouldDemolish(
-    const CarState& a, const CarConfig& a_cfg, const Vec3& a_start_vel,
-    const CarState& v, const CarConfig& v_cfg, const MutatorConfig& mutator,
+    CarCArgT a_arg, const CarConfig& a_cfg, const Vec3& a_start_vel,
+    CarCArgT v_arg, const CarConfig& v_cfg, const MutatorConfig& mutator,
     const Vec3* v_start_vel = nullptr, float tick_dt = 0.0f,
     bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr) {
+    CarCRefT a = a_arg;
+    CarCRefT v = v_arg;
     if (!a.is_supersonic) {
         return false;
     }
@@ -2807,13 +2814,13 @@ ROCKETGPU_HD bool InForwardConePose(
 }
 
 ROCKETGPU_HD bool InForwardCone(
-    const CarState& a, const CarConfig& a_cfg, const CarState& v, const CarConfig& v_cfg, bool reverse, float max_yaw_deg) {
+    CarCRefT a, const CarConfig& a_cfg, CarCRefT v, const CarConfig& v_cfg, bool reverse, float max_yaw_deg) {
     return InForwardConePose(a.pos, a.rot, a_cfg, v.pos, v.rot, v_cfg, reverse, max_yaw_deg);
 }
 
 ROCKETGPU_HD bool BumpCone(
-    CarState& hitter, uint32_t hitter_id, Team hitter_team, const CarConfig& hitter_cfg, const Vec3& hitter_start_vel,
-    CarState& victim, uint32_t victim_id, Team victim_team, const CarConfig& victim_cfg,
+    CarRefT hitter, uint32_t hitter_id, Team hitter_team, const CarConfig& hitter_cfg, const Vec3& hitter_start_vel,
+    CarRefT victim, uint32_t victim_id, Team victim_team, const CarConfig& victim_cfg,
     const MutatorConfig& mutator, uint8_t enable_demos, bool cal_demo, float tick_dt) {
     const bool bumper = InForwardCone(hitter, hitter_cfg, victim, victim_cfg, false, 70.0f);
     bool is_demo = false;
@@ -2890,11 +2897,11 @@ ROCKETGPU_HD bool BumpCone(
 
 template <bool kRequireScratch = false>
 ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool ResolveCarCarDirectionalContact(
-    CarState& hitter,
+    CarArgT hitter_arg,
     uint32_t hitter_id,
     Team hitter_team,
     const CarConfig& hitter_cfg,
-    CarState& victim,
+    CarArgT victim_arg,
     uint32_t victim_id,
     Team victim_team,
     const MutatorConfig& mutator,
@@ -2908,6 +2915,8 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool ResolveCarCarDirectionalCo
     const Vec3* victim_start_vel = nullptr,
     float tick_dt = 0.0f,
     bullet_port::btGjkEpaScratch* gjk_epa_scratch = nullptr) {
+    CarRefT hitter = hitter_arg;
+    CarRefT victim = victim_arg;
     (void)hitter_id;
 
     const bool cal_demo = true;
@@ -3101,10 +3110,10 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool ResolveCarCarDirectionalCo
 }
 
 ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE int ComputeApproxCarCarContactAnchorPairsWithBtObb(
-    const CarState& a,
+    CarCArgT a_arg,
     const CarConfig& cfg_a,
     const ObbData& obb_a_bt,
-    const CarState& b,
+    CarCArgT b_arg,
     const CarConfig& cfg_b,
     const ObbData& obb_b_bt,
     const Vec3& normal,
@@ -3120,6 +3129,8 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE int ComputeApproxCarCarContactA
     float* out_game_depths_bt = nullptr,
     bool* out_game_points_valid = nullptr,
     Vec3* out_game_normal_bt = nullptr) {
+    CarCRefT a = a_arg;
+    CarCRefT b = b_arg;
     if (out_game_points_valid) {
         *out_game_points_valid = false;
     }
@@ -3234,10 +3245,10 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE int ComputeApproxCarCarContactA
 }
 
 ROCKETGPU_HD int ComputeApproxCarCarContactAnchorPairs(
-    const CarState& a,
+    CarCRefT a,
     const CarConfig& cfg_a,
     const ObbData& obb_a,
-    const CarState& b,
+    CarCRefT b,
     const CarConfig& cfg_b,
     const ObbData& obb_b,
     const Vec3& normal,
@@ -3278,10 +3289,10 @@ ROCKETGPU_HD int ComputeApproxCarCarContactAnchorPairs(
 }
 
 ROCKETGPU_HD void ComputeApproxCarCarContactAnchors(
-    const CarState& a,
+    CarCRefT a,
     const CarConfig& cfg_a,
     const ObbData& obb_a,
-    const CarState& b,
+    CarCRefT b,
     const CarConfig& cfg_b,
     const ObbData& obb_b,
     const Vec3& normal,
@@ -3310,7 +3321,7 @@ ROCKETGPU_HD void ComputeApproxCarCarContactAnchors(
 }
 
 ROCKETGPU_HD CarState BuildPredictedCarSolverState(
-    const CarState& car,
+    CarCRefT car,
     const Vec3& external_linear_delta,
     const Vec3& external_angular_delta,
     float dt,

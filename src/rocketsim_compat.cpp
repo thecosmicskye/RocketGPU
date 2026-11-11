@@ -80,7 +80,7 @@ Arena* Arena::Create(GameMode mode, const ArenaConfig& arena_config, float tick_
     a->mode_ = mode;
     a->arena_config_ = arena_config;
 
-    SimConfig cfg{};
+    SimConfig cfg = SimConfig();
     cfg.mode = mode == GameMode::THE_VOID ? Mode::TheVoid
         : (mode == GameMode::HEATSEEKER ? Mode::Heatseeker
         : (mode == GameMode::SNOWDAY ? Mode::Snowday : Mode::Soccar));
@@ -243,7 +243,7 @@ void Arena::PushCarState(int slot) {
     sim_->upload_car_states(car_states_.data(), car_states_.size(), nullptr,
                             BatchSim::StateUploadMode::PreserveInternal);
 #if defined(ROCKETGPU_USE_CUDA)
-    detail::LaunchCanonicalizeImportedCars(sim_->device_view().car_states + slot, 1, nullptr);
+    detail::LaunchCanonicalizeImportedCars(detail::CarSpanFromBytes(sim_->device_view().car_states) + slot, 1, nullptr);
 #endif
     dirty_ = true;
 }

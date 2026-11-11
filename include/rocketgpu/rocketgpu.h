@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include "rocketgpu/detail/common.hpp"
 
@@ -20,8 +22,11 @@ struct KickoffSettledRow;
 struct WorldSolverScratch;
 struct WorldSolverScratchRowPoolHost;
 struct RespawnRngState;
+struct ArenaRules;
 #if !defined(ROCKETGPU_USE_CUDA)
 struct HostStepTables;
+#else
+struct ArenaMeshClearance;
 #endif
 }
 
@@ -544,7 +549,8 @@ ROCKETGPU_HD uint32_t PackCarVisitOrder(const int* slots, int count) {
     return packed;
 }
 
-ROCKETGPU_HD void UpdateGameCarVisitOrder(EnvState& env, const CarState* env_cars, int count) {
+template <class Cars>
+ROCKETGPU_HD void UpdateGameCarVisitOrder(EnvState& env, Cars env_cars, int count) {
     if (env.car_visit_order_mode != 3) return;
 #if !defined(ROCKETGPU_USE_CUDA)
     bool change = false;
@@ -720,6 +726,7 @@ struct MutatorConfig {
     float car_air_damp_yaw = 20.0f;
     float car_air_damp_roll = 50.0f;
 
+    // Set by BatchSim. 0: none; 1: the official arena's static planes and meshes; 2: meshes only (a custom ArenaLayout).
     uint8_t arena_collision = 1;
 
     uint8_t game_mode = 0;
@@ -806,11 +813,70 @@ struct SimConfig {
     const detail::ArenaMeshLeafGridInfo* arena_mesh_ray_grid_infos = nullptr;
     const int32_t* arena_mesh_ray_cell_start = nullptr;
     const detail::ArenaMeshLeafEntry* arena_mesh_ray_entries = nullptr;
+    const detail::ArenaMeshClearance* arena_mesh_clearance = nullptr;
+    int32_t arena_mesh_slot = -1;
 #endif
+    // Set by BatchSim from an ArenaLayout whose goals or spawns differ from the official arena's; null: official.
+    // BatchSim rejects a config that has it set: pass the layout again instead of a config() copy alone.
+    const detail::ArenaRules* arena_rules = nullptr;
+};
+
+// A custom arena for BatchSim(config, layout) in Mode::Soccar. Positions are in uu; teams index the arrays. A default
+// ArenaLayout is the official soccar arena. BatchSim throws std::invalid_argument for a value that is not finite, a
+// position (mesh vertex, plane point, pad, goal point, spawn, ball spawn) beyond kArenaLayoutMaxCoord on any axis or a
+// spawn yaw beyond kArenaLayoutMaxYaw (8 pi) either way.
+constexpr float kArenaLayoutMaxCoord = 11500.0f;
+constexpr float kArenaLayoutMaxYaw = 25.132741f;
+struct ArenaMesh {
+    std::vector<Vec3> vertices;
+    std::vector<int32_t> indices;  // three per triangle
+};
+
+// A static plane through point, normal facing into the arena.
+struct ArenaPlane {
+    Vec3 point = Vec3(0.0f, 0.0f, 0.0f);
+    Vec3 normal = Vec3(0.0f, 0.0f, 1.0f);
+};
+
+// pos.z is the ground under the car (its CarConfig::spawn_z is added); yaw in radians.
+struct ArenaSpawn {
+    Vec3 pos = Vec3(0.0f, 0.0f, 0.0f);
+    float yaw = 0.0f;
+};
+
+// A team's goal: the other team scores when the ball's center is at least the ball radius past the plane through
+// point (normal facing into the goal) and inside [min, max].
+struct ArenaGoal {
+    Vec3 point = Vec3(0.0f, 0.0f, 0.0f);
+    Vec3 normal = Vec3(0.0f, 1.0f, 0.0f);
+    Vec3 min = Vec3(-1.0e30f, -1.0e30f, -1.0e30f);  // any size, also infinite; not NaN
+    Vec3 max = Vec3(1.0e30f, 1.0e30f, 1.0e30f);
+};
+
+struct ArenaLayout {
+    // Geometry: every .cmf file in mesh_dir (RocketSim's format), in name order, plus meshes and planes. All three
+    // empty: the official arena. Planes become two-triangle quads that cover the rest of the layout.
+    std::string mesh_dir;
+    std::vector<ArenaMesh> meshes;
+    std::vector<ArenaPlane> planes;
+
+    std::vector<BoostPadConfig> boost_pads;  // at most kMaxBoostPads
+    ArenaGoal goals[2];
+    ArenaSpawn kickoff_spawns[2][5];
+    // A team's respawn spots; also the kickoff spots of its 6th car on (each later car 250 uu further back).
+    ArenaSpawn respawn_spawns[2][4];
+    Vec3 ball_spawn = Vec3(0.0f, 0.0f, 92.75f);  // the ball waits here at kickoff until touched
+
+    ArenaLayout();  // the official arena
+    static std::vector<ArenaPlane> OfficialPlanes();  // floor, ceiling and side walls, for use with custom meshes
 };
 
 struct DeviceView {
+#if defined(ROCKETGPU_USE_CUDA) && !defined(ROCKETGPU_CAR_AOS)
+    void* car_states = nullptr;  // tiles of 32 car slots: layout in state_layouts()["car_states"]["device"]
+#else
     CarState* car_states = nullptr;
+#endif
     CarControls* controls = nullptr;
     CarConfig* car_configs = nullptr;
     Team* teams = nullptr;
@@ -823,6 +889,8 @@ struct DeviceView {
 class BatchSim {
 public:
     explicit BatchSim(const SimConfig& config);
+    // config.mode must be Soccar unless layout is the official arena.
+    BatchSim(const SimConfig& config, const ArenaLayout& layout);
     ~BatchSim();
 
     BatchSim(BatchSim&& other) noexcept;

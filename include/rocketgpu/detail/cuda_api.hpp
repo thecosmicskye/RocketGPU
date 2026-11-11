@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "rocketgpu/rocketgpu.h"
+#include "rocketgpu/detail/car_ref.hpp"
 
 namespace rocketgpu {
 namespace detail {
@@ -14,8 +15,10 @@ struct RespawnRngState;
 
 #if defined(ROCKETGPU_USE_CUDA)
 
+int32_t AssignArenaMeshSlot(const ArenaMeshBvhMeshInfo* infos, int32_t count);
+
 void LaunchPrepareRespawnSlots(
-    const SimConfig& cfg, const CarState* cars, const int32_t* counts,
+    const SimConfig& cfg, CarCSpanT cars, const int32_t* counts,
     const EnvState* envs, RespawnRngState* rng, const int32_t* order,
     uint8_t* slots, cudaStream_t stream);
 
@@ -23,7 +26,7 @@ void LaunchResetToKickoff(
     const SimConfig& cfg,
     Team* teams,
     int32_t* env_car_count,
-    CarState* cars,
+    CarSpanT cars,
     CarControls* controls,
     BallState* balls,
     EnvState* env_states,
@@ -38,7 +41,7 @@ void LaunchApplyEnvCommands(
     const SimConfig& cfg,
     Team* teams,
     int32_t* env_car_count,
-    CarState* cars,
+    CarSpanT cars,
     CarControls* controls,
     WorldSolverScratch* solver_scratch,
     BallState* balls,
@@ -51,7 +54,7 @@ void LaunchApplyEnvCommands(
     cudaStream_t stream);
 
 void LaunchCanonicalizeImportedCars(
-    CarState* cars,
+    CarSpanT cars,
     int32_t count,
     cudaStream_t stream);
 
@@ -67,7 +70,7 @@ void LaunchStep(
     const SimConfig& cfg,
     Team* teams,
     int32_t* env_car_count,
-    CarState* cars,
+    CarSpanT cars,
     WheelRuntimeState* wheel_runtime_states,
     WorldSolverScratch* solver_scratch,
     const WorldSolverScratchRowPool& row_pool,
@@ -88,7 +91,7 @@ void LaunchStepWithControlStream(
     const SimConfig& cfg,
     Team* teams,
     int32_t* env_car_count,
-    CarState* cars,
+    CarSpanT cars,
     WheelRuntimeState* wheel_runtime_states,
     WorldSolverScratch* solver_scratch,
     const WorldSolverScratchRowPool& row_pool,
@@ -110,7 +113,7 @@ void LaunchStepWithCommandStreams(
     const SimConfig& cfg,
     Team* teams,
     int32_t* env_car_count,
-    CarState* cars,
+    CarSpanT cars,
     WheelRuntimeState* wheel_runtime_states,
     WorldSolverScratch* solver_scratch,
     const WorldSolverScratchRowPool& row_pool,
@@ -131,6 +134,8 @@ void LaunchStepWithCommandStreams(
     uint8_t* respawn_slots = nullptr);
 
 void PrepareCarWorldStage(int env_count, int max_cars_per_env, cudaStream_t stream);
+
+void LaunchZeroTickRows(const WorldSolverScratchRowPool& row_pool, size_t first, size_t count, cudaStream_t stream);
 
 #endif
 }

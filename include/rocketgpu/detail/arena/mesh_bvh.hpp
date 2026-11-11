@@ -77,6 +77,7 @@ struct alignas(16) ArenaMeshLeafEntry {
 static_assert(sizeof(ArenaMeshLeafEntry) == 16, "ArenaMeshLeafEntry must stay one 128-bit load");
 
 struct HostStepTables;
+struct ArenaMeshClearance;
 
 struct ArenaMeshLeafGrid {
     const ArenaMeshLeafGridInfo* infos = nullptr;
@@ -90,6 +91,7 @@ struct ArenaMeshLeafGrid {
     const ArenaMeshLeafGridInfo* ray_infos = nullptr;
     const int32_t* ray_cell_start = nullptr;
     const ArenaMeshLeafEntry* ray_entries = nullptr;
+    const ArenaMeshClearance* clearance = nullptr;
 #endif
 };
 
@@ -185,7 +187,11 @@ struct ArenaMeshClearance {
         const int ix = static_cast<int>(fx);
         const int iy = static_cast<int>(fy);
         const int iz = static_cast<int>(fz);
+#if defined(__CUDA_ARCH__)
+        return static_cast<float>(__ldg(&lb[(static_cast<size_t>(iz) * ny + iy) * nx + ix])) * unit;
+#else
         return static_cast<float>(lb[(static_cast<size_t>(iz) * ny + iy) * nx + ix]) * unit;
+#endif
     }
 };
 

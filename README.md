@@ -12,13 +12,13 @@ CPU (profile-guided build) and RocketSim v3 0.3.5 (`arena_scale_v3`, same record
 
 | Arenas | RocketGPU CUDA | RocketGPU CPU | RocketSim v3 |
 |---|---|---|---|
-| 96 | 0.59M | 4.17M | 2.91M |
-| 256 | 1.31M | 4.26M | 3.54M |
-| 512 | 2.24M | 4.43M | 3.51M |
-| 1,024 | 3.79M | 4.38M | 3.79M |
-| 4,096 | 9.03M | 3.65M | 3.61M |
-| 8,192 | 11.48M | 3.61M | 3.73M |
-| 16,384 | 12.42M | 3.68M | 3.52M |
+| 96 | 0.66M | 4.26M | 2.91M |
+| 256 | 1.49M | 4.35M | 3.54M |
+| 512 | 2.53M | 4.44M | 3.51M |
+| 1,024 | 4.33M | 4.44M | 3.79M |
+| 4,096 | 10.71M | 3.62M | 3.61M |
+| 8,192 | 15.42M | 3.55M | 3.73M |
+| 16,384 | 18.55M | 3.65M | 3.52M |
 
 ## Accuracy
 
@@ -39,7 +39,7 @@ rad/s, axes / 0.05, car plus ball), capped at 10.
 
 ## Build
 
-Needs CMake 3.21+ and a C++17 compiler. CUDA builds also need the CUDA toolkit; Python bindings need Python
+Needs CMake 3.21+ and a C++17 compiler. CUDA builds also need CUDA 12.1+; Python bindings need Python
 development files and pybind11.
 
 ```bash
@@ -55,6 +55,10 @@ Without `-DROCKETGPU_USE_CUDA=ON` you get a CPU build, tuned for the machine tha
 `-DROCKETGPU_NATIVE_ARCH=OFF` for a binary that runs on other machines. `ROCKETGPU_CPU_THREADS`, set before the first
 CPU call, fixes the thread count.
 
+CUDA builds compile the kernels as seven translation units by default, which needs Python 3 at configure time.
+Without it, or with `-DROCKETGPU_CUDA_SPLIT=OFF`, they build as one file: slower, in about twice the memory, with
+identical results.
+
 The fastest CPU build is profile-guided (needs `ROCKETGPU_COLLISION_MESH_DIR` and numpy):
 
 ```bash
@@ -64,7 +68,7 @@ tools/pgo_build.sh build -DROCKETGPU_USE_CUDA=OFF -DCMAKE_CXX_COMPILER=clang++
 CPU builds use ISPC kernels when `ispc` is installed; `-DROCKETGPU_CPU_ISPC=OFF` gives a scalar build.
 
 `-DROCKETGPU_BUILD_BENCH=ON` also builds `bench_cpp`, a C++ throughput benchmark (RocketSim v3's `arena_scale_v3`
-workload). It needs a C++20 compiler, and with CUDA, CMake 3.25.2+ and CUDA 12+:
+workload). It needs a C++20 compiler, and with CUDA, CMake 3.25.2+ and CUDA 12.1+:
 
 ```bash
 python3 tools/replay_controls.py path/to/RocketGPU-fullstate-suite replay.bin
@@ -128,6 +132,41 @@ positions = cars['pos'].copy()
 Rows are `env * max_cars_per_env + slot`; the first `env_car_count` slots of each arena are active. The view is
 read-only and changes as the simulator steps, so copy what you keep and set state through the state API.
 
+On CUDA builds, `views.field_arrays(sim, 'car_states')` gives zero-copy device views shaped `(tiles, 32[, dims])`, car
+`i` at `[i // 32, i % 32]`:
+
+```python
+pos = cp.asarray(views.field_arrays(sim, 'car_states')['pos']).reshape(-1, 3)[:sim.car_capacity()]  # copies
+```
+
+The raw car pointer (`DeviceView::car_states`, `sim.device_arrays()['car_states']`) is that tile store, described by
+`views.state_layout('car_states')['device']`. To get plain `CarState` records on any build, use
+`sim.download_state_array('car_states', host_ptr, count)` or `download_car_states`.
+
+## Custom arenas
+
+A soccar match (scoring, kickoffs, boost pads, demos) on your own geometry. A default `ArenaLayout` is the official
+arena; change any part of it:
+
+```python
+layout = rg.ArenaLayout()
+layout.mesh_dir = '/path/to/my_arena'          # every .cmf file in it
+layout.meshes = [rg.ArenaMesh(vertices, indices)]  # and/or triangles: Vec3 vertices in uu, 3 indices per triangle
+layout.planes = rg.ArenaLayout.official_planes()   # floor, ceiling and side walls; or your own ArenaPlane(point, normal)
+pad = rg.BoostPadConfig()
+pad.pos, pad.is_big = rg.Vec3(0, 2000, 73), 1
+layout.boost_pads = layout.boost_pads + [pad]
+goals = layout.goals                           # [blue, orange]: point, normal (into the goal), optional min/max box
+goals[0].min, goals[0].max = rg.Vec3(-893, -1e30, -1e30), rg.Vec3(893, 1e30, 642.775)
+layout.goals = goals
+# layout.kickoff_spawns (2 x 5), layout.respawn_spawns (2 x 4): ArenaSpawn(pos, yaw); layout.ball_spawn
+sim = rg.BatchSim(cfg, layout)
+```
+
+Spawns and goals are in world coordinates for each team. Every position must be within 11,500 uu of the origin on each
+axis and every spawn yaw within 8π of zero. Meshes are merged into at most 16 groups. Custom geometry skips the
+official arena's fast paths, so it steps slower than the official arena.
+
 ## Car state
 
 `CarState` fields that RLBot v5 exposes hold RLBot's value for the tick:
@@ -168,4 +207,4 @@ MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 ## Credits
 
 Built on [RocketSim](https://github.com/ZealanL/RocketSim) by ZealanL. Thanks to [VirxEC](https://github.com/VirxEC) for
-guidance.
+guidance. Thanks to akaAMAZING, creator of [RLMAX](https://github.com/akaAMAZING/RLMAX), for ideas that made RocketGPU faster.

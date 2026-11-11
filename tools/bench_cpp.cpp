@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -294,6 +295,7 @@ int main(int argc, char** argv) {
     const long target = Arg(argc, argv, "--target-arena-ticks", 40000000);
     const long max_steps = Arg(argc, argv, "--max-steps", 6000);
     const bool fused = Flag(argc, argv, "--fused"), stats = Flag(argc, argv, "--stats"), pin = Flag(argc, argv, "--pin");
+    const bool custom_arena = Flag(argc, argv, "--custom-arena");
     const char* replay_path = StrArg(argc, argv, "--replay");
     const Replay replay = replay_path ? LoadReplay(replay_path) : Replay{};
     const int steps = (int)std::clamp((target + (long)n * kTickSkip - 1) / ((long)n * kTickSkip), 8L, max_steps);
@@ -337,7 +339,21 @@ int main(int argc, char** argv) {
     SimConfig cfg;
     cfg.env_count = n;
     cfg.max_cars_per_env = 6;
-    BatchSim sim(cfg);
+    ArenaLayout layout;
+    if (custom_arena) {
+        const char* mesh_root = std::getenv("ROCKETGPU_COLLISION_MESH_DIR");
+        layout.mesh_dir = std::string(mesh_root ? mesh_root : ".") + "/soccar";
+        layout.planes = ArenaLayout::OfficialPlanes();
+        for (ArenaGoal& g : layout.goals) {
+            g.min = Vec3(-893.0f, -1.0e30f, -1.0e30f);
+            g.max = Vec3(893.0f, 1.0e30f, 642.775f);
+        }
+        BoostPadConfig pad;
+        pad.pos = Vec3(0.0f, 2000.0f, 73.0f);
+        pad.is_big = 1;
+        layout.boost_pads.push_back(pad);
+    }
+    BatchSim sim = custom_arena ? BatchSim(cfg, layout) : BatchSim(cfg);
     sim.set_env_car_count(car_count.data(), n);
     sim.set_teams(teams.data(), teams.size());
     std::vector<EnvState> states(n);

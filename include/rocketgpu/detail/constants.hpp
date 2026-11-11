@@ -54,6 +54,18 @@ ROCKETGPU_HD constexpr SpawnPos SoccarRespawnSpawn(int index) {
     }
 }
 
+struct ArenaRules {
+    Vec3 kickoff_pos[2][5];
+    float kickoff_yaw[2][5];
+    Vec3 respawn_pos[2][4];
+    float respawn_yaw[2][4];
+    Vec3 ball_spawn;
+    Vec3 goal_point[2];
+    Vec3 goal_normal[2];
+    Vec3 goal_min[2];
+    Vec3 goal_max[2];
+};
+
 ROCKETGPU_HD constexpr Vec3 BoostPadLocSoccar(int index) {
     switch (index) {
     case 0: return Vec3(0.0f, -4240.0f, 70.0f);

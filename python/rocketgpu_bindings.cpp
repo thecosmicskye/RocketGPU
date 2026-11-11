@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -31,156 +32,8 @@ cudaStream_t StreamFromInt(uintptr_t raw_stream) {
     return reinterpret_cast<cudaStream_t>(raw_stream);
 }
 
-constexpr size_t kSharedScratchBytes =
+constexpr size_t kBlobScratchBytes =
     offsetof(rocketgpu::detail::WorldSolverScratch, pair_cache_maybe_valid) + sizeof(uint32_t);
-
-namespace scratch_layout {
-using Scratch = rocketgpu::detail::WorldSolverScratch;
-using Proxy = rocketgpu::detail::BulletBroadphaseProxy;
-using rocketgpu::Vec3;
-
-constexpr size_t kAbsent = ~size_t{0};
-struct Member {
-    size_t off;
-    size_t size;
-    size_t align;
-};
-
-constexpr size_t AlignUp(size_t v, size_t a) {
-    return (v + a - 1) / a * a;
-}
-
-#define RG_HAS(S, m) Member{offsetof(S, m), sizeof(S::m), alignof(decltype(S::m))}
-#if defined(ROCKETGPU_USE_CUDA)
-#define RG_CPU_ONLY(S, m, T) Member{kAbsent, sizeof(T), alignof(T)}
-#else
-#define RG_CPU_ONLY(S, m, T) RG_HAS(S, m)
-#endif
-
-constexpr Member kProxyMembers[] = {
-    RG_HAS(Proxy, aabb_min), RG_HAS(Proxy, aabb_max), RG_HAS(Proxy, child_aabb_min), RG_HAS(Proxy, child_aabb_max),
-    RG_HAS(Proxy, child_center), RG_HAS(Proxy, child_axis), RG_HAS(Proxy, child_half),
-    RG_CPU_ONLY(Proxy, child_local_min, Vec3), RG_CPU_ONLY(Proxy, child_local_max, Vec3),
-    RG_CPU_ONLY(Proxy, origin, Vec3),
-    RG_HAS(Proxy, cell_i), RG_HAS(Proxy, cell_j), RG_HAS(Proxy, cell_k), RG_HAS(Proxy, valid), RG_HAS(Proxy, is_ball),
-};
-constexpr size_t kProxyCount = sizeof(Scratch::w3_proxies) / sizeof(Proxy);
-
-template <size_t N>
-struct Layout {
-    size_t off[N] = {};
-    size_t end = 0;
-    size_t align = 1;
-};
-
-template <size_t N>
-constexpr Layout<N> Walk(const Member (&m)[N], size_t start) {
-    Layout<N> l{};
-    size_t at = start;
-    for (size_t i = 0; i < N; ++i) {
-        at = AlignUp(at, m[i].align);
-        l.off[i] = at;
-        at += m[i].size;
-        l.align = m[i].align > l.align ? m[i].align : l.align;
-    }
-    l.end = at;
-    return l;
-}
-
-constexpr Layout<sizeof(kProxyMembers) / sizeof(Member)> kProxy = Walk(kProxyMembers, 0);
-constexpr size_t kProxyBytes = AlignUp(kProxy.end, kProxy.align);
-
-constexpr Member kScratchMembers[] = {
-    RG_HAS(Scratch, ball_predict_vel_bt),
-    RG_CPU_ONLY(Scratch, car_predict_vel, Vec3[8]),
-    RG_HAS(Scratch, car_predict_vel_bt), RG_HAS(Scratch, car_predict_ang_vel), RG_HAS(Scratch, car_predict_valid),
-    RG_HAS(Scratch, predictive_hit_mask), RG_HAS(Scratch, predictive_staged), RG_HAS(Scratch, predictive_normal),
-    RG_HAS(Scratch, predictive_distance_bt), RG_HAS(Scratch, ball_world_mesh_manifolds),
-    RG_HAS(Scratch, ball_world_plane_manifolds), RG_HAS(Scratch, ball_settled),
-    RG_HAS(Scratch, ball_settled_world_entry_count), RG_HAS(Scratch, ball_settled_world_entries),
-    RG_HAS(Scratch, ball_settled_mutator_epoch), RG_HAS(Scratch, ball_settled_sub_dt),
-    RG_HAS(Scratch, ball_settled_solver_vel_bt), RG_HAS(Scratch, ball_settled_state), RG_HAS(Scratch, bp),
-    RG_HAS(Scratch, w3_prefix_done), RG_HAS(Scratch, w3_proxies_done), RG_HAS(Scratch, w3_info_done),
-    RG_HAS(Scratch, w3_removed_count), RG_HAS(Scratch, w3_removed),
-    Member{offsetof(Scratch, w3_proxies), kProxyCount * kProxyBytes, alignof(Proxy)},
-    RG_HAS(Scratch, retained_reset_pending), RG_HAS(Scratch, car_world_reset), RG_HAS(Scratch, vehicle_apart_mask),
-    RG_HAS(Scratch, bullet_manifold_count), RG_HAS(Scratch, shared_contact_order_group_count),
-    RG_HAS(Scratch, wheel_ray_stage),
-    Member{offsetof(Scratch, wheel_ray_ordered), sizeof(Scratch::wheel_ray_ordered), 16},
-    RG_HAS(Scratch, world_step_carry), RG_HAS(Scratch, car_world_rows_out), RG_HAS(Scratch, pair_cache_cars),
-    RG_HAS(Scratch, vehicle_updates_independent), RG_HAS(Scratch, ball_mesh_maybe_retained),
-    RG_HAS(Scratch, pair_cache_maybe_valid),
-};
-#undef RG_HAS
-#undef RG_CPU_ONLY
-constexpr size_t kScratchMemberCount = sizeof(kScratchMembers) / sizeof(Member);
-constexpr size_t kProxiesIndex = 24;
-constexpr size_t kStart = offsetof(Scratch, ball_predict_vel_bt);
-constexpr Layout<kScratchMemberCount> kScratch = Walk(kScratchMembers, kStart);
-static_assert(kScratchMembers[kProxiesIndex].off == offsetof(Scratch, w3_proxies), "kProxiesIndex");
-
-#if !defined(ROCKETGPU_USE_CUDA)
-template <size_t N>
-constexpr bool MatchesBuild(const Member (&m)[N], const Layout<N>& l) {
-    for (size_t i = 0; i < N; ++i) {
-        if (m[i].off != l.off[i]) return false;
-    }
-    return true;
-}
-static_assert(MatchesBuild(kProxyMembers, kProxy) && kProxyBytes == sizeof(Proxy), "proxy member list");
-static_assert(MatchesBuild(kScratchMembers, kScratch) && kScratch.end == kSharedScratchBytes, "scratch member list");
-static_assert(sizeof(Scratch::car_predict_vel) == sizeof(Vec3[8]), "car_predict_vel type");
-#endif
-}
-
-constexpr size_t kBlobScratchBytes = scratch_layout::kScratch.end;
-
-#if defined(ROCKETGPU_USE_CUDA)
-void ScratchToBlob(const rocketgpu::detail::WorldSolverScratch& s, uint8_t* out) {
-    using namespace scratch_layout;
-    const auto* in = reinterpret_cast<const uint8_t*>(&s);
-    std::memset(out, 0, kBlobScratchBytes);
-    std::memcpy(out, in, kStart);
-    for (size_t i = 0; i < kScratchMemberCount; ++i) {
-        const Member& m = kScratchMembers[i];
-        if (m.off == kAbsent) continue;
-        if (i != kProxiesIndex) {
-            std::memcpy(out + kScratch.off[i], in + m.off, m.size);
-            continue;
-        }
-        for (size_t p = 0; p < kProxyCount; ++p) {
-            for (size_t j = 0; j < sizeof(kProxyMembers) / sizeof(Member); ++j) {
-                const Member& pm = kProxyMembers[j];
-                if (pm.off == kAbsent) continue;
-                std::memcpy(out + kScratch.off[i] + p * kProxyBytes + kProxy.off[j], in + m.off + p * sizeof(Proxy) + pm.off,
-                            pm.size);
-            }
-        }
-    }
-}
-
-void ScratchFromBlob(const uint8_t* in, rocketgpu::detail::WorldSolverScratch& s) {
-    using namespace scratch_layout;
-    auto* out = reinterpret_cast<uint8_t*>(&s);
-    std::memcpy(out, in, kStart);
-    for (size_t i = 0; i < kScratchMemberCount; ++i) {
-        const Member& m = kScratchMembers[i];
-        if (m.off == kAbsent) continue;
-        if (i != kProxiesIndex) {
-            std::memcpy(out + m.off, in + kScratch.off[i], m.size);
-            continue;
-        }
-        for (size_t p = 0; p < kProxyCount; ++p) {
-            for (size_t j = 0; j < sizeof(kProxyMembers) / sizeof(Member); ++j) {
-                const Member& pm = kProxyMembers[j];
-                if (pm.off == kAbsent) continue;
-                std::memcpy(out + m.off + p * sizeof(Proxy) + pm.off, in + kScratch.off[i] + p * kProxyBytes + kProxy.off[j],
-                            pm.size);
-            }
-        }
-    }
-}
-#endif
 
 template <typename F>
 void ForInternalState(const rocketgpu::BatchSim& sim, rocketgpu::detail::WorldSolverScratchRowPoolHost& rows, F&& f) {
@@ -553,6 +406,76 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
                 for (size_t p = 0; p < pads.size(); ++p) c.boost_pads[p] = pads[p];
             });
 
+    py::class_<rocketgpu::ArenaMesh>(m, "ArenaMesh")
+        .def(py::init<>())
+        .def(py::init([](const std::vector<rocketgpu::Vec3>& vertices, const std::vector<int32_t>& indices) {
+                 rocketgpu::ArenaMesh mesh;
+                 mesh.vertices = vertices;
+                 mesh.indices = indices;
+                 return mesh;
+             }),
+             py::arg("vertices"), py::arg("indices"))
+        .def_readwrite("vertices", &rocketgpu::ArenaMesh::vertices)
+        .def_readwrite("indices", &rocketgpu::ArenaMesh::indices);
+    py::class_<rocketgpu::ArenaPlane>(m, "ArenaPlane")
+        .def(py::init<>())
+        .def(py::init([](const rocketgpu::Vec3& point, const rocketgpu::Vec3& normal) {
+                 return rocketgpu::ArenaPlane{point, normal};
+             }),
+             py::arg("point"), py::arg("normal"))
+        .def_readwrite("point", &rocketgpu::ArenaPlane::point)
+        .def_readwrite("normal", &rocketgpu::ArenaPlane::normal);
+    py::class_<rocketgpu::ArenaSpawn>(m, "ArenaSpawn")
+        .def(py::init<>())
+        .def(py::init([](const rocketgpu::Vec3& pos, float yaw) { return rocketgpu::ArenaSpawn{pos, yaw}; }),
+             py::arg("pos"), py::arg("yaw"))
+        .def_readwrite("pos", &rocketgpu::ArenaSpawn::pos)
+        .def_readwrite("yaw", &rocketgpu::ArenaSpawn::yaw);
+    py::class_<rocketgpu::ArenaGoal>(m, "ArenaGoal")
+        .def(py::init<>())
+        .def_readwrite("point", &rocketgpu::ArenaGoal::point)
+        .def_readwrite("normal", &rocketgpu::ArenaGoal::normal)
+        .def_readwrite("min", &rocketgpu::ArenaGoal::min)
+        .def_readwrite("max", &rocketgpu::ArenaGoal::max);
+    py::class_<rocketgpu::ArenaLayout>(m, "ArenaLayout")
+        .def(py::init<>())
+        .def_readwrite("mesh_dir", &rocketgpu::ArenaLayout::mesh_dir)
+        .def_readwrite("meshes", &rocketgpu::ArenaLayout::meshes)
+        .def_readwrite("planes", &rocketgpu::ArenaLayout::planes)
+        .def_readwrite("boost_pads", &rocketgpu::ArenaLayout::boost_pads)
+        .def_readwrite("ball_spawn", &rocketgpu::ArenaLayout::ball_spawn)
+        .def_static("official_planes", &rocketgpu::ArenaLayout::OfficialPlanes)
+        .def_property(
+            "goals",
+            [](const rocketgpu::ArenaLayout& l) { return std::vector<rocketgpu::ArenaGoal>{l.goals[0], l.goals[1]}; },
+            [](rocketgpu::ArenaLayout& l, const std::vector<rocketgpu::ArenaGoal>& g) {
+                if (g.size() != 2) throw std::invalid_argument("goals: one per team");
+                l.goals[0] = g[0];
+                l.goals[1] = g[1];
+            })
+        .def_property(
+            "kickoff_spawns",
+            [](const rocketgpu::ArenaLayout& l) {
+                std::vector<std::vector<rocketgpu::ArenaSpawn>> out(2);
+                for (int t = 0; t < 2; ++t) out[t].assign(l.kickoff_spawns[t], l.kickoff_spawns[t] + 5);
+                return out;
+            },
+            [](rocketgpu::ArenaLayout& l, const std::vector<std::vector<rocketgpu::ArenaSpawn>>& s) {
+                if (s.size() != 2 || s[0].size() != 5 || s[1].size() != 5) throw std::invalid_argument("kickoff_spawns: 2 x 5");
+                for (int t = 0; t < 2; ++t) std::copy(s[t].begin(), s[t].end(), l.kickoff_spawns[t]);
+            })
+        .def_property(
+            "respawn_spawns",
+            [](const rocketgpu::ArenaLayout& l) {
+                std::vector<std::vector<rocketgpu::ArenaSpawn>> out(2);
+                for (int t = 0; t < 2; ++t) out[t].assign(l.respawn_spawns[t], l.respawn_spawns[t] + 4);
+                return out;
+            },
+            [](rocketgpu::ArenaLayout& l, const std::vector<std::vector<rocketgpu::ArenaSpawn>>& s) {
+                if (s.size() != 2 || s[0].size() != 4 || s[1].size() != 4) throw std::invalid_argument("respawn_spawns: 2 x 4");
+                for (int t = 0; t < 2; ++t) std::copy(s[t].begin(), s[t].end(), l.respawn_spawns[t]);
+            });
+
 #if defined(ROCKETGPU_USE_CUDA)
     m.attr("is_cuda_build") = true;
 #else
@@ -702,6 +625,36 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
             vec3("latest_touch_location", offsetof(S, latest_touch_location), f);
             vec3("latest_touch_normal", offsetof(S, latest_touch_normal), f);
             finish("car_states", sizeof(S), f);
+#if defined(ROCKETGPU_CAR_TILES)
+            {
+                namespace d = rocketgpu::detail;
+                struct Loc { size_t aos, size; int region; size_t offset; };
+                std::vector<Loc> locs;
+#define ROCKETGPU_CAR_TILE_LOC(name, region, offset) locs.push_back({offsetof(S, name), sizeof(S::name), region, offset});
+                ROCKETGPU_CAR_TILE_FIELDS(ROCKETGPU_CAR_TILE_LOC)
+#undef ROCKETGPU_CAR_TILE_LOC
+                const size_t starts[3] = {0, d::kCarTileWideStart, d::kCarTileColdStart};
+                const size_t lane_strides[3] = {d::kCarTileWordBytes, ROCKETGPU_CAR_TILE_WIDE_BYTES, ROCKETGPU_CAR_TILE_COLD_BYTES};
+                py::list device_fields;
+                for (const py::handle item : f) {
+                    const py::tuple t = item.cast<py::tuple>();
+                    const size_t aos = t[2].cast<size_t>();
+                    const Loc* loc = nullptr;
+                    for (const Loc& l : locs) {
+                        if (aos >= l.aos && aos < l.aos + l.size) loc = &l;
+                    }
+                    if (loc == nullptr) throw std::logic_error("car tile layout is missing a field");
+                    device_fields.append(py::make_tuple(t[0], t[1], starts[loc->region] + loc->offset + (aos - loc->aos),
+                                                        lane_strides[loc->region], t[3]));
+                }
+                py::dict device;
+                device["tile_cars"] = d::kCarTileLanes;
+                device["tile_bytes"] = d::kCarTileBytes;
+                device["fields"] = device_fields;
+                py::dict car_layout = out["car_states"];
+                car_layout["device"] = device;
+            }
+#endif
         }
         {
             using S = rocketgpu::BallState;
@@ -777,6 +730,7 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
 
     py::class_<rocketgpu::BatchSim>(m, "BatchSim")
         .def(py::init<const rocketgpu::SimConfig&>(), py::arg("config"))
+        .def(py::init<const rocketgpu::SimConfig&, const rocketgpu::ArenaLayout&>(), py::arg("config"), py::arg("layout"))
         .def_property_readonly("config", &rocketgpu::BatchSim::config, py::return_value_policy::reference_internal)
         .def("device_view", &rocketgpu::BatchSim::device_view)
         .def("set_physics_event_stream", [](rocketgpu::BatchSim& sim, uintptr_t records,
@@ -810,7 +764,13 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
                      entry["count"] = count;
                      out[name] = entry;
                  };
+#if defined(ROCKETGPU_CAR_TILES)
+                 add("car_states", v.car_states,
+                     (sim.car_capacity() + rocketgpu::detail::kCarTileLanes - 1) / rocketgpu::detail::kCarTileLanes,
+                     rocketgpu::detail::kCarTileBytes);
+#else
                  add("car_states", v.car_states, sim.car_capacity(), sizeof(rocketgpu::CarState));
+#endif
                  add("controls", v.controls, sim.car_capacity(), sizeof(rocketgpu::CarControls));
                  add("car_configs", v.car_configs, sim.car_capacity(), sizeof(rocketgpu::CarConfig));
                  add("teams", v.teams, sim.car_capacity(), sizeof(rocketgpu::Team));
@@ -906,6 +866,24 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
             "Uploads `count` raw structs (layout from state_layouts()) from host memory; PublicState canonicalizes "
             "imported cars and balls, PreserveInternal copies them as they are.")
         .def(
+            "download_state_array",
+            [](const rocketgpu::BatchSim& sim, const std::string& name, uintptr_t host_ptr, size_t count, uintptr_t stream) {
+                void* p = reinterpret_cast<void*>(host_ptr);
+                if (name == "car_states") {
+                    sim.download_car_states(static_cast<rocketgpu::CarState*>(p), count, StreamFromInt(stream));
+                } else if (name == "ball_states") {
+                    sim.download_ball_states(static_cast<rocketgpu::BallState*>(p), count, StreamFromInt(stream));
+                } else if (name == "env_states") {
+                    sim.download_env_states(static_cast<rocketgpu::EnvState*>(p), count, StreamFromInt(stream));
+                } else if (name == "boost_pad_states") {
+                    sim.download_boost_pad_states(static_cast<rocketgpu::BoostPadState*>(p), count, StreamFromInt(stream));
+                } else {
+                    throw std::invalid_argument("unknown state array: " + name);
+                }
+            },
+            py::arg("name"), py::arg("host_ptr"), py::arg("count"), py::arg("stream") = 0,
+            "Downloads `count` raw structs (layout from state_layouts()) to host memory.")
+        .def(
             "internal_state_layout",
             [](const rocketgpu::BatchSim& sim) {
                 rocketgpu::detail::WorldSolverScratchRowPoolHost rows;
@@ -931,11 +909,7 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
                         std::vector<rocketgpu::detail::WorldSolverScratch> scratch(sim.env_count());
                         sim.download_solver_scratch(scratch.data(), scratch.size(), StreamFromInt(stream));
                         for (size_t env = 0; env < scratch.size(); ++env) {
-#if defined(ROCKETGPU_USE_CUDA)
-                            ScratchToBlob(scratch[env], out + env * kBlobScratchBytes);
-#else
-                            std::memcpy(out + env * kSharedScratchBytes, &scratch[env], kSharedScratchBytes);
-#endif
+                            std::memcpy(out + env * kBlobScratchBytes, &scratch[env], kBlobScratchBytes);
                         }
                     }
                     out += bytes;
@@ -958,11 +932,7 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
                     } else {
                         std::vector<rocketgpu::detail::WorldSolverScratch> scratch(sim.env_count());
                         for (size_t env = 0; env < scratch.size(); ++env) {
-#if defined(ROCKETGPU_USE_CUDA)
-                            ScratchFromBlob(in + env * kBlobScratchBytes, scratch[env]);
-#else
-                            std::memcpy(&scratch[env], in + env * kSharedScratchBytes, kSharedScratchBytes);
-#endif
+                            std::memcpy(&scratch[env], in + env * kBlobScratchBytes, kBlobScratchBytes);
                         }
                         sim.upload_solver_scratch_range_dev(scratch.data(), 0, scratch.size(), StreamFromInt(stream));
                     }

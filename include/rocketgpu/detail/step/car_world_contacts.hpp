@@ -3,7 +3,7 @@ struct ArenaMeshTriangle;
 constexpr bool EnableArenaTriangleInternalEdgeAdjust();
 
 ROCKETGPU_HD void BuildInvInertiaTensorWorldBt(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     float mass,
     Vec3& out_row0,
@@ -268,7 +268,7 @@ ROCKETGPU_HD int MergeCarWorldRetainedPlanePoint(Manifold& manifold, const Point
 #define ROCKETGPU_CAR_WORLD_ALWAYS_INLINE
 #endif
 ROCKETGPU_HD void AppendCarWorldPlaneContactRows(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
     const Vec3& axis_normal,
@@ -650,7 +650,7 @@ struct CarWorldTriangleHit {
 };
 
 ROCKETGPU_HD CarWorldTriangleHit ComputeCarWorldTriangleHit(
-    const CarState& car,
+    CarCArgT car_arg,
     const CarConfig& cfg,
     const ArenaMeshTriangle* mesh_triangles,
     const ArenaMeshTriangle* cal_arena_local_tris,
@@ -659,6 +659,7 @@ ROCKETGPU_HD CarWorldTriangleHit ComputeCarWorldTriangleHit(
     int32_t tri_idx,
     bullet_port::btGjkEpaScratch* gjk_epa_scratch,
     float precomputed_threshold_bt = -1.0f) {
+    CarCRefT car = car_arg;
     const ArenaMeshTriangle& tri = mesh_triangles[tri_idx];
     CarWorldTriangleHit out;
     out.hit = 0;
@@ -694,7 +695,7 @@ ROCKETGPU_HD CarWorldTriangleHit ComputeCarWorldTriangleHit(
 }
 
 ROCKETGPU_HD CarWorldTriangleHit ComputeCarWorldTriangleHit(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
     const ArenaMeshTriangle* mesh_triangles,
@@ -766,27 +767,23 @@ ROCKETGPU_HD int CarWorldMeshStageSlot(uint32_t mesh_mask, int mesh) {
     return static_cast<int>((((v + (v >> 4)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24);
 }
 
-#if defined(__CUDACC__)
-extern __device__ CarWorldMeshCandidateStage* g_rocketgpu_car_world_stage;
-extern __device__ int g_rocketgpu_car_world_stage_stride;
-#endif
-
-ROCKETGPU_HD CarWorldMeshCandidateStage* CarWorldMeshCandidateStageFor(int env_idx, int car_slot) {
-#if defined(__CUDA_ARCH__)
-    CarWorldMeshCandidateStage* base = g_rocketgpu_car_world_stage;
-    const int stride = g_rocketgpu_car_world_stage_stride;
+#if defined(ROCKETGPU_USE_CUDA)
+ROCKETGPU_HD CarWorldMeshCandidateStage* CarWorldMeshCandidateStageFor(
+    CarWorldMeshCandidateStage* base, int stride, int env_idx, int car_slot) {
     if (base == nullptr || stride <= 0 || car_slot < 0 || car_slot >= stride || env_idx < 0) {
         return nullptr;
     }
     return base + static_cast<size_t>(env_idx) * static_cast<size_t>(stride) + car_slot;
+}
 #else
+ROCKETGPU_HD CarWorldMeshCandidateStage* CarWorldMeshCandidateStageFor(int env_idx, int car_slot) {
     (void)env_idx;
     (void)car_slot;
     return nullptr;
-#endif
 }
+#endif
 
-ROCKETGPU_HD void FillCarWorldMeshCandidateFingerprint(const CarState& car, const CarConfig& cfg, float* fp) {
+ROCKETGPU_HD void FillCarWorldMeshCandidateFingerprint(CarCRefT car, const CarConfig& cfg, float* fp) {
     Vec3 axis_x(1.0f, 0.0f, 0.0f);
     Vec3 axis_y(0.0f, 1.0f, 0.0f);
     Vec3 axis_z(0.0f, 0.0f, 1.0f);
@@ -802,7 +799,7 @@ ROCKETGPU_HD void FillCarWorldMeshCandidateFingerprint(const CarState& car, cons
 }
 
 ROCKETGPU_HD bool CarWorldMeshCandidateStageMatches(const CarWorldMeshCandidateStage& stage,
-                                                const CarState& car,
+                                                CarCRefT car,
                                                 const CarConfig& cfg) {
     float fp[kCarWorldMeshStageFingerprintFloats];
     FillCarWorldMeshCandidateFingerprint(car, cfg, fp);
@@ -890,7 +887,7 @@ struct CarWorldMeshQueryFrame {
     Vec3 aabb_max_bt;
 };
 
-ROCKETGPU_HD CarWorldMeshQueryFrame ComputeCarWorldMeshQueryFrame(const CarState& car, const CarConfig& cfg,
+ROCKETGPU_HD CarWorldMeshQueryFrame ComputeCarWorldMeshQueryFrame(CarCRefT car, const CarConfig& cfg,
                                                                   const CarShapeCacheEntry* shape = nullptr) {
     constexpr float kUUToBT = 1.0f / 50.0f;
     CarWorldMeshQueryFrame f;
@@ -929,6 +926,9 @@ ROCKETGPU_HD CarWorldMeshQueryFrame ComputeCarWorldMeshQueryFrame(const CarState
 
 #if !defined(ROCKETGPU_USE_CUDA)
 inline bool CarWorldBoxClearOfMeshes(const ArenaMeshClearance& clearance, const CarWorldMeshQueryFrame& f,
+#else
+ROCKETGPU_HD bool CarWorldBoxClearOfMeshes(const ArenaMeshClearance& clearance, const CarWorldMeshQueryFrame& f,
+#endif
                                      float contact_threshold_bt) {
     const Vec3 h = f.box_half_extent_with_margin_bt;
     const float pad = contact_threshold_bt + 1.0e-3f;
@@ -948,7 +948,6 @@ inline bool CarWorldBoxClearOfMeshes(const ArenaMeshClearance& clearance, const 
     }
     return true;
 }
-#endif
 
 ROCKETGPU_HD bool CarWorldMeshInfoUsable(
     const ArenaMeshBvhMeshInfo& mesh_info,
@@ -1078,7 +1077,7 @@ ROCKETGPU_HD float CarWorldMeshReachBt(const CarConfig& cfg) {
     return SqrtScalar(Dot(half_bt, half_bt)) + SqrtScalar(Dot(offset_bt, offset_bt)) + kSlackBt;
 }
 
-ROCKETGPU_HD CarWorldMeshReach ComputeCarWorldMeshReach(const CarState& car, const CarConfig& cfg, float dt,
+ROCKETGPU_HD CarWorldMeshReach ComputeCarWorldMeshReach(CarCRefT car, const CarConfig& cfg, float dt,
                                                         const CarShapeCacheEntry* shape = nullptr) {
     constexpr float kUUToBT = 1.0f / 50.0f;
     const float reach_bt = shape != nullptr ? shape->mesh_reach_bt : CarWorldMeshReachBt(cfg);
@@ -1147,7 +1146,7 @@ ROCKETGPU_HD uint32_t CarWorldMeshReachMask(
 }
 
 ROCKETGPU_HD bool CarWorldMeshesOutOfReach(
-    const CarState& car,
+    CarCRefT car,
     const CarConfig& cfg,
     const ArenaMeshBvhMeshInfo* mesh_infos,
     int32_t mesh_count,
@@ -1203,7 +1202,7 @@ ROCKETGPU_HD void ReleaseCarWorldMeshManifoldsOutOfReach(
 
 constexpr float kCarWorldPlaneReachSlackBt = 1.0e-3f;
 ROCKETGPU_HD void CarWorldPlaneSupportDistances(
-    const CarState& car, const CarConfig& cfg, float d[4], float& threshold_bt, float& window_bt,
+    CarCRefT car, const CarConfig& cfg, float d[4], float& threshold_bt, float& window_bt,
     const CarShapeCacheEntry* shape = nullptr) {
     constexpr float kUUToBT = 1.0f / 50.0f;
     constexpr float kBulletGContactBreakingThresholdBt = 0.02f;
@@ -1226,7 +1225,11 @@ ROCKETGPU_HD void CarWorldPlaneSupportDistances(
     d[3] = ArenaHeight() * kUUToBT - center_bt.z - ext_z;
 }
 
-ROCKETGPU_HD int CarWorldPlanesOutOfReach(const CarState& car, const CarConfig& cfg) {
+ROCKETGPU_HD void CarWorldNoPlaneDistances(float d[4]) {
+    d[0] = d[1] = d[2] = d[3] = 1.0e30f;
+}
+
+ROCKETGPU_HD int CarWorldPlanesOutOfReach(CarCRefT car, const CarConfig& cfg) {
     constexpr float kSlackBt = kCarWorldPlaneReachSlackBt;
     float d[4];
     float threshold_bt;
@@ -1250,7 +1253,7 @@ ROCKETGPU_HD int CarWorldPlanesOutOfReach(const CarState& car, const CarConfig& 
     return mask;
 }
 
-ROCKETGPU_HD int CarWorldPlanesInReachCount(const CarState& car, const CarConfig& cfg) {
+ROCKETGPU_HD int CarWorldPlanesInReachCount(CarCRefT car, const CarConfig& cfg) {
     float d[4];
     float threshold_bt;
     float window_bt;
@@ -1265,7 +1268,7 @@ ROCKETGPU_HD int CarWorldPlanesInReachCount(const CarState& car, const CarConfig
 
 template <bool kStagedHitsOnly = false, bool kAllowTrianglePairsGather = false>
 ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRowsBody(
-    const CarState& car,
+    CarCArgT car_arg,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
     const Vec3& external_linear_delta,
@@ -1308,6 +1311,7 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
     const BulletBroadphaseProxy* fresh_car_proxy = nullptr,
     const CarShapeCacheEntry* shape = nullptr,
     const CarListManifolds* list_manifolds = nullptr) {
+    CarCRefT car = car_arg;
     if (mesh_triangles == nullptr || mesh_triangle_count <= 0) {
         return;
     }

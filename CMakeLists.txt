@@ -1,17 +1,31 @@
 cmake_minimum_required(VERSION 3.21)
-project(RocketGPU VERSION 1.1.0 LANGUAGES CXX)
+project(RocketGPU VERSION 1.2.0 LANGUAGES CXX)
 
 option(ROCKETGPU_USE_CUDA "Build CUDA kernels" OFF)
 option(ROCKETGPU_BUILD_PYTHON "Build Python bindings" OFF)
 option(ROCKETGPU_BUILD_BENCH "Build tools/bench_cpp (throughput benchmark)" OFF)
+if (MSVC)
+    set(_rocketgpu_cuda_split_default OFF)
+else()
+    set(_rocketgpu_cuda_split_default ON)
+endif()
+option(ROCKETGPU_CUDA_SPLIT "CUDA builds: compile the kernels as seven translation units (tools/split_cuda.py, needs Python 3 at configure time); OFF: one file. Off by default with MSVC, where the split has not been built" ${_rocketgpu_cuda_split_default})
+set(ROCKETGPU_OBJECT_CACHE "" CACHE PATH "Dev builds: directory of reusable objects (tools/obj_cache.py); empty for none")
 option(ROCKETGPU_NATIVE_ARCH "CPU builds: tune for this machine (-march=native / -mcpu=native); OFF for binaries that run on other machines" ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if (ROCKETGPU_OBJECT_CACHE)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(_rocketgpu_obj_cache ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/obj_cache.py
+        --root ${CMAKE_CURRENT_SOURCE_DIR} --cache ${ROCKETGPU_OBJECT_CACHE} --)
+    set(CMAKE_CXX_COMPILER_LAUNCHER ${_rocketgpu_obj_cache})
+    set(CMAKE_CUDA_COMPILER_LAUNCHER ${_rocketgpu_obj_cache})
+endif()
 find_program(ROCKETGPU_CCACHE_EXECUTABLE ccache)
-if (ROCKETGPU_CCACHE_EXECUTABLE)
+if (ROCKETGPU_CCACHE_EXECUTABLE AND NOT ROCKETGPU_OBJECT_CACHE)
     if (NOT DEFINED CMAKE_CXX_COMPILER_LAUNCHER)
         set(CMAKE_CXX_COMPILER_LAUNCHER "${ROCKETGPU_CCACHE_EXECUTABLE}" CACHE STRING "CXX compiler launcher")
     endif()
@@ -38,7 +52,7 @@ endif()
 
 if (ROCKETGPU_USE_CUDA)
     enable_language(CUDA)
-    find_package(CUDAToolkit REQUIRED)
+    find_package(CUDAToolkit 12.1 REQUIRED)
 endif()
 
 set(ROCKETGPU_PGO OFF CACHE STRING "CPU builds: profile-guided optimization (OFF, GENERATE, USE); see tools/pgo_build.sh")
@@ -174,14 +188,37 @@ endif()
 
 if (ROCKETGPU_USE_CUDA)
     target_compile_definitions(rocketgpu PUBLIC ROCKETGPU_USE_CUDA=1)
-    target_sources(rocketgpu PRIVATE src/rocketgpu_cuda.cu)
+    set(_rocketgpu_cuda_split ${ROCKETGPU_CUDA_SPLIT})
+    if (_rocketgpu_cuda_split)
+        find_package(Python3 COMPONENTS Interpreter)
+        if (NOT Python3_Interpreter_FOUND)
+            message(WARNING "ROCKETGPU_CUDA_SPLIT needs Python 3 at configure time (tools/split_cuda.py); "
+                            "building the kernels as one file")
+            set(_rocketgpu_cuda_split OFF)
+        endif()
+    endif()
+    if (_rocketgpu_cuda_split)
+        set(_rocketgpu_cuda_split_dir ${CMAKE_CURRENT_BINARY_DIR}/cuda_split)
+        set(_rocketgpu_cuda_split_srcs)
+        foreach(_m host step post world rows rays misc)
+            list(APPEND _rocketgpu_cuda_split_srcs ${_rocketgpu_cuda_split_dir}/rocketgpu_cuda_${_m}.cu)
+        endforeach()
+        add_custom_command(
+            OUTPUT ${_rocketgpu_cuda_split_srcs}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${_rocketgpu_cuda_split_dir}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/split_cuda.py
+                    ${CMAKE_CURRENT_SOURCE_DIR}/src/rocketgpu_cuda.cu ${_rocketgpu_cuda_split_dir}
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/rocketgpu_cuda.cu ${CMAKE_CURRENT_SOURCE_DIR}/tools/split_cuda.py
+            VERBATIM)
+        target_sources(rocketgpu PRIVATE ${_rocketgpu_cuda_split_srcs})
+    else()
+        target_sources(rocketgpu PRIVATE src/rocketgpu_cuda.cu)
+    endif()
     target_link_libraries(rocketgpu PUBLIC CUDA::cudart)
     target_compile_options(rocketgpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
     set_target_properties(rocketgpu PROPERTIES
         CUDA_STANDARD 17
-        CUDA_STANDARD_REQUIRED ON
-        CUDA_SEPARABLE_COMPILATION ON
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+        CUDA_STANDARD_REQUIRED ON)
 endif()
 
 if (ROCKETGPU_BUILD_PYTHON)

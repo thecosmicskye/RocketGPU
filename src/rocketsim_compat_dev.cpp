@@ -197,15 +197,7 @@ std::vector<Arena::DevField> Arena::DevLayouts() {
     RG_DEV_F(WorldSolverScratch, ball_world_mesh_manifolds); RG_DEV_F(WorldSolverScratch, ball_world_plane_manifolds);
     RG_DEV_F(WorldSolverScratch, ball_mesh_maybe_retained); RG_DEV_F(WorldSolverScratch, pair_cache_maybe_valid);
     RG_DEV_F(WorldSolverScratch, retained_reset_pending); RG_DEV_F(WorldSolverScratch, car_world_reset);
-    RG_DEV_F(WorldSolverScratch, predictive_hit_mask); RG_DEV_F(WorldSolverScratch, predictive_staged);
-    RG_DEV_F(WorldSolverScratch, predictive_normal); RG_DEV_F(WorldSolverScratch, predictive_distance_bt);
-    RG_DEV_F(WorldSolverScratch, ball_settled); RG_DEV_F(WorldSolverScratch, cal_start_vel);
-    RG_DEV_F(WorldSolverScratch, cal_ball_start_vel); RG_DEV_F(WorldSolverScratch, ball_predict_vel_bt);
-#if !defined(ROCKETGPU_USE_CUDA)
-    RG_DEV_F(WorldSolverScratch, car_predict_vel);
-#endif
-    RG_DEV_F(WorldSolverScratch, car_predict_ang_vel); RG_DEV_F(WorldSolverScratch, car_predict_valid);
-    RG_DEV_F(WorldSolverScratch, w3_prefix_done); RG_DEV_F(WorldSolverScratch, pair_cache_cars);
+    RG_DEV_F(WorldSolverScratch, ball_settled); RG_DEV_F(WorldSolverScratch, pair_cache_cars);
 
     RG_DEV_S(BallMeshPersistentManifold);
     RG_DEV_F(BallMeshPersistentManifold, count); RG_DEV_F(BallMeshPersistentManifold, points);
@@ -365,12 +357,17 @@ void Arena::SetFullState(const std::map<std::string, std::vector<uint8_t>>& stat
             ++used;
         }
     }
-#if defined(ROCKETGPU_USE_CUDA)
-    if (state.count("solver_scratch.car_predict_vel") != 0 && !seen.count("solver_scratch.car_predict_vel")) {
-        seen["solver_scratch.car_predict_vel"] = true;
-        ++used;
+    for (const char* key : {"solver_scratch.predictive_hit_mask", "solver_scratch.predictive_staged",
+                            "solver_scratch.predictive_normal", "solver_scratch.predictive_distance_bt",
+                            "solver_scratch.cal_start_vel", "solver_scratch.cal_ball_start_vel",
+                            "solver_scratch.ball_predict_vel_bt", "solver_scratch.car_predict_vel",
+                            "solver_scratch.car_predict_ang_vel", "solver_scratch.car_predict_valid",
+                            "solver_scratch.w3_prefix_done"}) {
+        if (state.count(key) != 0 && !seen.count(key)) {
+            seen[key] = true;
+            ++used;
+        }
     }
-#endif
     if (used != state.size()) {
         for (const auto& kv : state) {
             if (!seen.count(kv.first)) throw std::invalid_argument("SetFullState: unknown field " + kv.first);

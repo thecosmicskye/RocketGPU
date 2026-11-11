@@ -1500,9 +1500,9 @@ struct btGjkEpaScratch {
 };
 
 #if defined(__CUDACC__)
-extern __device__ EPA* g_rocketgpu_epa_pool;
-extern __device__ unsigned int* g_rocketgpu_epa_busy;
-extern __device__ unsigned int g_rocketgpu_epa_slots;
+ROCKETGPU_DEVICE_GLOBAL EPA* g_rocketgpu_epa_pool;
+ROCKETGPU_DEVICE_GLOBAL unsigned int* g_rocketgpu_epa_busy;
+ROCKETGPU_DEVICE_GLOBAL unsigned int g_rocketgpu_epa_slots;
 #endif
 
 struct btEpaLease {

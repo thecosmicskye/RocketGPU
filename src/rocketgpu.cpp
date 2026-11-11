@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -36,6 +37,9 @@
 #include "rocketgpu/detail/arena/mesh_loader.hpp"
 #include "rocketgpu/detail/arena/mesh_path.hpp"
 #include "rocketgpu/detail/buffer.hpp"
+#if defined(ROCKETGPU_USE_CUDA)
+#include "rocketgpu/detail/car_buffer.hpp"
+#endif
 #include "rocketgpu/detail/cuda_api.hpp"
 #include "rocketgpu/detail/respawn_rng.hpp"
 #include "rocketgpu/detail/step.hpp"
@@ -494,15 +498,353 @@ struct ArenaMeshHost {
 #if !defined(ROCKETGPU_USE_CUDA)
     std::vector<float> ray_entry_boxes;
     std::vector<detail::ArenaMeshRayBlock> ray_blocks;
+#endif
     std::vector<uint8_t> clearance;
     Vec3 clearance_lo;
     float clearance_inv_cell = 0.0f;
     float clearance_unit = 0.0f;
     int32_t clearance_dims[3] = {0, 0, 0};
-#endif
     detail::ArenaBroadphaseGrid grid{};
     std::vector<uint16_t> cell_mask;
 };
+
+void BuildArenaMeshHostTables(ArenaMeshHost* h, bool custom) {
+    detail::SetArenaMeshFreeBox(h->infos);
+    if (custom) {
+        detail::SetArenaMeshRayOrder(h->infos, std::numeric_limits<float>::infinity());
+        for (detail::ArenaMeshBvhMeshInfo& info : h->infos) info.ray_neg_x_plane_pos = -1;
+    } else {
+        Vec3 neg_x_min, neg_x_max;
+        detail::BulletStaticPlaneShapeAabb(2, neg_x_min, neg_x_max);
+        detail::SetArenaMeshRayOrder(h->infos, neg_x_max.x);
+    }
+    detail::BuildArenaMeshLeafGrid(h->quantization, h->infos, h->nodes, h->subtrees, h->leaf_grid_infos,
+                                   h->leaf_cell_start, h->leaf_entries);
+#if defined(ROCKETGPU_USE_CUDA)
+    detail::BuildArenaMeshLeafGrid(h->quantization, h->infos, h->nodes, h->subtrees, h->ray_grid_infos,
+                                   h->ray_cell_start, h->ray_entries, 1.4f, 1);
+#else
+    detail::BuildArenaMeshLeafGrid(h->quantization, h->infos, h->nodes, h->subtrees, h->ray_grid_infos,
+                                   h->ray_cell_start, h->ray_entries, 1.4f, 4);
+    h->ray_entry_boxes.assign(h->ray_entries.size() * 8, 0.0f);
+    for (size_t m = 0; m < h->ray_grid_infos.size(); ++m) {
+        const detail::ArenaMeshLeafGridInfo& gi = h->ray_grid_infos[m];
+        const int mesh_index = h->infos[m].mesh_index;
+        if (gi.cell_offset < 0 || mesh_index < 0 || mesh_index >= static_cast<int>(h->quantization.size())) {
+            continue;
+        }
+        const detail::ArenaMeshBvhQuantization& q = h->quantization[static_cast<size_t>(mesh_index)];
+        const int cells = gi.cells[0] * gi.cells[1] * gi.cells[2];
+        for (int e = h->ray_cell_start[gi.cell_offset]; e < h->ray_cell_start[gi.cell_offset + cells]; ++e) {
+            const Vec3 lo = detail::UnquantizeArenaMeshBvhPoint(q, h->ray_entries[e].quantized_aabb_min);
+            const Vec3 hi = detail::UnquantizeArenaMeshBvhPoint(q, h->ray_entries[e].quantized_aabb_max);
+            float* b = &h->ray_entry_boxes[static_cast<size_t>(e) * 8];
+            b[0] = lo.x; b[1] = lo.y; b[2] = lo.z; b[4] = hi.x; b[5] = hi.y; b[6] = hi.z;
+        }
+    }
+    {
+        const bool local = !h->local_mesh.empty();
+        const std::vector<detail::ArenaMeshTriangle>& tris = local ? h->local_mesh : h->mesh;
+        detail::ArenaMeshRayBlock nan_block;
+        std::fill_n(&nan_block.lo[0][0], (sizeof(nan_block) - offsetof(detail::ArenaMeshRayBlock, lo)) / sizeof(float),
+                    std::numeric_limits<float>::quiet_NaN());
+        std::fill_n(nan_block.tri, 4, -1);
+        std::fill_n(nan_block.mesh_index, 4, -1);
+        h->ray_blocks.assign(h->ray_entries.size() / 4, nan_block);
+        for (size_t e = 0; e < h->ray_entries.size(); ++e) {
+            const detail::ArenaMeshLeafEntry& entry = h->ray_entries[e];
+            detail::ArenaMeshRayBlock& blk = h->ray_blocks[e / 4];
+            const int k = static_cast<int>(e % 4);
+            blk.quant[0][k] = entry.quantized_aabb_min[0];
+            blk.quant[0][4 + k] = entry.quantized_aabb_min[1];
+            blk.quant[1][k] = entry.quantized_aabb_min[2];
+            blk.quant[1][4 + k] = static_cast<uint16_t>(~entry.quantized_aabb_max[0]);
+            blk.quant[2][k] = static_cast<uint16_t>(~entry.quantized_aabb_max[1]);
+            blk.quant[2][4 + k] = static_cast<uint16_t>(~entry.quantized_aabb_max[2]);
+        }
+        for (size_t m = 0; m < h->ray_grid_infos.size(); ++m) {
+            const detail::ArenaMeshLeafGridInfo& gi = h->ray_grid_infos[m];
+            const detail::ArenaMeshBvhMeshInfo& mi = h->infos[m];
+            if (gi.cell_offset < 0) {
+                continue;
+            }
+            const int cells = gi.cells[0] * gi.cells[1] * gi.cells[2];
+            for (int e = h->ray_cell_start[gi.cell_offset]; e < h->ray_cell_start[gi.cell_offset + cells]; ++e) {
+                const int idx = h->ray_entries[e].triangle_index;
+                const int g = mi.triangle_start + idx;
+                if (idx < 0 || idx >= mi.triangle_count || g < 0 || g >= static_cast<int>(tris.size())) {
+                    continue;
+                }
+                detail::ArenaMeshRayBlock& blk = h->ray_blocks[static_cast<size_t>(e) / 4];
+                const int k = e % 4;
+                const float* box = &h->ray_entry_boxes[static_cast<size_t>(e) * 8];
+                const detail::ArenaMeshTriangle& tri = tris[static_cast<size_t>(g)];
+                const bool hit_local = local && mi.cal_origin_y != 0.0f;
+                if (!hit_local && g >= static_cast<int>(h->mesh.size())) {
+                    continue;
+                }
+                blk.tri[k] = g;
+                blk.mesh_index[k] =
+                    static_cast<int32_t>((hit_local ? tri : h->mesh[static_cast<size_t>(g)]).mesh_index);
+                const Vec3 n = detail::Cross(detail::operator-(tri.b, tri.a), detail::operator-(tri.c, tri.a));
+                const Vec3* v[4] = {&tri.a, &tri.b, &tri.c, &n};
+                float(*dst[4])[4] = {blk.a, blk.b, blk.c, blk.n};
+                for (int a = 0; a < 3; ++a) {
+                    blk.lo[a][k] = box[a];
+                    blk.hi[a][k] = box[4 + a];
+                    for (int j = 0; j < 4; ++j) {
+                        dst[j][a][k] = a == 0 ? v[j]->x : a == 1 ? v[j]->y : v[j]->z;
+                    }
+                }
+                blk.plane[k] = detail::Dot(tri.a, n);
+                blk.tol[k] = -0.0001f * detail::LengthSq(n);
+                blk.origin_y[k] = local ? static_cast<float>(tri.cal_origin_sign) * detail::kGoalMeshOriginYBt : 0.0f;
+            }
+        }
+    }
+#endif
+    int clearance_threads = 0;
+    if (const char* s = std::getenv("ROCKETGPU_CPU_THREADS")) {
+        clearance_threads = std::atoi(s);
+    }
+    if (clearance_threads <= 0) {
+#if !defined(ROCKETGPU_USE_CUDA)
+        clearance_threads = std::min(DefaultCpuHardwareThreads(), 16);
+#else
+        clearance_threads = std::min(std::max(1, static_cast<int>(std::thread::hardware_concurrency())), 16);
+#endif
+    }
+    detail::BuildArenaMeshClearance(h->mesh, h->local_mesh, h->clearance, h->clearance_lo, h->clearance_inv_cell,
+                                    h->clearance_unit, h->clearance_dims, clearance_threads);
+    h->cell_mask = detail::BuildArenaBroadphaseCellMask(h->mesh, h->infos, h->grid, custom);
+}
+
+std::vector<detail::ArenaMeshSource> CustomArenaMeshSources(const ArenaLayout& layout) {
+    constexpr float kUuToBt = 1.0f / 50.0f;
+    std::vector<detail::ArenaMeshSource> sources;
+    if (!layout.mesh_dir.empty()) {
+        std::vector<std::filesystem::path> files;
+        for (const auto& entry : std::filesystem::directory_iterator(layout.mesh_dir)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".cmf") files.push_back(entry.path());
+        }
+        if (files.empty()) {
+            throw std::invalid_argument("ArenaLayout::mesh_dir has no .cmf files: " + layout.mesh_dir);
+        }
+        std::sort(files.begin(), files.end());
+        constexpr float kMaxBt = kArenaLayoutMaxCoord * kUuToBt;
+        for (const auto& f : files) {
+            sources.push_back(detail::ReadArenaMeshFile(f));
+            for (const Vec3& v : sources.back().vertices) {
+                if (!(std::abs(v.x) <= kMaxBt && std::abs(v.y) <= kMaxBt && std::abs(v.z) <= kMaxBt)) {
+                    throw std::invalid_argument("ArenaLayout::mesh_dir: a vertex of " + f.filename().string() +
+                                                " is not finite or is beyond kArenaLayoutMaxCoord");
+                }
+            }
+        }
+    }
+    for (const ArenaMesh& m : layout.meshes) {
+        detail::ArenaMeshSource s;
+        s.indices = m.indices;
+        for (const Vec3& v : m.vertices) s.vertices.push_back(Vec3(v.x * kUuToBt, v.y * kUuToBt, v.z * kUuToBt));
+        sources.push_back(std::move(s));
+    }
+    if (!layout.planes.empty()) {
+        double lo[3] = {1e30, 1e30, 1e30}, hi[3] = {-1e30, -1e30, -1e30};
+        const auto add = [&](double x, double y, double z) {
+            const double p[3] = {x, y, z};
+            for (int a = 0; a < 3; ++a) {
+                lo[a] = std::min(lo[a], p[a]);
+                hi[a] = std::max(hi[a], p[a]);
+            }
+        };
+        for (const auto& s : sources) {
+            for (const Vec3& v : s.vertices) add(v.x * 50.0, v.y * 50.0, v.z * 50.0);
+        }
+        for (const ArenaPlane& pl : layout.planes) add(pl.point.x, pl.point.y, pl.point.z);
+        for (const BoostPadConfig& pad : layout.boost_pads) add(pad.pos.x, pad.pos.y, pad.pos.z);
+        for (int t = 0; t < 2; ++t) {
+            add(layout.goals[t].point.x, layout.goals[t].point.y, layout.goals[t].point.z);
+            for (const ArenaSpawn& s : layout.kickoff_spawns[t]) add(s.pos.x, s.pos.y, s.pos.z);
+            for (const ArenaSpawn& s : layout.respawn_spawns[t]) add(s.pos.x, s.pos.y, s.pos.z);
+        }
+        add(layout.ball_spawn.x, layout.ball_spawn.y, layout.ball_spawn.z);
+        double center[3], half[3];
+        for (int a = 0; a < 3; ++a) {
+            center[a] = 0.5 * (lo[a] + hi[a]);
+            half[a] = 0.5 * (hi[a] - lo[a]) + 1000.0;
+        }
+        detail::ArenaMeshSource quads;
+        for (const ArenaPlane& pl : layout.planes) {
+            double n[3] = {pl.normal.x, pl.normal.y, pl.normal.z};
+            const double len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+            if (!(len > 0.0) || !std::isfinite(len)) {
+                throw std::invalid_argument("ArenaPlane normal must be nonzero");
+            }
+            for (double& c : n) c /= len;
+            const auto cross = [](const double* a, const double* b, double* o) {
+                o[0] = a[1] * b[2] - a[2] * b[1];
+                o[1] = a[2] * b[0] - a[0] * b[2];
+                o[2] = a[0] * b[1] - a[1] * b[0];
+            };
+            const double ref[3] = {std::abs(n[2]) < 0.9 ? 0.0 : 1.0, 0.0, std::abs(n[2]) < 0.9 ? 1.0 : 0.0};
+            double t1[3], t2[3];
+            cross(ref, n, t1);
+            const double t1_len = std::sqrt(t1[0] * t1[0] + t1[1] * t1[1] + t1[2] * t1[2]);
+            for (double& c : t1) c /= t1_len;
+            cross(n, t1, t2);
+            const double p[3] = {pl.point.x, pl.point.y, pl.point.z};
+            const double d = (center[0] - p[0]) * n[0] + (center[1] - p[1]) * n[1] + (center[2] - p[2]) * n[2];
+            double e1 = 0.0, e2 = 0.0;
+            for (int a = 0; a < 3; ++a) {
+                e1 += std::abs(t1[a]) * half[a];
+                e2 += std::abs(t2[a]) * half[a];
+            }
+            const int32_t base = static_cast<int32_t>(quads.vertices.size());
+            const double s1[4] = {-1.0, 1.0, 1.0, -1.0}, s2[4] = {-1.0, -1.0, 1.0, 1.0};
+            for (int k = 0; k < 4; ++k) {
+                double v[3];
+                for (int a = 0; a < 3; ++a) v[a] = center[a] - n[a] * d + t1[a] * e1 * s1[k] + t2[a] * e2 * s2[k];
+                quads.vertices.push_back(Vec3(static_cast<float>(v[0] / 50.0), static_cast<float>(v[1] / 50.0),
+                                              static_cast<float>(v[2] / 50.0)));
+            }
+            for (int32_t i : {0, 1, 2, 0, 2, 3}) quads.indices.push_back(base + i);
+        }
+        sources.push_back(std::move(quads));
+    }
+    if (sources.empty()) {
+        throw std::invalid_argument("a custom ArenaLayout needs mesh_dir, meshes or planes");
+    }
+    const size_t groups = std::min(sources.size(), static_cast<size_t>(detail::kCustomArenaMaxMeshes));
+    std::vector<detail::ArenaMeshSource> merged(groups);
+    for (size_t i = 0; i < sources.size(); ++i) {
+        detail::ArenaMeshSource& m = merged[i * groups / sources.size()];
+        const int32_t base = static_cast<int32_t>(m.vertices.size());
+        m.vertices.insert(m.vertices.end(), sources[i].vertices.begin(), sources[i].vertices.end());
+        for (int32_t idx : sources[i].indices) m.indices.push_back(idx < 0 ? idx : idx + base);
+    }
+    return merged;
+}
+
+std::shared_ptr<const ArenaMeshHost> CustomArenaMeshHost(const ArenaLayout& layout) {
+    const std::vector<detail::ArenaMeshSource> sources = CustomArenaMeshSources(layout);
+    std::string key;
+    for (const auto& s : sources) {
+        const uint64_t sizes[2] = {s.vertices.size(), s.indices.size()};
+        key.append(reinterpret_cast<const char*>(sizes), sizeof(sizes));
+        for (const Vec3& v : s.vertices) {
+            const float f[3] = {v.x, v.y, v.z};
+            key.append(reinterpret_cast<const char*>(f), sizeof(f));
+        }
+        key.append(reinterpret_cast<const char*>(s.indices.data()), s.indices.size() * sizeof(int32_t));
+    }
+    static std::mutex mutex;
+    static std::map<std::string, std::weak_ptr<const ArenaMeshHost>> cache;
+    const std::lock_guard<std::mutex> lock(mutex);
+    for (auto it = cache.begin(); it != cache.end();) {
+        it = it->second.expired() ? cache.erase(it) : std::next(it);
+    }
+    if (auto hit = cache[key].lock()) {
+        return hit;
+    }
+    auto h = std::make_shared<ArenaMeshHost>();
+    h->mesh = detail::LoadCustomArenaMeshTriangles(sources, h->quantization, h->infos, h->nodes, h->subtrees,
+                                                   h->local_mesh);
+    BuildArenaMeshHostTables(h.get(), true);
+    cache[key] = h;
+    return h;
+}
+
+void ValidateArenaLayout(const ArenaLayout& in) {
+    const auto finite = [](const Vec3& v) { return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z); };
+    const auto fail = [](const char* what, const char* rule) {
+        throw std::invalid_argument(std::string("ArenaLayout: ") + what + rule);
+    };
+    const auto position = [&](const Vec3& v, const char* what) {
+        if (!finite(v) || std::abs(v.x) > kArenaLayoutMaxCoord || std::abs(v.y) > kArenaLayoutMaxCoord ||
+            std::abs(v.z) > kArenaLayoutMaxCoord) {
+            fail(what, " must be finite and within kArenaLayoutMaxCoord (11500 uu) of the origin on every axis");
+        }
+    };
+    for (const ArenaMesh& m : in.meshes) {
+        for (const Vec3& v : m.vertices) position(v, "a mesh vertex");
+    }
+    for (const ArenaPlane& p : in.planes) {
+        position(p.point, "a plane point");
+        if (!finite(p.normal)) fail("a plane normal", " must be finite");
+    }
+    for (const BoostPadConfig& p : in.boost_pads) position(p.pos, "a boost pad position");
+    for (int t = 0; t < 2; ++t) {
+        const ArenaGoal& g = in.goals[t];
+        position(g.point, "a goal point");
+        if (!finite(g.normal)) fail("a goal normal", " must be finite");
+        for (const float x : {g.min.x, g.min.y, g.min.z, g.max.x, g.max.y, g.max.z}) {
+            if (std::isnan(x)) fail("a goal's min and max", " must not be NaN");
+        }
+        for (const ArenaSpawn& s : in.kickoff_spawns[t]) {
+            position(s.pos, "a kickoff spawn position");
+            if (!(std::abs(s.yaw) <= kArenaLayoutMaxYaw)) fail("a kickoff spawn yaw", " must be within 8 pi of zero");
+        }
+        for (const ArenaSpawn& s : in.respawn_spawns[t]) {
+            position(s.pos, "a respawn spawn position");
+            if (!(std::abs(s.yaw) <= kArenaLayoutMaxYaw)) fail("a respawn spawn yaw", " must be within 8 pi of zero");
+        }
+    }
+    position(in.ball_spawn, "the ball spawn");
+}
+
+bool SameVec3(const Vec3& a, const Vec3& b) {
+    return a.x == b.x && a.y == b.y && a.z == b.z;
+}
+
+bool SameArenaRules(const ArenaLayout& a, const ArenaLayout& b) {
+    bool same = SameVec3(a.ball_spawn, b.ball_spawn);
+    for (int t = 0; t < 2; ++t) {
+        same = same && SameVec3(a.goals[t].point, b.goals[t].point) && SameVec3(a.goals[t].normal, b.goals[t].normal) &&
+               SameVec3(a.goals[t].min, b.goals[t].min) && SameVec3(a.goals[t].max, b.goals[t].max);
+        for (int s = 0; s < 5; ++s) {
+            same = same && SameVec3(a.kickoff_spawns[t][s].pos, b.kickoff_spawns[t][s].pos) &&
+                   a.kickoff_spawns[t][s].yaw == b.kickoff_spawns[t][s].yaw;
+        }
+        for (int s = 0; s < 4; ++s) {
+            same = same && SameVec3(a.respawn_spawns[t][s].pos, b.respawn_spawns[t][s].pos) &&
+                   a.respawn_spawns[t][s].yaw == b.respawn_spawns[t][s].yaw;
+        }
+    }
+    return same;
+}
+
+bool SameBoostPads(const std::vector<BoostPadConfig>& a, const std::vector<BoostPadConfig>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t p = 0; p < a.size(); ++p) {
+        if (!SameVec3(a[p].pos, b[p].pos) || a[p].is_big != b[p].is_big) return false;
+    }
+    return true;
+}
+
+detail::ArenaRules MakeArenaRules(const ArenaLayout& layout) {
+    detail::ArenaRules r{};
+    for (int t = 0; t < 2; ++t) {
+        for (int s = 0; s < 5; ++s) {
+            r.kickoff_pos[t][s] = layout.kickoff_spawns[t][s].pos;
+            r.kickoff_yaw[t][s] = layout.kickoff_spawns[t][s].yaw;
+        }
+        for (int s = 0; s < 4; ++s) {
+            r.respawn_pos[t][s] = layout.respawn_spawns[t][s].pos;
+            r.respawn_yaw[t][s] = layout.respawn_spawns[t][s].yaw;
+        }
+        const ArenaGoal& g = layout.goals[t];
+        const float len = std::sqrt(g.normal.x * g.normal.x + g.normal.y * g.normal.y + g.normal.z * g.normal.z);
+        if (!(len > 0.0f) || !std::isfinite(len)) {
+            throw std::invalid_argument("ArenaGoal normal must be nonzero");
+        }
+        r.goal_point[t] = g.point;
+        r.goal_normal[t] = Vec3(g.normal.x / len, g.normal.y / len, g.normal.z / len);
+        r.goal_min[t] = g.min;
+        r.goal_max[t] = g.max;
+    }
+    r.ball_spawn = layout.ball_spawn;
+    return r;
+}
 
 const ArenaMeshHost& CachedArenaMeshHost(bool soccar_arena) {
     static std::mutex mutex;
@@ -524,112 +866,126 @@ const ArenaMeshHost& CachedArenaMeshHost(bool soccar_arena) {
         throw std::runtime_error("no goal mesh found in the soccar arena meshes");
     }
     if (!h->mesh.empty()) {
-        detail::SetArenaMeshFreeBox(h->infos);
-        Vec3 neg_x_min, neg_x_max;
-        detail::BulletStaticPlaneShapeAabb(2, neg_x_min, neg_x_max);
-        detail::SetArenaMeshRayOrder(h->infos, neg_x_max.x);
-        detail::BuildArenaMeshLeafGrid(h->quantization, h->infos, h->nodes, h->subtrees, h->leaf_grid_infos,
-                                       h->leaf_cell_start, h->leaf_entries);
-#if defined(ROCKETGPU_USE_CUDA)
-        detail::BuildArenaMeshLeafGrid(h->quantization, h->infos, h->nodes, h->subtrees, h->ray_grid_infos,
-                                       h->ray_cell_start, h->ray_entries, 1.4f, 1);
-#else
-        detail::BuildArenaMeshLeafGrid(h->quantization, h->infos, h->nodes, h->subtrees, h->ray_grid_infos,
-                                       h->ray_cell_start, h->ray_entries, 1.4f, 4);
-        h->ray_entry_boxes.assign(h->ray_entries.size() * 8, 0.0f);
-        for (size_t m = 0; m < h->ray_grid_infos.size(); ++m) {
-            const detail::ArenaMeshLeafGridInfo& gi = h->ray_grid_infos[m];
-            const int mesh_index = h->infos[m].mesh_index;
-            if (gi.cell_offset < 0 || mesh_index < 0 || mesh_index >= static_cast<int>(h->quantization.size())) {
-                continue;
-            }
-            const detail::ArenaMeshBvhQuantization& q = h->quantization[static_cast<size_t>(mesh_index)];
-            const int cells = gi.cells[0] * gi.cells[1] * gi.cells[2];
-            for (int e = h->ray_cell_start[gi.cell_offset]; e < h->ray_cell_start[gi.cell_offset + cells]; ++e) {
-                const Vec3 lo = detail::UnquantizeArenaMeshBvhPoint(q, h->ray_entries[e].quantized_aabb_min);
-                const Vec3 hi = detail::UnquantizeArenaMeshBvhPoint(q, h->ray_entries[e].quantized_aabb_max);
-                float* b = &h->ray_entry_boxes[static_cast<size_t>(e) * 8];
-                b[0] = lo.x; b[1] = lo.y; b[2] = lo.z; b[4] = hi.x; b[5] = hi.y; b[6] = hi.z;
-            }
-        }
-        {
-            const bool local = !h->local_mesh.empty();
-            const std::vector<detail::ArenaMeshTriangle>& tris = local ? h->local_mesh : h->mesh;
-            detail::ArenaMeshRayBlock nan_block;
-            std::fill_n(&nan_block.lo[0][0], (sizeof(nan_block) - offsetof(detail::ArenaMeshRayBlock, lo)) / sizeof(float),
-                        std::numeric_limits<float>::quiet_NaN());
-            std::fill_n(nan_block.tri, 4, -1);
-            std::fill_n(nan_block.mesh_index, 4, -1);
-            h->ray_blocks.assign(h->ray_entries.size() / 4, nan_block);
-            for (size_t e = 0; e < h->ray_entries.size(); ++e) {
-                const detail::ArenaMeshLeafEntry& entry = h->ray_entries[e];
-                detail::ArenaMeshRayBlock& blk = h->ray_blocks[e / 4];
-                const int k = static_cast<int>(e % 4);
-                blk.quant[0][k] = entry.quantized_aabb_min[0];
-                blk.quant[0][4 + k] = entry.quantized_aabb_min[1];
-                blk.quant[1][k] = entry.quantized_aabb_min[2];
-                blk.quant[1][4 + k] = static_cast<uint16_t>(~entry.quantized_aabb_max[0]);
-                blk.quant[2][k] = static_cast<uint16_t>(~entry.quantized_aabb_max[1]);
-                blk.quant[2][4 + k] = static_cast<uint16_t>(~entry.quantized_aabb_max[2]);
-            }
-            for (size_t m = 0; m < h->ray_grid_infos.size(); ++m) {
-                const detail::ArenaMeshLeafGridInfo& gi = h->ray_grid_infos[m];
-                const detail::ArenaMeshBvhMeshInfo& mi = h->infos[m];
-                if (gi.cell_offset < 0) {
-                    continue;
-                }
-                const int cells = gi.cells[0] * gi.cells[1] * gi.cells[2];
-                for (int e = h->ray_cell_start[gi.cell_offset]; e < h->ray_cell_start[gi.cell_offset + cells]; ++e) {
-                    const int idx = h->ray_entries[e].triangle_index;
-                    const int g = mi.triangle_start + idx;
-                    if (idx < 0 || idx >= mi.triangle_count || g < 0 || g >= static_cast<int>(tris.size())) {
-                        continue;
-                    }
-                    detail::ArenaMeshRayBlock& blk = h->ray_blocks[static_cast<size_t>(e) / 4];
-                    const int k = e % 4;
-                    const float* box = &h->ray_entry_boxes[static_cast<size_t>(e) * 8];
-                    const detail::ArenaMeshTriangle& tri = tris[static_cast<size_t>(g)];
-                    const bool hit_local = local && mi.cal_origin_y != 0.0f;
-                    if (!hit_local && g >= static_cast<int>(h->mesh.size())) {
-                        continue;
-                    }
-                    blk.tri[k] = g;
-                    blk.mesh_index[k] =
-                        static_cast<int32_t>((hit_local ? tri : h->mesh[static_cast<size_t>(g)]).mesh_index);
-                    const Vec3 n = detail::Cross(detail::operator-(tri.b, tri.a), detail::operator-(tri.c, tri.a));
-                    const Vec3* v[4] = {&tri.a, &tri.b, &tri.c, &n};
-                    float(*dst[4])[4] = {blk.a, blk.b, blk.c, blk.n};
-                    for (int a = 0; a < 3; ++a) {
-                        blk.lo[a][k] = box[a];
-                        blk.hi[a][k] = box[4 + a];
-                        for (int j = 0; j < 4; ++j) {
-                            dst[j][a][k] = a == 0 ? v[j]->x : a == 1 ? v[j]->y : v[j]->z;
-                        }
-                    }
-                    blk.plane[k] = detail::Dot(tri.a, n);
-                    blk.tol[k] = -0.0001f * detail::LengthSq(n);
-                    blk.origin_y[k] = local ? static_cast<float>(tri.cal_origin_sign) * detail::kGoalMeshOriginYBt : 0.0f;
-                }
-            }
-        }
-        int clearance_threads = 0;
-        if (const char* s = std::getenv("ROCKETGPU_CPU_THREADS")) {
-            clearance_threads = std::atoi(s);
-        }
-        if (clearance_threads <= 0) {
-            clearance_threads = std::min(DefaultCpuHardwareThreads(), 16);
-        }
-        detail::BuildArenaMeshClearance(h->mesh, h->local_mesh, h->clearance, h->clearance_lo, h->clearance_inv_cell,
-                                        h->clearance_unit, h->clearance_dims, clearance_threads);
-#endif
-        h->cell_mask = detail::BuildArenaBroadphaseCellMask(h->mesh, h->infos, h->grid);
+        BuildArenaMeshHostTables(h.get(), false);
     }
     slot = std::move(h);
     return *slot;
 }
 
+struct KickoffSettledCache {
+    struct Entry {
+        std::vector<unsigned char> key;
+        std::vector<detail::KickoffSettledRow> rows;
+        BallState ball;
+    };
+    static constexpr size_t kMaxEntries = 32;
+    static constexpr size_t kMaxRowBytes = size_t{1} << 20;
+
+#if !defined(ROCKETGPU_USE_CUDA)
+    static_assert(sizeof(SimConfig) == 2032 && sizeof(MutatorConfig) == 848,
+#else
+    static_assert(sizeof(SimConfig) == 2064 && sizeof(MutatorConfig) == 848,
+#endif
+                  "SimConfig or MutatorConfig changed: add any new pointer member to KickoffSettledCache::Cacheable");
+
+    static bool Cacheable(const SimConfig& c) {
+        const MutatorConfig& m = c.mutator;
+        return c.arena_mesh_tris == nullptr && c.arena_mesh_bvh_quantization == nullptr &&
+               c.arena_mesh_bvh_meshes == nullptr && c.arena_mesh_bvh_nodes == nullptr &&
+               c.arena_mesh_bvh_subtrees == nullptr && c.arena_mesh_leaf_grid_infos == nullptr &&
+               c.arena_mesh_leaf_cell_start == nullptr && c.arena_mesh_leaf_entries == nullptr &&
+               c.arena_broadphase_cell_mask == nullptr && c.arena_sweep_statics == nullptr &&
+               c.env_step_order == nullptr && c.env_frame_frac == nullptr && c.env_frame_start_dt == nullptr &&
+               c.kickoff_settled_rows == nullptr && c.kickoff_settled_entry == nullptr &&
+               c.kickoff_settled_ball == nullptr && c.kickoff_settled_wheels == nullptr && c.arena_rules == nullptr &&
+#if !defined(ROCKETGPU_USE_CUDA)
+               c.host_tables == nullptr &&
+#else
+               c.arena_mesh_ray_grid_infos == nullptr && c.arena_mesh_ray_cell_start == nullptr &&
+               c.arena_mesh_ray_entries == nullptr && c.arena_mesh_clearance == nullptr &&
+#endif
+               m.physics_events.records == nullptr && m.physics_events.windows == nullptr &&
+               m.native_sphere_rsqrt_table == nullptr && m.cal_arena_local_tris == nullptr;
+    }
+
+    template <typename T>
+    static void ClearPadding(T& x) {
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_clear_padding)
+        __builtin_clear_padding(&x);
+#endif
+#endif
+        (void)x;
+    }
+
+    static std::vector<unsigned char> Key(const SimConfig& run_cfg, const std::vector<size_t>& first,
+                                          const std::vector<CarConfig>& configs, const std::vector<Team>& teams) {
+        std::vector<unsigned char> key(sizeof(SimConfig) + first.size() * (sizeof(CarConfig) + sizeof(Team)));
+        unsigned char* at = key.data();
+        SimConfig cfg_bytes = run_cfg;
+        ClearPadding(cfg_bytes);
+        std::memcpy(at, &cfg_bytes, sizeof(SimConfig));
+        at += sizeof(SimConfig);
+        for (const size_t i : first) {
+            CarConfig car_bytes = configs[i];
+            ClearPadding(car_bytes);
+            std::memcpy(at, &car_bytes, sizeof(CarConfig));
+            at += sizeof(CarConfig);
+            std::memcpy(at, &teams[i], sizeof(Team));
+            at += sizeof(Team);
+        }
+        return key;
+    }
+
+    static std::mutex& Mutex() {
+        static std::mutex mutex;
+        return mutex;
+    }
+    static std::deque<Entry>& Entries() {
+        static std::deque<Entry> entries;
+        return entries;
+    }
+
+    static bool Get(const std::vector<unsigned char>& key, std::vector<detail::KickoffSettledRow>& rows,
+                    std::vector<BallState>& ball) {
+        const std::lock_guard<std::mutex> lock(Mutex());
+        for (const Entry& e : Entries()) {
+            if (e.key == key) {
+                rows.insert(rows.end(), e.rows.begin(), e.rows.end());
+                if (ball.empty()) {
+                    ball.push_back(e.ball);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static void Put(std::vector<unsigned char>&& key, const detail::KickoffSettledRow* rows, size_t count,
+                    const BallState& ball) {
+        if (count * sizeof(detail::KickoffSettledRow) > kMaxRowBytes) {
+            return;
+        }
+        const std::lock_guard<std::mutex> lock(Mutex());
+        std::deque<Entry>& entries = Entries();
+        for (const Entry& e : entries) {
+            if (e.key == key) {
+                return;
+            }
+        }
+        if (entries.size() >= kMaxEntries) {
+            entries.pop_front();
+        }
+        entries.push_back(Entry{std::move(key), std::vector<detail::KickoffSettledRow>(rows, rows + count), ball});
+    }
+};
+
 struct BatchSim::Impl {
-    explicit Impl(const SimConfig& in_cfg) : cfg(in_cfg), user_cfg(in_cfg) {
+    explicit Impl(const SimConfig& in_cfg, const ArenaLayout* in_layout = nullptr) : cfg(in_cfg), user_cfg(in_cfg) {
+        if (in_cfg.arena_rules != nullptr) {
+            throw std::invalid_argument("SimConfig::arena_rules is set by BatchSim: pass the ArenaLayout to "
+                                        "BatchSim(config, layout) and leave it null");
+        }
         cfg.mutator.physics_events = {};
         cfg.mutator.native_sphere_rsqrt_table = nullptr;
         cfg.mutator.native_sphere_rsqrt_shift = 0;
@@ -664,11 +1020,17 @@ struct BatchSim::Impl {
         } else {
             cfg.mutator.arena_collision = 1;
         }
+        if (in_layout != nullptr) {
+            ApplyArenaLayout(*in_layout);
+        }
         if (cfg.env_count <= 0) {
             throw std::invalid_argument("env_count must be > 0");
         }
         if (cfg.max_cars_per_env <= 0) {
             throw std::invalid_argument("max_cars_per_env must be > 0");
+        }
+        if (cfg.max_cars_per_env > detail::kMaxCarWorldMeshPersistentCars) {
+            throw std::invalid_argument("max_cars_per_env must be <= 8");
         }
         if (!(cfg.tick_dt > 0.0f)) {
             throw std::invalid_argument("tick_dt must be > 0");
@@ -694,6 +1056,7 @@ struct BatchSim::Impl {
         ray_hints.assign(car_capacity * 8, -1);
 #endif
         solver_scratch.resize(static_cast<size_t>(cfg.env_count));
+        tick_scratch.resize(static_cast<size_t>(cfg.env_count));
 #if defined(ROCKETGPU_USE_CUDA)
 
         detail::PrepareCarWorldStage(cfg.env_count, cfg.max_cars_per_env, nullptr);
@@ -736,10 +1099,12 @@ struct BatchSim::Impl {
 
 #if defined(ROCKETGPU_USE_CUDA)
         cfg.arena_mesh_ray_grid_infos = nullptr;
+        cfg.arena_mesh_clearance = nullptr;
+        cfg.arena_mesh_slot = -1;
 #endif
         if (cfg.arena_mesh_tris == nullptr || cfg.arena_mesh_tri_count <= 0) {
             const bool soccar_arena = cfg.mode == Mode::Soccar || cfg.mode == Mode::Snowday || cfg.mode == Mode::Heatseeker;
-            const ArenaMeshHost& mh = CachedArenaMeshHost(soccar_arena);
+            const ArenaMeshHost& mh = custom_mesh ? *custom_mesh : CachedArenaMeshHost(soccar_arena);
 #if !defined(ROCKETGPU_USE_CUDA)
             host_mesh = &mh;
 #endif
@@ -767,10 +1132,14 @@ struct BatchSim::Impl {
                 arena_mesh_bvh_meshes.copy_from_host(host_mesh_infos.data(), host_mesh_infos.size());
                 cfg.arena_mesh_bvh_meshes = arena_mesh_bvh_meshes.data();
                 cfg.arena_mesh_bvh_mesh_count = static_cast<int32_t>(arena_mesh_bvh_meshes.size());
+#if defined(ROCKETGPU_USE_CUDA)
+                cfg.arena_mesh_slot = detail::AssignArenaMeshSlot(host_mesh_infos.data(), cfg.arena_mesh_bvh_mesh_count);
+#endif
                 detail::BulletSweepHistory sweep_statics[2];
                 for (int goal_floors = 0; goal_floors < 2; ++goal_floors) {
                     detail::BulletSweepAddStatics(sweep_statics[goal_floors], true, goal_floors != 0,
-                                                  host_mesh_infos.data(), static_cast<int>(host_mesh_infos.size()));
+                                                  host_mesh_infos.data(), static_cast<int>(host_mesh_infos.size()),
+                                                  cfg.mutator.arena_collision == 1);
                 }
                 arena_sweep_statics.resize(2);
                 arena_sweep_statics.copy_from_host(sweep_statics, 2);
@@ -809,6 +1178,22 @@ struct BatchSim::Impl {
                     cfg.arena_mesh_ray_grid_infos = arena_mesh_ray_grid_infos.data();
                     cfg.arena_mesh_ray_cell_start = arena_mesh_ray_cell_start.data();
                     cfg.arena_mesh_ray_entries = arena_mesh_ray_entries.data();
+                }
+                if (!mh.clearance.empty()) {
+                    arena_mesh_clearance_codes.resize(mh.clearance.size());
+                    arena_mesh_clearance_codes.copy_from_host(mh.clearance.data(), mh.clearance.size());
+                    detail::ArenaMeshClearance c;
+                    c.mesh = cfg.arena_mesh_tris;
+                    c.lb = arena_mesh_clearance_codes.data();
+                    c.lo = mh.clearance_lo;
+                    c.inv_cell = mh.clearance_inv_cell;
+                    c.unit = mh.clearance_unit;
+                    c.nx = mh.clearance_dims[0];
+                    c.ny = mh.clearance_dims[1];
+                    c.nz = mh.clearance_dims[2];
+                    arena_mesh_clearance.resize(1);
+                    arena_mesh_clearance.copy_from_host(&c, 1);
+                    cfg.arena_mesh_clearance = arena_mesh_clearance.data();
                 }
 #endif
 
@@ -997,6 +1382,9 @@ struct BatchSim::Impl {
     std::vector<float> host_tri_normals;
     const ArenaMeshHost* host_mesh = nullptr;
 #endif
+    std::shared_ptr<const ArenaLayout> layout;
+    std::shared_ptr<const ArenaMeshHost> custom_mesh;
+    detail::Buffer<detail::ArenaRules> arena_rules_buf;
 
     SimConfig cfg;
     SimConfig user_cfg;
@@ -1076,6 +1464,42 @@ struct BatchSim::Impl {
         kickoff_settled_dirty = false;
     }
 
+    void ApplyArenaLayout(const ArenaLayout& in) {
+        const ArenaLayout official;
+        const bool geometry = !in.mesh_dir.empty() || !in.meshes.empty() || !in.planes.empty();
+        const bool rules = !SameArenaRules(in, official);
+        const bool pads = !SameBoostPads(in.boost_pads, official.boost_pads);
+        if (!geometry && !rules && !pads) {
+            return;
+        }
+        if (cfg.mode != Mode::Soccar) {
+            throw std::invalid_argument("a custom ArenaLayout needs Mode::Soccar");
+        }
+        if (cfg.arena_mesh_tris != nullptr) {
+            throw std::invalid_argument("a custom ArenaLayout can't be combined with SimConfig::arena_mesh_tris");
+        }
+        if (in.boost_pads.size() > static_cast<size_t>(kMaxBoostPads)) {
+            throw std::invalid_argument("ArenaLayout::boost_pads holds at most kMaxBoostPads pads");
+        }
+        ValidateArenaLayout(in);
+        layout = std::make_shared<const ArenaLayout>(in);
+        if (geometry || pads) {
+            cfg.use_custom_boost_pads = 1;
+            cfg.boost_pad_count = static_cast<int32_t>(in.boost_pads.size());
+            for (size_t p = 0; p < in.boost_pads.size(); ++p) cfg.boost_pads[p] = in.boost_pads[p];
+        }
+        if (geometry) {
+            custom_mesh = CustomArenaMeshHost(in);
+            cfg.mutator.arena_collision = 2;
+        }
+        if (rules) {
+            const detail::ArenaRules r = MakeArenaRules(in);
+            arena_rules_buf.resize(1);
+            arena_rules_buf.copy_from_host(&r, 1);
+            cfg.arena_rules = arena_rules_buf.data();
+        }
+    }
+
     void record_kickoff_settled(const std::vector<size_t>& first, const std::vector<CarConfig>& configs,
                                 const std::vector<Team>& host_teams, int spawns) {
         const size_t envs = first.size();
@@ -1094,7 +1518,14 @@ struct BatchSim::Impl {
             run_cfg.mutator.frame_start_dt = frames_default.frame_start_dt;
             run_cfg.mutator.boost_pad_frame_frac = frames_default.boost_pad_frame_frac;
         }
-        BatchSim run(run_cfg);
+        std::vector<unsigned char> key;
+        if (!layout && KickoffSettledCache::Cacheable(run_cfg)) {
+            key = KickoffSettledCache::Key(run_cfg, first, configs, host_teams);
+            if (KickoffSettledCache::Get(key, kickoff_settled_pair_rows, kickoff_settled_pair_ball)) {
+                return;
+            }
+        }
+        BatchSim run = layout ? BatchSim(run_cfg, *layout) : BatchSim(run_cfg);
         const size_t m = envs * static_cast<size_t>(spawns);
         std::vector<int32_t> counts(envs, spawns);
         std::vector<CarConfig> run_configs(m);
@@ -1140,6 +1571,9 @@ struct BatchSim::Impl {
         if (kickoff_settled_pair_ball.empty()) {
             kickoff_settled_pair_ball.push_back(ball);
         }
+        if (!key.empty()) {
+            KickoffSettledCache::Put(std::move(key), kickoff_settled_pair_rows.data() + base, m, ball);
+        }
     }
 
     detail::Buffer<detail::ArenaMeshTriangle> arena_mesh_triangles;
@@ -1155,13 +1589,29 @@ struct BatchSim::Impl {
     detail::Buffer<detail::ArenaMeshLeafGridInfo> arena_mesh_ray_grid_infos;
     detail::Buffer<int32_t> arena_mesh_ray_cell_start;
     detail::Buffer<detail::ArenaMeshLeafEntry> arena_mesh_ray_entries;
+    detail::Buffer<uint8_t> arena_mesh_clearance_codes;
+    detail::Buffer<detail::ArenaMeshClearance> arena_mesh_clearance;
 #endif
     detail::Buffer<detail::BulletSweepHistory> arena_sweep_statics;
     detail::Buffer<uint16_t> arena_broadphase_cell_mask;
     detail::Buffer<uint32_t> native_sphere_rsqrt;
+#if defined(ROCKETGPU_CAR_TILES)
+    detail::CarTileBuffer car_states;
+#else
     detail::Buffer<CarState> car_states;
+#endif
     detail::Buffer<detail::WheelRuntimeState> wheel_runtime_states;
     detail::Buffer<detail::WorldSolverScratch> solver_scratch;
+    detail::Buffer<detail::WorldTickScratch> tick_scratch;
+#if defined(ROCKETGPU_USE_CUDA)
+    detail::Buffer<unsigned char> tc_planes;
+    detail::Buffer<uint4> world_step_carry_words;
+#else
+    struct alignas(128) TickCarLine {
+        unsigned char b[128];
+    };
+    detail::Buffer<TickCarLine> tc_lines;
+#endif
 
     detail::Buffer<detail::BallSplitContactRow> rows_ball_split;
     detail::Buffer<detail::BallVelocityContactRow> rows_ball_velocity;
@@ -1180,6 +1630,13 @@ struct BatchSim::Impl {
     detail::Buffer<detail::CarCarRetainedManifold> rows_car_car_retained;
     detail::Buffer<detail::BallCarRetainedManifold> rows_ball_car_retained;
     detail::Buffer<detail::CarWorldLocalRows> rows_car_world_local;
+#if !defined(ROCKETGPU_USE_CUDA)
+    detail::Buffer<detail::WorldSolverRowGroup> row_groups;
+#endif
+    detail::Buffer<uint32_t> env_row_slot;
+#if defined(ROCKETGPU_USE_CUDA)
+    detail::Buffer<uint64_t> pad_work;
+#endif
     detail::WorldSolverScratchRowPool solver_row_pool;
     detail::Buffer<uint8_t> respawn_slot_overrides;
     detail::Buffer<CarControls> controls;
@@ -1196,16 +1653,17 @@ struct BatchSim::Impl {
 
     void rebuild_env_step_order(cudaStream_t stream) {
         const size_t n = env_car_count.size();
-        if (n < 128) {
-            cfg.env_step_order = nullptr;
-            cfg.env_car_total = 0;
-            return;
-        }
         std::vector<int32_t> counts(n);
         env_car_count.copy_to_host(counts.data(), n, stream);
 #if defined(ROCKETGPU_USE_CUDA)
         CheckCuda(cudaStreamSynchronize(stream), "env step order counts");
 #endif
+        relayout_tick_rows(counts, stream);
+        if (n < 128) {
+            cfg.env_step_order = nullptr;
+            cfg.env_car_total = 0;
+            return;
+        }
         std::vector<int32_t> order(n);
         for (size_t i = 0; i < n; ++i) order[i] = static_cast<int32_t>(i);
         std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return counts[a] > counts[b]; });
@@ -1313,7 +1771,11 @@ struct BatchSim::Impl {
 
     DeviceView view() const noexcept {
         DeviceView v;
+#if defined(ROCKETGPU_CAR_TILES)
+        v.car_states = detail::CarSpanBytes(car_states.data());
+#else
         v.car_states = const_cast<CarState*>(car_states.data());
+#endif
         v.controls = const_cast<CarControls*>(controls.data());
         v.car_configs = const_cast<CarConfig*>(car_configs.data());
         v.teams = const_cast<Team*>(teams.data());
@@ -1347,47 +1809,171 @@ struct BatchSim::Impl {
     void allocate_solver_rows() {
         const size_t n = static_cast<size_t>(cfg.env_count);
         const detail::WorldSolverScratchRowCaps caps = detail::MakeWorldSolverScratchRowCaps(cfg.max_cars_per_env);
-        rows_ball_split.resize(n * caps.ball_split);
-        rows_ball_velocity.resize(n * caps.ball_velocity);
-        rows_ball_friction.resize(n * caps.ball_friction);
-        rows_pair_split.resize(n * caps.pair_split);
-        rows_world_split.resize(n * caps.world_split);
-        rows_pair_velocity.resize(n * caps.pair_velocity);
-        rows_pair_friction.resize(n * caps.pair_friction);
-        rows_world_velocity.resize(n * caps.world_velocity);
-        rows_world_friction.resize(n * caps.world_friction);
-        rows_shared_contact_order_groups.resize(n * caps.order_groups);
-        rows_bullet_manifolds.resize(n * caps.manifolds);
-        rows_pair_contact_cache.resize(n * caps.pair_cache_cars * caps.pair_cache_cars);
         rows_car_world_plane.resize(n * caps.car_world_plane);
         rows_car_world_mesh.resize(n * caps.car_world_mesh);
         rows_car_car_retained.resize(n * caps.car_car_retained);
         rows_ball_car_retained.resize(n * caps.ball_car_retained);
-        rows_car_world_local.resize(n * caps.car_world_local);
+#if !defined(ROCKETGPU_USE_CUDA)
+        row_groups.resize(detail::kRowGroups);
+#endif
+        env_row_slot.resize(n);
+#if defined(ROCKETGPU_USE_CUDA)
+        pad_work.resize(2 * n);
+#endif
         solver_row_pool = detail::WorldSolverScratchRowPool{};
-        solver_row_pool.ball_split_rows = rows_ball_split.data();
-        solver_row_pool.ball_velocity_rows = rows_ball_velocity.data();
-        solver_row_pool.ball_friction_rows = rows_ball_friction.data();
-        solver_row_pool.pair_split_rows = rows_pair_split.data();
-        solver_row_pool.world_split_rows = rows_world_split.data();
-        solver_row_pool.pair_velocity_rows = rows_pair_velocity.data();
-        solver_row_pool.pair_friction_rows = rows_pair_friction.data();
-        solver_row_pool.world_velocity_rows = rows_world_velocity.data();
-        solver_row_pool.world_friction_rows = rows_world_friction.data();
-        solver_row_pool.shared_contact_order_groups = rows_shared_contact_order_groups.data();
-        solver_row_pool.bullet_manifolds = rows_bullet_manifolds.data();
-        solver_row_pool.pair_contact_cache = rows_pair_contact_cache.data();
         solver_row_pool.car_world_plane_manifolds = rows_car_world_plane.data();
         solver_row_pool.car_world_mesh_manifolds = rows_car_world_mesh.data();
         solver_row_pool.car_car_retained_manifolds = rows_car_car_retained.data();
         solver_row_pool.ball_car_retained_manifolds = rows_ball_car_retained.data();
-        solver_row_pool.car_world_local_rows = rows_car_world_local.data();
+        solver_row_pool.tick_scratch = tick_scratch.data();
+#if defined(ROCKETGPU_USE_CUDA)
+        const size_t cars = n * static_cast<size_t>(cfg.max_cars_per_env);
+        detail::TickCars& tc = solver_row_pool.car_planes;
+        const long long a = detail::TickCars::kPlaneAlign;
+        const long long plane_cars = (static_cast<long long>(cars) + a - 1) / a * a;
+        tc_planes.resize(static_cast<size_t>(plane_cars * detail::TickCars::kBytesPerCar));
+        tc = detail::TickCars{};
+        tc.base = tc_planes.data();
+        tc.plane_cars = plane_cars;
+        world_step_carry_words.resize(3 * n);
+        solver_row_pool.carry_words = world_step_carry_words.data();
+#else
+        {
+            const size_t m = static_cast<size_t>(cfg.max_cars_per_env);
+            size_t bytes = 0;
+            const auto place = [&bytes](size_t align, size_t size) {
+                bytes = (bytes + align - 1) / align * align;
+                const size_t at = bytes;
+                bytes += size;
+                return at;
+            };
+            const size_t o_pre = place(alignof(detail::PreContactCar), m * sizeof(detail::PreContactCar));
+            size_t o_v[6];
+            for (size_t& o : o_v) o = place(alignof(Vec3), m * sizeof(Vec3));
+            const size_t o_rot = place(alignof(Quat), m * sizeof(Quat));
+            const size_t o_wheel = place(alignof(detail::WheelRayStage), 4 * m * sizeof(detail::WheelRayStage));
+            const size_t o_valid = place(1, m);
+            const size_t lines = (bytes + sizeof(TickCarLine) - 1) / sizeof(TickCarLine);
+            tc_lines.resize(n * lines);
+            unsigned char* b = reinterpret_cast<unsigned char*>(tc_lines.data());
+            detail::TickCars& tc = solver_row_pool.car_planes;
+            tc.pre_contact_cars_ = reinterpret_cast<detail::PreContactCar*>(b + o_pre);
+            tc.deferred_linear_deltas_ = reinterpret_cast<Vec3*>(b + o_v[0]);
+            tc.deferred_angular_deltas_ = reinterpret_cast<Vec3*>(b + o_v[1]);
+            tc.cal_start_vel_ = reinterpret_cast<Vec3*>(b + o_v[2]);
+            tc.hit_car_pos_ = reinterpret_cast<Vec3*>(b + o_v[3]);
+            tc.car_predict_vel_bt_ = reinterpret_cast<Vec3*>(b + o_v[4]);
+            tc.car_predict_ang_vel_ = reinterpret_cast<Vec3*>(b + o_v[5]);
+            tc.hit_car_rot_ = reinterpret_cast<Quat*>(b + o_rot);
+            tc.car_predict_valid_ = b + o_valid;
+            tc.wheel_ray_stage_ = reinterpret_cast<detail::WheelRayStage*>(b + o_wheel);
+            solver_row_pool.car_tick_env_bytes = static_cast<std::ptrdiff_t>(lines * sizeof(TickCarLine));
+        }
+#endif
+        solver_row_pool.cars_per_env = cfg.max_cars_per_env;
+#if !defined(ROCKETGPU_USE_CUDA)
+        solver_row_pool.row_groups = row_groups.data();
+#endif
+        solver_row_pool.env_row_slot = env_row_slot.data();
+#if defined(ROCKETGPU_USE_CUDA)
+        solver_row_pool.pad_work = pad_work.data();
+#endif
         solver_row_pool.env_count = cfg.env_count;
         solver_row_pool.interleaved = SolverRowsInterleavedDefault() ? 1 : 0;
         solver_row_pool.caps = caps;
     }
 
+    void relayout_tick_rows(const std::vector<int32_t>& counts, cudaStream_t stream) {
+        std::vector<detail::WorldSolverRowGroup> groups(detail::kRowGroups);
+        std::vector<uint32_t> slots(counts.size());
+        for (size_t e = 0; e < counts.size(); ++e) {
+            const int k = counts[e];
+            slots[e] = (static_cast<uint32_t>(k) << 24) | static_cast<uint32_t>(groups[static_cast<size_t>(k)].n++);
+        }
+        int64_t total[detail::kTickRowArrays] = {};
+        for (detail::WorldSolverRowGroup& g : groups) {
+            g.caps = detail::MakeWorldSolverScratchRowCaps(static_cast<int>(&g - groups.data()));
+            for (int a = 0; a < detail::kTickRowArrays; ++a) {
+                g.first[a] = total[a];
+                total[a] += static_cast<int64_t>(g.n) * detail::TickRowsPerEnv(g.caps, a);
+            }
+        }
+        const auto fit = [&](auto& rows, int a) {
+            const size_t need = static_cast<size_t>(total[a]);
+            if (rows.size() < need || rows.size() / 2 > need) {
+                rows.resize(need);
+            }
+            rows.memset_zero(stream);
+            return rows.data();
+        };
+        detail::WorldSolverScratchRowPool& p = solver_row_pool;
+        p.ball_split_rows = fit(rows_ball_split, detail::kTickBallSplit);
+        p.ball_velocity_rows = fit(rows_ball_velocity, detail::kTickBallVelocity);
+        p.ball_friction_rows = fit(rows_ball_friction, detail::kTickBallFriction);
+        p.pair_split_rows = fit(rows_pair_split, detail::kTickPairSplit);
+        p.world_split_rows = fit(rows_world_split, detail::kTickWorldSplit);
+        p.pair_velocity_rows = fit(rows_pair_velocity, detail::kTickPairVelocity);
+        p.pair_friction_rows = fit(rows_pair_friction, detail::kTickPairFriction);
+        p.world_velocity_rows = fit(rows_world_velocity, detail::kTickWorldVelocity);
+        p.world_friction_rows = fit(rows_world_friction, detail::kTickWorldFriction);
+        p.shared_contact_order_groups = fit(rows_shared_contact_order_groups, detail::kTickOrderGroups);
+        p.bullet_manifolds = fit(rows_bullet_manifolds, detail::kTickManifolds);
+        p.pair_contact_cache = fit(rows_pair_contact_cache, detail::kTickPairCache);
+        p.car_world_local_rows = fit(rows_car_world_local, detail::kTickCarWorldLocal);
+#if defined(ROCKETGPU_USE_CUDA)
+        for (detail::WorldSolverRowGroup& g : groups) {
+            for (int a = 0; a < detail::kTickRowArrays; ++a) {
+                g.base[a] = p.tick_array_at(a, g.first[a]);
+                const char* const b0 = static_cast<const char*>(p.tick_array_at(a, 0));
+                const int64_t elem = b0 == nullptr ? 0 : static_cast<const char*>(p.tick_array_at(a, 1)) - b0;
+                const int64_t per_env = p.interleaved && a != detail::kTickCarWorldLocal ? 1 : detail::TickRowsPerEnv(g.caps, a);
+                g.step_bytes[a] = static_cast<int32_t>(elem * per_env);
+            }
+        }
+#endif
+#if defined(ROCKETGPU_USE_CUDA)
+        for (int k = 0; k < detail::kRowGroups; ++k) p.row_group_table[k] = groups[static_cast<size_t>(k)];
+        p.has_row_groups = 1;
+#else
+        row_groups.copy_from_host(groups.data(), groups.size(), stream);
+#endif
+        env_row_slot.copy_from_host(slots.data(), slots.size(), stream);
+#if defined(ROCKETGPU_USE_CUDA)
+        CheckCuda(cudaStreamSynchronize(stream), "tick row layout upload");
+#endif
+    }
+
     void memset_zero_solver_rows(cudaStream_t stream) {
+        zero_tick_rows(stream);
+        rows_car_world_plane.memset_zero(stream);
+        rows_car_world_mesh.memset_zero(stream);
+        rows_car_car_retained.memset_zero(stream);
+        rows_ball_car_retained.memset_zero(stream);
+    }
+
+    void reset_tick_scratch(size_t first, size_t count, cudaStream_t stream) {
+#if defined(ROCKETGPU_USE_CUDA)
+        CheckCuda(cudaMemsetAsync(tick_scratch.data() + first, 0, count * sizeof(detail::WorldTickScratch), stream),
+                  "cudaMemsetAsync tick scratch");
+#else
+        std::fill(tick_scratch.data() + first, tick_scratch.data() + first + count, detail::WorldTickScratch{});
+        (void)stream;
+#endif
+    }
+
+    void reset_transient_rows(size_t first, size_t count, cudaStream_t stream) {
+#if defined(ROCKETGPU_USE_CUDA)
+        detail::LaunchZeroTickRows(solver_row_pool, first, count, stream);
+#else
+        for (size_t env = first; env < first + count; ++env) {
+            const int e = static_cast<int>(env);
+            detail::ZeroTickRows(solver_row_pool.view(e), solver_row_pool.env_caps(e));
+        }
+        (void)stream;
+#endif
+    }
+
+    void zero_tick_rows(cudaStream_t stream) {
         rows_ball_split.memset_zero(stream);
         rows_ball_velocity.memset_zero(stream);
         rows_ball_friction.memset_zero(stream);
@@ -1400,47 +1986,6 @@ struct BatchSim::Impl {
         rows_shared_contact_order_groups.memset_zero(stream);
         rows_bullet_manifolds.memset_zero(stream);
         rows_pair_contact_cache.memset_zero(stream);
-        rows_car_world_plane.memset_zero(stream);
-        rows_car_world_mesh.memset_zero(stream);
-        rows_car_car_retained.memset_zero(stream);
-        rows_ball_car_retained.memset_zero(stream);
-    }
-
-    template <typename T>
-    void reset_rows_one(detail::Buffer<T>& rows, int max_rows, size_t first, size_t count, cudaStream_t stream) {
-        const size_t n = static_cast<size_t>(cfg.env_count);
-        const size_t r = static_cast<size_t>(max_rows);
-        const bool il = solver_row_pool.interleaved != 0;
-#if defined(ROCKETGPU_USE_CUDA)
-        if (il) {
-            CheckCuda(cudaMemset2DAsync(rows.data() + first, n * sizeof(T), 0, count * sizeof(T), r, stream),
-                      "cudaMemset2DAsync rows");
-        } else {
-            CheckCuda(cudaMemsetAsync(rows.data() + first * r, 0, count * r * sizeof(T), stream), "cudaMemsetAsync rows");
-        }
-#else
-        for (size_t i = 0; i < (il ? r : 1); ++i) {
-            T* p = il ? rows.data() + i * n + first : rows.data() + first * r;
-            std::fill(p, p + (il ? count : count * r), T{});
-        }
-        (void)stream;
-#endif
-    }
-
-    void reset_transient_rows(size_t first, size_t count, cudaStream_t stream) {
-        const detail::WorldSolverScratchRowCaps& c = solver_row_pool.caps;
-        reset_rows_one(rows_ball_split, c.ball_split, first, count, stream);
-        reset_rows_one(rows_ball_velocity, c.ball_velocity, first, count, stream);
-        reset_rows_one(rows_ball_friction, c.ball_friction, first, count, stream);
-        reset_rows_one(rows_pair_split, c.pair_split, first, count, stream);
-        reset_rows_one(rows_world_split, c.world_split, first, count, stream);
-        reset_rows_one(rows_pair_velocity, c.pair_velocity, first, count, stream);
-        reset_rows_one(rows_pair_friction, c.pair_friction, first, count, stream);
-        reset_rows_one(rows_world_velocity, c.world_velocity, first, count, stream);
-        reset_rows_one(rows_world_friction, c.world_friction, first, count, stream);
-        reset_rows_one(rows_shared_contact_order_groups, c.order_groups, first, count, stream);
-        reset_rows_one(rows_bullet_manifolds, c.manifolds, first, count, stream);
-        reset_rows_one(rows_pair_contact_cache, c.pair_cache_cars * c.pair_cache_cars, first, count, stream);
     }
 
     void copy_solver_rows_from(const Impl& source, cudaStream_t stream) {
@@ -1449,43 +1994,11 @@ struct BatchSim::Impl {
             source.cfg.max_cars_per_env != cfg.max_cars_per_env) {
             throw std::invalid_argument("copy_solver_rows_from: row pool layout mismatch");
         }
-        rows_ball_split.copy_from_buffer(source.rows_ball_split, rows_ball_split.size(), stream);
-        rows_ball_velocity.copy_from_buffer(source.rows_ball_velocity, rows_ball_velocity.size(), stream);
-        rows_ball_friction.copy_from_buffer(source.rows_ball_friction, rows_ball_friction.size(), stream);
-        rows_pair_split.copy_from_buffer(source.rows_pair_split, rows_pair_split.size(), stream);
-        rows_world_split.copy_from_buffer(source.rows_world_split, rows_world_split.size(), stream);
-        rows_pair_velocity.copy_from_buffer(source.rows_pair_velocity, rows_pair_velocity.size(), stream);
-        rows_pair_friction.copy_from_buffer(source.rows_pair_friction, rows_pair_friction.size(), stream);
-        rows_world_velocity.copy_from_buffer(source.rows_world_velocity, rows_world_velocity.size(), stream);
-        rows_world_friction.copy_from_buffer(source.rows_world_friction, rows_world_friction.size(), stream);
-        rows_shared_contact_order_groups.copy_from_buffer(source.rows_shared_contact_order_groups, rows_shared_contact_order_groups.size(), stream);
-        rows_bullet_manifolds.copy_from_buffer(source.rows_bullet_manifolds, rows_bullet_manifolds.size(), stream);
-        rows_pair_contact_cache.copy_from_buffer(source.rows_pair_contact_cache, rows_pair_contact_cache.size(), stream);
+        zero_tick_rows(stream);
         rows_car_world_plane.copy_from_buffer(source.rows_car_world_plane, rows_car_world_plane.size(), stream);
         rows_car_world_mesh.copy_from_buffer(source.rows_car_world_mesh, rows_car_world_mesh.size(), stream);
         rows_car_car_retained.copy_from_buffer(source.rows_car_car_retained, rows_car_car_retained.size(), stream);
         rows_ball_car_retained.copy_from_buffer(source.rows_ball_car_retained, rows_ball_car_retained.size(), stream);
-    }
-
-    template <typename T>
-    void download_rows_one(const detail::Buffer<T>& src, T* dst, int max_rows, size_t first, size_t count, cudaStream_t stream) const {
-        const size_t n = static_cast<size_t>(cfg.env_count);
-        if (solver_row_pool.interleaved) {
-#if defined(ROCKETGPU_USE_CUDA)
-            CheckCuda(cudaMemcpy2DAsync(
-                dst, count * sizeof(T),
-                src.data() + first, n * sizeof(T),
-                count * sizeof(T), static_cast<size_t>(max_rows),
-                cudaMemcpyDeviceToHost, stream), "cudaMemcpy2DAsync D2H rows");
-#else
-            for (int i = 0; i < max_rows; ++i) {
-                std::copy_n(src.data() + static_cast<size_t>(i) * n + first, count, dst + static_cast<size_t>(i) * count);
-            }
-            (void)stream;
-#endif
-        } else {
-            src.copy_range_to_host(dst, first * static_cast<size_t>(max_rows), count * static_cast<size_t>(max_rows), stream);
-        }
     }
 
     void download_solver_rows(detail::WorldSolverScratchRowPoolHost& out, size_t first, size_t count, cudaStream_t stream) const {
@@ -1493,19 +2006,6 @@ struct BatchSim::Impl {
         if (count == 0) {
             return;
         }
-        download_rows_one(rows_ball_split, out.ball_split_rows.data(), solver_row_pool.caps.ball_split, first, count, stream);
-        download_rows_one(rows_ball_velocity, out.ball_velocity_rows.data(), solver_row_pool.caps.ball_velocity, first, count, stream);
-        download_rows_one(rows_ball_friction, out.ball_friction_rows.data(), solver_row_pool.caps.ball_friction, first, count, stream);
-        download_rows_one(rows_pair_split, out.pair_split_rows.data(), solver_row_pool.caps.pair_split, first, count, stream);
-        download_rows_one(rows_world_split, out.world_split_rows.data(), solver_row_pool.caps.world_split, first, count, stream);
-        download_rows_one(rows_pair_velocity, out.pair_velocity_rows.data(), solver_row_pool.caps.pair_velocity, first, count, stream);
-        download_rows_one(rows_pair_friction, out.pair_friction_rows.data(), solver_row_pool.caps.pair_friction, first, count, stream);
-        download_rows_one(rows_world_velocity, out.world_velocity_rows.data(), solver_row_pool.caps.world_velocity, first, count, stream);
-        download_rows_one(rows_world_friction, out.world_friction_rows.data(), solver_row_pool.caps.world_friction, first, count, stream);
-        download_rows_one(rows_shared_contact_order_groups, out.shared_contact_order_groups.data(), solver_row_pool.caps.order_groups, first, count, stream);
-        download_rows_one(rows_bullet_manifolds, out.bullet_manifolds.data(), solver_row_pool.caps.manifolds, first, count, stream);
-        download_rows_one(rows_pair_contact_cache, out.pair_contact_cache.data(),
-                          solver_row_pool.caps.pair_cache_cars * solver_row_pool.caps.pair_cache_cars, first, count, stream);
         const detail::WorldSolverScratchRowCaps& caps = solver_row_pool.caps;
         rows_car_world_plane.copy_range_to_host(out.car_world_plane_manifolds.data(), first * caps.car_world_plane,
                                                 count * caps.car_world_plane, stream);
@@ -1540,6 +2040,7 @@ struct BatchSim::Impl {
         ensure_kickoff_settled(stream);
 #if defined(ROCKETGPU_USE_CUDA)
         solver_scratch.memset_zero(stream);
+        tick_scratch.memset_zero(stream);
         memset_zero_solver_rows(stream);
         detail::LaunchResetToKickoff(
             cfg,
@@ -1558,7 +2059,9 @@ struct BatchSim::Impl {
 #else
         cpu_envs().run(cfg.env_count, [&](int env_idx) {
             solver_scratch.data()[env_idx] = detail::WorldSolverScratch{};
-            detail::ZeroWorldSolverScratchRows(solver_row_pool.view(static_cast<size_t>(env_idx)), solver_row_pool.caps);
+            tick_scratch.data()[env_idx] = detail::WorldTickScratch{};
+            detail::ZeroWorldSolverScratchRows(solver_row_pool.view(static_cast<size_t>(env_idx)),
+                                              solver_row_pool.env_caps(static_cast<int>(env_idx)));
             int kickoff_order[5];
             const bool have_order = host_kickoff_order(env_idx, seed, 0, kickoff_order);
             detail::ResetEnvToKickoff(
@@ -1653,7 +2156,8 @@ struct BatchSim::Impl {
                 const detail::BulletBroadphaseHistory bp = solver_scratch.data()[env_idx].bp;
                 solver_scratch.data()[env_idx] = detail::WorldSolverScratch{};
                 solver_scratch.data()[env_idx].bp = bp;
-                detail::ZeroWorldSolverScratchRows(solver_row_pool.view(env_idx), solver_row_pool.caps);
+                tick_scratch.data()[env_idx] = detail::WorldTickScratch{};
+                detail::ZeroWorldSolverScratchRows(solver_row_pool.view(env_idx), solver_row_pool.env_caps(env_idx));
             }
         };
         if (active_cmds < 16) {
@@ -2179,7 +2683,39 @@ struct BatchSim::Impl {
     }
 };
 
+ArenaLayout::ArenaLayout() {
+    boost_pads.resize(static_cast<size_t>(detail::BoostPadCountSoccar()));
+    for (int p = 0; p < detail::BoostPadCountSoccar(); ++p) {
+        boost_pads[static_cast<size_t>(p)].pos = detail::BoostPadLocSoccar(p);
+        boost_pads[static_cast<size_t>(p)].is_big = detail::BoostPadIsBigSoccar(p);
+    }
+    MutatorConfig m;
+    goals[0].point = Vec3(0.0f, -m.goal_base_threshold_y, 0.0f);
+    goals[0].normal = Vec3(0.0f, -1.0f, 0.0f);
+    goals[1].point = Vec3(0.0f, m.goal_base_threshold_y, 0.0f);
+    goals[1].normal = Vec3(0.0f, 1.0f, 0.0f);
+    for (int s = 0; s < 5; ++s) {
+        const detail::SpawnPos k = detail::SoccarKickoffSpawn(s);
+        kickoff_spawns[0][s] = {Vec3(k.x, k.y, 0.0f), k.yaw};
+        kickoff_spawns[1][s] = {Vec3(-k.x, -k.y, 0.0f), k.yaw + Pi()};
+    }
+    for (int s = 0; s < 4; ++s) {
+        const detail::SpawnPos r = detail::SoccarRespawnSpawn(s);
+        respawn_spawns[0][s] = {Vec3(r.x, r.y, 0.0f), r.yaw};
+        respawn_spawns[1][s] = {Vec3(r.x, -r.y, 0.0f), r.yaw + Pi()};
+    }
+}
+
+std::vector<ArenaPlane> ArenaLayout::OfficialPlanes() {
+    return {{Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 1.0f)},
+            {Vec3(0.0f, 0.0f, detail::ArenaHeight()), Vec3(0.0f, 0.0f, -1.0f)},
+            {Vec3(-detail::ArenaExtentX(), 0.0f, 0.0f), Vec3(1.0f, 0.0f, 0.0f)},
+            {Vec3(detail::ArenaExtentX(), 0.0f, 0.0f), Vec3(-1.0f, 0.0f, 0.0f)}};
+}
+
 BatchSim::BatchSim(const SimConfig& config) : impl_(new Impl(config)) {}
+
+BatchSim::BatchSim(const SimConfig& config, const ArenaLayout& layout) : impl_(new Impl(config, &layout)) {}
 
 BatchSim::~BatchSim() {
     delete impl_;
@@ -2469,6 +3005,7 @@ void BatchSim::copy_state_from(const BatchSim& source, cudaStream_t stream) {
     impl_->controls.copy_from_buffer(source.impl_->controls, car_capacity(), stream);
     impl_->wheel_runtime_states.copy_from_buffer(source.impl_->wheel_runtime_states, car_capacity(), stream);
     impl_->solver_scratch.copy_from_buffer(source.impl_->solver_scratch, env_count(), stream);
+    impl_->tick_scratch.copy_from_buffer(source.impl_->tick_scratch, env_count(), stream);
     impl_->copy_solver_rows_from(*source.impl_, stream);
 
     impl_->seed = source.impl_->seed;
@@ -2482,6 +3019,7 @@ void BatchSim::copy_solver_scratch_from(const BatchSim& source, cudaStream_t str
         throw std::invalid_argument("copy_solver_scratch_from: env count mismatch");
     }
     impl_->solver_scratch.copy_from_buffer(source.impl_->solver_scratch, env_count(), stream);
+    impl_->tick_scratch.copy_from_buffer(source.impl_->tick_scratch, env_count(), stream);
     impl_->copy_solver_rows_from(*source.impl_, stream);
     impl_->mark_exact_host_dirty();
 }
@@ -2603,6 +3141,7 @@ void BatchSim::upload_solver_scratch_range_dev(const detail::WorldSolverScratch*
         throw std::out_of_range("upload_solver_scratch_range_dev exceeds env_count");
     }
     impl_->solver_scratch.copy_range_from_host(host_states, first, count, stream);
+    impl_->reset_tick_scratch(first, count, stream);
     impl_->reset_transient_rows(first, count, stream);
     impl_->mark_exact_host_dirty();
 }
@@ -2646,7 +3185,7 @@ void BatchSim::step_with_device_commands(
 }
 
 size_t SolverScratchBytesPerEnv() {
-    return sizeof(detail::WorldSolverScratch) + detail::WorldSolverScratchRowBytesPerEnv();
+    return sizeof(detail::WorldSolverScratch) + sizeof(detail::WorldTickScratch) + detail::WorldSolverScratchRowBytesPerEnv();
 }
 
 void BatchSim::synchronize(cudaStream_t stream) const {

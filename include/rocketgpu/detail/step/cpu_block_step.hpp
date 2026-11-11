@@ -206,34 +206,44 @@ inline bool CarPreTickInMatches(const CarState* cars, const WheelRuntimeState* w
 #endif
 
 static_assert(sizeof(WorldSolverScratchRows) ==
-                  11 * sizeof(EnvStridedArray<int>) + sizeof(CarCarPairCacheView) + 5 * sizeof(void*) + 4 * sizeof(int),
+                  11 * sizeof(EnvStridedArray<int>) + sizeof(CarCarPairCacheView) + 6 * sizeof(void*) +
+                      sizeof(TickCars) + 4 * sizeof(int),
               "CpuRowsView must set every WorldSolverScratchRows field");
 inline WorldSolverScratchRows CpuRowsView(const WorldSolverScratchRowPool& p, int env_idx) {
-    if (p.interleaved) {
+    if (p.interleaved || p.row_groups == nullptr) {
         return p.view(env_idx);
     }
     const std::ptrdiff_t e = env_idx;
     const auto at = [e](auto* base, int per_env) { return base == nullptr ? base : base + e * per_env; };
     const WorldSolverScratchRowCaps& c = p.caps;
+    const uint32_t slot = p.env_row_slot[env_idx];
+    const WorldSolverRowGroup& g = p.row_groups[slot >> 24];
+    const std::ptrdiff_t gi = static_cast<std::ptrdiff_t>(slot & 0xFFFFFFu);
+    const WorldSolverScratchRowCaps& t = g.caps;
+    const auto tick = [&g, gi](auto* base, int a, int per_env) {
+        return base == nullptr ? base : base + g.first[a] + gi * per_env;
+    };
     WorldSolverScratchRows r;
-    r.ball_split_rows = at(p.ball_split_rows, c.ball_split);
-    r.ball_velocity_rows = at(p.ball_velocity_rows, c.ball_velocity);
-    r.ball_friction_rows = at(p.ball_friction_rows, c.ball_friction);
-    r.pair_split_rows = at(p.pair_split_rows, c.pair_split);
-    r.world_split_rows = at(p.world_split_rows, c.world_split);
-    r.pair_velocity_rows = at(p.pair_velocity_rows, c.pair_velocity);
-    r.pair_friction_rows = at(p.pair_friction_rows, c.pair_friction);
-    r.world_velocity_rows = at(p.world_velocity_rows, c.world_velocity);
-    r.world_friction_rows = at(p.world_friction_rows, c.world_friction);
-    r.shared_contact_order_groups = at(p.shared_contact_order_groups, c.order_groups);
-    r.bullet_manifolds = at(p.bullet_manifolds, c.manifolds);
-    r.pair_contact_cache.slots = at(p.pair_contact_cache, c.pair_cache_cars * c.pair_cache_cars);
-    r.pair_contact_cache.cars = c.pair_cache_cars;
+    r.ball_split_rows_ = tick(p.ball_split_rows, kTickBallSplit, t.ball_split);
+    r.ball_velocity_rows_ = tick(p.ball_velocity_rows, kTickBallVelocity, t.ball_velocity);
+    r.ball_friction_rows_ = tick(p.ball_friction_rows, kTickBallFriction, t.ball_friction);
+    r.pair_split_rows_ = tick(p.pair_split_rows, kTickPairSplit, t.pair_split);
+    r.world_split_rows_ = tick(p.world_split_rows, kTickWorldSplit, t.world_split);
+    r.pair_velocity_rows_ = tick(p.pair_velocity_rows, kTickPairVelocity, t.pair_velocity);
+    r.pair_friction_rows_ = tick(p.pair_friction_rows, kTickPairFriction, t.pair_friction);
+    r.world_velocity_rows_ = tick(p.world_velocity_rows, kTickWorldVelocity, t.world_velocity);
+    r.world_friction_rows_ = tick(p.world_friction_rows, kTickWorldFriction, t.world_friction);
+    r.shared_contact_order_groups_ = tick(p.shared_contact_order_groups, kTickOrderGroups, t.order_groups);
+    r.bullet_manifolds_ = tick(p.bullet_manifolds, kTickManifolds, t.manifolds);
+    r.pair_contact_cache.slots = tick(p.pair_contact_cache, kTickPairCache, t.pair_cache_cars * t.pair_cache_cars);
+    r.pair_contact_cache.cars = t.pair_cache_cars;
     r.car_world_plane_manifolds = at(p.car_world_plane_manifolds, c.car_world_plane);
     r.car_world_mesh_manifolds = at(p.car_world_mesh_manifolds, c.car_world_mesh);
     r.car_car_retained_manifolds = at(p.car_car_retained_manifolds, c.car_car_retained);
     r.ball_car_retained_manifolds = at(p.ball_car_retained_manifolds, c.ball_car_retained);
-    r.car_world_local_rows = at(p.car_world_local_rows, c.car_world_local);
+    r.car_world_local_rows = tick(p.car_world_local_rows, kTickCarWorldLocal, t.car_world_local);
+    r.tick = p.tick_at(env_idx);
+    r.tick_cars = p.tick_cars_at(env_idx);
     r.car_world_plane_count = c.car_world_plane;
     r.car_world_mesh_count = c.car_world_mesh;
     r.car_car_retained_count = c.car_car_retained;
@@ -451,7 +461,8 @@ inline void StepEnvBlockCpu(
                     lane_frac[n++] = env_frac;
                     continue;
                 }
-                StepEnvPreTickCar(env_idx, slot, cfg, teams, cars, solver_scratch, env_states[env_idx], respawn_overrides[e], seed, c,
+                StepEnvPreTickCar(env_idx, slot, cfg, teams, cars, solver_scratch != nullptr ? env_rows[e].tick_cars : TickCars{},
+                                  env_states[env_idx], respawn_overrides[e], seed, c,
                                   car_configs[base + slot],
                                   wheel_runtime_states ? &wheel_runtime_states[base + slot] : nullptr);
             }
@@ -478,14 +489,16 @@ inline void StepEnvBlockCpu(
                     std::memcpy(static_cast<void*>(&got_w), &wheel_runtime_states[lane_idx[j]], sizeof(WheelRuntimeState));
                     StoreCarPreTickOut(got, got_w, o, car_wout + jj);
                     const int env_idx = lane_env[j], slot = lane_slot[j];
-                    StepEnvPreTickCar(env_idx, slot, cfg, teams, cars, solver_scratch, env_states[env_idx], respawn_overrides[env_idx - env0],
+                    StepEnvPreTickCar(env_idx, slot, cfg, teams, cars,
+                                      solver_scratch != nullptr ? env_rows[env_idx - env0].tick_cars : TickCars{},
+                                      env_states[env_idx], respawn_overrides[env_idx - env0],
                                       seed, controls_for(env_idx).get(slot, t), car_configs[lane_idx[j]],
                                       &wheel_runtime_states[lane_idx[j]]);
                     const Vec3 start_vel = CarOutV3(o, kCarOutStartVel);
                     if (!StateDataEqual(&got, &cars[lane_idx[j]], kCarStateData) ||
                         !StateDataEqual(&got_w, &wheel_runtime_states[lane_idx[j]], kWheelRuntimeStateData) ||
                         (solver_scratch != nullptr && slot < 8 &&
-                         std::memcmp(&start_vel, &solver_scratch[env_idx].cal_start_vel[slot], sizeof(Vec3)) != 0)) {
+                         std::memcmp(&start_vel, &env_rows[env_idx - env0].tick_cars.cal_start_vel()[slot], sizeof(Vec3)) != 0)) {
                         std::fprintf(stderr, "ROCKETGPU_ISPC_CHECK pre-tick mismatch, car %d\n", lane_idx[j]);
                     }
                     const CarState& cc = cars[lane_idx[j]];
@@ -507,11 +520,11 @@ inline void StepEnvBlockCpu(
                 const int slot = lane_slot[j];
                 if (solver_scratch != nullptr && slot < 8) {
                     WorldSolverScratch& s = solver_scratch[lane_env[j]];
-                    s.cal_start_vel[slot] = CarOutV3(o, kCarOutStartVel);
-                    s.car_predict_vel[slot] = car.vel;
-                    s.car_predict_vel_bt[slot] = car.vel_bt;
-                    s.car_predict_ang_vel[slot] = car.ang_vel;
-                    s.car_predict_valid[slot] = 1;
+                    const TickCars& tk = env_rows[lane_env[j] - env0].tick_cars;
+                    tk.cal_start_vel()[slot] = CarOutV3(o, kCarOutStartVel);
+                    tk.car_predict_vel_bt()[slot] = car.vel_bt;
+                    tk.car_predict_ang_vel()[slot] = car.ang_vel;
+                    tk.car_predict_valid()[slot] = 1;
                     if (mirror_rng == nullptr) {
                         CarRbSnapMemo& snap = s.rb_snap[slot];
                         snap.fwd = car.basis_forward;
@@ -540,12 +553,12 @@ inline void StepEnvBlockCpu(
                 std::memcpy(got, balls + env0, sizeof(BallState) * env_n);
                 std::memcpy(balls + env0, start, sizeof(BallState) * env_n);
                 for (int e = 0; e < env_n; ++e) {
-                    StepEnvPreTickBall(env0 + e, cfg, solver_scratch, balls);
+                    StepEnvPreTickBall(env0 + e, cfg, solver_scratch != nullptr ? env_rows[e].tick : nullptr, balls);
                     if (!StateDataEqual(&got[e], &balls[env0 + e], kBallStateData) ||
                         (solver_scratch != nullptr &&
-                         (!SameVec3(BallOutV3(ball_out + e, kBallOutStartVel), solver_scratch[env0 + e].cal_ball_start_vel) ||
+                         (!SameVec3(BallOutV3(ball_out + e, kBallOutStartVel), env_rows[e].tick->cal_ball_start_vel) ||
                           (!ball_heatseeker && !SameVec3(BallOutV3(ball_out + e, kBallOutPredictVel),
-                                                       solver_scratch[env0 + e].ball_predict_vel_bt))))) {
+                                                       env_rows[e].tick->ball_predict_vel_bt))))) {
                         std::fprintf(stderr, "ROCKETGPU_ISPC_CHECK ball pre-tick mismatch, env %d\n", env0 + e);
                     }
                 }
@@ -557,9 +570,9 @@ inline void StepEnvBlockCpu(
                 }
                 if (solver_scratch != nullptr) {
                     for (int e = 0; e < env_n; ++e) {
-                        solver_scratch[env0 + e].cal_ball_start_vel = BallOutV3(ball_out + e, kBallOutStartVel);
+                        env_rows[e].tick->cal_ball_start_vel = BallOutV3(ball_out + e, kBallOutStartVel);
                         if (!ball_heatseeker) {
-                            solver_scratch[env0 + e].ball_predict_vel_bt = BallOutV3(ball_out + e, kBallOutPredictVel);
+                            env_rows[e].tick->ball_predict_vel_bt = BallOutV3(ball_out + e, kBallOutPredictVel);
                         }
                     }
                 }
@@ -570,7 +583,7 @@ inline void StepEnvBlockCpu(
             const bool report_fields = kReportEachTick || t + 1 == ticks || mirror_reports_each_tick[e];
             const int env_idx = env0 + e;
             if (!ball_lanes) {
-                StepEnvPreTickBall(env_idx, cfg, solver_scratch, balls);
+                StepEnvPreTickBall(env_idx, cfg, solver_scratch != nullptr ? env_rows[e].tick : nullptr, balls);
             }
             if (e + 1 < env_n && cfg.enable_boost_pads) {
                 const int pad_count = BoostPadCount(cfg);
@@ -620,7 +633,8 @@ inline void StepEnvBlockCpu(
             }
             for (int k = 0; k < count; ++k) {
                 const int i = env_order[k];
-                StepEnvPostCar(env_idx, i, cfg, cars, wheel_runtime_states, solver_scratch, car_configs,
+                StepEnvPostCar(env_idx, i, cfg, cars, wheel_runtime_states, solver_scratch,
+                               solver_scratch != nullptr ? env_rows[e].tick_cars : TickCars{}, car_configs,
                                env_controls[i], false, report_fields);
             }
             StepEnvTail(env_idx, count, cfg, cars, car_configs, ball, env, pads, true, true,

@@ -48,17 +48,19 @@ def state_dtype(name):
 class DeviceFieldArray:
 
 
-    def __init__(self, array_name, field, typestr, base_ptr, count, itemsize, offset, shape, owner=None):
+    def __init__(self, array_name, field, typestr, base_ptr, count, itemsize, offset, shape, owner=None, lanes=None):
         import numpy as np
 
         elem = np.dtype(typestr)
-        strides = [itemsize]
+        inner = []
         stride = elem.itemsize
         for dim in reversed(tuple(shape)):
-            strides.insert(1, stride)
+            inner.insert(0, stride)
             stride *= dim
-        full_shape = (count,) + tuple(shape)
-        full_strides = tuple(strides[: len(full_shape)])
+        lead = (count,) if lanes is None else (count, lanes[0])
+        lead_strides = (itemsize,) if lanes is None else (itemsize, lanes[1])
+        full_shape = lead + tuple(shape)
+        full_strides = lead_strides + tuple(inner)
         self._owner = owner
         self.name = f"{array_name}.{field}"
         self.dtype = elem
@@ -81,6 +83,14 @@ def field_arrays(sim, array_name):
     base_ptr = entry["__cuda_array_interface__"]["data"][0]
     count = entry["count"]
     layout = state_layout(array_name)
+    if "device" in layout and _rs.is_cuda_build:
+        dev = layout["device"]
+        assert dev["tile_bytes"] == entry["itemsize"], (array_name, dev["tile_bytes"], entry["itemsize"])
+        return {
+            field: DeviceFieldArray(array_name, field, typestr, base_ptr, count, dev["tile_bytes"], offset, shape, sim,
+                                    (dev["tile_cars"], lane_stride))
+            for field, typestr, offset, lane_stride, shape in dev["fields"]
+        }
     itemsize = layout["itemsize"]
     assert itemsize == entry["itemsize"], (array_name, itemsize, entry["itemsize"])
     return {

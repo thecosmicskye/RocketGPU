@@ -9,6 +9,7 @@
 #include <map>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace rocketgpu {
@@ -728,11 +729,28 @@ std::vector<ArenaMeshTriangle> LoadArenaMeshTriangles(
 std::vector<uint16_t> BuildArenaBroadphaseCellMask(
     const std::vector<ArenaMeshTriangle>& triangles,
     const std::vector<ArenaMeshBvhMeshInfo>& mesh_infos,
-    ArenaBroadphaseGrid& out_grid) {
+    ArenaBroadphaseGrid& out_grid,
+    bool fit_to_meshes) {
     constexpr float kUUToBT = 1.0f / 50.0f;
     out_grid.min_bt = Vec3(-5600.0f * kUUToBT, -6000.0f * kUUToBT, 0.0f);
     out_grid.max_bt = Vec3(5600.0f * kUUToBT, 6000.0f * kUUToBT, 2200.0f * kUUToBT);
     out_grid.cell_size_bt = 370.0f * kUUToBT;
+    if (fit_to_meshes && !mesh_infos.empty()) {
+        Vec3 lo = mesh_infos[0].aabb_min, hi = mesh_infos[0].aabb_max;
+        for (const ArenaMeshBvhMeshInfo& info : mesh_infos) {
+            lo = MinComponents(lo, info.aabb_min);
+            hi = MaxComponents(hi, info.aabb_max);
+        }
+        float cell = out_grid.cell_size_bt;
+        const auto cells = [&](float c) {
+            return static_cast<double>((hi.x - lo.x) / c + 3.0f) * static_cast<double>((hi.y - lo.y) / c + 3.0f) *
+                   static_cast<double>((hi.z - lo.z) / c + 3.0f);
+        };
+        while (cells(cell) > 1.0e6) cell *= 2.0f;
+        out_grid.cell_size_bt = cell;
+        out_grid.min_bt = Vec3(lo.x - cell, lo.y - cell, lo.z - cell);
+        out_grid.max_bt = Vec3(hi.x + cell, hi.y + cell, hi.z + cell);
+    }
     const Vec3 range(
         out_grid.max_bt.x - out_grid.min_bt.x,
         out_grid.max_bt.y - out_grid.min_bt.y,
@@ -874,6 +892,9 @@ void BuildArenaMeshClearance(
             return;
         }
         dims[a] = static_cast<int>(count);
+    }
+    if (static_cast<double>(dims[0]) * dims[1] * dims[2] > 268435456.0) {
+        return;
     }
     const double unit = kMax / 255.0;
     const double half_diag = 0.5 * kCell * std::sqrt(3.0);
@@ -1205,6 +1226,189 @@ void BuildArenaMeshLeafGrid(
             out_cell_start.push_back(static_cast<int32_t>(out_entries.size()));
         }
     }
+}
+
+ArenaMeshSource ReadArenaMeshFile(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("failed to open collision mesh: " + path.string());
+    }
+    int32_t num_tris = 0;
+    int32_t num_vertices = 0;
+    input.read(reinterpret_cast<char*>(&num_tris), sizeof(num_tris));
+    input.read(reinterpret_cast<char*>(&num_vertices), sizeof(num_vertices));
+    if (!input || num_tris <= 0 || num_vertices <= 0) {
+        throw std::runtime_error("invalid collision mesh header: " + path.string());
+    }
+    std::error_code ec;
+    const std::uintmax_t file_bytes = std::filesystem::file_size(path, ec);
+    const std::uintmax_t need = 8u + static_cast<std::uintmax_t>(num_tris) * 3u * sizeof(int32_t) +
+                                static_cast<std::uintmax_t>(num_vertices) * sizeof(MeshVertex);
+    if (ec || need > file_bytes) {
+        throw std::runtime_error("collision mesh header counts exceed the file: " + path.string());
+    }
+    ArenaMeshSource out;
+    out.indices.resize(static_cast<size_t>(num_tris) * 3);
+    std::vector<MeshVertex> vertices(static_cast<size_t>(num_vertices));
+    input.read(reinterpret_cast<char*>(out.indices.data()), static_cast<std::streamsize>(out.indices.size() * sizeof(int32_t)));
+    input.read(reinterpret_cast<char*>(vertices.data()), static_cast<std::streamsize>(vertices.size() * sizeof(MeshVertex)));
+    if (!input) {
+        throw std::runtime_error("failed to read collision mesh: " + path.string());
+    }
+    out.vertices.reserve(vertices.size());
+    for (const MeshVertex& v : vertices) out.vertices.emplace_back(v.x, v.y, v.z);
+    return out;
+}
+
+std::vector<ArenaMeshTriangle> LoadCustomArenaMeshTriangles(
+    const std::vector<ArenaMeshSource>& meshes,
+    std::vector<ArenaMeshBvhQuantization>& out_quantization,
+    std::vector<ArenaMeshBvhMeshInfo>& out_mesh_infos,
+    std::vector<ArenaMeshBvhNode>& out_nodes,
+    std::vector<ArenaMeshBvhSubtreeInfo>& out_subtrees,
+    std::vector<ArenaMeshTriangle>& out_local_triangles) {
+    if (meshes.empty() || meshes.size() > static_cast<size_t>(kCustomArenaMaxMeshes)) {
+        throw std::invalid_argument("a custom arena needs 1 to 16 meshes");
+    }
+    std::vector<ArenaMeshTriangle> triangles;
+    out_quantization.assign(meshes.size(), ArenaMeshBvhQuantization{});
+    out_mesh_infos.clear();
+    out_nodes.clear();
+    out_subtrees.clear();
+    const std::vector<TriangleIndex> no_indices;
+    for (size_t mesh_idx = 0; mesh_idx < meshes.size(); ++mesh_idx) {
+        const ArenaMeshSource& src = meshes[mesh_idx];
+        const int32_t num_tris = static_cast<int32_t>(src.indices.size() / 3);
+        if (num_tris <= 0 || src.indices.size() % 3 != 0) {
+            throw std::invalid_argument("a custom arena mesh needs a whole number of triangles (three indices each)");
+        }
+        const size_t mesh_base = triangles.size();
+        Vec3 mesh_min(std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity());
+        Vec3 mesh_max(-std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity());
+        for (int32_t tri_i = 0; tri_i < num_tris; ++tri_i) {
+            const Vec3* v[3];
+            for (int k = 0; k < 3; ++k) {
+                const int32_t idx = src.indices[static_cast<size_t>(tri_i) * 3 + k];
+                if (idx < 0 || static_cast<size_t>(idx) >= src.vertices.size()) {
+                    throw std::invalid_argument("custom arena mesh triangle index out of range");
+                }
+                v[k] = &src.vertices[static_cast<size_t>(idx)];
+                if (!std::isfinite(v[k]->x) || !std::isfinite(v[k]->y) || !std::isfinite(v[k]->z)) {
+                    throw std::invalid_argument("custom arena mesh vertex is not finite");
+                }
+            }
+            ArenaMeshTriangle tri;
+            tri.a = *v[0];
+            tri.b = *v[1];
+            tri.c = *v[2];
+            const Vec3 ab(tri.b.x - tri.a.x, tri.b.y - tri.a.y, tri.b.z - tri.a.z);
+            const Vec3 ac(tri.c.x - tri.a.x, tri.c.y - tri.a.y, tri.c.z - tri.a.z);
+            tri.normal = Normalize(Cross(ab, ac), Vec3(0.0f, 0.0f, 1.0f));
+            tri.min = Vec3(Min(tri.a.x, Min(tri.b.x, tri.c.x)), Min(tri.a.y, Min(tri.b.y, tri.c.y)),
+                           Min(tri.a.z, Min(tri.b.z, tri.c.z)));
+            tri.max = Vec3(Max(tri.a.x, Max(tri.b.x, tri.c.x)), Max(tri.a.y, Max(tri.b.y, tri.c.y)),
+                           Max(tri.a.z, Max(tri.b.z, tri.c.z)));
+            tri.mesh_index = static_cast<uint8_t>(mesh_idx);
+            mesh_min = MinComponents(mesh_min, tri.min);
+            mesh_max = MaxComponents(mesh_max, tri.max);
+            triangles.push_back(tri);
+        }
+
+        constexpr float kCell = 1.0e-3f;
+        const auto cell_key = [](int64_t x, int64_t y, int64_t z) {
+            return (static_cast<uint64_t>(x & 0x1fffff) << 42) | (static_cast<uint64_t>(y & 0x1fffff) << 21) |
+                   static_cast<uint64_t>(z & 0x1fffff);
+        };
+        const auto cell_of = [&](const Vec3& p, int64_t c[3]) {
+            c[0] = static_cast<int64_t>(std::floor(p.x / kCell));
+            c[1] = static_cast<int64_t>(std::floor(p.y / kCell));
+            c[2] = static_cast<int64_t>(std::floor(p.z / kCell));
+        };
+        std::unordered_map<uint64_t, std::vector<int32_t>> by_cell;
+        for (int32_t tri_i = 0; tri_i < num_tris; ++tri_i) {
+            const ArenaMeshTriangle& tri = triangles[mesh_base + static_cast<size_t>(tri_i)];
+            for (const Vec3* p : {&tri.a, &tri.b, &tri.c}) {
+                int64_t c[3];
+                cell_of(*p, c);
+                std::vector<int32_t>& list = by_cell[cell_key(c[0], c[1], c[2])];
+                if (list.empty() || list.back() != tri_i) list.push_back(tri_i);
+            }
+        }
+        std::vector<int32_t> candidates;
+        for (int32_t tri_a = 0; tri_a < num_tris; ++tri_a) {
+            const ArenaMeshTriangle& tri_a_ref = triangles[mesh_base + static_cast<size_t>(tri_a)];
+            candidates.clear();
+            for (const Vec3* p : {&tri_a_ref.a, &tri_a_ref.b, &tri_a_ref.c}) {
+                int64_t c[3];
+                cell_of(*p, c);
+                for (int dx = -1; dx <= 1; ++dx) {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dz = -1; dz <= 1; ++dz) {
+                            const auto it = by_cell.find(cell_key(c[0] + dx, c[1] + dy, c[2] + dz));
+                            if (it != by_cell.end()) candidates.insert(candidates.end(), it->second.begin(), it->second.end());
+                        }
+                    }
+                }
+            }
+            std::sort(candidates.begin(), candidates.end());
+            candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+            for (const int32_t tri_b : candidates) {
+                if (tri_a == tri_b) continue;
+                const ArenaMeshTriangle& tri_b_ref = triangles[mesh_base + static_cast<size_t>(tri_b)];
+                if (tri_a_ref.max.x < tri_b_ref.min.x || tri_a_ref.min.x > tri_b_ref.max.x ||
+                    tri_a_ref.max.y < tri_b_ref.min.y || tri_a_ref.min.y > tri_b_ref.max.y ||
+                    tri_a_ref.max.z < tri_b_ref.min.z || tri_a_ref.min.z > tri_b_ref.max.z) {
+                    continue;
+                }
+                PopulateTriangleInternalEdgeInfo(no_indices, triangles, static_cast<int>(mesh_base + static_cast<size_t>(tri_a)),
+                                                 static_cast<int>(mesh_base + static_cast<size_t>(tri_b)),
+                                                 static_cast<int>(mesh_base));
+            }
+        }
+        for (int32_t tri_i = 0; tri_i < num_tris; ++tri_i) {
+            ArenaMeshTriangle& wt = triangles[mesh_base + static_cast<size_t>(tri_i)];
+            if (wt.edge_v0v1_angle == 2.0f * Pi()) wt.edge_v0v1_angle = 0.0f;
+            if (wt.edge_v1v2_angle == 2.0f * Pi()) wt.edge_v1v2_angle = 0.0f;
+            if (wt.edge_v2v0_angle == 2.0f * Pi()) wt.edge_v2v0_angle = 0.0f;
+        }
+
+        ArenaMeshBvhQuantization& quantization = out_quantization[mesh_idx];
+        SetArenaMeshBvhQuantization(quantization, mesh_min, mesh_max, 1.0f, true);
+        for (size_t tri_pos = mesh_base; tri_pos < triangles.size(); ++tri_pos) {
+            ArenaMeshTriangle& tri = triangles[tri_pos];
+            QuantizeArenaMeshBvhPoint(quantization, tri.min, 0, tri.quantized_aabb_min);
+            QuantizeArenaMeshBvhPoint(quantization, tri.max, 1, tri.quantized_aabb_max);
+        }
+        std::vector<ArenaMeshBvhNode> mesh_nodes;
+        std::vector<ArenaMeshBvhSubtreeInfo> mesh_subtrees;
+        BuildArenaMeshBulletStyleBvh(triangles, static_cast<int32_t>(mesh_base), num_tris, quantization, mesh_nodes,
+                                     mesh_subtrees);
+        ArenaMeshBvhMeshInfo mesh_info;
+        mesh_info.aabb_min = mesh_min;
+        mesh_info.aabb_max = mesh_max;
+        mesh_info.mesh_index = static_cast<int32_t>(mesh_idx);
+        mesh_info.cal_origin_y = 0.0f;
+        mesh_info.triangle_start = static_cast<int32_t>(mesh_base);
+        mesh_info.triangle_count = num_tris;
+        mesh_info.node_offset = static_cast<int32_t>(out_nodes.size());
+        mesh_info.node_count = static_cast<int32_t>(mesh_nodes.size());
+        mesh_info.subtree_offset = static_cast<int32_t>(out_subtrees.size());
+        mesh_info.subtree_count = static_cast<int32_t>(mesh_subtrees.size());
+        mesh_info.dfs_subtree_offset = mesh_info.subtree_offset + mesh_info.subtree_count;
+        out_mesh_infos.push_back(mesh_info);
+        out_nodes.insert(out_nodes.end(), mesh_nodes.begin(), mesh_nodes.end());
+        for (ArenaMeshBvhSubtreeInfo& subtree : mesh_subtrees) {
+            subtree.root_node_index += mesh_info.node_offset;
+        }
+        out_subtrees.insert(out_subtrees.end(), mesh_subtrees.begin(), mesh_subtrees.end());
+        std::stable_sort(mesh_subtrees.begin(), mesh_subtrees.end(),
+                         [](const ArenaMeshBvhSubtreeInfo& a, const ArenaMeshBvhSubtreeInfo& b) {
+                             return a.root_node_index < b.root_node_index;
+                         });
+        out_subtrees.insert(out_subtrees.end(), mesh_subtrees.begin(), mesh_subtrees.end());
+    }
+    out_local_triangles = triangles;
+    return triangles;
 }
 }
 }
