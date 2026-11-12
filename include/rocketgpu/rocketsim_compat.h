@@ -125,7 +125,7 @@ struct CarStateV3 {
     Vec3 vel{};
     Vec3 angVel{};
     CarControls controls{};  // controls for the next step (Car::SetControls)
-    bool hasJumped = false;
+    bool hasJumped = false;  // as v3: also set by a double jump or dodge with no jump before it (CarStateCompat: the game's)
     bool hasDoubleJumped = false;
     bool hasFlipped = false;
     Vec3 flipRelTorque{};
@@ -133,7 +133,7 @@ struct CarStateV3 {
     float flipTime = 0.0f;
     bool isFlipping = false;
     bool isJumping = false;
-    bool jumpHoldBroken = false;  // tracked and stored, but RocketGPU's jump does not read it (a re-press resumes it)
+    bool jumpHoldBroken = false;  // the jump's hold was released: pressing again does not resume it
     float airTime = 0.0f;
     float airTimeSinceJump = 0.0f;
     float boost = 33.3f;
@@ -341,7 +341,7 @@ private:
     std::vector<EnvState> env_states_;
     CarBumpEventFn bump_callback_;
     void* bump_user_info_ = nullptr;
-    std::vector<uint64_t> bump_event_seen_tick_;
+    std::vector<uint8_t> bump_seen_;
     struct ExtraHitGuess {
         bool known = false;
         bool pending = false;
@@ -352,6 +352,7 @@ private:
     std::vector<ExtraHitGuess> extra_hit_guess_;
     void GuessExtraHits();
     void DrainBumpEvents();
+    void SyncBumpSeen();
     mutable std::vector<BoostPadState> pad_states_;
     std::vector<BoostPad*> boost_pads_;
     std::vector<uint8_t> slot_used_;

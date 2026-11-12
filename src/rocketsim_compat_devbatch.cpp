@@ -67,7 +67,6 @@ void DevBatch::SetEnv(int i, const Arena& a) {
     for (size_t j = 0; j < cap_; ++j) {
         CarState& c = cars_[e * cap_ + j];
         if (c.car_contact.other_car_id != 0) c.car_contact.other_car_id += id_base;
-        if (c.bump_event_other_id != 0) c.bump_event_other_id += id_base;
         if (c.ball_hit_info.hit_car_id != 0) c.ball_hit_info.hit_car_id += id_base;
         for (int m = 0; m < 7; ++m) {
             if (c.pending_bump_hitter[m] != 0) c.pending_bump_hitter[m] += id_base;

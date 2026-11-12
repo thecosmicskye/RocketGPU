@@ -133,43 +133,12 @@ ROCKETGPU_GLOBAL void ResetToKickoffKernel(
                       kickoff_seed_mode, respawn_rng, nullptr, false, car_configs);
 }
 
-ROCKETGPU_DEVICE void ApplyEnvCommandForEnv(
-    int env_idx,
-    const SimConfig& cfg,
-    Team* teams,
-    int32_t* env_car_count,
-    CarSpanT cars,
-    CarControls* controls,
-    WorldSolverScratch* solver_scratch,
-    BallState* balls,
-    EnvState* env_states,
-    BoostPadState* pads,
-    const EnvCommand& command,
-    RespawnRngState* respawn_rng,
-    const CarConfig* car_configs) {
-    if (!command.reset_to_kickoff && !command.new_round_bodies) {
-        return;
-    }
-    if (solver_scratch != nullptr) {
-        ApplyEnvCommandBodies(
-            solver_scratch[env_idx], command, env_car_count[env_idx], cars + env_idx * cfg.max_cars_per_env);
-    }
-    ApplyEnvCommand(env_idx, cfg, teams, env_car_count, cars, controls, balls, env_states, pads, command, respawn_rng, nullptr,
-                    car_configs);
-    if (solver_scratch != nullptr && command.reset_to_kickoff) {
-        for (int manifold_idx = 0; manifold_idx < kMaxBallWorldMeshPersistentManifolds; ++manifold_idx) {
-            solver_scratch[env_idx].ball_world_mesh_manifolds[manifold_idx] = BallMeshPersistentManifold{};
-        }
-        for (int manifold_idx = 0; manifold_idx < kBallWorldPlaneSlots; ++manifold_idx) {
-            solver_scratch[env_idx].ball_world_plane_manifolds[manifold_idx] = BallMeshPersistentManifold{};
-        }
-        solver_scratch[env_idx].retained_reset_pending = 1;
-        for (int k = 0; k < 8; ++k) {
-            solver_scratch[env_idx].car_world_reset[k] = 1;
-        }
-    }
+constexpr int kEnvCommandBlockEnvsMax = 32;
+constexpr int kEnvCommandSlotsMax = 8;
+ROCKETGPU_HD int EnvCommandBlockEnvs(int max_cars_per_env) {
+    const int envs = 1024 / (max_cars_per_env + 1);
+    return envs < 1 ? 1 : envs > kEnvCommandBlockEnvsMax ? kEnvCommandBlockEnvsMax : envs;
 }
-
 ROCKETGPU_GLOBAL void ApplyEnvCommandsKernel(
     const __grid_constant__ SimConfig cfg,
     Team* teams,
@@ -183,19 +152,159 @@ ROCKETGPU_GLOBAL void ApplyEnvCommandsKernel(
     const EnvCommand* env_commands,
     int32_t command_count,
     RespawnRngState* respawn_rng,
-    const CarConfig* car_configs) {
-    const int env_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (env_idx >= command_count) {
+    const CarConfig* car_configs,
+    bool step_order) {
+    const int slots = cfg.max_cars_per_env;
+    const int lanes = slots + 1;
+    const int block_envs = EnvCommandBlockEnvs(slots);
+    const int local_env = static_cast<int>(threadIdx.x) / lanes;
+    const int lane = static_cast<int>(threadIdx.x) - local_env * lanes;
+    int env_idx = static_cast<int>(blockIdx.x) * block_envs + local_env;
+    __shared__ KickoffPlan s_plan[kEnvCommandBlockEnvsMax];
+    __shared__ int32_t s_settle_env[kEnvCommandBlockEnvsMax];
+    __shared__ int32_t s_settle_row[kEnvCommandBlockEnvsMax][kEnvCommandSlotsMax];
+    bool reset = false;
+    bool bodies = false;
+    if (local_env < block_envs && env_idx < command_count) {
+        if (step_order) {
+            MapStepEnv(cfg, env_idx);
+        }
+        reset = env_commands[env_idx].reset_to_kickoff != 0;
+        bodies = reset || env_commands[env_idx].new_round_bodies != 0;
+    }
+    const bool new_match = reset && env_commands[env_idx].reset_scoreboard != 0;
+    const bool settle = reset && env_commands[env_idx].kickoff_countdown_ticks == 0 && cfg.kickoff_settled_rows != nullptr;
+    if (lane == 0) {
+        s_settle_env[local_env] = settle ? env_idx : -1;
+    }
+    if (bodies && lane == 0) {
+        const EnvCommand& command = env_commands[env_idx];
+        if (solver_scratch != nullptr && !new_match) {
+            BulletSweepNewRound(solver_scratch[env_idx].bp, env_car_count[env_idx], cars + env_idx * slots);
+        }
+        if (reset) {
+            s_plan[local_env] = ResetEnvToKickoffState(env_idx, cfg, teams, env_car_count, command.kickoff_seed,
+                                                       command.reset_scoreboard == 0, env_states,
+                                                       command.kickoff_seed_mode, respawn_rng, nullptr);
+            ApplyEnvCommandEnvState(env_states[env_idx], command);
+        }
+    }
+    __syncthreads();
+    static_assert(kEnvCommandBlockEnvsMax <= 32, "a bit per env of the block");
+    uint32_t settling = 0;
+    for (int e = 0; e < block_envs; ++e) {
+        settling |= static_cast<uint32_t>(s_settle_env[e] >= 0) << e;
+    }
+    if (bodies) {
+        const EnvCommand& command = env_commands[env_idx];
+        const bool game_spawn = command.kickoff_countdown_ticks != 0;
+        if (lane == 0) {
+            if (reset && !(settle && KickoffSettlesBall(cfg))) {
+                ResetKickoffBall(env_idx, cfg, balls, s_plan[local_env], game_spawn, false);
+                balls[env_idx].constrained_2d = command.kickoff_countdown_ticks;
+            }
+            if (solver_scratch != nullptr) {
+                solver_scratch[env_idx].retained_reset_pending = 1;
+                for (int k = 0; k < 8; ++k) {
+                    solver_scratch[env_idx].car_world_reset[k] = 1;
+                }
+            }
+        } else if (reset) {
+            const int i = lane - 1;
+            const int idx = env_idx * slots + i;
+            controls[idx] = CarControls{};
+            KickoffCarSpot at;
+            const bool placed = i < env_car_count[env_idx] &&
+                                FindKickoffCarSpot(env_idx, i, cfg, teams, env_car_count, env_states, s_plan[local_env], at);
+            const KickoffSettledRow* const row = placed && settle ? KickoffSettledRowFor(cfg, idx, at.spot) : nullptr;
+            const bool in_parts = row != nullptr && kSettledCarParts != 0;
+            if (placed) {
+                if (!in_parts) {
+                    PlaceKickoffCar(env_idx, i, cfg, cars, car_configs, at, game_spawn);
+                    if (row != nullptr) {
+                        SettleKickoffCar(cfg, idx, at.spot, cars);
+                    }
+                }
+                cars[idx].driving_disabled = command.kickoff_countdown_ticks;
+            }
+            if (settle) {
+                s_settle_row[local_env][i] = in_parts ? static_cast<int32_t>(row - cfg.kickoff_settled_rows) : -1;
+            }
+        }
+        if (reset && command.keep_boost_pads == 0) {
+            for (int p = lane; p < BoostPadCount(cfg); p += lanes) {
+                ResetBoostPad(cfg, pads, env_idx, p);
+            }
+        }
+        if (solver_scratch != nullptr && new_match) {
+            static_assert(sizeof(BulletBroadphaseHistory) % 16 == 0, "16-byte chunks");
+            unsigned char* const bp = reinterpret_cast<unsigned char*>(&solver_scratch[env_idx].bp);
+            for (int c = lane; c < static_cast<int>(sizeof(BulletBroadphaseHistory) / 16); c += lanes) {
+                memset(bp + 16 * c, 0, 16);
+            }
+        }
+        if (solver_scratch != nullptr) {
+            for (int m = lane; m < kMaxBallWorldMeshPersistentManifolds + kBallWorldPlaneSlots; m += lanes) {
+                BallMeshPersistentManifold& manifold =
+                    m < kMaxBallWorldMeshPersistentManifolds
+                        ? solver_scratch[env_idx].ball_world_mesh_manifolds[m]
+                        : solver_scratch[env_idx].ball_world_plane_manifolds[m - kMaxBallWorldMeshPersistentManifolds];
+                if (reset) {
+                    manifold = BallMeshPersistentManifold{};
+                } else {
+                    ResetBallMeshPersistentManifold(manifold);
+                }
+            }
+        }
+    }
+    if (settling == 0) {
         return;
     }
-    ApplyEnvCommandForEnv(env_idx, cfg, teams, env_car_count, cars, controls, solver_scratch, balls, env_states, pads,
-                          env_commands[env_idx], respawn_rng, car_configs);
+    __syncthreads();
+    constexpr int kCarParts = kSettledCarParts + kStateWordParts<WheelRuntimeState>;
+    constexpr int kBallConstrainedPart = static_cast<int>(offsetof(BallState, constrained_2d) / 32);
+    const int car_parts = slots * kCarParts;
+    const int env_parts = car_parts + (KickoffSettlesBall(cfg) ? kStateWordParts<BallState> : 0);
+    const int threads = block_envs * lanes;
+    for (uint32_t left = settling; left != 0; left &= left - 1) {
+        const int e = CountTrailingZeros32(left);
+        const int env = s_settle_env[e];
+        int first = static_cast<int>(threadIdx.x) - e * lanes;
+        if (first < 0) {
+            first += threads;
+        }
+        for (int k = first; k < env_parts; k += threads) {
+            if (k >= car_parts) {
+                CopyStateWordsPart(balls[env], *cfg.kickoff_settled_ball, k - car_parts);
+                if (k - car_parts == kBallConstrainedPart) {
+                    balls[env].constrained_2d = 0;
+                }
+                continue;
+            }
+            const int i = k / kCarParts;
+            const int part = k - i * kCarParts;
+            const int32_t row_idx = s_settle_row[e][i];
+            if (row_idx < 0) {
+                continue;
+            }
+            const KickoffSettledRow& row = cfg.kickoff_settled_rows[row_idx];
+            const int idx = env * slots + i;
+            if (part < kSettledCarParts) {
+                CopySettledCarPart(cars[idx], row.car, part);
+            } else {
+                CopyStateWordsPart(cfg.kickoff_settled_wheels[idx], row.wheels, part - kSettledCarParts);
+            }
+        }
+    }
 }
 
-ROCKETGPU_GLOBAL void CanonicalizeImportedCarsKernel(CarSpanT cars, int32_t count) {
+ROCKETGPU_GLOBAL void CanonicalizeImportedCarsKernel(CarSpanT cars, int32_t count, bool placed) {
     const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (idx >= count) {
         return;
+    }
+    if (placed) {
+        cars[idx].pad_frame_pos_valid = 0;
     }
     constexpr float kCarBTToUU = 50.0f;
     const uint8_t kept = cars[idx].tick_count_since_update != 0 ? cars[idx].RestoreWorkingFields() : 0;
@@ -288,8 +397,6 @@ __device__ __forceinline__ void PreTickBlock(
     BoostPadState* pads,
     const CarControls* controls_by_tick,
     int32_t control_stride,
-    const EnvCommand* env_commands_by_tick,
-    int32_t env_command_stride,
     const uint8_t* respawn_slots,
     uint8_t* writable_respawn_slots,
     RespawnRngState* respawn_rng,
@@ -314,17 +421,12 @@ __device__ __forceinline__ void PreTickBlock(
         int env_idx = block_env0 + t;
         if (env_idx < cfg.env_count) {
             MapStepEnv(cfg, env_idx);
-            if (env_commands_by_tick) {
-                const EnvCommand command = env_commands_by_tick[
-                    static_cast<size_t>(tick_idx) * static_cast<size_t>(env_command_stride) + static_cast<size_t>(env_idx)];
-                ApplyEnvCommandForEnv(env_idx, cfg, teams, env_car_count, cars, controls, solver_scratch,
-                                      balls, env_states, pads, command, respawn_rng, car_configs);
-            }
             if (respawn_rng) {
                 PrepareRespawnSlotsForEnv(env_idx, cfg, cars, env_car_count, env_states,
                     respawn_rng, respawn_order, writable_respawn_slots, false);
             }
-            StepEnvPreTickEnvState(env_idx, cfg, env_car_count, cars, balls, env_states);
+            StepEnvPreTickEnvState(env_idx, cfg, env_car_count, cars, balls, env_states, teams, seed, car_configs,
+                                   respawn_slots);
         }
     }
     __syncthreads();
@@ -424,8 +526,6 @@ ROCKETGPU_GLOBAL void PreTickKernel(
     BoostPadState* pads,
     const CarControls* controls_by_tick,
     int32_t control_stride,
-    const EnvCommand* env_commands_by_tick,
-    int32_t env_command_stride,
     const uint8_t* respawn_slots,
     uint8_t* writable_respawn_slots,
     RespawnRngState* respawn_rng,
@@ -443,7 +543,7 @@ ROCKETGPU_GLOBAL void PreTickKernel(
                  solver_scratch, tick_scratch, tick_cars, controls, car_configs, wheel_runtime_states, balls, env_states, pads,
                  controls_by_tick,
                  control_stride,
-                 env_commands_by_tick, env_command_stride, respawn_slots, writable_respawn_slots, respawn_rng,
+                 respawn_slots, writable_respawn_slots, respawn_rng,
                  respawn_order, seed, tick_idx, pad_pre_tick, zero_ints, zero_count, pad_work, pad_work_valid,
                  ball_world_stage);
 }
@@ -1043,19 +1143,18 @@ ROCKETGPU_GLOBAL void StagedPostPreFusedKernel(
     const __grid_constant__ SimConfig cfg, Team* teams, int32_t* env_car_count, CarSpanT cars,
     WheelRuntimeState* wheel_runtime_states, WorldSolverScratch* solver_scratch, WorldTickScratch* tick_scratch, TickCars tick_cars,
     CarControls* controls, CarConfig* car_configs, BallState* balls, EnvState* env_states, BoostPadState* pads, bool pads_apart,
-    int envs_per_block, const CarControls* controls_by_tick, int32_t control_stride,
-    const EnvCommand* env_commands_by_tick, int32_t env_command_stride, const uint8_t* respawn_slots,
+    int envs_per_block, const CarControls* controls_by_tick, int32_t control_stride, const uint8_t* respawn_slots,
     uint8_t* writable_respawn_slots, RespawnRngState* respawn_rng, const int32_t* respawn_order, uint64_t seed,
     int32_t next_tick_idx, bool pad_pre_tick, int32_t* zero_ints, int zero_count, uint64_t* pad_work, bool pad_work_valid,
     BallWorldStage* ball_world_stage) {
     PostFusedBlock(cfg, env_car_count, cars, wheel_runtime_states, solver_scratch, tick_scratch, tick_cars, controls, car_configs,
-                   balls, env_states, pads, pads_apart, envs_per_block, env_commands_by_tick != nullptr, pad_work, pad_work_valid);
+                   balls, env_states, pads, pads_apart, envs_per_block, false, pad_work, pad_work_valid);
     __syncthreads();
     PreTickBlock(cfg, envs_per_block, static_cast<int>(blockIdx.x) * envs_per_block, teams, env_car_count, cars,
                  solver_scratch, tick_scratch, tick_cars, controls, car_configs, wheel_runtime_states, balls, env_states, pads,
                  controls_by_tick,
                  control_stride,
-                 env_commands_by_tick, env_command_stride, respawn_slots, writable_respawn_slots, respawn_rng,
+                 respawn_slots, writable_respawn_slots, respawn_rng,
                  respawn_order, seed, next_tick_idx, pad_pre_tick, zero_ints, zero_count, pad_work, pad_work != nullptr,
                  ball_world_stage);
 }
@@ -2436,6 +2535,18 @@ inline void EnsureCudaStepStackLimit(bool step_kernel) {
     configured[step_kernel ? 1 : 0] = true;
 }
 
+inline void LaunchTickEnvCommands(const SimConfig& cfg, Team* teams, int32_t* env_car_count, CarSpanT cars,
+                                  CarControls* controls, WorldSolverScratch* solver_scratch, BallState* balls,
+                                  EnvState* env_states, BoostPadState* pads, const EnvCommand* tick_commands,
+                                  RespawnRngState* respawn_rng, const CarConfig* car_configs, cudaStream_t stream) {
+    const int block_envs = EnvCommandBlockEnvs(cfg.max_cars_per_env);
+    const int blocks = (cfg.env_count + block_envs - 1) / block_envs;
+    ApplyEnvCommandsKernel<<<blocks, block_envs * (cfg.max_cars_per_env + 1), 0, stream>>>(
+        cfg, teams, env_car_count, cars, controls, solver_scratch, balls, env_states, pads, tick_commands, cfg.env_count,
+        respawn_rng, car_configs, true);
+    CheckCuda(cudaGetLastError(), "ApplyEnvCommandsKernel launch (tick)");
+}
+
 template <typename... Args>
 void LaunchPreTick(bool pack, unsigned blocks, unsigned threads, cudaStream_t stream, const Args&... args) {
     if (pack) {
@@ -3294,18 +3405,24 @@ inline void LaunchStepTicksDirect(
                 ? GetCarWorldStageBuffers().mesh_work_count : nullptr;
         const bool pad_pre_on_ball = ball_stages != nullptr;
         const int tail_envs_per_block = static_cast<int>(env_tail.threads) / kEnvTailLanes;
-        const bool post_pre_fused = post_fused && tail_envs_per_block <= static_cast<int>(env_tail.threads);
+        const bool post_pre_fused = post_fused && tail_envs_per_block <= static_cast<int>(env_tail.threads) &&
+                                    env_commands_by_tick == nullptr;
         const bool need_w3_info_kernel =
             cfg.max_cars_per_env > kMaxBallCarRetainedManifolds || DebugWorldSubsteps() != 1;
         uint64_t* const pad_work = row_pool.pad_work;
         for (int32_t t = 0; t < ticks; ++t) {
             const bool pad_work_valid = pad_work != nullptr && t > 0;
+            if (env_commands_by_tick != nullptr) {
+                LaunchTickEnvCommands(cfg, teams, env_car_count, cars, controls, solver_scratch, balls, env_states, pads,
+                                      env_commands_by_tick + static_cast<size_t>(t) * env_command_stride, respawn_rng,
+                                      car_configs, stream);
+            }
             if (!post_pre_fused || t == 0) {
                 LaunchPreTick(pack_cars, pre_blocks, pre_block_size, stream,
                     cfg, teams, env_car_count, cars, solver_scratch, row_pool.tick_scratch, row_pool.car_planes, controls, car_configs,
                     wheel_runtime_states, balls,
                     env_states, pads,
-                    controls_by_tick, control_stride, env_commands_by_tick, env_command_stride,
+                    controls_by_tick, control_stride,
                     respawn_slots, writable_respawn_slots, respawn_rng, respawn_order, seed, t, pad_pre_blocks == 0,
                     pre_zero_counts, kCarWorldMeshStageMeshes + 4 + kRowsFullKeys, pad_work, pad_work_valid, ball_stages);
                 CheckCuda(cudaGetLastError(), "PreTickKernel launch");
@@ -3492,7 +3609,7 @@ inline void LaunchStepTicksDirect(
                 StagedPostPreFusedKernel<<<env_tail.blocks, env_tail.threads, 0, stream>>>(
                     cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool.tick_scratch, row_pool.car_planes, controls,
                     car_configs, balls, env_states, pads, pads_apart, tail_envs_per_block, controls_by_tick, control_stride,
-                    env_commands_by_tick, env_command_stride, respawn_slots, writable_respawn_slots, respawn_rng,
+                    respawn_slots, writable_respawn_slots, respawn_rng,
                     respawn_order, seed, t + 1, pad_pre_blocks == 0, pre_zero_counts,
                     kCarWorldMeshStageMeshes + 4 + kRowsFullKeys, pad_work, pad_work_valid, ball_stages);
                 CheckCuda(cudaGetLastError(), "StagedPostPreFusedKernel launch");
@@ -3584,11 +3701,16 @@ inline void LaunchStepTicksDirect(
         return;
     }
     for (int32_t t = 0; t < ticks; ++t) {
+        if (env_commands_by_tick != nullptr) {
+            LaunchTickEnvCommands(cfg, teams, env_car_count, cars, controls, solver_scratch, balls, env_states, pads,
+                                  env_commands_by_tick + static_cast<size_t>(t) * env_command_stride, respawn_rng,
+                                  car_configs, stream);
+        }
         PreTickKernel<false><<<pre_blocks, pre_block_size, 0, stream>>>(
             cfg, teams, env_car_count, cars, solver_scratch, row_pool.tick_scratch, row_pool.car_planes, controls, car_configs,
             wheel_runtime_states, balls,
             env_states, pads,
-            controls_by_tick, control_stride, env_commands_by_tick, env_command_stride,
+            controls_by_tick, control_stride,
             respawn_slots, writable_respawn_slots, respawn_rng, respawn_order, seed, t);
         CheckCuda(cudaGetLastError(), "PreTickKernel launch");
         StagedStreams& side = GetStagedStreams();
@@ -3765,24 +3887,25 @@ void LaunchApplyEnvCommands(
     if (command_count <= 0) {
         return;
     }
-    constexpr int kBlockSize = 256;
-    const int blocks = (command_count + kBlockSize - 1) / kBlockSize;
-    ApplyEnvCommandsKernel<<<blocks, kBlockSize, 0, stream>>>(
+    const int block_envs = EnvCommandBlockEnvs(cfg.max_cars_per_env);
+    const int blocks = (command_count + block_envs - 1) / block_envs;
+    ApplyEnvCommandsKernel<<<blocks, block_envs * (cfg.max_cars_per_env + 1), 0, stream>>>(
         cfg, teams, env_car_count, cars, controls, solver_scratch, balls, env_states, pads, env_commands, command_count, respawn_rng,
-        car_configs);
+        car_configs, false);
     CheckCuda(cudaGetLastError(), "ApplyEnvCommandsKernel launch");
 }
 
 void LaunchCanonicalizeImportedCars(
     CarSpanT cars,
     int32_t count,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    bool placed) {
     if (count <= 0) {
         return;
     }
     constexpr int kBlockSize = 256;
     const int blocks = (count + kBlockSize - 1) / kBlockSize;
-    CanonicalizeImportedCarsKernel<<<blocks, kBlockSize, 0, stream>>>(cars, count);
+    CanonicalizeImportedCarsKernel<<<blocks, kBlockSize, 0, stream>>>(cars, count, placed);
     CheckCuda(cudaGetLastError(), "CanonicalizeImportedCarsKernel launch");
 }
 
@@ -3837,10 +3960,9 @@ void LaunchCopyCars(CarSpan dst, CarCSpan src, size_t count, cudaStream_t stream
 #endif
 
 ROCKETGPU_GLOBAL void ZeroTickRowsKernel(const __grid_constant__ WorldSolverScratchRowPool row_pool, size_t first, size_t count) {
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i < count) {
+    for (size_t i = blockIdx.x; i < count; i += gridDim.x) {
         const int env = static_cast<int>(first + i);
-        ZeroTickRows(row_pool.view(env), row_pool.env_caps(env));
+        ZeroTickRows(row_pool.view(env), row_pool.env_caps(env), static_cast<int>(threadIdx.x), static_cast<int>(blockDim.x));
     }
 }
 
@@ -3849,8 +3971,7 @@ void LaunchZeroTickRows(const WorldSolverScratchRowPool& row_pool, size_t first,
         return;
     }
     constexpr int kBlockSize = 128;
-    ZeroTickRowsKernel<<<static_cast<unsigned>((count + kBlockSize - 1) / kBlockSize), kBlockSize, 0, stream>>>(
-        row_pool, first, count);
+    ZeroTickRowsKernel<<<static_cast<unsigned>(std::min<size_t>(count, 65535)), kBlockSize, 0, stream>>>(row_pool, first, count);
     CheckCuda(cudaGetLastError(), "ZeroTickRowsKernel launch");
 }
 

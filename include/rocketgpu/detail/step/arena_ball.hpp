@@ -1891,7 +1891,12 @@ ROCKETGPU_HD ROCKETGPU_NOINLINE void AppendBallWorldSpecialContactRows(
     int32_t mesh_bvh_subtree_count = 0,
     const Vec3* bt_ball_linear_velocity_override = nullptr,
     int event_env_idx = -1,
+#if !defined(ROCKETGPU_USE_CUDA)
+    const BallWorldStage* stage = nullptr,
+    const ArenaMeshLeafGrid* leaf_grid = nullptr) {
+#else
     const BallWorldStage* stage = nullptr) {
+#endif
     int hs_world_normal_count = 0;
 
     BallWorldContactAggregate aggregate;
@@ -2178,6 +2183,7 @@ ROCKETGPU_HD ROCKETGPU_NOINLINE void AppendBallWorldSpecialContactRows(
                 mesh_subtree_count = mesh_info.subtree_count;
             }
             if (walk_mesh) {
+#if defined(ROCKETGPU_USE_CUDA)
                 auto walk_ball_mesh_bvh = [&]() ROCKETGPU_NOINLINE {
                     WalkArenaMeshBvhStacklessQuantizedTreeCacheFriendly(
                         mesh_bvh_nodes,
@@ -2210,6 +2216,47 @@ ROCKETGPU_HD ROCKETGPU_NOINLINE void AppendBallWorldSpecialContactRows(
                             }
                         });
                 };
+#else
+                auto walk_ball_mesh_bvh = [&]() ROCKETGPU_NOINLINE {
+                    const auto visit_leaf = [&](int32_t local_tri_idx) {
+                            if (local_tri_idx < 0 || local_tri_idx >= mesh_info.triangle_count) {
+                                return;
+                            }
+                            const int32_t global_tri_idx = mesh_info.triangle_start + local_tri_idx;
+                            if (global_tri_idx >= mesh_triangle_count) {
+                                return;
+                            }
+                            const ArenaMeshTriangle& tri = mesh_triangles[global_tri_idx];
+
+                            BallMeshManifoldPoint new_pt;
+                            Vec3 raw_normal;
+                            if (BallMeshTriangleHit(mutator, ball, ball_center_bt, radius_bt, contact_breaking_threshold_bt,
+                                                    cal_origin_y, tri, global_tri_idx, new_pt, raw_normal)) {
+                                emit_world_event(raw_normal);
+                                InsertBallMeshManifoldPoint(
+                                    persistent_manifold->points,
+                                    persistent_count,
+                                    new_pt,
+                                    mutator.cal_ball_world != 0 ? contact_breaking_threshold_bt : -1.0f);
+                            }
+                        };
+#if !defined(ROCKETGPU_USE_CUDA)
+                    if (leaf_grid != nullptr && WalkArenaMeshLeafGrid(leaf_grid, mesh_info_idx, quantized_query_aabb_min,
+                                                                      quantized_query_aabb_max, visit_leaf)) {
+                        return;
+                    }
+#endif
+                    WalkArenaMeshBvhStacklessQuantizedTreeCacheFriendly(
+                        mesh_bvh_nodes,
+                        mesh_subtrees,
+                        true ? 0 : mesh_subtree_count,
+                        quantized_query_aabb_min,
+                        quantized_query_aabb_max,
+                        mesh_info.node_offset,
+                        mesh_info.node_count,
+                        visit_leaf);
+                };
+#endif
                 walk_ball_mesh_bvh();
             }
             if (stage != nullptr) {
@@ -2475,6 +2522,8 @@ ROCKETGPU_HD void ResetCarCommonState(CarRefT car, const MutatorConfig& mutator,
     car.car_contact.other_car_id = 0;
     car.car_contact.cooldown_timer = 0.0f;
     car.vel_impulse_cache = Vec3(0.0f, 0.0f, 0.0f);
+    car.vel_impulse_cache_bt = Vec3(0.0f, 0.0f, 0.0f);
+    car.pending_bump_count = 0;
     car.ball_hit_info = BallHitInfo{};
     car.last_controls = CarControls{};
     car.boost_pad_touching = 0;
@@ -2551,45 +2600,52 @@ ROCKETGPU_HD uint32_t AdvanceDeterministicRng(uint32_t state) {
 ROCKETGPU_HD uint32_t MixSeed(uint64_t seed, int env_idx, int extra);
 
 ROCKETGPU_HD void BuildKickoffOrder(uint64_t seed, int env_idx, int* order) {
-    for (int i = 0; i < 5; ++i) {
-        order[i] = i;
-    }
+    int left[5] = {0, 1, 2, 3, 4};
     uint32_t state = MixSeed(seed, env_idx, 0x6b1d4f2a);
-    for (int i = 5 - 1; i > 0; --i) {
+    for (int n = 5; n > 0; --n) {
         state = AdvanceDeterministicRng(state);
-        const int j = static_cast<int>(state % static_cast<uint32_t>(i + 1));
-        const int tmp = order[i];
-        order[i] = order[j];
-        order[j] = tmp;
+        const int idx = static_cast<int>(static_cast<float>((state >> 16) & 0x7fffu) * (1.0f / 32768.0f) *
+                                         static_cast<float>(n));
+        order[5 - n] = left[idx];
+        for (int i = idx; i + 1 < n; ++i) left[i] = left[i + 1];
     }
 }
 
-ROCKETGPU_HD int PlaceNthTeamCarAtKickoff(
-    int base,
-    int count,
-    Team team,
-    int nth,
-    Team* teams,
-    CarSpanT cars,
-    const SpawnPos& spawn,
-    const MutatorConfig& mutator,
-    const EnvState& env_state,
-    const CarConfig* car_configs) {
-    int seen = 0;
-    for (int k = 0; k < count; ++k) {
-        const int i = CarVisitSlot(env_state, k, count);
-        const int idx = base + i;
-        if (teams[idx] != team) {
-            continue;
-        }
-        if (seen == nth) {
-            const float z = car_configs != nullptr ? car_configs[idx].spawn_z : CarSpawnRestZ();
-            PlaceCarAtKickoffSpawn(cars[idx], team, spawn, z, mutator, mutator.boost_spawn_amount);
-            return idx;
-        }
-        ++seen;
+ROCKETGPU_HD uint8_t BuildRespawnOrder(uint64_t seed, int env_idx) {
+    uint32_t left = 0x3210u;
+    uint32_t state = MixSeed(seed, env_idx, 0x3c6ef372);
+    uint32_t packed = 0;
+    for (int n = 4; n > 0; --n) {
+        state = AdvanceDeterministicRng(state);
+        const int idx = static_cast<int>(static_cast<float>((state >> 16) & 0x7fffu) * (1.0f / 32768.0f) *
+                                         static_cast<float>(n));
+        packed |= ((left >> (4 * idx)) & 0xFu) << (2 * (4 - n));
+        left = (left & ((1u << (4 * idx)) - 1u)) | ((left >> (4 * (idx + 1))) << (4 * idx));
     }
-    return -1;
+    return static_cast<uint8_t>(packed);
+}
+
+ROCKETGPU_HD bool KickoffSpotPreferred(const SpawnPos& a, const SpawnPos& b) {
+    const float da = a.x * a.x + a.y * a.y;
+    const float db = b.x * b.x + b.y * b.y;
+    if (da != db) return da < db;
+    const bool left_a = a.x * a.y < 0.0f;
+    const bool left_b = b.x * b.y < 0.0f;
+    if (left_a != left_b) return left_a;
+    return (a.y < 0.0f ? -a.y : a.y) > (b.y < 0.0f ? -b.y : b.y);
+}
+
+ROCKETGPU_HD void PreferKickoffSpotForShortTeam(int* order, int team_count, const SpawnPos* spots) {
+    constexpr int kMaxTeamSize = 4;
+    if (team_count <= 0 || team_count >= kMaxTeamSize) return;
+    int best = 0;
+    for (int i = 1; i < kMaxTeamSize; ++i) {
+        if (KickoffSpotPreferred(spots[order[i]], spots[order[best]])) best = i;
+    }
+    if (best < team_count) return;
+    const int spot = order[best];
+    order[best] = order[team_count - 1];
+    order[team_count - 1] = spot;
 }
 
 template <typename T>
@@ -2597,74 +2653,113 @@ ROCKETGPU_HD void CopyStateWords(T& dst, const T& src) {
     static_assert(sizeof(T) % 4 == 0, "word copy");
     unsigned char* d = reinterpret_cast<unsigned char*>(&dst);
     const unsigned char* s = reinterpret_cast<const unsigned char*>(&src);
+    constexpr size_t kWords = sizeof(T) / 4;
+    size_t i = 0;
 #pragma unroll 1
-    for (size_t i = 0; i < sizeof(T) / 4; ++i) {
+    for (; i + 8 <= kWords; i += 8) {
+        uint32_t w[8];
+        memcpy(w, s + i * 4, sizeof(w));
+        memcpy(d + i * 4, w, sizeof(w));
+    }
+#pragma unroll 1
+    for (; i < kWords; ++i) {
         uint32_t word;
         memcpy(&word, s + i * 4, sizeof(word));
         memcpy(d + i * 4, &word, sizeof(word));
     }
 }
+template <typename T>
+constexpr int kStateWordParts = static_cast<int>((sizeof(T) / 4 + 7) / 8);
+template <typename T>
+ROCKETGPU_HD void CopyStateWordsPart(T& dst, const T& src, int part) {
+    static_assert(sizeof(T) % 4 == 0, "word copy");
+    unsigned char* d = reinterpret_cast<unsigned char*>(&dst) + static_cast<size_t>(part) * 32;
+    const unsigned char* s = reinterpret_cast<const unsigned char*>(&src) + static_cast<size_t>(part) * 32;
+    const int left = static_cast<int>(sizeof(T) / 4) - part * 8;
+    const int n = left < 8 ? left : 8;
+    uint32_t w[8];
+    for (int j = 0; j < n; ++j) {
+        memcpy(&w[j], s + j * 4, 4);
+    }
+    for (int j = 0; j < n; ++j) {
+        memcpy(d + j * 4, &w[j], 4);
+    }
+}
 #if defined(ROCKETGPU_CAR_TILES)
 ROCKETGPU_HD void CopyStateWords(const CarRef& dst, const CarState& src) {
-    dst = src;
+    dst.AssignStretches(src);
 }
 #endif
 
-ROCKETGPU_HD void SettleKickoffCar(const SimConfig& cfg, int idx, int spawn, CarSpanT cars) {
+ROCKETGPU_HD const KickoffSettledRow* KickoffSettledRowFor(const SimConfig& cfg, int idx, int spawn) {
     if (cfg.kickoff_settled_rows == nullptr || spawn >= cfg.kickoff_settled_spawns || cfg.kickoff_settled_entry[idx] < 0) {
-        return;
+        return nullptr;
     }
-    const KickoffSettledRow& row = cfg.kickoff_settled_rows[static_cast<size_t>(cfg.kickoff_settled_entry[idx]) * cfg.kickoff_settled_spawns + spawn];
-    CarRefT car = cars[idx];
-    const auto bump_event_tick = car.bump_event_tick;
-    const auto bump_event_other_id = car.bump_event_other_id;
-    const auto bump_event_is_demo = car.bump_event_is_demo;
-    const auto bump_event_was_bumper = car.bump_event_was_bumper;
-    const auto previous_ball_contact_start = car.previous_ball_contact_start;
-    const auto last_ball_contact_start = car.last_ball_contact_start;
-    const auto last_world_surface_contact = car.last_world_surface_contact;
-    const auto first_world_after_previous_ball = car.first_world_after_previous_ball;
-    const auto first_world_after_last_ball = car.first_world_after_last_ball;
-    const auto last_flip_or_jump_start = car.last_flip_or_jump_start;
-    const auto last_directional_flip_start = car.last_directional_flip_start;
-    const auto last_ball_started_with_world = car.last_ball_started_with_world;
-    const auto flip_or_jump_last_tick = car.flip_or_jump_last_tick;
-    const auto latest_touch_tick = car.latest_touch_tick;
-    const auto latest_touch_location = car.latest_touch_location;
-    const auto latest_touch_normal = car.latest_touch_normal;
-    CopyStateWords(car, row.car);
-    car.bump_event_tick = bump_event_tick;
-    car.bump_event_other_id = bump_event_other_id;
-    car.bump_event_is_demo = bump_event_is_demo;
-    car.bump_event_was_bumper = bump_event_was_bumper;
-    car.previous_ball_contact_start = previous_ball_contact_start;
-    car.last_ball_contact_start = last_ball_contact_start;
-    car.last_world_surface_contact = last_world_surface_contact;
-    car.first_world_after_previous_ball = first_world_after_previous_ball;
-    car.first_world_after_last_ball = first_world_after_last_ball;
-    car.last_flip_or_jump_start = last_flip_or_jump_start;
-    car.last_directional_flip_start = last_directional_flip_start;
-    car.last_ball_started_with_world = last_ball_started_with_world;
-    car.flip_or_jump_last_tick = flip_or_jump_last_tick;
-    car.latest_touch_tick = latest_touch_tick;
-    car.latest_touch_location = latest_touch_location;
-    car.latest_touch_normal = latest_touch_normal;
-    CopyStateWords(cfg.kickoff_settled_wheels[idx], row.wheels);
+    return &cfg.kickoff_settled_rows[static_cast<size_t>(cfg.kickoff_settled_entry[idx]) * cfg.kickoff_settled_spawns + spawn];
 }
 
-ROCKETGPU_HD ROCKETGPU_NOINLINE void SettleKickoffEnv(
-    const SimConfig& cfg, int env_idx, int base, int count, const Team* teams, CarSpanT cars, BallState* balls,
-    const EnvState& env_state, uint32_t order_bits) {
-    int seen[2] = {0, 0};
-    for (int k = 0; k < count; ++k) {
-        const int idx = base + CarVisitSlot(env_state, k, count);
-        const int t = teams[idx] == Team::Blue ? 0 : 1;
-        const int nth = seen[t]++;
-        SettleKickoffCar(cfg, idx, nth < 5 ? static_cast<int>((order_bits >> (3 * nth)) & 7u) : nth, cars);
+#define ROCKETGPU_KICKOFF_HISTORY_FIELDS(X) \
+    X(bump_event_bumps)                     \
+    X(bump_event_demos)                     \
+    X(previous_ball_contact_start)          \
+    X(last_ball_contact_start)              \
+    X(last_world_surface_contact)           \
+    X(first_world_after_previous_ball)      \
+    X(first_world_after_last_ball)          \
+    X(last_flip_or_jump_start)              \
+    X(last_directional_flip_start)          \
+    X(last_ball_started_with_world)         \
+    X(flip_or_jump_last_tick)               \
+    X(latest_touch_tick)                    \
+    X(latest_touch_location)                \
+    X(latest_touch_normal)
+struct KickoffCarHistory {
+#define ROCKETGPU_KICKOFF_HISTORY_MEMBER(name) decltype(CarState::name) name;
+    ROCKETGPU_KICKOFF_HISTORY_FIELDS(ROCKETGPU_KICKOFF_HISTORY_MEMBER)
+#undef ROCKETGPU_KICKOFF_HISTORY_MEMBER
+};
+template <typename T>
+ROCKETGPU_HD void CopyKickoffHistoryField(T& dst, const T& src) {
+    memcpy(&dst, &src, sizeof(T));
+}
+ROCKETGPU_HD void SaveKickoffCarHistory(CarRefT car, KickoffCarHistory& h) {
+#define ROCKETGPU_KICKOFF_HISTORY_SAVE(name) CopyKickoffHistoryField(h.name, car.name);
+    ROCKETGPU_KICKOFF_HISTORY_FIELDS(ROCKETGPU_KICKOFF_HISTORY_SAVE)
+#undef ROCKETGPU_KICKOFF_HISTORY_SAVE
+}
+ROCKETGPU_HD void RestoreKickoffCarHistory(CarRefT car, const KickoffCarHistory& h) {
+#define ROCKETGPU_KICKOFF_HISTORY_RESTORE(name) CopyKickoffHistoryField(car.name, h.name);
+    ROCKETGPU_KICKOFF_HISTORY_FIELDS(ROCKETGPU_KICKOFF_HISTORY_RESTORE)
+#undef ROCKETGPU_KICKOFF_HISTORY_RESTORE
+}
+#if defined(ROCKETGPU_CAR_TILES)
+struct KickoffSettledKeeps {
+    static constexpr bool Field(size_t offset) {
+#define ROCKETGPU_KICKOFF_HISTORY_AT(name) || offset == offsetof(CarState, name)
+        return offset == offsetof(CarState, driving_disabled) ROCKETGPU_KICKOFF_HISTORY_FIELDS(ROCKETGPU_KICKOFF_HISTORY_AT);
+#undef ROCKETGPU_KICKOFF_HISTORY_AT
     }
-    if (cfg.mutator.game_mode != static_cast<uint8_t>(Mode::Heatseeker) && cfg.kickoff_settled_ball != nullptr) {
-        CopyStateWords(balls[env_idx], *cfg.kickoff_settled_ball);
+};
+constexpr int kSettledCarParts = CarRef::kStretches;
+ROCKETGPU_HD void CopySettledCarPart(const CarRef& dst, const CarState& src, int part) {
+    dst.AssignStretch<KickoffSettledKeeps>(src, part);
+}
+#else
+constexpr int kSettledCarParts = 0;
+ROCKETGPU_HD void CopySettledCarPart(CarState&, const CarState&, int) {}
+#endif
+
+ROCKETGPU_HD void SettleKickoffCar(const SimConfig& cfg, int idx, int spawn, CarSpanT cars) {
+    const KickoffSettledRow* const row = KickoffSettledRowFor(cfg, idx, spawn);
+    if (row == nullptr) {
+        return;
     }
+    CarRefT car = cars[idx];
+    KickoffCarHistory history;
+    SaveKickoffCarHistory(car, history);
+    CopyStateWords(car, row->car);
+    RestoreKickoffCarHistory(car, history);
+    CopyStateWords(cfg.kickoff_settled_wheels[idx], row->wheels);
 }
 
 ROCKETGPU_HD void PendKickoffSpawn(CarRefT car, int spot, float tick_dt) {
@@ -2715,15 +2810,19 @@ ROCKETGPU_HD void ResetBall(BallState& ball, uint8_t game_mode, bool game_spawn 
     }
 }
 
+ROCKETGPU_HD void ResetBoostPad(const SimConfig& cfg, BoostPadState* pads, int env_idx, int p) {
+    BoostPadState& pad = pads[env_idx * BoostPadCount(cfg) + p];
+    pad.cooldown = 0.0f;
+    pad.is_active = 1;
+    pad.is_big = BoostPadIsBig(cfg, p);
+    pad.prev_locked_car_id = 0;
+    pad.cur_locked_car_id = 0;
+    pad.pickup_frac_q = 32768;
+}
+
 ROCKETGPU_HD void ResetBoostPads(const SimConfig& cfg, BoostPadState* pads, int env_idx) {
-    const int base = env_idx * BoostPadCount(cfg);
     for (int p = 0; p < BoostPadCount(cfg); ++p) {
-        pads[base + p].cooldown = 0.0f;
-        pads[base + p].is_active = 1;
-        pads[base + p].is_big = BoostPadIsBig(cfg, p);
-        pads[base + p].prev_locked_car_id = 0;
-        pads[base + p].cur_locked_car_id = 0;
-        pads[base + p].pickup_frac_q = 32768;
+        ResetBoostPad(cfg, pads, env_idx, p);
     }
 }
 
@@ -2732,6 +2831,220 @@ ROCKETGPU_HD uint32_t MixSeed(uint64_t seed, int env_idx, int extra) {
     x ^= static_cast<uint64_t>(env_idx + 0x9e3779b9U) + (x << 6U) + (x >> 2U);
     x ^= static_cast<uint64_t>(extra + 0x85ebca6bU) + (x << 13U) + (x >> 7U);
     return static_cast<uint32_t>(x & 0xffffffffu);
+}
+
+struct KickoffPlan {
+    uint32_t order_bits[2];
+    uint64_t seed;
+};
+
+ROCKETGPU_HD KickoffPlan ResetEnvToKickoffState(
+    int env_idx,
+    const SimConfig& cfg,
+    const Team* teams,
+    const int32_t* env_car_count,
+    uint64_t seed,
+    bool preserve_score,
+    EnvState* env_states,
+    uint8_t kickoff_seed_mode = 0,
+    RespawnRngState* respawn_rng = nullptr,
+    const int* kickoff_order_override = nullptr) {
+    const EnvState saved = env_states[env_idx];
+    EnvState next{};
+    next.kickoff_resets = static_cast<uint8_t>(saved.kickoff_resets + 1);
+    next.kickoff_match_order = saved.kickoff_match_order;
+    next.kickoff_match_index = saved.kickoff_match_index;
+    next.respawn_match_order = saved.respawn_match_order;
+    const bool no_seed = (kickoff_seed_mode == 2 || (kickoff_seed_mode == 0 && seed == 0)) && respawn_rng == nullptr &&
+                         kickoff_order_override == nullptr;
+    const bool next_kickoff = no_seed && preserve_score && (saved.kickoff_match_order & 0x8000u) != 0;
+    if (no_seed) {
+        seed = saved.kickoff_resets * 0x9e3779b97f4a7c15ull;
+    }
+
+    next.car_visit_order_mode = saved.car_visit_order_mode;
+    next.car_visit_order_packed = saved.car_visit_order_packed;
+    if (saved.car_visit_order_mode == 3) {
+        next.car_visit_order_packed = 0x76543210u;
+        next.car_visit_present_mask = 0xFFu;
+    }
+    next.frame_ticks = saved.frame_ticks;
+    next.frame_frac_prev = saved.frame_frac_prev;
+    if (preserve_score) {
+        next.blue_score = saved.blue_score;
+        next.orange_score = saved.orange_score;
+        next.tick = saved.tick;
+        next.last_scored_team = saved.last_scored_team;
+    }
+
+    const int base = env_idx * cfg.max_cars_per_env;
+    const int count = env_car_count[env_idx];
+    int blue_count = 0;
+    int orange_count = 0;
+    for (int i = 0; i < count; ++i) {
+        const Team team = teams[base + CarVisitSlot(next, i, count)];
+        if (team == Team::Blue) {
+            ++blue_count;
+        } else {
+            ++orange_count;
+        }
+    }
+
+    int kickoff_order[5] = {0, 1, 2, 3, 4};
+    if (kickoff_order_override != nullptr) {
+        for (int i = 0; i < 5; ++i) kickoff_order[i] = kickoff_order_override[i];
+    } else if (kickoff_seed_mode == 3) {
+    } else if (next_kickoff) {
+        for (int j = 0; j < 5; ++j) {
+            kickoff_order[j] = (saved.kickoff_match_order >> (3 * ((saved.kickoff_match_index + j) % 5))) & 7;
+        }
+    } else if (respawn_rng != nullptr) {
+        const uint32_t engine_seed = kickoff_seed_mode == 1
+            ? static_cast<uint32_t>(seed)
+            : MixSeed(seed, env_idx, 0x6b1d4f2a);
+        if (kickoff_seed_mode == 2 || static_cast<int32_t>(engine_seed) == -1) {
+            ShuffleLikePlatformStd(kickoff_order, respawn_rng[env_idx]);
+        } else {
+            TempRespawnRngState temp_engine;
+            SeedTempRespawnRng(temp_engine, respawn_rng[env_idx].kind, engine_seed);
+            ShuffleLikePlatformStd(kickoff_order, temp_engine);
+        }
+    } else {
+        BuildKickoffOrder(seed, env_idx, kickoff_order);
+    }
+    if (kickoff_order_override == nullptr && kickoff_seed_mode != 3) {
+        if (next_kickoff) {
+            next.kickoff_match_index = static_cast<uint8_t>((saved.kickoff_match_index + 1) % 5);
+        } else {
+            uint32_t packed = 0x8000u;
+            for (int j = 0; j < 5; ++j) packed |= static_cast<uint32_t>(kickoff_order[j]) << (3 * j);
+            next.kickoff_match_order = static_cast<uint16_t>(packed);
+            next.kickoff_match_index = 1;
+            next.respawn_match_order = BuildRespawnOrder(seed, env_idx);
+        }
+    }
+    int team_order[2][5];
+    for (int j = 0; j < 5; ++j) team_order[0][j] = team_order[1][j] = kickoff_order[j];
+    if (next_kickoff && blue_count != orange_count) {
+        SpawnPos spots[5];
+        for (int i = 0; i < 5; ++i) {
+            if (cfg.arena_rules != nullptr) {
+                spots[i] = SpawnPos{cfg.arena_rules->kickoff_pos[0][i].x, cfg.arena_rules->kickoff_pos[0][i].y, 0.0f};
+            } else {
+                spots[i] = cfg.mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker) ? HeatseekerKickoffSpawn(i)
+                                                                                             : SoccarKickoffSpawn(i);
+            }
+        }
+        const int short_team = blue_count < orange_count ? 0 : 1;
+        PreferKickoffSpotForShortTeam(team_order[short_team], short_team == 0 ? blue_count : orange_count, spots);
+    }
+    env_states[env_idx] = next;
+    KickoffPlan plan;
+    plan.seed = seed;
+    for (int t = 0; t < 2; ++t) {
+        plan.order_bits[t] = 0;
+        for (int i = 0; i < 5; ++i) plan.order_bits[t] |= static_cast<uint32_t>(team_order[t][i]) << (3 * i);
+    }
+    return plan;
+}
+
+ROCKETGPU_HD bool KickoffSettlesBall(const SimConfig& cfg) {
+    return cfg.mutator.game_mode != static_cast<uint8_t>(Mode::Heatseeker) && cfg.kickoff_settled_ball != nullptr;
+}
+
+ROCKETGPU_HD void ResetKickoffBall(int env_idx, const SimConfig& cfg, BallState* balls, const KickoffPlan& plan,
+                                  bool game_spawn, bool settle = true) {
+    ResetBall(balls[env_idx], cfg.mutator.game_mode, game_spawn, cfg.arena_rules);
+    if (cfg.mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker)) {
+        const uint32_t draw = AdvanceDeterministicRng(MixSeed(plan.seed ^ 0x9e3779b97f4a7c15ull, env_idx, 0x48534b4f));
+        const float y_scale = (draw % 2u) ? 1.0f : -1.0f;
+        BallState& hs_ball = balls[env_idx];
+        hs_ball.pos = Vec3(-1000.0f, -2220.0f * y_scale, 92.75f);
+        hs_ball.vel = Vec3(0.0f, -65.0f * y_scale, 650.0f);
+        hs_ball.pos_bt = hs_ball.pos * (1.0f / 50.0f);
+        hs_ball.vel_bt = hs_ball.vel * (1.0f / 50.0f);
+        hs_ball.hs_info = {};
+    }
+    if (settle && !game_spawn && cfg.kickoff_settled_rows != nullptr && KickoffSettlesBall(cfg)) {
+        CopyStateWords(balls[env_idx], *cfg.kickoff_settled_ball);
+    }
+}
+
+struct KickoffCarSpot {
+    Team team;
+    int nth;
+    int spot;
+};
+ROCKETGPU_HD bool FindKickoffCarSpot(int env_idx, int i, const SimConfig& cfg, const Team* teams,
+                                    const int32_t* env_car_count, const EnvState* env_states, const KickoffPlan& plan,
+                                    KickoffCarSpot& at) {
+    const int base = env_idx * cfg.max_cars_per_env;
+    const int count = env_car_count[env_idx];
+    const Team team = teams[base + i];
+    int nth = 0;
+    bool found = false;
+    for (int k = 0; k < count && !found; ++k) {
+        const int s = CarVisitSlot(env_states[env_idx], k, count);
+        if (s == i) {
+            found = true;
+        } else if (teams[base + s] == team) {
+            ++nth;
+        }
+    }
+    if (!found) {
+        return false;
+    }
+    at.team = team;
+    at.nth = nth;
+    at.spot = nth < 5 ? static_cast<int>((plan.order_bits[team == Team::Blue ? 0 : 1] >> (3 * nth)) & 7u) : nth;
+    return true;
+}
+ROCKETGPU_HD void PlaceKickoffCar(int env_idx, int i, const SimConfig& cfg, CarSpanT cars, const CarConfig* car_configs,
+                                 const KickoffCarSpot& at, bool game_spawn) {
+    constexpr float kCarSpawnExtraOffsetY = 250.0f;
+    const int idx = env_idx * cfg.max_cars_per_env + i;
+    const Team team = at.team;
+    const int nth = at.nth;
+    const int spot = at.spot;
+    const int t = team == Team::Blue ? 0 : 1;
+    const int respawn_idx = (nth - 5) % 4;
+    const float respawn_step = kCarSpawnExtraOffsetY * static_cast<float>((nth - 5) / 4);
+    const float z = car_configs != nullptr ? car_configs[idx].spawn_z : CarSpawnRestZ();
+    if (cfg.arena_rules != nullptr) {
+        const ArenaRules& rules = *cfg.arena_rules;
+        Vec3 pos = nth < 5 ? rules.kickoff_pos[t][spot] : rules.respawn_pos[t][respawn_idx];
+        const float yaw = nth < 5 ? rules.kickoff_yaw[t][spot] : rules.respawn_yaw[t][respawn_idx];
+        if (nth >= 5) {
+            pos = pos - Vec3(RocketGpuCosf(yaw), RocketGpuSinf(yaw), 0.0f) * respawn_step;
+        }
+        PlaceCarAtWorldSpawn(cars[idx], pos, yaw, z, cfg.mutator, cfg.mutator.boost_spawn_amount);
+    } else {
+        SpawnPos spawn{};
+        if (nth >= 5) {
+            spawn = SoccarRespawnSpawn(respawn_idx);
+            spawn.y += respawn_step;
+        } else {
+            spawn = cfg.mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker) ? HeatseekerKickoffSpawn(spot)
+                                                                                      : SoccarKickoffSpawn(spot);
+        }
+        PlaceCarAtKickoffSpawn(cars[idx], team, spawn, z, cfg.mutator, cfg.mutator.boost_spawn_amount);
+    }
+    if (game_spawn && nth < 5) {
+        PendKickoffSpawn(cars[idx], spot, cfg.tick_dt);
+    }
+}
+ROCKETGPU_HD bool ResetKickoffCar(int env_idx, int i, const SimConfig& cfg, const Team* teams,
+                                 const int32_t* env_car_count, CarSpanT cars, const EnvState* env_states,
+                                 const KickoffPlan& plan, const CarConfig* car_configs, bool game_spawn) {
+    KickoffCarSpot at;
+    if (!FindKickoffCarSpot(env_idx, i, cfg, teams, env_car_count, env_states, plan, at)) {
+        return false;
+    }
+    PlaceKickoffCar(env_idx, i, cfg, cars, car_configs, at, game_spawn);
+    if (!game_spawn && cfg.kickoff_settled_rows != nullptr) {
+        SettleKickoffCar(cfg, env_idx * cfg.max_cars_per_env + i, at.spot, cars);
+    }
+    return true;
 }
 
 ROCKETGPU_HD void ResetEnvToKickoff(
@@ -2752,134 +3065,18 @@ ROCKETGPU_HD void ResetEnvToKickoff(
     bool keep_boost_pads = false,
     const CarConfig* car_configs = nullptr,
     bool game_spawn = false) {
-    constexpr float kCarSpawnExtraOffsetY = 250.0f;
-
-    EnvState saved = env_states[env_idx];
-    env_states[env_idx] = EnvState{};
-    env_states[env_idx].kickoff_resets = static_cast<uint8_t>(saved.kickoff_resets + 1);
-    if ((kickoff_seed_mode == 2 || (kickoff_seed_mode == 0 && seed == 0)) && respawn_rng == nullptr &&
-        kickoff_order_override == nullptr) {
-        seed = saved.kickoff_resets * 0x9e3779b97f4a7c15ull;
-    }
-
-    env_states[env_idx].car_visit_order_mode = saved.car_visit_order_mode;
-    env_states[env_idx].car_visit_order_packed = saved.car_visit_order_packed;
-    if (saved.car_visit_order_mode == 3) {
-        env_states[env_idx].car_visit_order_packed = 0x76543210u;
-        env_states[env_idx].car_visit_present_mask = 0xFFu;
-    }
-    env_states[env_idx].frame_ticks = saved.frame_ticks;
-    env_states[env_idx].frame_frac_prev = saved.frame_frac_prev;
-    if (preserve_score) {
-        env_states[env_idx].blue_score = saved.blue_score;
-        env_states[env_idx].orange_score = saved.orange_score;
-        env_states[env_idx].tick = saved.tick;
-        env_states[env_idx].last_scored_team = saved.last_scored_team;
-    }
-
-    ResetBall(balls[env_idx], cfg.mutator.game_mode, game_spawn, cfg.arena_rules);
-    if (cfg.mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker)) {
-        const uint32_t draw = AdvanceDeterministicRng(MixSeed(seed ^ 0x9e3779b97f4a7c15ull, env_idx, 0x48534b4f));
-        const float y_scale = (draw % 2u) ? 1.0f : -1.0f;
-        BallState& hs_ball = balls[env_idx];
-        hs_ball.pos = Vec3(-1000.0f, -2220.0f * y_scale, 92.75f);
-        hs_ball.vel = Vec3(0.0f, -65.0f * y_scale, 650.0f);
-        hs_ball.pos_bt = hs_ball.pos * (1.0f / 50.0f);
-        hs_ball.vel_bt = hs_ball.vel * (1.0f / 50.0f);
-        hs_ball.hs_info = {};
-    }
+    const KickoffPlan plan = ResetEnvToKickoffState(env_idx, cfg, teams, env_car_count, seed, preserve_score, env_states,
+                                                    kickoff_seed_mode, respawn_rng, kickoff_order_override);
+    ResetKickoffBall(env_idx, cfg, balls, plan, game_spawn);
     if (!keep_boost_pads) {
         ResetBoostPads(cfg, pads, env_idx);
     }
-
     const int base = env_idx * cfg.max_cars_per_env;
-    const int count = env_car_count[env_idx];
-    int blue_count = 0;
-    int orange_count = 0;
-    for (int i = 0; i < count; ++i) {
-        const Team team = teams[base + CarVisitSlot(env_states[env_idx], i, count)];
-        if (team == Team::Blue) {
-            ++blue_count;
-        } else {
-            ++orange_count;
-        }
-    }
-
     for (int i = 0; i < cfg.max_cars_per_env; ++i) {
         controls[base + i] = CarControls{};
     }
-
-    int kickoff_order[5] = {0, 1, 2, 3, 4};
-    if (kickoff_order_override != nullptr) {
-        for (int i = 0; i < 5; ++i) kickoff_order[i] = kickoff_order_override[i];
-    } else if (kickoff_seed_mode == 3) {
-    } else if (respawn_rng != nullptr) {
-        const uint32_t engine_seed = kickoff_seed_mode == 1
-            ? static_cast<uint32_t>(seed)
-            : MixSeed(seed, env_idx, 0x6b1d4f2a);
-        if (kickoff_seed_mode == 2 || static_cast<int32_t>(engine_seed) == -1) {
-            ShuffleLikePlatformStd(kickoff_order, respawn_rng[env_idx]);
-        } else {
-            TempRespawnRngState temp_engine;
-            SeedTempRespawnRng(temp_engine, respawn_rng[env_idx].kind, engine_seed);
-            ShuffleLikePlatformStd(kickoff_order, temp_engine);
-        }
-    } else {
-        BuildKickoffOrder(seed, env_idx, kickoff_order);
-    }
-
-    const int kickoff_position_amount = (blue_count > orange_count) ? blue_count : orange_count;
-    int respawn_counts[4] = {0, 0, 0, 0};
-    for (int slot = 0; slot < kickoff_position_amount && cfg.arena_rules != nullptr; ++slot) {
-        const ArenaRules& rules = *cfg.arena_rules;
-        const int respawn_idx = (slot - 5) % 4;
-        for (int t = 0; t < 2; ++t) {
-            const Team team = t == 0 ? Team::Blue : Team::Orange;
-            if (slot >= (t == 0 ? blue_count : orange_count)) continue;
-            Vec3 pos = slot < 5 ? rules.kickoff_pos[t][kickoff_order[slot]] : rules.respawn_pos[t][respawn_idx];
-            const float yaw = slot < 5 ? rules.kickoff_yaw[t][kickoff_order[slot]] : rules.respawn_yaw[t][respawn_idx];
-            if (slot >= 5) {
-                const float back = kCarSpawnExtraOffsetY * static_cast<float>(respawn_counts[respawn_idx]);
-                pos = pos - Vec3(RocketGpuCosf(yaw), RocketGpuSinf(yaw), 0.0f) * back;
-            }
-            int seen = 0;
-            int idx = -1;
-            for (int k = 0; k < count && idx < 0; ++k) {
-                const int i = base + CarVisitSlot(env_states[env_idx], k, count);
-                if (teams[i] == team && seen++ == slot) idx = i;
-            }
-            if (idx < 0) continue;
-            const float z = car_configs != nullptr ? car_configs[idx].spawn_z : CarSpawnRestZ();
-            PlaceCarAtWorldSpawn(cars[idx], pos, yaw, z, cfg.mutator, cfg.mutator.boost_spawn_amount);
-            if (game_spawn && slot < 5) PendKickoffSpawn(cars[idx], kickoff_order[slot], cfg.tick_dt);
-        }
-        if (slot >= 5) ++respawn_counts[respawn_idx];
-    }
-    for (int slot = 0; slot < kickoff_position_amount && cfg.arena_rules == nullptr; ++slot) {
-        SpawnPos spawn{};
-        if (slot < 5) {
-            spawn = cfg.mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker)
-                        ? HeatseekerKickoffSpawn(kickoff_order[slot])
-                        : SoccarKickoffSpawn(kickoff_order[slot]);
-        } else {
-            const int respawn_idx = (slot - 5) % 4;
-            spawn = SoccarRespawnSpawn(respawn_idx);
-            spawn.y += kCarSpawnExtraOffsetY * static_cast<float>(respawn_counts[respawn_idx]);
-            ++respawn_counts[respawn_idx];
-        }
-
-        for (int t = 0; t < 2; ++t) {
-            const Team team = t == 0 ? Team::Blue : Team::Orange;
-            if (slot >= (t == 0 ? blue_count : orange_count)) continue;
-            const int idx = PlaceNthTeamCarAtKickoff(base, count, team, slot, teams, cars, spawn, cfg.mutator,
-                                                     env_states[env_idx], car_configs);
-            if (game_spawn && idx >= 0 && slot < 5) PendKickoffSpawn(cars[idx], kickoff_order[slot], cfg.tick_dt);
-        }
-    }
-    if (!game_spawn && cfg.kickoff_settled_rows != nullptr) {
-        uint32_t order_bits = 0;
-        for (int i = 0; i < 5; ++i) order_bits |= static_cast<uint32_t>(kickoff_order[i]) << (3 * i);
-        SettleKickoffEnv(cfg, env_idx, base, count, teams, cars, balls, env_states[env_idx], order_bits);
+    for (int i = 0; i < env_car_count[env_idx]; ++i) {
+        ResetKickoffCar(env_idx, i, cfg, teams, env_car_count, cars, env_states, plan, car_configs, game_spawn);
     }
 }
 
@@ -2888,22 +3085,56 @@ ROCKETGPU_HD void DemolishCar(CarRefT car, const MutatorConfig& mutator) {
     car.demo_respawn_timer = mutator.demo_respawn_time;
 }
 
-ROCKETGPU_HD int PickRespawnSlot(uint64_t seed, int env_idx, uint64_t current_tick, uint32_t car_id) {
+ROCKETGPU_HD int RespawnStartIndex(uint64_t seed, int env_idx, uint64_t current_tick, uint32_t car_id) {
     uint32_t state = MixSeed(seed ^ (current_tick * 0x9e3779b97f4a7c15ull), env_idx, static_cast<int>(car_id * 0x45d9f3bu));
     state = AdvanceDeterministicRng(state);
-    return static_cast<int>(state % 4u);
+    return static_cast<int>(static_cast<float>((state >> 16) & 0x7fffu) * (1.0f / 32768.0f) * 4.0f);
+}
+
+ROCKETGPU_HD void RespawnPlace(Team team, int spot, int dir, const ArenaRules* rules, Vec3& ground, float& yaw) {
+    const bool blue = team == Team::Blue;
+    float fx = 0.0f;
+    float fy = blue ? 1.0f : -1.0f;
+    if (ROCKETGPU_HOST_UNLIKELY(rules != nullptr)) {
+        const int t = blue ? 0 : 1;
+        ground = rules->respawn_pos[t][spot & 3];
+        yaw = rules->respawn_yaw[t][spot & 3];
+        const Quat q = FromYaw(WrapAngle(yaw));
+        fx = q.w * q.w - q.z * q.z;
+        fy = 2.0f * q.w * q.z;
+    } else {
+        const SpawnPos spawn = SoccarRespawnSpawn(spot & 3);
+        ground = Vec3(spawn.x, blue ? spawn.y : -spawn.y, 0.0f);
+        yaw = spawn.yaw + (blue ? 0.0f : Pi());
+    }
+    if (dir >= 0) {
+        constexpr float k = 0.70710677f;
+        const int d = dir & 7;
+        const float ux = d == 0 ? 1.0f : (d == 1 || d == 7) ? k : (d == 2 || d == 6) ? 0.0f : (d == 3 || d == 5) ? -k : -1.0f;
+        const float uy = (d == 0 || d == 4) ? 0.0f : (d == 1 || d == 3) ? k : d == 2 ? 1.0f : d == 6 ? -1.0f : -k;
+        ground.x += 192.0f * (fx * ux - fy * uy);
+        ground.y += 192.0f * (fx * uy + fy * ux);
+    }
 }
 
 ROCKETGPU_HD void RespawnCar(CarRefT car, Team team, int slot, const MutatorConfig& mutator, float spawn_z,
-                            const ArenaRules* rules = nullptr) {
+                            const ArenaRules* rules = nullptr, int offset_dir = -1) {
     if (ROCKETGPU_HOST_UNLIKELY(rules != nullptr)) {
-        const int t = team == Team::Blue ? 0 : 1;
-        PlaceCarAtWorldSpawn(car, rules->respawn_pos[t][slot % 4], rules->respawn_yaw[t][slot % 4], spawn_z, mutator,
-                             mutator.boost_spawn_amount);
+        Vec3 ground;
+        float yaw;
+        RespawnPlace(team, slot % 4, offset_dir, rules, ground, yaw);
+        PlaceCarAtWorldSpawn(car, ground, yaw, spawn_z, mutator, mutator.boost_spawn_amount);
         car.vel_impulse_cache = Vec3(0.0f, 0.0f, 0.0f);
         return;
     }
-    const SpawnPos spawn = SoccarRespawnSpawn(slot % 4);
+    SpawnPos spawn = SoccarRespawnSpawn(slot % 4);
+    if (offset_dir >= 0) {
+        Vec3 ground;
+        float yaw;
+        RespawnPlace(team, slot % 4, offset_dir, nullptr, ground, yaw);
+        spawn.x = ground.x;
+        spawn.y = team == Team::Blue ? ground.y : -ground.y;
+    }
     PlaceCarAtRespawnSpawn(car, team, spawn, spawn_z, mutator, mutator.boost_spawn_amount);
     car.vel_impulse_cache = Vec3(0.0f, 0.0f, 0.0f);
 }

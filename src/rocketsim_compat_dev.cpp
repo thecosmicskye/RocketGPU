@@ -82,6 +82,7 @@ void Arena::DevSetRaw(const std::string& what, const std::vector<uint8_t>& bytes
     if (what == "car_states") {
         Fill(car_states_, cars, bytes, what);
         s.upload_car_states(car_states_.data(), cars, nullptr, BatchSim::StateUploadMode::PreserveInternal);
+        SyncBumpSeen();
     } else if (what == "ball_states") {
         Fill(ball_states_, 1, bytes, what);
         s.upload_ball_states(ball_states_.data(), 1, nullptr, BatchSim::StateUploadMode::PreserveInternal);

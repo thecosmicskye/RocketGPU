@@ -44,6 +44,17 @@ using cudaStream_t = void*;
 #else
 #define ROCKETGPU_ALWAYS_INLINE
 #endif
+#if defined(__CUDACC__) && defined(_MSC_VER)
+#define ROCKETGPU_NOINLINE __noinline__
+#elif defined(__CUDACC__)
+#define ROCKETGPU_NOINLINE __noinline__ __attribute__((noinline))
+#elif defined(__GNUC__) || defined(__clang__)
+#define ROCKETGPU_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define ROCKETGPU_NOINLINE __declspec(noinline)
+#else
+#define ROCKETGPU_NOINLINE
+#endif
 
 #if !defined(ROCKETGPU_USE_CUDA) && defined(__GNUC__)
 #define ROCKETGPU_HOST_INLINE __attribute__((always_inline))

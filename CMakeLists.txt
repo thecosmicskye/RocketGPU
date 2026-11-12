@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(RocketGPU VERSION 1.2.0 LANGUAGES CXX)
+project(RocketGPU VERSION 1.3.0 LANGUAGES CXX)
 
 option(ROCKETGPU_USE_CUDA "Build CUDA kernels" OFF)
 option(ROCKETGPU_BUILD_PYTHON "Build Python bindings" OFF)
@@ -148,7 +148,7 @@ if (NOT ROCKETGPU_USE_CUDA AND ROCKETGPU_CPU_ISPC AND ROCKETGPU_ISPC_EXECUTABLE 
     NOT _rocketgpu_ispc_portable_x86 AND NOT CMAKE_OSX_ARCHITECTURES MATCHES ";")
     if (NOT ROCKETGPU_ISPC_TARGET)
         if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
-            set(ROCKETGPU_ISPC_TARGET neon-i32x8)
+            set(ROCKETGPU_ISPC_TARGET neon-i32x4)
         elseif (ROCKETGPU_NATIVE_ARCH AND EXISTS /proc/cpuinfo)
             file(STRINGS /proc/cpuinfo _rocketgpu_avx512 REGEX "avx512f" LIMIT_COUNT 1)
             if (_rocketgpu_avx512)

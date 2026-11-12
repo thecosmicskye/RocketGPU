@@ -111,6 +111,108 @@ inline void LoadBallPreTickIn(const BallState& b, float* in) {
     in[21 * s] = b.rot.z;
     in[22 * s] = b.basis_authoritative != 0 ? 1.0f : 0.0f;
 }
+#if defined(__clang__)
+typedef float CarOutF4 __attribute__((vector_size(16)));
+typedef uint32_t CarOutU4 __attribute__((vector_size(16)));
+template <typename V, typename T, int S = kCarOutLanes>
+inline void StoreCarOutBlock4(unsigned char* const dst[4], int off, const T* o, const int* f) {
+    V r0, r1, r2, r3;
+    std::memcpy(&r0, o + f[0] * S, sizeof(V));
+    std::memcpy(&r1, o + f[1] * S, sizeof(V));
+    std::memcpy(&r2, o + f[2] * S, sizeof(V));
+    std::memcpy(&r3, o + f[3] * S, sizeof(V));
+    const V t0 = __builtin_shufflevector(r0, r1, 0, 4, 1, 5);
+    const V t1 = __builtin_shufflevector(r2, r3, 0, 4, 1, 5);
+    const V t2 = __builtin_shufflevector(r0, r1, 2, 6, 3, 7);
+    const V t3 = __builtin_shufflevector(r2, r3, 2, 6, 3, 7);
+    const V c0 = __builtin_shufflevector(t0, t1, 0, 1, 4, 5);
+    const V c1 = __builtin_shufflevector(t0, t1, 2, 3, 6, 7);
+    const V c2 = __builtin_shufflevector(t2, t3, 0, 1, 4, 5);
+    const V c3 = __builtin_shufflevector(t2, t3, 2, 3, 6, 7);
+    std::memcpy(dst[0] + off, &c0, sizeof(V));
+    std::memcpy(dst[1] + off, &c1, sizeof(V));
+    std::memcpy(dst[2] + off, &c2, sizeof(V));
+    std::memcpy(dst[3] + off, &c3, sizeof(V));
+}
+template <typename V, typename T, int L, int S = kCarOutLanes>
+inline void StoreCarOutRun4(unsigned char* const dst[4], int off, const T* o, const int (&f)[L]) {
+    static_assert(L >= 4, "run shorter than a block");
+    for (int b = 0; b + 4 <= L; b += 4) {
+        StoreCarOutBlock4<V, T, S>(dst, off + 4 * b, o, f + b);
+    }
+    if (L % 4 != 0) {
+        StoreCarOutBlock4<V, T, S>(dst, off + 4 * (L - 4), o, f + (L - 4));
+    }
+}
+template <int S, int L>
+inline void LoadColsRun4(const unsigned char* const src[4], int off, float* in, const int (&f)[L]) {
+    static_assert(L >= 4, "run shorter than a block");
+    for (int k = 0; k < L; k += 4) {
+        const int b = k + 4 <= L ? k : L - 4;
+        CarOutF4 r0, r1, r2, r3;
+        std::memcpy(&r0, src[0] + off + 4 * b, sizeof(CarOutF4));
+        std::memcpy(&r1, src[1] + off + 4 * b, sizeof(CarOutF4));
+        std::memcpy(&r2, src[2] + off + 4 * b, sizeof(CarOutF4));
+        std::memcpy(&r3, src[3] + off + 4 * b, sizeof(CarOutF4));
+        const CarOutF4 t0 = __builtin_shufflevector(r0, r1, 0, 4, 1, 5);
+        const CarOutF4 t1 = __builtin_shufflevector(r2, r3, 0, 4, 1, 5);
+        const CarOutF4 t2 = __builtin_shufflevector(r0, r1, 2, 6, 3, 7);
+        const CarOutF4 t3 = __builtin_shufflevector(r2, r3, 2, 6, 3, 7);
+        const CarOutF4 c0 = __builtin_shufflevector(t0, t1, 0, 1, 4, 5);
+        const CarOutF4 c1 = __builtin_shufflevector(t0, t1, 2, 3, 6, 7);
+        const CarOutF4 c2 = __builtin_shufflevector(t2, t3, 0, 1, 4, 5);
+        const CarOutF4 c3 = __builtin_shufflevector(t2, t3, 2, 3, 6, 7);
+        std::memcpy(in + f[b] * S, &c0, sizeof(CarOutF4));
+        std::memcpy(in + f[b + 1] * S, &c1, sizeof(CarOutF4));
+        std::memcpy(in + f[b + 2] * S, &c2, sizeof(CarOutF4));
+        std::memcpy(in + f[b + 3] * S, &c3, sizeof(CarOutF4));
+    }
+}
+inline void StoreCarPreTickOut4(CarState* const c[4], WheelRuntimeState* const w[4], const float* o,
+                                const uint32_t* wo) {
+    constexpr int s = kCarOutLanes;
+    unsigned char* const cb[4] = {reinterpret_cast<unsigned char*>(c[0]), reinterpret_cast<unsigned char*>(c[1]),
+                                  reinterpret_cast<unsigned char*>(c[2]), reinterpret_cast<unsigned char*>(c[3])};
+    static constexpr int kRunPos[13] = {3, 4, 5, 36, 37, 38, 39, 26, 27, 28, 32, 33, 34};
+    static constexpr int kRunPosBt[9] = {23, 24, 25, 29, 30, 31, 0, 1, 2};
+    static constexpr int kRunBasis[9] = {40, 41, 42, 43, 44, 45, 46, 47, 48};
+    static constexpr int kRunCal[14] = {21, 22, 15, 16, 17, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+    static constexpr int kRunWords[5] = {0, 1, 2, 3, 4};
+    static_assert(offsetof(CarState, pos) == 0 && offsetof(CarState, rot) == 12 && offsetof(CarState, vel) == 28 &&
+                      offsetof(CarState, ang_vel) == 40 && offsetof(CarState, vel_bt) == offsetof(CarState, pos_bt) + 12 &&
+                      offsetof(CarState, tick_start_pos_bt) == offsetof(CarState, pos_bt) + 24 &&
+                      offsetof(CarState, basis_right) == offsetof(CarState, basis_forward) + 12 &&
+                      offsetof(CarState, basis_up) == offsetof(CarState, basis_forward) + 24 &&
+                      offsetof(CarState, cal_pre_pitchlock_restart_time) == offsetof(CarState, cal_pre_forward_speed_uu) + 4 &&
+                      offsetof(CarState, cal_tick_start_ang_vel) == offsetof(CarState, cal_pre_forward_speed_uu) + 8 &&
+                      offsetof(CarState, tick_start_basis_forward) == offsetof(CarState, cal_pre_forward_speed_uu) + 20 &&
+                      offsetof(CarState, tick_start_basis_right) == offsetof(CarState, cal_pre_forward_speed_uu) + 32 &&
+                      offsetof(CarState, tick_start_basis_up) == offsetof(CarState, cal_pre_forward_speed_uu) + 44 &&
+                      sizeof(Quat) == 16 && offsetof(Quat, w) == 0 && offsetof(Quat, z) == 12,
+                  "CarState spans of StoreCarPreTickOut4");
+    StoreCarOutRun4<CarOutF4>(cb, 0, o, kRunPos);
+    StoreCarOutRun4<CarOutF4>(cb, offsetof(CarState, pos_bt), o, kRunPosBt);
+    StoreCarOutRun4<CarOutF4>(cb, offsetof(CarState, basis_forward), o, kRunBasis);
+    StoreCarOutRun4<CarOutF4>(cb, offsetof(CarState, cal_pre_forward_speed_uu), o, kRunCal);
+    StoreCarOutRun4<CarOutU4>(cb, 120, wo, kRunWords);
+    constexpr int kCarWordOff[3] = {312, 608, 660};
+    constexpr int kWrsWordOff[2] = {280, 288};
+    for (int i = 0; i < 4; ++i) {
+        CarState& ci = *c[i];
+        ci.supersonic_time = o[18 * s + i];
+        ci.air_time = o[19 * s + i];
+        ci.air_time_since_jump = o[20 * s + i];
+        ci.internal_flip_time = o[35 * s + i];
+        for (int k = 0; k < 3; ++k) {
+            std::memcpy(cb[i] + kCarWordOff[k], &wo[(5 + k) * s + i], sizeof(uint32_t));
+        }
+        for (int k = 0; k < 2; ++k) {
+            std::memcpy(reinterpret_cast<unsigned char*>(w[i]) + kWrsWordOff[k], &wo[(8 + k) * s + i],
+                        sizeof(uint32_t));
+        }
+    }
+}
+#endif
 inline void StoreBallPreTickOut(BallState& b, const float* o) {
     constexpr int s = kCpuBlockMaxEnvs;
     const auto v3 = [&](int f) { return BallOutV3(o, f); };
@@ -203,6 +305,50 @@ inline bool CarPreTickInMatches(const CarState* cars, const WheelRuntimeState* w
     }
     return true;
 }
+#if defined(__clang__)
+static_assert(offsetof(BallState, rot) == offsetof(BallState, pos) + 12 &&
+                  offsetof(BallState, vel) == offsetof(BallState, pos) + 28 &&
+                  offsetof(BallState, ang_vel) == offsetof(BallState, pos) + 40 &&
+                  offsetof(BallState, vel_bt) == offsetof(BallState, pos_bt) + 12 &&
+                  offsetof(BallState, basis_forward) == offsetof(BallState, pos_bt) + 24 &&
+                  offsetof(BallState, basis_right) == offsetof(BallState, pos_bt) + 36 &&
+                  offsetof(BallState, basis_up) == offsetof(BallState, pos_bt) + 48 &&
+                  offsetof(BallState, inertia_basis_right) == offsetof(BallState, inertia_basis_forward) + 12 &&
+                  offsetof(BallState, inertia_basis_up) == offsetof(BallState, inertia_basis_forward) + 24 &&
+                  sizeof(Quat) == 16 && offsetof(Quat, w) == 0 && offsetof(Quat, x) == 4 && offsetof(Quat, y) == 8 &&
+                  offsetof(Quat, z) == 12,
+              "BallState spans of the 4-env ball pre-tick copies");
+inline void LoadBallPreTickIn4(const BallState* b, float* in) {
+    constexpr int s = kCpuBlockMaxEnvs;
+    const unsigned char* const src[4] = {reinterpret_cast<const unsigned char*>(b), reinterpret_cast<const unsigned char*>(b + 1),
+                                         reinterpret_cast<const unsigned char*>(b + 2), reinterpret_cast<const unsigned char*>(b + 3)};
+    static constexpr int kRunPosBt[15] = {6, 7, 8, 0, 1, 2, 9, 10, 11, 12, 13, 14, 15, 16, 17};
+    static constexpr int kRunRot[4] = {18, 19, 20, 21};
+    LoadColsRun4<s>(src, offsetof(BallState, pos_bt), in, kRunPosBt);
+    LoadColsRun4<s>(src, offsetof(BallState, rot), in, kRunRot);
+    for (int i = 0; i < 4; ++i) {
+        in[3 * s + i] = b[i].ang_vel.x;
+        in[4 * s + i] = b[i].ang_vel.y;
+        in[5 * s + i] = b[i].ang_vel.z;
+        in[22 * s + i] = b[i].basis_authoritative != 0 ? 1.0f : 0.0f;
+    }
+}
+inline void StoreBallPreTickOut4(BallState* b, const float* o) {
+    constexpr int s = kCpuBlockMaxEnvs;
+    unsigned char* const dst[4] = {reinterpret_cast<unsigned char*>(b), reinterpret_cast<unsigned char*>(b + 1),
+                                   reinterpret_cast<unsigned char*>(b + 2), reinterpret_cast<unsigned char*>(b + 3)};
+    static constexpr int kRunPos[13] = {3, 4, 5, 15, 16, 17, 18, 9, 10, 11, 12, 13, 14};
+    static constexpr int kRunPosBt[15] = {0, 1, 2, 6, 7, 8, 19, 20, 21, 22, 23, 24, 25, 26, 27};
+    static constexpr int kRunInertia[9] = {28, 29, 30, 31, 32, 33, 34, 35, 36};
+    StoreCarOutRun4<CarOutF4, float, 13, s>(dst, offsetof(BallState, pos), o, kRunPos);
+    StoreCarOutRun4<CarOutF4, float, 15, s>(dst, offsetof(BallState, pos_bt), o, kRunPosBt);
+    StoreCarOutRun4<CarOutF4, float, 9, s>(dst, offsetof(BallState, inertia_basis_forward), o, kRunInertia);
+    for (int i = 0; i < 4; ++i) {
+        b[i].basis_authoritative = 1;
+        b[i].inertia_basis_valid = 1;
+    }
+}
+#endif
 #endif
 
 static_assert(sizeof(WorldSolverScratchRows) ==
@@ -430,13 +576,16 @@ inline void StepEnvBlockCpu(
                         mirror_rng->kickoff(mirror_rng->context, env_idx, command.kickoff_seed,
                                             command.kickoff_seed_mode, kickoff_order);
                     StepEnvPreTickEnv(env_idx, cfg, teams, env_car_count, cars, solver_scratch, controls_for_reset,
-                                      balls, env_states, pads, command, have_order ? kickoff_order : nullptr, car_configs);
+                                      balls, env_states, pads, command, have_order ? kickoff_order : nullptr, car_configs,
+                                      seed, respawn_overrides[e]);
                     pad_work_ok[e] = false;
                 } else {
-                    StepEnvPreTickEnvState(env_idx, cfg, env_car_count, cars, balls, env_states);
+                    StepEnvPreTickEnvState(env_idx, cfg, env_car_count, cars, balls, env_states, teams, seed, car_configs,
+                                           respawn_overrides[e]);
                 }
             } else {
-                StepEnvPreTickEnvState(env_idx, cfg, env_car_count, cars, balls, env_states);
+                StepEnvPreTickEnvState(env_idx, cfg, env_car_count, cars, balls, env_states, teams, seed, car_configs,
+                                       respawn_overrides[e]);
             }
             const int pre_count = env_car_count[env_idx];
             pre_counts[e] = pre_count;
@@ -480,6 +629,29 @@ inline void StepEnvBlockCpu(
                 if (!CarPreTickInMatches(cars, wheel_runtime_states, lane_idx + j0, ln, car_in)) {
                     std::fprintf(stderr, "ROCKETGPU_ISPC_CHECK pre-tick input rows mismatch, lanes from car %d\n", lane_idx[j0]);
                 }
+#if defined(__clang__)
+                for (int jj = 0; jj + 4 <= ln; jj += 4) {
+                    CarState a[4], b[4];
+                    WheelRuntimeState aw[4], bw[4];
+                    CarState* bp[4];
+                    WheelRuntimeState* bwp[4];
+                    for (int i = 0; i < 4; ++i) {
+                        const int j = j0 + jj + i;
+                        std::memcpy(static_cast<void*>(&a[i]), &cars[lane_idx[j]], sizeof(CarState));
+                        std::memcpy(static_cast<void*>(&b[i]), &cars[lane_idx[j]], sizeof(CarState));
+                        std::memcpy(static_cast<void*>(&aw[i]), &wheel_runtime_states[lane_idx[j]], sizeof(WheelRuntimeState));
+                        std::memcpy(static_cast<void*>(&bw[i]), &wheel_runtime_states[lane_idx[j]], sizeof(WheelRuntimeState));
+                        StoreCarPreTickOut(a[i], aw[i], car_out + jj + i, car_wout + jj + i);
+                        bp[i] = &b[i];
+                        bwp[i] = &bw[i];
+                    }
+                    StoreCarPreTickOut4(bp, bwp, car_out + jj, car_wout + jj);
+                    if (std::memcmp(static_cast<const void*>(a), static_cast<const void*>(b), sizeof(a)) != 0 ||
+                        std::memcmp(static_cast<const void*>(aw), static_cast<const void*>(bw), sizeof(aw)) != 0) {
+                        std::fprintf(stderr, "ROCKETGPU_ISPC_CHECK pre-tick 4-lane store mismatch, car %d\n", lane_idx[j0 + jj]);
+                    }
+                }
+#endif
                 for (int jj = 0; jj < ln; ++jj) {
                     const int j = j0 + jj;
                     const float* const o = car_out + jj;
@@ -512,11 +684,51 @@ inline void StepEnvBlockCpu(
                 }
                 continue;
             }
+            int stored = 0;
+#if defined(__clang__)
+            for (; stored + 4 <= ln; stored += 4) {
+                const int* const li = lane_idx + j0 + stored;
+                CarState* const c4[4] = {&cars[li[0]], &cars[li[1]], &cars[li[2]], &cars[li[3]]};
+                WheelRuntimeState* const w4[4] = {&wheel_runtime_states[li[0]], &wheel_runtime_states[li[1]],
+                                                  &wheel_runtime_states[li[2]], &wheel_runtime_states[li[3]]};
+                StoreCarPreTickOut4(c4, w4, car_out + stored, car_wout + stored);
+            }
+#endif
+            for (int jj = stored; jj < ln; ++jj) {
+                StoreCarPreTickOut(cars[lane_idx[j0 + jj]], wheel_runtime_states[lane_idx[j0 + jj]], car_out + jj,
+                                   car_wout + jj);
+            }
+            int snapped = 0;
+#if defined(__clang__)
+            if (solver_scratch != nullptr && mirror_rng == nullptr) {
+                static constexpr int kRunSnap[17] = {40, 41, 42, 43, 44, 45, 46, 47, 48, 52, 53, 54, 55, 56, 57, 58, 59};
+                static_assert(kCarOutSnapRot == 52 && kCarOutSnapRaw == 56 && offsetof(CarRbSnapMemo, fwd) == 0 &&
+                                  offsetof(CarRbSnapMemo, right) == 12 && offsetof(CarRbSnapMemo, up) == 24 &&
+                                  offsetof(CarRbSnapMemo, rot) == 36 && offsetof(CarRbSnapMemo, raw) == 52,
+                              "CarRbSnapMemo span of the 4-lane snap store");
+                for (; snapped + 4 <= ln; snapped += 4) {
+                    const int j = j0 + snapped;
+                    if ((lane_slot[j] | lane_slot[j + 1] | lane_slot[j + 2] | lane_slot[j + 3]) >= 8) {
+                        break;
+                    }
+                    CarRbSnapMemo* const m[4] = {&solver_scratch[lane_env[j]].rb_snap[lane_slot[j]],
+                                                 &solver_scratch[lane_env[j + 1]].rb_snap[lane_slot[j + 1]],
+                                                 &solver_scratch[lane_env[j + 2]].rb_snap[lane_slot[j + 2]],
+                                                 &solver_scratch[lane_env[j + 3]].rb_snap[lane_slot[j + 3]]};
+                    unsigned char* const d[4] = {reinterpret_cast<unsigned char*>(m[0]), reinterpret_cast<unsigned char*>(m[1]),
+                                                 reinterpret_cast<unsigned char*>(m[2]), reinterpret_cast<unsigned char*>(m[3])};
+                    StoreCarOutRun4<CarOutF4>(d, 0, car_out + snapped, kRunSnap);
+                    m[0]->valid = 1;
+                    m[1]->valid = 1;
+                    m[2]->valid = 1;
+                    m[3]->valid = 1;
+                }
+            }
+#endif
             for (int jj = 0; jj < ln; ++jj) {
                 const int j = j0 + jj;
                 const float* const o = car_out + jj;
                 CarState& car = cars[lane_idx[j]];
-                StoreCarPreTickOut(car, wheel_runtime_states[lane_idx[j]], o, car_wout + jj);
                 const int slot = lane_slot[j];
                 if (solver_scratch != nullptr && slot < 8) {
                     WorldSolverScratch& s = solver_scratch[lane_env[j]];
@@ -525,7 +737,7 @@ inline void StepEnvBlockCpu(
                     tk.car_predict_vel_bt()[slot] = car.vel_bt;
                     tk.car_predict_ang_vel()[slot] = car.ang_vel;
                     tk.car_predict_valid()[slot] = 1;
-                    if (mirror_rng == nullptr) {
+                    if (mirror_rng == nullptr && jj >= snapped) {
                         CarRbSnapMemo& snap = s.rb_snap[slot];
                         snap.fwd = car.basis_forward;
                         snap.right = car.basis_right;
@@ -538,7 +750,13 @@ inline void StepEnvBlockCpu(
             }
         }
         if (ball_lanes) {
-            for (int e = 0; e < env_n; ++e) {
+            int loaded = 0;
+#if defined(__clang__)
+            for (; loaded + 4 <= env_n; loaded += 4) {
+                LoadBallPreTickIn4(balls + env0 + loaded, ball_in + loaded);
+            }
+#endif
+            for (int e = loaded; e < env_n; ++e) {
                 LoadBallPreTickIn(balls[env0 + e], ball_in + e);
             }
             if (CpuIspcCheck()) {
@@ -547,7 +765,13 @@ inline void StepEnvBlockCpu(
                 std::memcpy(start, balls + env0, sizeof(BallState) * env_n);
                 rg_pretick_balls(ball_in, env_n, m.ball_max_speed, m.ball_max_ang_speed, ball_heatseeker, ball_damp,
                                  ball_damp_scale, ball_out);
-                for (int e = 0; e < env_n; ++e) {
+                int stored_balls = 0;
+#if defined(__clang__)
+                for (; stored_balls + 4 <= env_n; stored_balls += 4) {
+                    StoreBallPreTickOut4(balls + env0 + stored_balls, ball_out + stored_balls);
+                }
+#endif
+                for (int e = stored_balls; e < env_n; ++e) {
                     StoreBallPreTickOut(balls[env0 + e], ball_out + e);
                 }
                 std::memcpy(got, balls + env0, sizeof(BallState) * env_n);
@@ -565,7 +789,13 @@ inline void StepEnvBlockCpu(
             } else {
                 rg_pretick_balls(ball_in, env_n, m.ball_max_speed, m.ball_max_ang_speed, ball_heatseeker, ball_damp,
                                  ball_damp_scale, ball_out);
-                for (int e = 0; e < env_n; ++e) {
+                int stored_balls = 0;
+#if defined(__clang__)
+                for (; stored_balls + 4 <= env_n; stored_balls += 4) {
+                    StoreBallPreTickOut4(balls + env0 + stored_balls, ball_out + stored_balls);
+                }
+#endif
+                for (int e = stored_balls; e < env_n; ++e) {
                     StoreBallPreTickOut(balls[env0 + e], ball_out + e);
                 }
                 if (solver_scratch != nullptr) {
@@ -639,7 +869,7 @@ inline void StepEnvBlockCpu(
             }
             StepEnvTail(env_idx, count, cfg, cars, car_configs, ball, env, pads, true, true,
                         pad_pre ? &pad_masks : nullptr,
-                        solver_scratch != nullptr && count <= 8 ? solver_scratch[env_idx].pad_budget : nullptr);
+                        solver_scratch != nullptr && count <= 8 ? solver_scratch[env_idx].pad_budget : nullptr, env_order);
             pad_work_ok[e] = pad_pre;
             if (pad_pre) {
                 const int pad_count = BoostPadCount(cfg);

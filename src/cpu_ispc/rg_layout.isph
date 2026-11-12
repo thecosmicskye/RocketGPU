@@ -89,10 +89,8 @@ export void rg_ispc_layout(uniform int32 out[]) {
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->solve_delta_linear_bt - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->vel_impulse_cache_bt - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->solve_delta_angular - (uniform int8 * uniform)p);
-      out[k++] = (uniform int32)((uniform int8 * uniform)&p->bump_event_tick - (uniform int8 * uniform)p);
-      out[k++] = (uniform int32)((uniform int8 * uniform)&p->bump_event_other_id - (uniform int8 * uniform)p);
-      out[k++] = (uniform int32)((uniform int8 * uniform)&p->bump_event_is_demo - (uniform int8 * uniform)p);
-      out[k++] = (uniform int32)((uniform int8 * uniform)&p->bump_event_was_bumper - (uniform int8 * uniform)p);
+      out[k++] = (uniform int32)((uniform int8 * uniform)&p->bump_event_bumps - (uniform int8 * uniform)p);
+      out[k++] = (uniform int32)((uniform int8 * uniform)&p->bump_event_demos - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->boost_pad_touching - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->bump_event_reserved1 - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->previous_ball_contact_start - (uniform int8 * uniform)p);
@@ -184,6 +182,7 @@ export void rg_ispc_layout(uniform int32 out[]) {
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->back_suspension_rest - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->dodge_deadzone - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->three_wheels - (uniform int8 * uniform)p);
+      out[k++] = (uniform int32)((uniform int8 * uniform)&p->body - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->steer_angle_curve_deg - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->powerslide_steer_angle_curve_deg - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->spawn_z - (uniform int8 * uniform)p);
@@ -203,6 +202,10 @@ export void rg_ispc_layout(uniform int32 out[]) {
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->frame_ticks - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->countdown_count - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->frame_frac_prev - (uniform int8 * uniform)p);
+      out[k++] = (uniform int32)((uniform int8 * uniform)&p->kickoff_match_order - (uniform int8 * uniform)p);
+      out[k++] = (uniform int32)((uniform int8 * uniform)&p->kickoff_match_index - (uniform int8 * uniform)p);
+      out[k++] = (uniform int32)((uniform int8 * uniform)&p->goal_latched - (uniform int8 * uniform)p);
+      out[k++] = (uniform int32)((uniform int8 * uniform)&p->respawn_match_order - (uniform int8 * uniform)p);
     }
     { uniform WheelRuntimeState * uniform p = (uniform WheelRuntimeState * uniform)0; out[k++] = sizeof(uniform WheelRuntimeState);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->event_world_ids - (uniform int8 * uniform)p);

@@ -12,13 +12,13 @@ CPU (profile-guided build) and RocketSim v3 0.3.5 (`arena_scale_v3`, same record
 
 | Arenas | RocketGPU CUDA | RocketGPU CPU | RocketSim v3 |
 |---|---|---|---|
-| 96 | 0.66M | 4.26M | 2.91M |
-| 256 | 1.49M | 4.35M | 3.54M |
-| 512 | 2.53M | 4.44M | 3.51M |
-| 1,024 | 4.33M | 4.44M | 3.79M |
-| 4,096 | 10.71M | 3.62M | 3.61M |
-| 8,192 | 15.42M | 3.55M | 3.73M |
-| 16,384 | 18.55M | 3.65M | 3.52M |
+| 96 | 0.66M | 4.40M | 2.91M |
+| 256 | 1.49M | 4.57M | 3.54M |
+| 512 | 2.56M | 4.72M | 3.51M |
+| 1,024 | 4.43M | 4.68M | 3.79M |
+| 4,096 | 10.84M | 3.86M | 3.61M |
+| 8,192 | 15.65M | 3.69M | 3.73M |
+| 16,384 | 18.56M | 3.75M | 3.52M |
 
 ## Accuracy
 
@@ -183,11 +183,9 @@ For RocketSim v3's own conventions, use `get_state_v3` / `set_state_v3` (C++ `Ca
 `CarStateV3` matches v3's `CarState` field for field:
 
 - velocities before the caps
-- the step's own flags and `jump_ticks`
+- the step's own flags and `jump_ticks`; `has_jumped` is also set by a double jump or dodge with no jump before it
 - `is_supersonic` with v3's grace timer
 - `bump_cooldown_victim` (a car id) and `last_extra_hit_tick` (`None`: no earlier hit)
-
-`jump_hold_broken` is stored, but RocketGPU's jump does not read it.
 
 `Arena.get_full_state()` returns the whole simulation state, including contact manifolds and timers, as
 `{"array.field": bytes}`. `set_full_state` writes the fields it is given and keeps the rest.

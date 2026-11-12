@@ -145,6 +145,7 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
         .def_readwrite("dodge_deadzone", &rocketgpu::CarConfig::dodge_deadzone)
         .def_readwrite("three_wheels", &rocketgpu::CarConfig::three_wheels)
         .def_readwrite("spawn_z", &rocketgpu::CarConfig::spawn_z)
+        .def_readwrite("body", &rocketgpu::CarConfig::body)
         .def_property("steer_angle_curve_deg",
             [](const rocketgpu::CarConfig& c) { return std::vector<float>(c.steer_angle_curve_deg, c.steer_angle_curve_deg + 6); },
             [](rocketgpu::CarConfig& c, const std::vector<float>& v) {
@@ -608,10 +609,8 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
             vec3("basis_right", offsetof(S, basis_right), f);
             vec3("basis_up", offsetof(S, basis_up), f);
             scalar("basis_authoritative", "|u1", offsetof(S, basis_authoritative), f);
-            scalar("bump_event_tick", "<u8", offsetof(S, bump_event_tick), f);
-            scalar("bump_event_other_id", "<u4", offsetof(S, bump_event_other_id), f);
-            scalar("bump_event_is_demo", "|u1", offsetof(S, bump_event_is_demo), f);
-            scalar("bump_event_was_bumper", "|u1", offsetof(S, bump_event_was_bumper), f);
+            u8arr("bump_event_bumps", offsetof(S, bump_event_bumps), 7, f);
+            u8arr("bump_event_demos", offsetof(S, bump_event_demos), 7, f);
             scalar("boost_pad_touching", "|u1", offsetof(S, boost_pad_touching), f);
             vec3("pad_frame_pos_bt", offsetof(S, pad_frame_pos_bt), f);
             scalar("pad_frame_pos_valid", "|u1", offsetof(S, pad_frame_pos_valid), f);
@@ -1055,6 +1054,9 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
             py::arg("stream") = 0);
 
     m.def("OctaneConfig", &rocketgpu::OctaneConfig);
+    m.def("CarBodyCount", &rocketgpu::CarBodyCount);
+    m.def("CarBodyName", &rocketgpu::CarBodyName);
+    m.def("CarBodyId", &rocketgpu::CarBodyId);
 
     {
         namespace rc = rocketgpu::compat;

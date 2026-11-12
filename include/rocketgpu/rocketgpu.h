@@ -151,6 +151,10 @@ struct CarConfig {
     // force, auto-flip time 0.2 s, wheel ContactForceDistance 4 uu, the position-seeded jump / double-jump torques,
     // and air control that stops on world contact and adds a position-seeded torque while boosting.
     uint8_t three_wheels = 0;
+    // The car's body: a row of tools/data/car_body_mesh_bounds.tsv (CarBodyId("Body_Octane")). It gives the body's mesh
+    // bounds, which the game tests a respawn spot against (occupied when the box is within 48 uu of the spot); bodies
+    // sharing a hitbox differ. Defaults: each preset's stock body (Octane here).
+    uint16_t body = 147;
     // Steer angle curve (degrees) at |forward speed| 0, 500, 1000, 1500, 1750, 3000 uu/s, and the powerslide one at
     // 0, 2500. The game's keys are 35, 20, 11, 6.25, 5, 2 and 25, 7.5 degrees; with Ackermann steering off it replaces
     // each key by the mean of the inner wheel angle a and the outer one atan(L / (T + L / tan a)), L = wheelbase
@@ -302,10 +306,11 @@ struct CarState {
     Vec3 vel_impulse_cache_bt = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 solve_delta_angular = Vec3(0.0f, 0.0f, 0.0f);
 
-    uint64_t bump_event_tick = 0;
-    uint32_t bump_event_other_id = 0;
-    uint8_t bump_event_is_demo = 0;
-    uint8_t bump_event_was_bumper = 0;
+    // How often this car has bumped / demolished each other car of its env: counts mod 256 that nothing resets, so the
+    // difference of two readings is the hits in between, however many ticks apart. Entry k is the car k + 1 slots after
+    // this one, wrapping at 8: slot (own + k + 1) & 7.
+    uint8_t bump_event_bumps[7] = {};
+    uint8_t bump_event_demos[7] = {};
     // The pad (index + 1, 0 for none) on the car's touch list: begun by entering its pickup cylinder at a render
     // frame's end, ended when the car stops overlapping it or anyone picks the pad up.
     uint8_t boost_pad_touching = 0;
@@ -506,12 +511,18 @@ constexpr int kMaxBoostPads = 48;
 // CarState.respawn_slot_override_plus1 = kKickoffSpawnOverridePlus1 + spot: the car's next spawn is a kickoff
 // re-creation at kickoff spot `spot` (0-4).
 constexpr int kKickoffSpawnOverridePlus1 = 5;
+// CarState.respawn_slot_override_plus1 = kRespawnOffsetOverridePlus1 + 8 * spot + dir (128-159): the car's next spawn
+// is 192 uu from respawn spot `spot` (0-3), dir (0-7) * 45 degrees round from the spot's facing. Set by the step when
+// all four spots are occupied.
+constexpr int kRespawnOffsetOverridePlus1 = 128;
 
 struct EnvState {
     uint32_t tick = 0;
+    // Goals since the last reset_scoreboard.
     uint32_t blue_score = 0;
     uint32_t orange_score = 0;
     int32_t last_scored_team = -1;
+    // The ball is in a goal on this tick (every tick until the reset).
     uint8_t goal_scored_this_tick = 0;
 
     // The order the per-car loops (vehicle updates first) visit the cars: 3 (default) car_visit_order_packed kept as
@@ -531,6 +542,18 @@ struct EnvState {
     uint16_t frame_ticks = 0;
     float countdown_count = 0.0f;
     float frame_frac_prev = 0.5f;
+
+    // The game shuffles its kickoff spots once per match and starts each kickoff one spot further along that order: a
+    // team's j-th car takes spot order[(index + j) % 5], both teams alike. kickoff_match_order: the order, three bits
+    // per spot, bit 15 set once drawn; kickoff_match_index: where the next kickoff starts. Kept across resets.
+    uint16_t kickoff_match_order = 0;
+    uint8_t kickoff_match_index = 0;
+    // The ball was in a goal on the last tick: a goal counts once, on the tick the ball goes in (the game ends the
+    // round there; here play goes on until the caller resets, and the ball stays in the net).
+    uint8_t goal_latched = 0;
+    // The match's order of the four respawn spots, drawn with the kickoff order, two bits per spot (0: not drawn yet).
+    // A demolished car comes back on the first free spot from a random place in this order.
+    uint8_t respawn_match_order = 0;
 };
 
 ROCKETGPU_HD int CarVisitSlot(const EnvState& env, int k, int count) {
@@ -600,7 +623,7 @@ struct EnvCommand {
     uint8_t reset_scoreboard = 0;
     uint8_t reset_tick_count = 0;
 
-    // 2: a new shuffle on every reset, whatever kickoff_seed is. 3: no shuffle, a team's nth car takes kickoff spot n.
+    // 2: as kickoff_seed 0, whatever kickoff_seed is. 3: no shuffle, a team's nth car takes kickoff spot n.
     uint8_t kickoff_seed_mode = 0;
     // The bodies' side of a round reset alone (a reset_to_kickoff without reset_scoreboard implies it): every body
     // leaves the world and is re-added the way the game respawns them after a goal (BulletSweepNewRound).
@@ -614,7 +637,9 @@ struct EnvCommand {
     // either, the reset is the game's: the ball re-created high and falling under the 2D constraint, the cars one tick
     // later, held (bDriving off) until the countdown ends.
     uint16_t kickoff_countdown_ticks = 0;
-    // Seeds the kickoff spot shuffle. 0 (the default): each env takes a new shuffle on every reset.
+    // Seeds the kickoff spot order. 0 (the default): a reset with reset_scoreboard starts a match with a new order;
+    // one without is the match's next kickoff, as in the game (EnvState.kickoff_match_order), where a team with fewer
+    // cars than the other also gets the best of the spots a full team would take.
     uint64_t kickoff_seed = 0;
 };
 
@@ -1001,6 +1026,12 @@ CarConfig HybridConfig();
 CarConfig MercConfig();
 CarConfig PsyclopsConfig();
 CarConfig BatmobileConfig();
+// CarConfig::body of the presets' stock bodies, and the table: its size, a body's name, a name's row (-1: not a body;
+// letter case does not matter).
+constexpr uint16_t kCarBodyOctane = 147, kCarBodyDominus = 132, kCarBodyPlank = 150, kCarBodyBreakout = 64, kCarBodyHybrid = 56, kCarBodyMerc = 219, kCarBodyPsyclops = 214, kCarBodyBatmobile = 41;
+int CarBodyCount();
+const char* CarBodyName(int body);
+int CarBodyId(const char* name);
 
 size_t SolverScratchBytesPerEnv();
 }

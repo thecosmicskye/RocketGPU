@@ -101,6 +101,22 @@ for f in fields:
     r, off = place[f[0]]
     out.append(f"    X({f[0]}, {r}, {off}) \\")
 out.append("")
+stretches, size = [[]], 0
+for f in fields:
+    if stretches[-1] and size + f[2] > 128:
+        stretches.append([]); size = 0
+    stretches[-1].append(f); size += f[2]
+out.append("// The fields again in stretches of at most 128 CarState bytes: S(FIELDS) once per stretch, FIELDS(X) as above.")
+for i, st in enumerate(stretches):
+    out.append(f"#define ROCKETGPU_CAR_TILE_FIELDS_S{i}(X) \\")
+    for f in st:
+        r, off = place[f[0]]
+        out.append(f"    X({f[0]}, {r}, {off}) \\")
+    out.append("")
+out.append("#define ROCKETGPU_CAR_TILE_STRETCHES(S) \\")
+for i in range(len(stretches)):
+    out.append(f"    S(ROCKETGPU_CAR_TILE_FIELDS_S{i}) \\")
+out.append("")
 open(sys.argv[1], "w").write("\n".join(out) + "\n")
 for gname, names in GROUPS:
     ws = sorted({place[n][1] // (LANES * WORD) for n in names.split()})

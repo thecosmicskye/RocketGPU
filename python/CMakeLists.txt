@@ -19,6 +19,7 @@ target_link_libraries(rocketgpu_py PRIVATE rocketgpu)
 target_compile_definitions(rocketgpu_py PRIVATE ROCKETGPU_VERSION="${PROJECT_VERSION}")
 target_include_directories(rocketgpu_py PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 target_compile_features(rocketgpu_py PRIVATE cxx_std_17)
+target_compile_options(rocketgpu_py PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
 set_target_properties(rocketgpu_py PROPERTIES
     INTERPROCEDURAL_OPTIMIZATION OFF
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}

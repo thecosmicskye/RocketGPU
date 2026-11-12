@@ -86,10 +86,8 @@ inline bool RgIspcLayoutOk() {
     if (got[k++] != (int)offsetof(rocketgpu::CarState, solve_delta_linear_bt)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, vel_impulse_cache_bt)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, solve_delta_angular)) ++bad;
-    if (got[k++] != (int)offsetof(rocketgpu::CarState, bump_event_tick)) ++bad;
-    if (got[k++] != (int)offsetof(rocketgpu::CarState, bump_event_other_id)) ++bad;
-    if (got[k++] != (int)offsetof(rocketgpu::CarState, bump_event_is_demo)) ++bad;
-    if (got[k++] != (int)offsetof(rocketgpu::CarState, bump_event_was_bumper)) ++bad;
+    if (got[k++] != (int)offsetof(rocketgpu::CarState, bump_event_bumps)) ++bad;
+    if (got[k++] != (int)offsetof(rocketgpu::CarState, bump_event_demos)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, boost_pad_touching)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, bump_event_reserved1)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, previous_ball_contact_start)) ++bad;
@@ -179,6 +177,7 @@ inline bool RgIspcLayoutOk() {
     if (got[k++] != (int)offsetof(rocketgpu::CarConfig, back_suspension_rest)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarConfig, dodge_deadzone)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarConfig, three_wheels)) ++bad;
+    if (got[k++] != (int)offsetof(rocketgpu::CarConfig, body)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarConfig, steer_angle_curve_deg)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarConfig, powerslide_steer_angle_curve_deg)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarConfig, spawn_z)) ++bad;
@@ -197,6 +196,10 @@ inline bool RgIspcLayoutOk() {
     if (got[k++] != (int)offsetof(rocketgpu::EnvState, frame_ticks)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::EnvState, countdown_count)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::EnvState, frame_frac_prev)) ++bad;
+    if (got[k++] != (int)offsetof(rocketgpu::EnvState, kickoff_match_order)) ++bad;
+    if (got[k++] != (int)offsetof(rocketgpu::EnvState, kickoff_match_index)) ++bad;
+    if (got[k++] != (int)offsetof(rocketgpu::EnvState, goal_latched)) ++bad;
+    if (got[k++] != (int)offsetof(rocketgpu::EnvState, respawn_match_order)) ++bad;
     if (got[k++] != (int)sizeof(rocketgpu::detail::WheelRuntimeState)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::detail::WheelRuntimeState, event_world_ids)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::detail::WheelRuntimeState, event_world_normals)) ++bad;

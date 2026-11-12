@@ -118,6 +118,43 @@ struct BasicCarRef {
 #undef ROCKETGPU_CAR_REF_ASSIGN
         return *this;
     }
+    ROCKETGPU_HD const BasicCarRef& AssignStretches(const CarState& o) const {
+        static_assert(!kConst, "assignment through a const car view");
+#define ROCKETGPU_CAR_REF_READ(name, region, offset) \
+    FieldValue<decltype(o.name)> v_##name;           \
+    CopyField(v_##name.v, o.name);
+#define ROCKETGPU_CAR_REF_WRITE(name, region, offset) CopyField(name, v_##name.v);
+#define ROCKETGPU_CAR_REF_STRETCH(FIELDS) \
+    {                                     \
+        FIELDS(ROCKETGPU_CAR_REF_READ)    \
+        FIELDS(ROCKETGPU_CAR_REF_WRITE)   \
+    }
+        ROCKETGPU_CAR_TILE_STRETCHES(ROCKETGPU_CAR_REF_STRETCH)
+#undef ROCKETGPU_CAR_REF_STRETCH
+        return *this;
+    }
+#define ROCKETGPU_CAR_REF_STRETCH(FIELDS) +1
+    static constexpr int kStretches = 0 ROCKETGPU_CAR_TILE_STRETCHES(ROCKETGPU_CAR_REF_STRETCH);
+#undef ROCKETGPU_CAR_REF_STRETCH
+    template <class Keep>
+    ROCKETGPU_HD void AssignStretch(const CarState& o, int stretch) const {
+        static_assert(!kConst, "assignment through a const car view");
+        int n = 0;
+#define ROCKETGPU_CAR_REF_WRITE_UNKEPT(name, region, offset) \
+    if (!Keep::Field(offsetof(CarState, name))) {            \
+        CopyField(name, v_##name.v);                         \
+    }
+#define ROCKETGPU_CAR_REF_STRETCH(FIELDS)        \
+    if (n++ == stretch) {                        \
+        FIELDS(ROCKETGPU_CAR_REF_READ)           \
+        FIELDS(ROCKETGPU_CAR_REF_WRITE_UNKEPT)   \
+    }
+        ROCKETGPU_CAR_TILE_STRETCHES(ROCKETGPU_CAR_REF_STRETCH)
+#undef ROCKETGPU_CAR_REF_STRETCH
+#undef ROCKETGPU_CAR_REF_WRITE_UNKEPT
+#undef ROCKETGPU_CAR_REF_WRITE
+#undef ROCKETGPU_CAR_REF_READ
+    }
     ROCKETGPU_HD const BasicCarRef& operator=(const CarState& o) const { return Assign(o); }
     ROCKETGPU_HD const BasicCarRef& operator=(const BasicCarRef& o) const { return Assign(o); }
     template <class S2>
@@ -215,6 +252,10 @@ private:
 #undef ROCKETGPU_CAR_REF_FROM_TILE
           unused_(0), org_w_(w), org_wide_(wide), org_cold_(cold) {
     }
+    template <class T>
+    struct FieldValue {
+        T v;
+    };
     template <class T, size_t N, class U>
     ROCKETGPU_HD static void CopyField(T (&dst)[N], const U (&src)[N]) {
         for (size_t i = 0; i < N; ++i) dst[i] = src[i];
@@ -272,9 +313,9 @@ ROCKETGPU_HD BasicCarRef<S>::BasicCarRef(const BasicCarArg<S>& a)
                                                               (offset))),
 #else
 #define ROCKETGPU_CAR_REF_FROM_ARG(name, region, offset)                                                                \
-    name(a.state != nullptr ? a.state->name                                                                            \
-                            : *reinterpret_cast<Field<decltype(CarState::name)>*>(                                     \
-                                  ((region) == 0 ? a.w : (region) == 1 ? a.wide : a.cold) + (offset))),
+    name(*(a.state != nullptr ? &a.state->name                                                                         \
+                              : reinterpret_cast<Field<decltype(CarState::name)>*>(                                    \
+                                    ((region) == 0 ? a.w : (region) == 1 ? a.wide : a.cold) + (offset)))),
 #endif
       ROCKETGPU_CAR_TILE_FIELDS(ROCKETGPU_CAR_REF_FROM_ARG)
 #undef ROCKETGPU_CAR_REF_FROM_ARG

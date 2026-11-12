@@ -1,12 +1,16 @@
+#include <cstring>
 #include <rocketgpu/rocketsim_compat.h>
 #include <rocketgpu/detail/math.hpp>
 #include <rocketgpu/detail/constants.hpp>
 #include <rocketgpu/detail/cuda_api.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <cfloat>
 #include <cmath>
+#include <random>
 #include <stdexcept>
 
 namespace rocketgpu {
@@ -189,7 +193,7 @@ Car* Arena::AddCar(Team team, const CarConfig& config) {
     PullStates();
     car_states_[static_cast<size_t>(slot)] = CarState{};
     controls_[static_cast<size_t>(slot)] = CarControls{};
-    if (!bump_event_seen_tick_.empty()) bump_event_seen_tick_[static_cast<size_t>(slot)] = 0;
+    if (!bump_seen_.empty()) std::fill_n(&bump_seen_[static_cast<size_t>(slot) * 14], 14, uint8_t{0});
     if (extra_hit_guess_.empty()) extra_hit_guess_.assign(sim_->car_capacity(), ExtraHitGuess{});
     extra_hit_guess_[static_cast<size_t>(slot)] = ExtraHitGuess{};
     for (int w = 0; w < 4; ++w) car_states_[static_cast<size_t>(slot)].wheels_with_contact[w] = 0;
@@ -264,10 +268,18 @@ void Arena::SetCarBumpCallback(CarBumpEventFn callback_fn, void* user_info) {
     bump_callback_ = std::move(callback_fn);
     bump_user_info_ = user_info;
 
+    SyncBumpSeen();
+}
+void Arena::SyncBumpSeen() {
+    if (!bump_callback_) {
+        bump_seen_.clear();
+        return;
+    }
     PullStates();
-    bump_event_seen_tick_.assign(sim_->car_capacity(), 0u);
+    bump_seen_.resize(car_states_.size() * 14);
     for (size_t i = 0; i < car_states_.size(); ++i) {
-        bump_event_seen_tick_[i] = car_states_[i].bump_event_tick;
+        std::memcpy(&bump_seen_[i * 14], car_states_[i].bump_event_bumps, 7);
+        std::memcpy(&bump_seen_[i * 14 + 7], car_states_[i].bump_event_demos, 7);
     }
 }
 bool Arena::RemoveCar(Car* car) {
@@ -290,6 +302,7 @@ bool Arena::RemoveCar(uint32_t id) {
     }
 
     car_states_[static_cast<size_t>(slot)] = CarState{};
+    if (!bump_seen_.empty()) std::fill_n(&bump_seen_[static_cast<size_t>(slot) * 14], 14, uint8_t{0});
     car_states_[static_cast<size_t>(slot)].is_demoed = 1;
     car_states_[static_cast<size_t>(slot)].demo_respawn_timer = 1.0e30f;
     car_states_[static_cast<size_t>(slot)].demo_no_contact_response = 1;
@@ -349,7 +362,7 @@ Arena* Arena::Clone(bool copy_callbacks) const {
         a->goal_user_info_ = goal_user_info_;
         a->bump_callback_ = bump_callback_;
         a->bump_user_info_ = bump_user_info_;
-        a->bump_event_seen_tick_ = bump_event_seen_tick_;
+        a->bump_seen_ = bump_seen_;
     }
     a->extra_hit_guess_ = extra_hit_guess_;
     a->dirty_ = true;
@@ -439,15 +452,25 @@ void Arena::DrainBumpEvents() {
     PullStates();
 
     for (Car* bumper : cars) {
-        const CarState& s = car_states_[static_cast<size_t>(bumper->slot_)];
-        if (!s.bump_event_was_bumper || s.bump_event_tick == 0 ||
-            s.bump_event_tick == bump_event_seen_tick_[static_cast<size_t>(bumper->slot_)]) {
+        const size_t slot = static_cast<size_t>(bumper->slot_);
+        uint8_t now[14];
+        std::memcpy(now, car_states_[slot].bump_event_bumps, 7);
+        std::memcpy(now + 7, car_states_[slot].bump_event_demos, 7);
+        uint8_t* seen = &bump_seen_[slot * 14];
+        if (std::memcmp(now, seen, 14) == 0) {
             continue;
         }
-        bump_event_seen_tick_[static_cast<size_t>(bumper->slot_)] = s.bump_event_tick;
-        Car* victim = GetCar(CompatIdFromDeviceId(s.bump_event_other_id));
-        if (victim) {
-            bump_callback_(this, bumper, victim, s.bump_event_is_demo != 0, bump_user_info_);
+        uint8_t fresh[14];
+        for (int i = 0; i < 14; ++i) {
+            fresh[i] = static_cast<uint8_t>(now[i] - seen[i]);
+            seen[i] = now[i];
+        }
+        for (int i = 0; i < 14; ++i) {
+            if (fresh[i] == 0) continue;
+            Car* victim = GetCar(CompatIdFromDeviceId(static_cast<uint32_t>((slot + static_cast<size_t>(i % 7) + 1) & 7u) + 1u));
+            for (int n = victim ? fresh[i] : 0; n > 0; --n) {
+                bump_callback_(this, bumper, victim, i >= 7, bump_user_info_);
+            }
         }
     }
 }
@@ -557,8 +580,18 @@ void Arena::ResetToRandomKickoff(int seed, bool game_countdown) {
     command.reset_to_kickoff = 1;
     command.reset_scoreboard = 1;
     command.reset_tick_count = 1;
-    command.kickoff_seed_mode = seed == -1 ? 2 : 1;
-    command.kickoff_seed = static_cast<uint64_t>(static_cast<uint32_t>(seed));
+    static std::atomic<uint64_t> auto_seed{
+        static_cast<uint64_t>(std::chrono::system_clock::now().time_since_epoch().count()) ^
+        (static_cast<uint64_t>(std::random_device{}()) << 32)};
+    uint64_t kickoff_seed = static_cast<uint64_t>(static_cast<uint32_t>(seed));
+    if (seed == -1) {
+        kickoff_seed = (auto_seed.fetch_add(1) + 1) * 0x9e3779b97f4a7c15ull;
+        kickoff_seed = (kickoff_seed ^ (kickoff_seed >> 30)) * 0xbf58476d1ce4e5b9ull;
+        kickoff_seed = (kickoff_seed ^ (kickoff_seed >> 27)) * 0x94d049bb133111ebull;
+        kickoff_seed ^= kickoff_seed >> 31;
+    }
+    command.kickoff_seed_mode = 1;
+    command.kickoff_seed = kickoff_seed;
     command.kickoff_countdown_ticks = game_countdown ? kKickoffCountdownGameTimers : 0;
     sim_->apply_env_commands(&command, 1);
     sim_->download_env_states(env_states_.data(), env_states_.size());
@@ -572,12 +605,14 @@ void Arena::ResetToRandomKickoff(int seed, bool game_countdown) {
     sim_->upload_env_states(env_states_.data(), env_states_.size());
     sim_->synchronize();
     dirty_ = true;
+    for (ExtraHitGuess& g : extra_hit_guess_) g.pending = false;
 }
 
 void Arena::StartNewRoundBodies() {
     EnvCommand command;
     command.new_round_bodies = 1;
     sim_->apply_env_commands(&command, 1);
+    for (ExtraHitGuess& g : extra_hit_guess_) g.pending = false;
     dirty_ = true;
 }
 
@@ -727,6 +762,7 @@ CarStateCompat Car::GetState() const {
 void Car::SetState(const CarStateCompat& state) {
     arena_->PullStates();
     CarState& s = arena_->car_states_[slot_];
+    if (state.pos.x != s.pos.x || state.pos.y != s.pos.y || state.pos.z != s.pos.z) s.pad_frame_pos_valid = 0;
     s.pos = state.pos;
     SeedCarBasisFromRotMat(s, state.rotMat);
     s.set_wheel_normals_mask = 0;
@@ -740,6 +776,7 @@ void Car::SetState(const CarStateCompat& state) {
     s.has_double_jumped = state.hasDoubleJumped ? 1 : 0;
     s.has_flipped = state.hasFlipped ? 1 : 0;
     s.flip_rel_torque = state.flipRelTorque;
+    if (!(state.isJumping && s.is_jumping && state.jumpTime == s.jump_time)) s.jump_hold_broken = 0;
     s.jump_time = state.jumpTime;
     s.flip_time = state.flipTime;
     s.flip_timer_live = 0;
@@ -778,9 +815,9 @@ void Car::SetState(const CarStateCompat& state) {
     s.latest_touch_location = state.latestTouch.location;
     s.latest_touch_normal = state.latestTouch.normal;
     s.tick_count_since_update = 0;
-    s.bump_event_tick = 0;
-    s.bump_event_was_bumper = 0;
-    if (!arena_->bump_event_seen_tick_.empty()) arena_->bump_event_seen_tick_[slot_] = 0;
+    s.pending_bump_count = 0;
+    s.vel_impulse_cache = Vec3(0.0f, 0.0f, 0.0f);
+    s.vel_impulse_cache_bt = Vec3(0.0f, 0.0f, 0.0f);
     s.last_controls = state.lastControls;
     arena_->PushCarState(slot_);
 }
@@ -819,9 +856,9 @@ CarStateV3 Car::GetStateV3() const {
     out.vel = s.vel;
     out.angVel = s.ang_vel;
     out.controls = arena_->controls_[slot_];
-    out.hasJumped = s.has_jumped != 0;
     out.hasDoubleJumped = s.has_double_jumped != 0;
     out.hasFlipped = s.has_flipped != 0;
+    out.hasJumped = s.has_jumped != 0 || out.hasDoubleJumped || out.hasFlipped;
     out.flipRelTorque = s.flip_rel_torque;
     out.jumpTicks = static_cast<uint32_t>(rintf(s.jump_time / arena_->GetTickTime()));
     out.flipTime = s.flip_time;
@@ -863,11 +900,14 @@ void Car::SetStateV3(const CarStateV3& state) {
     const float dt = arena_->GetTickTime();
     const bool jump_starts = state.isJumping && state.jumpTicks == 0 && state.controls.jump;
     const bool flip_starts = state.isFlipping && state.flipTime == 0.0f && state.controls.jump;
+    if (state.pos.x != s.pos.x || state.pos.y != s.pos.y || state.pos.z != s.pos.z) s.pad_frame_pos_valid = 0;
     s.pos = state.pos;
     SeedCarBasisFromRotMat(s, state.rotMat);
     s.vel = state.vel;
     s.ang_vel = state.angVel;
-    s.has_jumped = state.hasJumped && !jump_starts ? 1 : 0;
+    const bool keeps_jumped = state.hasJumped && (state.hasDoubleJumped || state.hasFlipped) &&
+                              (s.has_double_jumped || s.has_flipped);
+    s.has_jumped = (keeps_jumped ? s.has_jumped != 0 : state.hasJumped) && !jump_starts ? 1 : 0;
     s.has_double_jumped = state.hasDoubleJumped && !flip_starts ? 1 : 0;
     s.has_flipped = state.hasFlipped && !flip_starts ? 1 : 0;
     s.flip_rel_torque = state.flipRelTorque;
@@ -929,9 +969,9 @@ void Car::SetStateV3(const CarStateV3& state) {
     }
     s.reported_flags = 0;
     s.tick_count_since_update = 0;
-    s.bump_event_tick = 0;
-    s.bump_event_was_bumper = 0;
-    if (!arena_->bump_event_seen_tick_.empty()) arena_->bump_event_seen_tick_[slot_] = 0;
+    s.pending_bump_count = 0;
+    s.vel_impulse_cache = Vec3(0.0f, 0.0f, 0.0f);
+    s.vel_impulse_cache_bt = Vec3(0.0f, 0.0f, 0.0f);
     arena_->controls_[slot_] = state.controls;
     arena_->PushCarState(slot_);
 }

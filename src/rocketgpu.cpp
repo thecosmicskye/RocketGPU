@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <cctype>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -351,8 +352,11 @@ Vec3 BtVec3ToUuMirror(const Vec3& value_bt) {
     return Vec3(value_bt.x * kBTToUU, value_bt.y * kBTToUU, value_bt.z * kBTToUU);
 }
 
-void CanonicalizeImportedCarStatesInPlace(CarState* states, size_t count) {
+void CanonicalizeImportedCarStatesInPlace(CarState* states, size_t count, bool placed = false) {
     for (size_t idx = 0; idx < count; ++idx) {
+        if (placed) {
+            states[idx].pad_frame_pos_valid = 0;
+        }
         const uint8_t kept = states[idx].tick_count_since_update != 0 ? states[idx].RestoreWorkingFields() : 0;
         states[idx].ResetTrainingHistory();
         states[idx].pos_bt = ImportedCarLinearVec3Bt(states[idx].pos);
@@ -384,6 +388,30 @@ void CanonicalizeImportedCarState(CarState& state) {
 
 void CanonicalizeImportedBallState(BallState& state) {
     CanonicalizeImportedBallStatesInPlace(&state, 1);
+}
+
+namespace {
+constexpr const char* kCarBodyNames[] = {
+#define ROCKETGPU_X(name, cx, cy, cz, hx, hy, hz) name,
+    ROCKETGPU_CAR_BODIES(ROCKETGPU_X)
+#undef ROCKETGPU_X
+};
+constexpr int kCarBodyCount = static_cast<int>(sizeof(kCarBodyNames) / sizeof(kCarBodyNames[0]));
+}
+
+int CarBodyCount() { return kCarBodyCount; }
+const char* CarBodyName(int body) { return body >= 0 && body < kCarBodyCount ? kCarBodyNames[body] : ""; }
+int CarBodyId(const char* name) {
+    for (int i = 0; name != nullptr && i < kCarBodyCount; ++i) {
+        const char* a = kCarBodyNames[i];
+        const char* b = name;
+        while (*a != 0 && *b != 0 && std::tolower(static_cast<unsigned char>(*a)) == std::tolower(static_cast<unsigned char>(*b))) {
+            ++a;
+            ++b;
+        }
+        if (*a == 0 && *b == 0) return i;
+    }
+    return -1;
 }
 
 CarConfig OctaneConfig() {
@@ -423,6 +451,7 @@ CarConfig DominusConfig() {
     SetSteerCurvesDeg(c, {29.923809051513672f, 18.018766403198242f, 10.329229354858398f, 6.019903182983398f,
                           4.85035514831543f, 1.9751166105270386f}, {22.08690071105957f, 7.173928260803223f});
     c.spawn_z = 36.01f;
+    c.body = kCarBodyDominus;
     return c;
 }
 CarConfig PlankConfig() {
@@ -433,6 +462,7 @@ CarConfig PlankConfig() {
     SetSteerCurvesDeg(c, {30.342710494995117f, 18.1981258392334f, 10.394840240478516f, 6.043498516082764f,
                           4.865903377532959f, 1.9777874946594238f}, {22.341325759887695f, 7.206938743591309f});
     c.spawn_z = 38.84f;
+    c.body = kCarBodyPlank;
     return c;
 }
 CarConfig BreakoutConfig() {
@@ -443,6 +473,7 @@ CarConfig BreakoutConfig() {
     SetSteerCurvesDeg(c, {30.55976104736328f, 18.289745330810547f, 10.42794418334961f, 6.055309772491455f,
                           4.873669147491455f, 1.9791138172149658f}, {22.472003936767578f, 7.2235002517700195f});
     c.spawn_z = 36.00f;
+    c.body = kCarBodyBreakout;
     return c;
 }
 CarConfig HybridConfig() {
@@ -453,6 +484,7 @@ CarConfig HybridConfig() {
     SetSteerCurvesDeg(c, {30.580455780029297f, 18.29843521118164f, 10.431071281433105f, 6.056422233581543f,
                           4.874399185180664f, 1.9792383909225464f}, {22.484424591064453f, 7.225060939788818f});
     c.spawn_z = 37.53f;
+    c.body = kCarBodyHybrid;
     return c;
 }
 CarConfig MercConfig() {
@@ -461,6 +493,7 @@ CarConfig MercConfig() {
                             15.00f, 39.104988f, Vec3(-33.75f, 29.50f, 21.504988f), false);
     c.hitbox_published = Vec3(120.72023f, 76.71031f, 41.659073f);
     c.spawn_z = 35.05f;
+    c.body = kCarBodyMerc;
     return c;
 }
 CarConfig PsyclopsConfig() {
@@ -470,6 +503,7 @@ CarConfig PsyclopsConfig() {
     c.powerslide_steer_angle_curve_deg[0] = 24.427291870117188f;
     c.powerslide_steer_angle_curve_deg[1] = 7.443766117095947f;
     c.spawn_z = 36.00f;
+    c.body = kCarBodyPsyclops;
     return c;
 }
 CarConfig BatmobileConfig() {
@@ -480,6 +514,7 @@ CarConfig BatmobileConfig() {
     SetSteerCurvesDeg(c, {30.342700958251953f, 18.1981201171875f, 10.394838333129883f, 6.0434980392456055f,
                           4.865902900695801f, 1.9777874946594238f}, {22.341318130493164f, 7.206938743591309f});
     c.spawn_z = 36.00f;
+    c.body = kCarBodyBatmobile;
     return c;
 }
 
@@ -2889,9 +2924,9 @@ void BatchSim::upload_car_states(const CarState* host_states, size_t count, cuda
     impl_->car_states.copy_from_host(host_states, count, stream);
     if (mode == StateUploadMode::PublicState) {
 #if defined(ROCKETGPU_USE_CUDA)
-    detail::LaunchCanonicalizeImportedCars(impl_->car_states.data(), static_cast<int32_t>(count), stream);
+    detail::LaunchCanonicalizeImportedCars(impl_->car_states.data(), static_cast<int32_t>(count), stream, true);
 #else
-    CanonicalizeImportedCarStatesInPlace(impl_->car_states.data(), count);
+    CanonicalizeImportedCarStatesInPlace(impl_->car_states.data(), count, true);
 #endif
     }
     impl_->mark_exact_host_dirty();

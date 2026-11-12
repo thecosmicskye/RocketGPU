@@ -2368,7 +2368,10 @@ ROCKETGPU_HD void BoostPadFrameAxes(const SimConfig& cfg, int env_idx, CarCRefT 
 
 ROCKETGPU_HD Vec3 BoostPadSweepFromBt(CarCRefT car, const Vec3& car_bt) {
     if (car.pad_frame_pos_valid) {
-        return car.pad_frame_pos_bt;
+        const Vec3 moved = car_bt - car.pad_frame_pos_bt;
+        if (Dot(moved, moved) <= (240.0f / 50.0f) * (240.0f / 50.0f)) {
+            return car.pad_frame_pos_bt;
+        }
     }
     const Vec3 p0 = BoostPadRbPosUu(car.tick_start_pos_bt);
     const Vec3 p1 = BoostPadRbPosUu(car.pos_bt);
@@ -2702,7 +2705,7 @@ ROCKETGPU_HD void BoostPadTouchPassForEnv(
     int env_idx, int count, const SimConfig& cfg, CarSpanT cars, const CarConfig* car_configs, const EnvState& env,
     BoostPadState* pads
 #if !defined(ROCKETGPU_USE_CUDA)
-    , BoostPadTickMasks* masks = nullptr, BoostPadBudget* budgets = nullptr
+    , BoostPadTickMasks* masks = nullptr, BoostPadBudget* budgets = nullptr, const int16_t* order = nullptr
 #endif
     ) {
     if (!cfg.enable_boost_pads || FrameFrac(cfg, env_idx) < 0.0f) {
@@ -2712,7 +2715,11 @@ ROCKETGPU_HD void BoostPadTouchPassForEnv(
     const int pad_count = BoostPadCount(cfg);
     const int pad_base = env_idx * pad_count;
     for (int k = 0; k < count; ++k) {
+#if !defined(ROCKETGPU_USE_CUDA)
+        const int i = order != nullptr ? order[k] : CarVisitSlot(env, k, count);
+#else
         const int i = CarVisitSlot(env, k, count);
+#endif
         CarRefT car = cars[base + i];
 #if !defined(ROCKETGPU_USE_CUDA)
         if (budgets != nullptr && BoostPadBudgetSkip(env_idx, cfg, car, car_configs[base + i], pads, budgets[i], i)) {
@@ -2805,7 +2812,11 @@ ROCKETGPU_HD void BoostPadTouchPassForEnv(
     }
 #endif
     for (int k = count - 1; k >= 0; --k) {
+#if !defined(ROCKETGPU_USE_CUDA)
+        const int i = order != nullptr ? order[k] : CarVisitSlot(env, k, count);
+#else
         const int i = CarVisitSlot(env, k, count);
+#endif
         CarCRefT car = cars[base + i];
         if (car.boost_pad_touching != 0) {
             const int p = car.boost_pad_touching - 1;
@@ -3133,9 +3144,13 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     float cal_dodge_raw_pitch = 2.0f;
 #if !defined(ROCKETGPU_USE_CUDA)
     if (CarControlsMemo* const memo = frame_out != nullptr ? frame_out->ctl_memo : nullptr) {
+#if defined(_MSC_VER) && !defined(__clang__)
+        static_assert(sizeof(CarControls) == 24 && offsetof(CarControls, handbrake) == 22, "CarControls layout");
+#else
         static_assert(sizeof(CarControls) == 24 && offsetof(CarControls, handbrake) == 22 &&
                           __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
                       "CarControls layout");
+#endif
         uint64_t in_w[3], ctl_w[3];
         std::memcpy(in_w, &memo->in, sizeof(in_w));
         std::memcpy(ctl_w, &controls, sizeof(ctl_w));
@@ -3784,6 +3799,49 @@ ROCKETGPU_HD void WorldStepFinishCar(
 }
 
 #if defined(ROCKETGPU_HOST_LANES)
+inline void WorldStepFinishCarsLanes(int count, CarState* cars, const CarConfig* car_configs,
+                                     WheelRuntimeState* wheel_runtime_states, const MutatorConfig& mutator,
+                                     float sub_dt, const PreContactCar* pre_contact_cars,
+                                     const Vec3* deferred_linear_deltas, const Vec3* deferred_angular_deltas,
+                                     const WorldSolverScratch* rb_snap_scratch) {
+    GameIntegrateLane lane[8];
+    int n = 0;
+    const bool native = NativeSseMath(mutator);
+    for (int i = 0; i < count; ++i) {
+        if (pre_contact_cars[i].is_demoed) {
+            continue;
+        }
+        CarState& car = cars[i];
+        ApplyDeferredVelocityDeltas(car, car_configs[i], deferred_linear_deltas[i], deferred_angular_deltas[i],
+                                    wheel_runtime_states ? &wheel_runtime_states[i] : nullptr, mutator, sub_dt);
+        if (car.just_respawned) {
+            continue;
+        }
+        const Quat* basis_rot = CarRbSnapRaw(rb_snap_scratch, i, car);
+        if (!car.basis_authoritative || native || n == 8) {
+            IntegrateCarTransformOnly(car, sub_dt, native, basis_rot);
+            continue;
+        }
+        if (!(car.vel_bt.x == 0.0f && car.vel_bt.y == 0.0f && car.vel_bt.z == 0.0f)) {
+            SetCarOriginBt(car, car.pos_bt + car.vel_bt * sub_dt);
+        }
+        GameIntegrateLane& l = lane[n++];
+        l.o = basis_rot != nullptr ? *basis_rot : GameGetRotationScalar(car.basis_forward, car.basis_right, car.basis_up);
+        l.w = car.ang_vel;
+        l.fwd = &car.basis_forward;
+        l.right = &car.basis_right;
+        l.up = &car.basis_up;
+        l.q = &car.rot;
+    }
+    for (int k0 = 0; k0 < n; k0 += 4) {
+        const int m = n - k0 < 4 ? n - k0 : 4;
+        for (uint32_t left = GameIntegrateOrientationBasisColumns4(m, lane + k0, sub_dt); left != 0u; left &= left - 1u) {
+            const GameIntegrateLane& l = lane[k0 + CountTrailingZeros32(left)];
+            GameIntegrateOrientationBasisColumns(*l.fwd, *l.right, *l.up, *l.q, l.w, sub_dt, &l.o);
+        }
+    }
+}
+
 inline bool LanesXyzTrue(lanes::I4 m) {
     typedef uint64_t U64x2 __attribute__((vector_size(16)));
     const U64x2 w = reinterpret_cast<U64x2>(m);
@@ -3800,6 +3858,31 @@ inline lanes::F4 LanesTurn(lanes::F4 v) {
 }
 #endif
 
+#if !defined(ROCKETGPU_USE_CUDA)
+struct PredictiveRayTables {
+    const ArenaMeshClearance* clearance = nullptr;
+    float free_x = 0.0f;
+    float free_y = 0.0f;
+};
+inline PredictiveRayTables FindPredictiveRayTables(const ArenaMeshLeafGrid* leaf_grid,
+                                                   const ArenaMeshTriangle* mesh_triangles,
+                                                   const ArenaMeshBvhMeshInfo* mesh_bvh_meshes,
+                                                   int32_t mesh_bvh_mesh_count) {
+    constexpr float margin = 0.04f + 1e-3f;
+    PredictiveRayTables t;
+    t.clearance =
+        leaf_grid != nullptr && leaf_grid->host_tables != nullptr && leaf_grid->host_tables->clearance.lb != nullptr &&
+                leaf_grid->host_tables->clearance.mesh == mesh_triangles
+            ? &leaf_grid->host_tables->clearance
+            : nullptr;
+    if (mesh_bvh_meshes != nullptr && mesh_bvh_mesh_count > 0) {
+        t.free_x = Min(mesh_bvh_meshes[0].free_half_x, 81.8f) - margin;
+        t.free_y = Min(mesh_bvh_meshes[0].free_half_y, 199.9f) - margin;
+    }
+    return t;
+}
+#endif
+
 template <typename MeshLanes = ArenaRayMeshOneLane>
 ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE bool PredictiveContactRayForBody(
     int body, const BallState& ball, bool ball_sleeping, CarCSpanT cars, const PreContactCar* pre_contact_cars,
@@ -3811,15 +3894,19 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE bool PredictiveContactRayForBody(
     const ArenaMeshBvhSubtreeInfo* mesh_bvh_subtrees, int32_t mesh_bvh_subtree_count,
     const ArenaMeshLeafGrid* leaf_grid, Vec3& normal_out, float& distance_bt_out,
     const MeshLanes& mesh_lanes = MeshLanes{},
+#if !defined(ROCKETGPU_USE_CUDA)
+    const ArenaMeshTriangle* local_triangles = nullptr, const WorldSolverScratch* rb_snap_scratch = nullptr,
+    const PredictiveRayTables* tables_found = nullptr) {
+#else
     const ArenaMeshTriangle* local_triangles = nullptr, const WorldSolverScratch* rb_snap_scratch = nullptr) {
+#endif
     constexpr float kCcdMotionThresholdBt = 0.02f;
     constexpr float kRayBackoffBt = 0.04f;
 #if !defined(ROCKETGPU_USE_CUDA)
-    const ArenaMeshClearance* clearance =
-        leaf_grid != nullptr && leaf_grid->host_tables != nullptr && leaf_grid->host_tables->clearance.lb != nullptr &&
-                leaf_grid->host_tables->clearance.mesh == mesh_triangles
-            ? &leaf_grid->host_tables->clearance
-            : nullptr;
+    const PredictiveRayTables tables = tables_found != nullptr
+        ? *tables_found
+        : FindPredictiveRayTables(leaf_grid, mesh_triangles, mesh_bvh_meshes, mesh_bvh_mesh_count);
+    const ArenaMeshClearance* const clearance = tables.clearance;
 #else
     const ArenaMeshClearance* clearance =
         leaf_grid != nullptr && leaf_grid->clearance != nullptr && leaf_grid->clearance->mesh == mesh_triangles
@@ -3852,8 +3939,13 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE bool PredictiveContactRayForBody(
 #endif
         if (have_bvh_free_box && car.basis_authoritative && !native_sse_math) {
             const float margin = kRayBackoffBt + 1e-3f;
+#if !defined(ROCKETGPU_USE_CUDA)
+            const float fx = tables.free_x;
+            const float fy = tables.free_y;
+#else
             const float fx = Min(mesh_bvh_meshes[0].free_half_x, 81.8f) - margin;
             const float fy = Min(mesh_bvh_meshes[0].free_half_y, 199.9f) - margin;
+#endif
 #if defined(ROCKETGPU_HOST_LANES)
             using lanes::F4;
             const F4 pos4 = lanes::LoadPadded(car.pos_bt);
@@ -3968,8 +4060,13 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE bool PredictiveContactRayForBody(
     }
     if (have_bvh_free_box) {
         const float margin = kRayBackoffBt + 1e-3f;
+#if !defined(ROCKETGPU_USE_CUDA)
+        const float fx = tables.free_x;
+        const float fy = tables.free_y;
+#else
         const float fx = Min(mesh_bvh_meshes[0].free_half_x, 81.8f) - margin;
         const float fy = Min(mesh_bvh_meshes[0].free_half_y, 199.9f) - margin;
+#endif
         if (cur.x > -fx && cur.x < fx && to.x > -fx && to.x < fx &&
             cur.y > -fy && cur.y < fy && to.y > -fy && to.y < fy &&
             cur.z > margin && to.z > 0.0f && cur.z < 40.75f && to.z < 40.8f) {
@@ -4034,15 +4131,28 @@ ROCKETGPU_HD ROCKETGPU_NOINLINE void ComputePredictiveContactHits(
     const ArenaMeshTriangle* local_triangles = nullptr) {
     tick.predictive_hit_mask = 0;
     const int body_count = Min(count + 1, 9);
+#if !defined(ROCKETGPU_USE_CUDA)
+    const PredictiveRayTables tables =
+        FindPredictiveRayTables(leaf_grid, mesh_triangles, mesh_bvh_meshes, mesh_bvh_mesh_count);
+#endif
     for (int body = 0; body < body_count; ++body) {
         Vec3 n;
         float distance_bt;
+#if !defined(ROCKETGPU_USE_CUDA)
+        if (PredictiveContactRayForBody(body, ball, ball_sleeping, cars, pre_contact_cars, car_configs, dt,
+                                        native_sse_math, mesh_triangles, mesh_triangle_count, mesh_bvh_quantization,
+                                        mesh_bvh_quantization_count, mesh_bvh_meshes, mesh_bvh_mesh_count,
+                                        mesh_bvh_nodes, mesh_bvh_node_count, mesh_bvh_subtrees,
+                                        mesh_bvh_subtree_count, leaf_grid, n, distance_bt,
+                                        ArenaRayMeshOneLane{}, local_triangles, &scratch, &tables)) {
+#else
         if (PredictiveContactRayForBody(body, ball, ball_sleeping, cars, pre_contact_cars, car_configs, dt,
                                         native_sse_math, mesh_triangles, mesh_triangle_count, mesh_bvh_quantization,
                                         mesh_bvh_quantization_count, mesh_bvh_meshes, mesh_bvh_mesh_count,
                                         mesh_bvh_nodes, mesh_bvh_node_count, mesh_bvh_subtrees,
                                         mesh_bvh_subtree_count, leaf_grid, n, distance_bt,
                                         ArenaRayMeshOneLane{}, local_triangles, &scratch)) {
+#endif
             tick.predictive_hit_mask = static_cast<uint16_t>(tick.predictive_hit_mask | (1u << body));
             tick.predictive_normal[body] = n;
             tick.predictive_distance_bt[body] = distance_bt;
@@ -4154,6 +4264,21 @@ ROCKETGPU_HD ROCKETGPU_NOINLINE void SortBulletManifoldListByIsland(
     const uint32_t* packed,
     const int8_t* manifold_body_islands,
     EnvStridedArray<BulletManifoldEntry> bullet_manifolds) {
+#if !defined(ROCKETGPU_USE_CUDA)
+    if (built == 2) {
+        BulletManifoldEntry e0 = UnpackBulletPairKey(packed[0]);
+        BulletManifoldEntry e1 = UnpackBulletPairKey(packed[1]);
+        const int8_t i0 = manifold_body_islands[e0.kind <= 1 ? 0 : e0.body_a + 1];
+        const int8_t i1 = manifold_body_islands[e1.kind <= 1 ? 0 : e1.body_a + 1];
+        if (i1 <= i0) {
+            e0.island_id = i0;
+            e1.island_id = i1;
+            bullet_manifolds[0] = e1;
+            bullet_manifolds[1] = e0;
+        }
+        return;
+    }
+#endif
     int8_t order[kMaxBulletManifoldEntries];
     int8_t island_ids[kMaxBulletManifoldEntries];
     for (int i = 0; i < built; ++i) {
@@ -5177,7 +5302,12 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE ROCKETGPU_WORLD_STEP_HOST_INLINE void W
                     mesh_bvh_node_count,
                     mesh_bvh_subtrees,
                     mesh_bvh_subtree_count,
+#if !defined(ROCKETGPU_USE_CUDA)
+                    &ball_solver_linear_velocity_bt, env_idx, ball_stage,
+                    broadphase_grid.valid() ? &broadphase_grid.leaf_grid : nullptr);
+#else
                     &ball_solver_linear_velocity_bt, env_idx, ball_stage);
+#endif
                 if (mutator.game_mode == static_cast<uint8_t>(Mode::Heatseeker) && solver_scratch) {
                     for (int hs_idx = 0; hs_idx < tick->hs_world_normal_count; ++hs_idx) {
                         if (HeatseekerOnWorldContact(ball, tick->hs_world_normals[hs_idx])) {
@@ -5465,12 +5595,20 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE ROCKETGPU_WORLD_STEP_HOST_INLINE void W
                  BallSettleStateEqual(ball, solver_scratch->ball_settled_state)) ? 1 : 0;
         }
 
+#if defined(ROCKETGPU_HOST_LANES)
+        if (world_part != kWorldStepRowsCarsApart) {
+            WorldStepFinishCarsLanes(count, cars + base, car_configs + base,
+                                     wheel_runtime_states ? wheel_runtime_states + base : nullptr, mutator, sub_dt,
+                                     pre_contact_cars, deferred_linear_deltas, deferred_angular_deltas, solver_scratch);
+        }
+#else
         for (int i = 0; world_part != kWorldStepRowsCarsApart && i < count; ++i) {
             WorldStepFinishCar(cars[base + i], car_configs[base + i],
                                wheel_runtime_states ? &wheel_runtime_states[base + i] : nullptr, mutator, sub_dt,
                                pre_contact_cars[i], deferred_linear_deltas[i], deferred_angular_deltas[i],
                                solver_scratch, i);
         }
+#endif
         if (should_stop_after_stage(9)) {
             return;
         }
@@ -5548,6 +5686,21 @@ ROCKETGPU_HD void ApplyEnvCommandBodies(
     }
 }
 
+ROCKETGPU_HD void ApplyEnvCommandEnvState(EnvState& env, const EnvCommand& command) {
+    if (command.reset_scoreboard) {
+        env.blue_score = 0;
+        env.orange_score = 0;
+        env.last_scored_team = -1;
+    }
+    if (command.reset_tick_count) {
+        env.tick = 0;
+    }
+    env.goal_scored_this_tick = 0;
+    env.countdown_phase = command.kickoff_countdown_ticks == kKickoffCountdownGameTimers ? 1 : 0;
+    env.countdown_fires = 0;
+    env.countdown_count = 0.0f;
+}
+
 ROCKETGPU_HD void ApplyEnvCommand(
     int env_idx,
     const SimConfig& cfg,
@@ -5589,20 +5742,7 @@ ROCKETGPU_HD void ApplyEnvCommand(
         cars[env_idx * cfg.max_cars_per_env + slot].driving_disabled = command.kickoff_countdown_ticks;
     }
     balls[env_idx].constrained_2d = command.kickoff_countdown_ticks;
-
-    EnvState& env = env_states[env_idx];
-    if (command.reset_scoreboard) {
-        env.blue_score = 0;
-        env.orange_score = 0;
-        env.last_scored_team = -1;
-    }
-    if (command.reset_tick_count) {
-        env.tick = 0;
-    }
-    env.goal_scored_this_tick = 0;
-    env.countdown_phase = command.kickoff_countdown_ticks == kKickoffCountdownGameTimers ? 1 : 0;
-    env.countdown_fires = 0;
-    env.countdown_count = 0.0f;
+    ApplyEnvCommandEnvState(env_states[env_idx], command);
 }
 
 template <bool kStagedIndependent = false>
@@ -6390,13 +6530,129 @@ ROCKETGPU_HD void CountdownUpdateTimers(EnvState& env, CarSpanT env_cars, int co
     }
 }
 
+ROCKETGPU_HD bool SpawnSpotNearBox(const Vec3& spot, const Vec3& center, const Vec3& half) {
+    const float dx = Max(Abs(spot.x - center.x) - half.x, 0.0f);
+    const float dy = Max(Abs(spot.y - center.y) - half.y, 0.0f);
+    const float dz = Max(Abs(spot.z - center.z) - half.z, 0.0f);
+    return dx * dx + dy * dy + dz * dz <= 48.0f * 48.0f;
+}
+
+ROCKETGPU_HD const float* CarBodyMeshBounds(int body) {
+    static constexpr float kBounds[][6] = {
+#define ROCKETGPU_X(name, cx, cy, cz, hx, hy, hz) {cx, cy, cz, hx, hy, hz},
+        ROCKETGPU_CAR_BODIES(ROCKETGPU_X)
+#undef ROCKETGPU_X
+    };
+    constexpr int kCount = static_cast<int>(sizeof(kBounds) / sizeof(kBounds[0]));
+    return kBounds[body >= 0 && body < kCount ? body : static_cast<int>(kCarBodyOctane)];
+}
+
+ROCKETGPU_HD bool SpawnSpotNearCar(const Vec3& spot, const Vec3& pos, const Vec3& fwd, const Vec3& right, const Vec3& up,
+                                  const Vec3& bounds_center, const Vec3& half) {
+    if (SpawnSpotNearBox(spot, pos, Vec3(48.0f, 48.0f, 32.0f))) return true;
+    const Vec3 center = pos + fwd * bounds_center.x + right * bounds_center.y + up * bounds_center.z;
+    return SpawnSpotNearBox(spot, center,
+                            Vec3(Abs(fwd.x) * half.x + Abs(right.x) * half.y + Abs(up.x) * half.z,
+                                 Abs(fwd.y) * half.x + Abs(right.y) * half.y + Abs(up.y) * half.z,
+                                 Abs(fwd.z) * half.x + Abs(right.z) * half.y + Abs(up.z) * half.z));
+}
+
+ROCKETGPU_HD ROCKETGPU_NOINLINE bool RespawnPlaceTaken(const Vec3& ground, int self, int env_idx, const SimConfig& cfg,
+                                                      const Team* teams, int count, uint32_t demoed, uint32_t due,
+                                                      CarSpanT cars, const CarConfig* car_configs,
+                                                      const uint8_t* respawn_slot_overrides, const Vec3& ball_pos) {
+    const int base = env_idx * cfg.max_cars_per_env;
+    const Vec3 spot(ground.x, ground.y, ground.z + 83.0f);
+    for (int j = 0; j < count && j < 32; ++j) {
+        if (j == self) continue;
+        Vec3 pos, fwd, right, up;
+        if (((demoed >> j) & 1u) == 0u) {
+            CarCRefT other = cars[base + j];
+            CarBasisColumns(other, fwd, right, up);
+            pos = other.pos_bt * 50.0f;
+        } else {
+            if (j > self || ((due >> j) & 1u) == 0u) continue;
+            const int code = cars[base + j].respawn_slot_override_plus1;
+            int s = -1;
+            int d = -1;
+            if (code >= kRespawnOffsetOverridePlus1 && code < kRespawnOffsetOverridePlus1 + 32) {
+                s = ((code - kRespawnOffsetOverridePlus1) >> 3) & 3;
+                d = (code - kRespawnOffsetOverridePlus1) & 7;
+            } else if (code != 0) {
+                if (code >= kKickoffSpawnOverridePlus1) continue;
+                s = code - 1;
+            } else if (respawn_slot_overrides != nullptr && respawn_slot_overrides[base + j] < 4u) {
+                s = respawn_slot_overrides[base + j];
+            } else {
+                continue;
+            }
+            float yaw;
+            RespawnPlace(teams[base + j], s, d, cfg.arena_rules, pos, yaw);
+            pos.z += car_configs ? car_configs[base + j].spawn_z : CarConfig{}.spawn_z;
+            const Quat q = FromYaw(WrapAngle(yaw));
+            fwd = Vec3(q.w * q.w - q.z * q.z, 2.0f * q.w * q.z, 0.0f);
+            right = Vec3(-fwd.y, fwd.x, 0.0f);
+            up = Vec3(0.0f, 0.0f, 1.0f);
+        }
+        const float* bounds = CarBodyMeshBounds(car_configs ? car_configs[base + j].body : kCarBodyOctane);
+        if (SpawnSpotNearCar(spot, pos, fwd, right, up, Vec3(bounds[0], bounds[1], bounds[2]),
+                             Vec3(bounds[3], bounds[4], bounds[5]))) {
+            return true;
+        }
+    }
+    const float ball_r = cfg.mutator.ball_radius;
+    return SpawnSpotNearBox(spot, ball_pos, Vec3(ball_r, ball_r, ball_r)) ||
+           SpawnSpotNearBox(spot, ball_pos, Vec3(34.0f, 34.0f, 78.0f));
+}
+
+ROCKETGPU_HD ROCKETGPU_NOINLINE void PickRespawnSpotsForEnv(int env_idx, const SimConfig& cfg, const Team* teams, int count,
+                                                           CarSpanT cars, const BallState& ball, const EnvState& env,
+                                                           uint64_t seed, const CarConfig* car_configs,
+                                                           const uint8_t* respawn_slot_overrides, uint32_t demoed,
+                                                           uint32_t due) {
+    const int base = env_idx * cfg.max_cars_per_env;
+    const Vec3 ball_pos = ball.pos_bt * 50.0f;
+    const uint32_t order = env.respawn_match_order != 0 ? env.respawn_match_order : BuildRespawnOrder(seed, env_idx);
+    for (int i = 0; i < count && i < 32; ++i) {
+        if (((due >> i) & 1u) == 0u) continue;
+        CarRefT car = cars[base + i];
+        if (car.respawn_slot_override_plus1 != 0) continue;
+        if (respawn_slot_overrides != nullptr && respawn_slot_overrides[base + i] != 0xFFu) continue;
+        const Team team = teams[base + i];
+        const int start = RespawnStartIndex(seed, env_idx, static_cast<uint64_t>(env.tick), static_cast<uint32_t>(base + i + 1));
+        const int flip = team == Team::Blue ? 0 : 2;
+        int spot = -1;
+        int dir = -1;
+        for (int k = 0; k < 36 && spot < 0; ++k) {
+            const int walk = k < 4 ? k : (k - 4) >> 3;
+            const int d = k < 4 ? -1 : (k - 4) & 7;
+            const int s = static_cast<int>((order >> (2 * ((start + walk) & 3))) & 3u) ^ flip;
+            Vec3 ground;
+            float yaw;
+            RespawnPlace(team, s, d, cfg.arena_rules, ground, yaw);
+            if (!RespawnPlaceTaken(ground, i, env_idx, cfg, teams, count, demoed, due, cars, car_configs,
+                                   respawn_slot_overrides, ball_pos)) {
+                spot = s;
+                dir = d;
+            }
+        }
+        if (spot < 0) spot = static_cast<int>((order >> (2 * (start & 3))) & 3u) ^ flip;
+        car.respawn_slot_override_plus1 =
+            static_cast<uint8_t>(dir < 0 ? spot + 1 : kRespawnOffsetOverridePlus1 + 8 * spot + dir);
+    }
+}
+
 ROCKETGPU_HD void StepEnvPreTickEnvState(
     int env_idx,
     const SimConfig& cfg,
     int32_t* env_car_count,
     CarSpanT cars,
     BallState* balls,
-    EnvState* env_states) {
+    EnvState* env_states,
+    const Team* teams = nullptr,
+    uint64_t seed = 0,
+    const CarConfig* car_configs = nullptr,
+    const uint8_t* respawn_slot_overrides = nullptr) {
     EnvState& env = env_states[env_idx];
     const float frame_start_dt = FrameStartDt(cfg, env_idx);
     if (cfg.mutator.countdown_on_frame_start && frame_start_dt >= 0.0f) {
@@ -6404,6 +6660,29 @@ ROCKETGPU_HD void StepEnvPreTickEnvState(
                               frame_start_dt);
     }
     UpdateGameCarVisitOrder(env, cars + env_idx * cfg.max_cars_per_env, env_car_count[env_idx]);
+    if (teams != nullptr) {
+        const int count = env_car_count[env_idx];
+        uint32_t demoed = 0;
+        if (env.car_visit_order_mode == 3 && count <= 8) {
+            demoed = ~static_cast<uint32_t>(env.car_visit_present_mask) & ((1u << count) - 1u);
+        } else {
+            const int base = env_idx * cfg.max_cars_per_env;
+            for (int i = 0; i < count && i < 32; ++i) demoed |= static_cast<uint32_t>(cars[base + i].is_demoed != 0) << i;
+        }
+        if (demoed != 0) {
+            const int base = env_idx * cfg.max_cars_per_env;
+            uint32_t due = 0;
+            for (int i = 0; i < count && i < 32; ++i) {
+                if (((demoed >> i) & 1u) != 0u && !(Max(0.0f, cars[base + i].demo_respawn_timer - cfg.tick_dt) > 0.0f)) {
+                    due |= 1u << i;
+                }
+            }
+            if (due != 0) {
+                PickRespawnSpotsForEnv(env_idx, cfg, teams, count, cars, balls[env_idx], env, seed, car_configs,
+                                       respawn_slot_overrides, demoed, due);
+            }
+        }
+    }
     if (cfg.mutator.physics_events.windows) {
         cfg.mutator.physics_events.windows[env_idx].tick = static_cast<uint64_t>(env.tick);
     }
@@ -6423,7 +6702,9 @@ ROCKETGPU_HD void StepEnvPreTickEnv(
     BoostPadState* pads,
     const EnvCommand& command,
     const int* kickoff_order_override,
-    const CarConfig* car_configs = nullptr) {
+    const CarConfig* car_configs = nullptr,
+    uint64_t seed = 0,
+    const uint8_t* respawn_slot_overrides = nullptr) {
     if (solver_scratch) {
         ApplyEnvCommandBodies(
             solver_scratch[env_idx], command, env_car_count[env_idx], cars + env_idx * cfg.max_cars_per_env);
@@ -6442,7 +6723,8 @@ ROCKETGPU_HD void StepEnvPreTickEnv(
         nullptr,
         kickoff_order_override,
         car_configs);
-    StepEnvPreTickEnvState(env_idx, cfg, env_car_count, cars, balls, env_states);
+    StepEnvPreTickEnvState(env_idx, cfg, env_car_count, cars, balls, env_states, teams, seed, car_configs,
+                           respawn_slot_overrides);
     if (solver_scratch && command.reset_to_kickoff) {
         for (int manifold_idx = 0; manifold_idx < kMaxBallWorldMeshPersistentManifolds; ++manifold_idx) {
             ResetBallMeshPersistentManifold(solver_scratch[env_idx].ball_world_mesh_manifolds[manifold_idx]);
@@ -6484,7 +6766,13 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE bool StepEnvPreTickCarStart(
         if (car.demo_respawn_timer <= 0.0f) {
             const uint32_t car_id = static_cast<uint32_t>(base + i + 1);
             int respawn_slot = -1;
-            if (car.respawn_slot_override_plus1 != 0) {
+            int offset_dir = -1;
+            if (car.respawn_slot_override_plus1 >= kRespawnOffsetOverridePlus1 &&
+                car.respawn_slot_override_plus1 < kRespawnOffsetOverridePlus1 + 32) {
+                offset_dir = (car.respawn_slot_override_plus1 - kRespawnOffsetOverridePlus1) & 7;
+                respawn_slot = ((car.respawn_slot_override_plus1 - kRespawnOffsetOverridePlus1) >> 3) & 3;
+                car.respawn_slot_override_plus1 = 0;
+            } else if (car.respawn_slot_override_plus1 != 0) {
                 respawn_slot = car.respawn_slot_override_plus1 - 1;
                 car.respawn_slot_override_plus1 = 0;
             } else if (respawn_slot_overrides) {
@@ -6494,9 +6782,11 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE bool StepEnvPreTickCarStart(
                 }
             }
             if (respawn_slot < 0) {
-                respawn_slot = PickRespawnSlot(seed, env_idx, static_cast<uint64_t>(env.tick), car_id);
+                respawn_slot = RespawnStartIndex(seed, env_idx, static_cast<uint64_t>(env.tick), car_id);
             }
-            if (respawn_slot >= kKickoffSpawnOverridePlus1 - 1) {
+            if (offset_dir >= 0) {
+                RespawnCar(car, teams[base + i], respawn_slot, cfg.mutator, car_cfg.spawn_z, cfg.arena_rules, offset_dir);
+            } else if (respawn_slot >= kKickoffSpawnOverridePlus1 - 1) {
                 KickoffSpawnCar(car, teams[base + i], respawn_slot - (kKickoffSpawnOverridePlus1 - 1), cfg.mutator,
                                 car_cfg.spawn_z, cfg.arena_rules);
             } else {
@@ -6655,7 +6945,7 @@ ROCKETGPU_HD ROCKETGPU_NOINLINE void ScoreArenaRulesGoals(const ArenaRules& rule
             const Team scorer = t == 0 ? Team::Orange : Team::Blue;
             env.last_scored_team = static_cast<int32_t>(scorer);
             env.goal_scored_this_tick = 1;
-            (scorer == Team::Blue ? env.blue_score : env.orange_score) += 1;
+            if (!env.goal_latched) (scorer == Team::Blue ? env.blue_score : env.orange_score) += 1;
             return;
         }
     }
@@ -6665,7 +6955,7 @@ ROCKETGPU_HD void StepEnvTail(
     int env_idx, int count, const SimConfig& cfg, CarSpanT cars, const CarConfig* car_configs, BallState& ball,
     EnvState& env, BoostPadState* pads, bool pads_post, bool car_pad_checks = true
 #if !defined(ROCKETGPU_USE_CUDA)
-    , BoostPadTickMasks* pad_masks = nullptr, BoostPadBudget* pad_budgets = nullptr
+    , BoostPadTickMasks* pad_masks = nullptr, BoostPadBudget* pad_budgets = nullptr, const int16_t* car_order = nullptr
 #else
     , uint64_t post_pads = ~uint64_t{0}
 #endif
@@ -6673,7 +6963,7 @@ ROCKETGPU_HD void StepEnvTail(
     if (car_pad_checks) {
         BoostPadTouchPassForEnv(env_idx, count, cfg, cars, car_configs, env, pads
 #if !defined(ROCKETGPU_USE_CUDA)
-                                , pad_masks, pad_budgets
+                                , pad_masks, pad_budgets, car_order
 #endif
         );
     }
@@ -6709,13 +6999,14 @@ ROCKETGPU_HD void StepEnvTail(
         if (ball.pos.y >= score_threshold) {
             env.last_scored_team = static_cast<int32_t>(Team::Blue);
             env.goal_scored_this_tick = 1;
-            env.blue_score += 1;
+            if (!env.goal_latched) env.blue_score += 1;
         } else if (ball.pos.y <= -score_threshold) {
             env.last_scored_team = static_cast<int32_t>(Team::Orange);
             env.goal_scored_this_tick = 1;
-            env.orange_score += 1;
+            if (!env.goal_latched) env.orange_score += 1;
         }
     }
+    if (cfg.enable_scoring) env.goal_latched = env.goal_scored_this_tick;
 
     if (env.goal_scored_this_tick && cfg.mutator.physics_events.windows) {
         PhysicsEvent event;
@@ -6786,9 +7077,11 @@ ROCKETGPU_HD ROCKETGPU_WORLD_STEP_INLINE void StepEnvGeneric(
             if (env_command_accessor.has_commands()) {
                 const EnvCommand command = env_command_accessor.get(tick_idx);
                 StepEnvPreTickEnv(env_idx, cfg, teams, env_car_count, cars, solver_scratch, controls_for_reset, balls,
-                                  env_states, pads, command, kickoff_order_override, car_configs);
+                                  env_states, pads, command, kickoff_order_override, car_configs, seed,
+                                  respawn_slot_overrides);
             } else {
-                StepEnvPreTickEnvState(env_idx, cfg, env_car_count, cars, balls, env_states);
+                StepEnvPreTickEnvState(env_idx, cfg, env_car_count, cars, balls, env_states, teams, seed, car_configs,
+                                       respawn_slot_overrides);
             }
             const int pre_count = env_car_count[env_idx];
             for (int k = 0; k < pre_count; ++k) {

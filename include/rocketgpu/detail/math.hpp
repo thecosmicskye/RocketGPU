@@ -1169,7 +1169,7 @@ ROCKETGPU_HD float GameQuatQuantizeComponent(float c) {
     return (r + r) * 0.707106769f;
 }
 
-ROCKETGPU_HD Quat GameRbStateQuantizeQuat(const Quat& q_in) {
+ROCKETGPU_HD ROCKETGPU_HOST_INLINE Quat GameRbStateQuantizeQuat(const Quat& q_in) {
     const Quat q = GameQuatNormalizeScalar(q_in, 1e-8f);
     const float a0 = fabsf(q.x), a1 = fabsf(q.y), a2 = fabsf(q.z), a3 = fabsf(q.w);
     const int i01 = a0 < a1 ? 1 : 0;
@@ -1193,7 +1193,7 @@ ROCKETGPU_HD Quat GameRbStateQuantizeQuat(const Quat& q_in) {
     return GameQuatNormalizeScalar(Quat(ow, ox, oy, oz), 1e-8f);
 }
 
-ROCKETGPU_HD Quat GameQuantizeBasisColumns(Vec3& fwd, Vec3& right, Vec3& up) {
+ROCKETGPU_HD ROCKETGPU_HOST_INLINE Quat GameQuantizeBasisColumns(Vec3& fwd, Vec3& right, Vec3& up) {
     const Quat q = GameRbStateQuantizeQuat(GameGetRotationScalar(fwd, right, up));
     GameSetRotationScalarColumns(q, fwd, right, up);
     return q;
@@ -1226,6 +1226,122 @@ ROCKETGPU_HD void GameIntegrateOrientationBasisColumns(
     q_mirror = GameQuatNormalizeScalar(p, -1.0f);
     GameSetRotationScalarColumns(q_mirror, fwd, right, up);
 }
+#if defined(ROCKETGPU_HOST_LANES)
+
+struct GameIntegrateLane {
+    Quat o;
+    Vec3 w;
+    Vec3* fwd;
+    Vec3* right;
+    Vec3* up;
+    Quat* q;
+};
+
+inline void RocketGpuUcrtSinCos4(lanes::F4 x, lanes::F4 y, lanes::F4& sin_x, lanes::F4& cos_y) {
+    using namespace lanes;
+    typedef double D4 __attribute__((vector_size(32)));
+    const auto fma4 = [](D4 a, D4 b, D4 c) {
+#if defined(__clang__)
+        return __builtin_elementwise_fma(a, b, c);
+#else
+        return D4{fma(a[0], b[0], c[0]), fma(a[1], b[1], c[1]), fma(a[2], b[2], c[2]), fma(a[3], b[3], c[3])};
+#endif
+    };
+    const auto splat_d = [](double v) { return D4{v, v, v, v}; };
+    const I4 abs_mask = I4{0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
+    const I4 tiny = I4{0x39000000, 0x39000000, 0x39000000, 0x39000000};
+    const I4 small = I4{0x3c000000, 0x3c000000, 0x3c000000, 0x3c000000};
+    const D4 hd = __builtin_convertvector(x, D4);
+    const D4 hd2 = hd * hd;
+    D4 sp = fma4(hd2, splat_d(0x1.71de3a556c734p-19), splat_d(-0x1.a01a01a01a01ap-13));
+    sp = fma4(sp, hd2, splat_d(0x1.1111111111111p-7));
+    sp = fma4(sp, hd2, splat_d(-0x1.5555555555555p-3));
+    sp = fma4(sp, hd * hd2, hd);
+    const D4 s1 = fma4(-((hd * hd) * hd), splat_d(0x1.5555555555555p-3), hd);
+    const I4 hb = reinterpret_cast<I4>(x) & abs_mask;
+    sin_x = Select(hb < tiny, x, Select(hb < small, __builtin_convertvector(s1, F4), __builtin_convertvector(sp, F4)));
+    const D4 cd = __builtin_convertvector(y, D4);
+    const D4 cd2 = cd * cd;
+    const D4 cbase = splat_d(1.0) - cd2 * splat_d(0.5);
+    D4 cp = fma4(cd2, splat_d(-0x1.27e4fb7789f5cp-22), splat_d(0x1.a01a01a01a019p-16));
+    cp = fma4(cp, cd2, splat_d(-0x1.6c16c16c16c16p-10));
+    cp = fma4(cp, cd2, splat_d(0x1.5555555555555p-5));
+    cp = fma4(cp, cd2 * cd2, cbase);
+    const D4 c1 = fma4(-(cd * splat_d(0.5)), cd, splat_d(1.0));
+    const I4 cb = reinterpret_cast<I4>(y) & abs_mask;
+    cos_y = Select(cb < tiny, Splat(1.0f), Select(cb < small, __builtin_convertvector(c1, F4), __builtin_convertvector(cp, F4)));
+}
+
+inline uint32_t GameIntegrateOrientationBasisColumns4(int n, const GameIntegrateLane* in, float dt) {
+    using namespace lanes;
+    constexpr float kAngularMotionThreshold = 0.5f * Pi() * 0.5f;
+    const auto sqrt4 = [](F4 v) {
+#if defined(__clang__)
+        return __builtin_elementwise_sqrt(v);
+#else
+        return F4{sqrtf(v[0]), sqrtf(v[1]), sqrtf(v[2]), sqrtf(v[3])};
+#endif
+    };
+    F4 wx = Splat(0.0f), wy = Splat(0.0f), wz = Splat(0.0f);
+    F4 ow = Splat(1.0f), ox = Splat(0.0f), oy = Splat(0.0f), oz = Splat(0.0f);
+    for (int k = 0; k < n; ++k) {
+        wx[k] = in[k].w.x;
+        wy[k] = in[k].w.y;
+        wz[k] = in[k].w.z;
+        ow[k] = in[k].o.w;
+        ox[k] = in[k].o.x;
+        oy[k] = in[k].o.y;
+        oz[k] = in[k].o.z;
+    }
+    const F4 dt4 = Splat(dt);
+    F4 angle = sqrt4((wx * wx + wy * wy) + wz * wz);
+    angle = Select(angle * dt4 > Splat(kAngularMotionThreshold), Splat(kAngularMotionThreshold / dt), angle);
+    const F4 half = (angle * Splat(0.5f)) * dt4;
+    const F4 carg = (angle * dt4) * Splat(0.5f);
+    const I4 poly_limit = I4{0x3f490fdb, 0x3f490fdb, 0x3f490fdb, 0x3f490fdb};
+    const I4 abs_mask = I4{0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
+    const I4 bad = ((reinterpret_cast<I4>(half) & abs_mask) > poly_limit) | ((reinterpret_cast<I4>(carg) & abs_mask) > poly_limit);
+    F4 sine, c;
+    RocketGpuUcrtSinCos4(half, carg, sine, c);
+    const F4 f_small = Splat(dt * 0.5f) - ((Splat(((dt * dt) * dt) * 0.020833333333f) * angle) * angle);
+    const F4 f = Select(angle < Splat(0.001f), f_small, sine / angle);
+    const F4 ax = wx * f, ay = wy * f, az = wz * f;
+    const F4 pw = ((c * ow - ax * ox) - ay * oy) - az * oz;
+    const F4 px = ((ax * ow + c * ox) + ay * oz) - az * oy;
+    const F4 py = ((c * oy + ay * ow) + az * ox) - ax * oz;
+    const F4 pz = ((c * oz + az * ow) + ax * oy) - ay * ox;
+    const F4 len_sq = ((px * px + py * py) + pz * pz) + pw * pw;
+    const I4 ok = len_sq > Splat(-1.0f);
+    const F4 inv = Splat(1.0f) / sqrt4(len_sq);
+    const F4 qw = Select(ok, pw * inv, Splat(1.0f)), qx = Select(ok, px * inv, Splat(0.0f));
+    const F4 qy = Select(ok, py * inv, Splat(0.0f)), qz = Select(ok, pz * inv, Splat(0.0f));
+    const F4 d = ((qx * qx + qy * qy) + qz * qz) + qw * qw;
+    const F4 s = Splat(2.0f) / d;
+    const F4 xs = qx * s, ys = qy * s, zs = qz * s;
+    const F4 wxs = qw * xs, wys = qw * ys, wzs = qw * zs;
+    const F4 xx = qx * xs, xy = qx * ys, xz = qx * zs;
+    const F4 yy = qy * ys, yz = qy * zs, zz = qz * zs;
+    const F4 one = Splat(1.0f);
+    const F4 f0 = one - (yy + zz), f1 = xy + wzs, f2 = xz - wys;
+    const F4 r0 = xy - wzs, r1 = one - (xx + zz), r2 = yz + wxs;
+    const F4 u0 = xz + wys, u1 = yz - wxs, u2 = one - (xx + yy);
+    uint32_t left = 0u;
+    for (int k = 0; k < n; ++k) {
+        if (bad[k] != 0) {
+            left |= 1u << k;
+            continue;
+        }
+        *in[k].fwd = Vec3(f0[k], f1[k], f2[k]);
+        *in[k].right = Vec3(r0[k], r1[k], r2[k]);
+        *in[k].up = Vec3(u0[k], u1[k], u2[k]);
+        if (in[k].q != nullptr) {
+            *in[k].q = Quat(qw[k], qx[k], qy[k], qz[k]);
+        }
+    }
+    return left;
+}
+
+#endif
 
 ROCKETGPU_HD bool IntegrateOrientationBasisColumns(
     Vec3& fwd, Vec3& right, Vec3& up, Quat& q_mirror, const Vec3& ang_vel_world, float dt, bool native_sse_math = false) {

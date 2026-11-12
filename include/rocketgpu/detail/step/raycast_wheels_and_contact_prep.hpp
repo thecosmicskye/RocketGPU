@@ -519,7 +519,7 @@ ROCKETGPU_HD uint32_t WheelRayExcludedBodies(CarCRefT car, const CarConfig& cfg,
         }
         return 0u;
     }
-#if !defined(__CUDA_ARCH__)
+#if !defined(__CUDA_ARCH__) && (defined(__GNUC__) || defined(__clang__))
     if (wheel_out == nullptr) {
         const float reach = cached_reach_bt != nullptr ? *cached_reach_bt : WheelRayReachBt(cfg);
         const Vec3 p = car.pos_bt;
@@ -914,6 +914,20 @@ ROCKETGPU_HD Vec3 GetUpwardsDirFromWheelContacts(const WheelStepState* wheels) {
 
 ROCKETGPU_HD float QuantTruncOffsetV3(float x, float scale);
 
+#if defined(ROCKETGPU_HOST_LANES)
+inline lanes::F4 QuantTruncOffsetV3Lanes(lanes::F4 x, float scale) {
+    using lanes::F4;
+    using lanes::Splat;
+    const float inv_scale = 1.0f / scale;
+    const F4 k = __builtin_convertvector(__builtin_convertvector(x * Splat(scale), lanes::I4), F4);
+    const F4 rounded = k * Splat(inv_scale);
+    const float offset_mag = 0.1f * inv_scale;
+    const F4 sgn = lanes::Select(rounded == Splat(0.0f), Splat(0.0f),
+                                 lanes::Select(rounded > Splat(0.0f), Splat(1.0f), Splat(-1.0f)));
+    return rounded + sgn * Splat(offset_mag);
+}
+#endif
+
 struct CarRbSnapshot {
     Quat rot;
     Vec3 vel_uu;
@@ -928,6 +942,18 @@ ROCKETGPU_HD CarRbSnapshot FreshCarRbSnapshot(CarCRefT car, const CarFrame* fram
     Vec3 car_right(0.0f, 1.0f, 0.0f);
     Vec3 car_up(0.0f, 0.0f, 1.0f);
     CarBasisColumns(frame, car, car_forward, car_right, car_up);
+#if defined(ROCKETGPU_HOST_LANES)
+    using lanes::F4;
+    using lanes::Splat;
+    F4 v = lanes::Load(car.vel_bt) * Splat(50.0f);
+    const F4 v2 = v * v;
+    const float len2 = (v2[1] + v2[0]) + v2[2];
+    if (max_speed > 0.0f && max_speed * max_speed < len2) {
+        const float inv = 1.0f / sqrtf(len2);
+        v = Splat(max_speed) * (Splat(inv) * v);
+    }
+    const Vec3 snap_vel = lanes::ToVec3(QuantTruncOffsetV3Lanes(v, 100.0f));
+#else
     Vec3 v = car.vel_bt * 50.0f;
     const float len2 = (v.y * v.y + v.x * v.x) + v.z * v.z;
     if (max_speed > 0.0f && max_speed * max_speed < len2) {
@@ -935,6 +961,7 @@ ROCKETGPU_HD CarRbSnapshot FreshCarRbSnapshot(CarCRefT car, const CarFrame* fram
         v = Vec3(max_speed * (inv * v.x), max_speed * (inv * v.y), max_speed * (inv * v.z));
     }
     const Vec3 snap_vel(QuantTruncOffsetV3(v.x, 100.0f), QuantTruncOffsetV3(v.y, 100.0f), QuantTruncOffsetV3(v.z, 100.0f));
+#endif
 #if !defined(ROCKETGPU_USE_CUDA)
     if (frame != nullptr && frame->rb_snap != nullptr && frame->rb_snap->valid) {
         const CarRbSnapMemo& m = *frame->rb_snap;
@@ -961,6 +988,20 @@ ROCKETGPU_HD CarRbSnapshot FreshCarRbSnapshot(CarCRefT car, const CarFrame* fram
 
 ROCKETGPU_HD float SnapshotForwardSpeed(const CarRbSnapshot& snapshot) {
     const Quat& q = snapshot.rot;
+#if defined(ROCKETGPU_HOST_LANES)
+    using lanes::F4;
+    using lanes::Splat;
+    const float w2_l = q.w + q.w;
+    const float s_l = q.w * q.w - ((q.y * q.y + q.x * q.x) + q.z * q.z);
+    float d_l = (1.0f * q.x + 0.0f * q.y) + 0.0f * q.z;
+    d_l = d_l + d_l;
+    const F4 qv{q.x, q.y, q.z, 0.0f};
+    const F4 q_yzx = lanes::Turn<1, 2, 0>(qv), q_zxy = lanes::Turn<2, 0, 1>(qv);
+    const F4 a = F4{0.0f, 1.0f, 0.0f, 0.0f} * q_yzx - F4{0.0f, 0.0f, 1.0f, 0.0f} * q_zxy;
+    const F4 fwd_l = (a * Splat(w2_l) + Splat(s_l) * F4{1.0f, 0.0f, 0.0f, 0.0f}) + Splat(d_l) * qv;
+    const F4 p = fwd_l * lanes::Load(snapshot.vel_uu);
+    return (p[0] + p[1]) + p[2];
+#else
     const float w2 = q.w + q.w;
     const float s = q.w * q.w - ((q.y * q.y + q.x * q.x) + q.z * q.z);
     float d = (1.0f * q.x + 0.0f * q.y) + 0.0f * q.z;
@@ -970,6 +1011,7 @@ ROCKETGPU_HD float SnapshotForwardSpeed(const CarRbSnapshot& snapshot) {
                    ((0.0f * q.x - 1.0f * q.y) * w2 + s * 0.0f) + d * q.z);
     const Vec3& v = snapshot.vel_uu;
     return (fwd.x * v.x + fwd.y * v.y) + fwd.z * v.z;
+#endif
 }
 
 ROCKETGPU_HD float WheelForwardSpeed(CarCRefT car) {
@@ -2443,7 +2485,7 @@ __attribute__((always_inline)) inline bool WheelRaysFloorOnlyHostX4(
 }
 #endif
 
-__attribute__((always_inline)) inline bool WheelRaysFloorOnlyHost(
+ROCKETGPU_ALWAYS_INLINE inline bool WheelRaysFloorOnlyHost(
     CarCRefT car, const CarConfig& cfg, const MutatorConfig& mutator, WheelStepState* wheels,
     float cal_front_scale, float cal_back_scale, float cal_min_hit_dist_sq_bt, WheelRuntimeState* wheel_runtime_state,
     const ArenaMeshTriangle* mesh_triangles, int32_t mesh_triangle_count, int32_t cars_in_env_count,

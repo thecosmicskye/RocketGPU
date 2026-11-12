@@ -30,6 +30,7 @@
 #include "rocketgpu/detail/bullet_gjk_epa2_port.hpp"
 #include "rocketgpu/detail/respawn_rng.hpp"
 #include "rocketgpu/detail/native_sse_normalization.hpp"
+#include "rocketgpu/detail/car_body_bounds.inc"
 
 namespace rocketgpu {
 namespace detail {

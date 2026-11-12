@@ -56,7 +56,8 @@ void LaunchApplyEnvCommands(
 void LaunchCanonicalizeImportedCars(
     CarSpanT cars,
     int32_t count,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    bool placed = false);
 
 void LaunchCanonicalizeImportedBalls(
     BallState* balls,

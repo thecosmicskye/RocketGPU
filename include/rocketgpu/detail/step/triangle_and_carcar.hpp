@@ -2818,6 +2818,15 @@ ROCKETGPU_HD bool InForwardCone(
     return InForwardConePose(a.pos, a.rot, a_cfg, v.pos, v.rot, v_cfg, reverse, max_yaw_deg);
 }
 
+ROCKETGPU_HD void RecordCarHit(CarRefT hitter, uint32_t hitter_id, uint32_t victim_id, bool is_demo) {
+    const uint32_t k = ((victim_id - hitter_id) & 7u) - 1u;
+    if (is_demo) {
+        hitter.bump_event_demos[k] = static_cast<uint8_t>(hitter.bump_event_demos[k] + 1u);
+    } else {
+        hitter.bump_event_bumps[k] = static_cast<uint8_t>(hitter.bump_event_bumps[k] + 1u);
+    }
+}
+
 ROCKETGPU_HD bool BumpCone(
     CarRefT hitter, uint32_t hitter_id, Team hitter_team, const CarConfig& hitter_cfg, const Vec3& hitter_start_vel,
     CarRefT victim, uint32_t victim_id, Team victim_team, const CarConfig& victim_cfg,
@@ -2871,14 +2880,7 @@ ROCKETGPU_HD bool BumpCone(
     hitter.car_contact.other_car_id = victim_id;
     hitter.car_contact.cooldown_timer = mutator.bump_cooldown_time + tick_dt * 0.5f;
     if (is_demo || bumper) {
-        hitter.bump_event_tick = hitter.tick_count_since_update;
-        hitter.bump_event_other_id = victim_id;
-        hitter.bump_event_is_demo = is_demo ? 1 : 0;
-        hitter.bump_event_was_bumper = 1;
-        victim.bump_event_tick = victim.tick_count_since_update;
-        victim.bump_event_other_id = hitter_id;
-        victim.bump_event_is_demo = is_demo ? 1 : 0;
-        victim.bump_event_was_bumper = 0;
+        RecordCarHit(hitter, hitter_id, victim_id, is_demo);
         if (mutator.physics_events.windows) {
             PhysicsEvent event;
             event.type = PhysicsEventType::CarBump;
@@ -2948,14 +2950,7 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool ResolveCarCarDirectionalCo
             }
             if (cal_is_demo) {
                 DemolishCar(victim, mutator);
-                hitter.bump_event_tick = hitter.tick_count_since_update;
-                hitter.bump_event_other_id = victim_id;
-                hitter.bump_event_is_demo = 1;
-                hitter.bump_event_was_bumper = 1;
-                victim.bump_event_tick = victim.tick_count_since_update;
-                victim.bump_event_other_id = hitter_id;
-                victim.bump_event_is_demo = 1;
-                victim.bump_event_was_bumper = 0;
+                RecordCarHit(hitter, hitter_id, victim_id, true);
                 if (mutator.physics_events.windows) {
                     PhysicsEvent event;
                     event.type = PhysicsEventType::CarBump;
@@ -3002,14 +2997,7 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool ResolveCarCarDirectionalCo
         }
         if (cal_is_demo) {
             DemolishCar(victim, mutator);
-            hitter.bump_event_tick = hitter.tick_count_since_update;
-            hitter.bump_event_other_id = victim_id;
-            hitter.bump_event_is_demo = 1;
-            hitter.bump_event_was_bumper = 1;
-            victim.bump_event_tick = victim.tick_count_since_update;
-            victim.bump_event_other_id = hitter_id;
-            victim.bump_event_is_demo = 1;
-            victim.bump_event_was_bumper = 0;
+            RecordCarHit(hitter, hitter_id, victim_id, true);
             if (mutator.physics_events.windows) {
                 PhysicsEvent event;
                 event.type = PhysicsEventType::CarBump;
@@ -3086,14 +3074,7 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool ResolveCarCarDirectionalCo
     hitter.car_contact.other_car_id = victim_id;
     hitter.car_contact.cooldown_timer = mutator.bump_cooldown_time;
 
-    hitter.bump_event_tick = hitter.tick_count_since_update;
-    hitter.bump_event_other_id = victim_id;
-    hitter.bump_event_is_demo = is_demo ? 1 : 0;
-    hitter.bump_event_was_bumper = 1;
-    victim.bump_event_tick = victim.tick_count_since_update;
-    victim.bump_event_other_id = hitter_id;
-    victim.bump_event_is_demo = is_demo ? 1 : 0;
-    victim.bump_event_was_bumper = 0;
+    RecordCarHit(hitter, hitter_id, victim_id, is_demo);
     if (mutator.physics_events.windows) {
         PhysicsEvent event;
         event.type = PhysicsEventType::CarBump;

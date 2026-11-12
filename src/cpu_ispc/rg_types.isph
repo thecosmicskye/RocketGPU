@@ -99,10 +99,8 @@ struct CarState {
     Vec3 solve_delta_linear_bt;
     Vec3 vel_impulse_cache_bt;
     Vec3 solve_delta_angular;
-    uint64 bump_event_tick;
-    uint32 bump_event_other_id;
-    uint8 bump_event_is_demo;
-    uint8 bump_event_was_bumper;
+    uint8 bump_event_bumps[7];
+    uint8 bump_event_demos[7];
     uint8 boost_pad_touching;
     uint8 bump_event_reserved1;
     uint64 previous_ball_contact_start;
@@ -209,6 +207,7 @@ struct CarConfig {
     float back_suspension_rest;
     float dodge_deadzone;
     uint8 three_wheels;
+    uint16 body;
     float steer_angle_curve_deg[6];
     float powerslide_steer_angle_curve_deg[2];
     float spawn_z;
@@ -228,6 +227,10 @@ struct EnvState {
     uint16 frame_ticks;
     float countdown_count;
     float frame_frac_prev;
+    uint16 kickoff_match_order;
+    uint8 kickoff_match_index;
+    uint8 goal_latched;
+    uint8 respawn_match_order;
 };
 struct WheelRuntimeState {
     int32 event_world_ids[4];
