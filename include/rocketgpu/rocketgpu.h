@@ -187,8 +187,8 @@ struct BallHitInfo {
 struct CarState {
     Vec3 pos = Vec3(0.0f, 0.0f, 17.0f);
     Quat rot = Quat(1.0f, 0.0f, 0.0f, 0.0f);
-    // Fields RLBot exposes hold RLBot's value for the tick (see internal_* at the end for the step's own values):
-    // vel and ang_vel after the 2300 uu/s and 5.5 rad/s caps.
+    // The game's own values after the tick; RLBot v5's are in rocketgpu/rlbotv5.h.
+    // vel and ang_vel are the body's: the game applies the 2300 uu/s and 5.5 rad/s caps when the next tick starts.
     Vec3 vel = Vec3(0.0f, 0.0f, 0.0f);
     Vec3 ang_vel = Vec3(0.0f, 0.0f, 0.0f);
 
@@ -203,13 +203,17 @@ struct CarState {
     float flip_time = 0.0f;
     float air_time = 0.0f;  // Total time in the air; 0 on the ground.
     float air_time_since_jump = 0.0f;  // Time in the air since the jump ended; 0 on the ground or without a jump.
-    float boost = 100.0f;
+    float boost = 100.0f;  // boost_amount times 100.
     float time_since_boosted = 0.0f;  // Seconds since boost was last applied.
     float boosting_time = 0.0f;  // Seconds of the current boost streak; 0 when not boosting.
     float supersonic_time = 0.0f;  // v3 supersonic_grace_timer: time below start speed while still supersonic.
     float handbrake_val = 0.0f;  // Smoothed handbrake, 0..1.
     float auto_flip_timer = 0.0f;  // Seconds left in auto-flip recovery.
-    float auto_flip_torque_scale = 0.0f;  // Roll direction sign of the auto-flip, +1 or -1.
+    // The game's own boost amount, 0..1, which the step counts in: boost is this times 100. A boost written as
+    // anything else replaces it when the next step starts.
+    float boost_amount = 1.0f;
+    // Seconds until a demolished car is simulated again. A demolition sets MutatorConfig.demo_respawn_time plus one
+    // tick: the game creates the new car when that time is up and simulates it from the next tick.
     float demo_respawn_timer = 0.0f;
     // Ticks since the last state set. Set it to 0 whenever you write a state: the next step then rebuilds
     // RocketGPU's internal clocks (internal_* below) from jump_time, flip_time and the flags.
@@ -247,16 +251,16 @@ struct CarState {
 
     uint8_t is_on_ground = 1;
     uint8_t wheels_with_contact[4] = {1,1,1,1};
-    // RLBot: has_jumped clears on a tick air_state reads OnGround more than 0.05 s after the jump started (it stays
-    // clear if the car then leaves the ground); has_double_jumped and has_flipped clear on the tick air_state reads
-    // OnGround.
+    // The game's flags as the next tick finds them. has_jumped is also set by a double jump or dodge with no jump
+    // before it, and stays set on the ground for 0.125 s after the jump ended. has_double_jumped and has_flipped are
+    // the game's one double-jump flag, split by which of the two the car did. RLBot's flags: rocketgpu/rlbotv5.h.
     uint8_t has_jumped = 0;
     uint8_t has_double_jumped = 0;
     uint8_t has_flipped = 0;
     uint8_t is_flipping = 0;
     uint8_t is_jumping = 0;
     uint8_t is_boosting = 0;
-    uint8_t is_supersonic = 0;  // RLBot: |vel| >= 2200 on this tick. The game's flag, held by supersonic_time, is internal.
+    uint8_t is_supersonic = 0;  // Set at the start of a tick from its speed: on at 2200 uu/s, held through supersonic_time.
     uint8_t is_auto_flipping = 0;
     uint8_t is_demoed = 0;
     uint8_t just_respawned = 0;
@@ -265,6 +269,9 @@ struct CarState {
     // The respawn slot (0-3) plus one that this car's next demo respawn takes instead of the RNG's pick; 0: none.
     // 5-9: the spawn is a kickoff re-creation at kickoff spot 0-4 (kKickoffSpawnOverridePlus1). Consumed by that spawn.
     uint8_t respawn_slot_override_plus1 = 0;
+    // For RlbotV5Boost: RLBot shows the boost of a pad that came back under the car one tick late. On the tick such a
+    // pad gives the car its boost: 1 + the car's whole-number boost before it; every other tick 0.
+    uint8_t rlbotv5_boost_hold = 0;
 
     struct {
         uint8_t has_contact = 0;
@@ -330,7 +337,7 @@ struct CarState {
     float internal_flip_time = 0.0f;
     uint8_t flip_timer_live = 0;
 
-    // RLBot v5 car fields, reported after every tick (not read by the step).
+    // RLBot v5 values for rocketgpu/rlbotv5.h, reported after every tick (not read by the step).
     uint8_t air_state = 0;  // RLBot AirState: 0 OnGround, 1 Jumping, 2 DoubleJumping (13 ticks), 3 Dodging, 4 InAir.
     // Ticks left with the game's Car_TA bDriving off (the round's countdown; 0 = driving), counted down after each
     // tick. Not driving: no engine, brake (not even the coast brake), handbrake, wheel steer, jump, boost or air
@@ -339,7 +346,7 @@ struct CarState {
     // Seconds left to dodge after the jump: 1.25 minus the time since the jump ended (the release tick counts one tick).
     // -1 on the ground, while jumping, after a double jump or dodge, without has_jumped, or once it runs out.
     float dodge_timeout = -1.0f;
-    float dodge_elapsed = 0.0f;  // Seconds since the dodge started, while has_flipped (not OnGround); else 0.
+    float dodge_elapsed = 0.0f;  // Seconds since the dodge started, while rlbotv5_dodged; else 0.
     float dodge_dir_x = 0.0f;  // Direction of the last dodge: (flip_rel_torque.y, -flip_rel_torque.x).
     float dodge_dir_y = 0.0f;
     // Latest ball touch: the tick a ball contact started, the car-side contact point, and the unit normal from the
@@ -359,9 +366,12 @@ struct CarState {
     uint8_t reported_flags = 0;
     uint8_t game_has_jumped = 0;
     uint8_t double_jump_ticks = 255;
-    // v3's jump_hold_broken (car/base.rs update_jump): the jump's hold was released; set only while jumping.
+    // v3's jump_hold_broken (car/base.rs update_jump): the jump's hold was released; cleared when the next jump starts.
     uint8_t jump_hold_broken = 0;
     uint8_t supersonic_set_v3 = 0;
+    // RLBot's has_dodged (RlbotV5HasDodged): set when a dodge starts, kept until air_state reads OnGround, also through
+    // a landing that goes straight into a jump.
+    uint8_t rlbotv5_dodged = 0;
     Vec3 set_wheel_normals[4] = {};
     uint8_t set_wheel_normals_mask = 0;
     uint8_t cal_pre_flags = 0;
@@ -377,6 +387,7 @@ struct CarState {
     Vec3 pending_bump_bt[kMaxPendingBumps] = {};
     uint32_t pending_bump_hitter[kMaxPendingBumps] = {};
     uint8_t pending_bump_count = 0;
+    float auto_flip_torque_scale = 0.0f;  // Roll direction sign of the auto-flip, +1 or -1.
 
     static constexpr uint8_t kReportedVel = 1, kReportedAngVel = 2, kReportedHasJumped = 4,
         kReportedHasDoubleJumped = 8, kReportedHasFlipped = 16, kReportedIsSupersonic = 32, kReportedValid = 128;
@@ -491,6 +502,8 @@ struct BallState {
 };
 
 struct BoostPadState {
+    // RLBot's BoostPadState.timer: seconds until the pad is back, 0 while it is active. A pad comes back a tick or two
+    // after this passes 0.
     float cooldown = 0.0f;
     uint8_t is_active = 1;
     uint8_t is_big = 0;

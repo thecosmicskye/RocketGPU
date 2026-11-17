@@ -1,4 +1,5 @@
 #include <rocketgpu/rocketgpu.h>
+#include <rocketgpu/rlbotv5.h>
 
 #include <algorithm>
 #include <atomic>
@@ -513,7 +514,9 @@ int main(int argc, char** argv) {
     for (int e = 0; e < n; ++e) {
         for (int i = 0; i < envs[e].cars; ++i) {
             const CarState& c = cs[(size_t)e * 6 + i];
-            mix_f(&c.pos.x, 3); mix_f(&c.vel.x, 3); mix_f(&c.ang_vel.x, 3); mix_f(&c.rot.w, 4);
+            Vec3 vel, ang_vel;
+            detail::CarVelAfterCaps(c, sim.config().mutator, vel, ang_vel);
+            mix_f(&c.pos.x, 3); mix_f(&vel.x, 3); mix_f(&ang_vel.x, 3); mix_f(&c.rot.w, 4);
         }
         mix_f(&bs[e].pos.x, 3); mix_f(&bs[e].vel.x, 3); mix_f(&bs[e].ang_vel.x, 3);
         resets += envs[e].resets;

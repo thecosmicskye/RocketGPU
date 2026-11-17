@@ -1446,6 +1446,7 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
 
     Vec3 last_collected_normal(0.0f, 0.0f, 1.0f);
     bool has_collected_normal = false;
+    bool manifold_has_point = false;
 
     uint16_t quantized_query_aabb_min[3] = {0, 0, 0};
     uint16_t quantized_query_aabb_max[3] = {0, 0, 0};
@@ -1480,6 +1481,7 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
         if (candidate_count <= 0) {
             return;
         }
+        manifold_has_point = true;
         Vec3 inv_r0, inv_r1, inv_r2;
         BuildInvInertiaTensorWorldBt(car, cfg, mutator.car_mass, inv_r0, inv_r1, inv_r2);
         const float inv_car_mass = 1.0f / mutator.car_mass;
@@ -2136,7 +2138,7 @@ ROCKETGPU_HD ROCKETGPU_CAR_WORLD_ALWAYS_INLINE void AppendCarWorldMeshContactRow
         }
         return;
     }
-    if (has_collected_normal) {
+    if (manifold_has_point) {
         acc.hit = 1;
         acc.latest_normal = last_collected_normal;
     }

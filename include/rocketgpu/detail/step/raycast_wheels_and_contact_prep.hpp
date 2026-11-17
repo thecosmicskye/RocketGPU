@@ -3239,6 +3239,16 @@ ROCKETGPU_HOST_NOINLINE ROCKETGPU_HD void ApplyAirControl(
     }
 }
 
+ROCKETGPU_HD float CarBoostAmount(CarRefT car) {
+    const float amount = car.boost_amount;
+    return amount * 100.0f == car.boost ? amount : car.boost / 100.0f;
+}
+
+ROCKETGPU_HD void SetCarBoostAmount(CarRefT car, float amount) {
+    car.boost_amount = amount;
+    car.boost = amount * 100.0f;
+}
+
 ROCKETGPU_HD void ApplyBoost(
     CarRefT car,
     const CarControls& controls,
@@ -3246,10 +3256,11 @@ ROCKETGPU_HD void ApplyBoost(
     float dt,
     WheelRuntimeState* wheel_runtime_state = nullptr,
     const CarFrame* frame = nullptr) {
+    car.rlbotv5_boost_hold = 0;
     if (!car.is_demoed) {
         bool push = false;
         if (car.is_boosting) {
-            car.boost = Max(0.0f, car.boost - mutator.boost_used_per_second * dt);
+            SetCarBoostAmount(car, Max(0.0f, CarBoostAmount(car) - (mutator.boost_used_per_second / 100.0f) * dt));
             const bool latch_expired = !controls.boost && car.boosting_time >= mutator.boost_min_time;
             push = !(car.boost == 0.0f || latch_expired);
         } else {
@@ -3271,10 +3282,12 @@ ROCKETGPU_HD void ApplyBoost(
             car.boosting_time = 0.0f;
             car.time_since_boosted += dt;
             if (mutator.recharge_boost_enabled && car.time_since_boosted >= mutator.recharge_boost_delay) {
-                car.boost += mutator.recharge_boost_per_second * dt;
+                SetCarBoostAmount(car, CarBoostAmount(car) + (mutator.recharge_boost_per_second / 100.0f) * dt);
             }
         }
-        car.boost = Min(Max(car.boost, 0.0f), mutator.boost_max);
+        if (car.boost < 0.0f || car.boost > mutator.boost_max) {
+            SetCarBoostAmount(car, Min(Max(car.boost, 0.0f), mutator.boost_max) / 100.0f);
+        }
         return;
     }
 
@@ -3469,15 +3482,19 @@ ROCKETGPU_HD void ApplyFlipTorque(
     }
 }
 
+ROCKETGPU_HD bool AutoFlipGate(CarRefT car) {
+    return car.world_contact.has_contact && car.world_contact.contact_normal.z > 0.707f &&
+           Dot(car.world_contact.contact_normal, Ue3RotatorUpAxis(Ue3QuatToRotator(car.rot))) < -0.966f;
+}
+
 ROCKETGPU_HD void ApplyAutoFlip(
     CarRefT car,
-    const CarControls& controls,
     const CarConfig& cfg,
     const MutatorConfig& mutator,
     float dt,
+    bool starts,
     const CarFrame* frame = nullptr) {
-    const bool jump_pressed = controls.jump && !car.last_controls.jump;
-    if (jump_pressed && car.world_contact.has_contact && car.world_contact.contact_normal.z > 0.707f) {
+    if (starts) {
         Vec3 rb_fwd(1.0f, 0.0f, 0.0f);
         Vec3 rb_rgt(0.0f, 1.0f, 0.0f);
         Vec3 rb_up(0.0f, 0.0f, 1.0f);
@@ -3486,9 +3503,7 @@ ROCKETGPU_HD void ApplyAutoFlip(
         const float roll = -RocketGpuUcrtAtan2f(rb_rgt.z, rb_up.z);
         const float abs_roll = Abs(roll);
 
-        const bool flip_gate =
-            (Dot(car.world_contact.contact_normal, Ue3RotatorUpAxis(Ue3QuatToRotator(car.rot))) < -0.966f);
-        if (flip_gate) {
+        {
             const float flip_time = cfg.three_wheels ? 0.2f : 0.4f;
             car.auto_flip_timer = static_cast<float>(
                 static_cast<double>(flip_time) * (static_cast<double>(abs_roll) / 3.14159265358979323846));

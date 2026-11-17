@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(RocketGPU VERSION 1.3.0 LANGUAGES CXX)
+project(RocketGPU VERSION 1.4.0 LANGUAGES CXX)
 
 option(ROCKETGPU_USE_CUDA "Build CUDA kernels" OFF)
 option(ROCKETGPU_BUILD_PYTHON "Build Python bindings" OFF)
@@ -96,6 +96,7 @@ target_sources(rocketgpu PRIVATE
     src/rocketsim_compat_serialize.cpp
     src/rocketsim_compat_dev.cpp
     src/rocketsim_compat_devbatch.cpp
+    src/rocketgpu_rlbotv5.cpp
     src/rocketgpu.cpp)
 set_target_properties(rocketgpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 find_package(Threads REQUIRED)
@@ -181,6 +182,21 @@ if (NOT ROCKETGPU_USE_CUDA AND ROCKETGPU_CPU_ISPC AND ROCKETGPU_ISPC_EXECUTABLE 
                 -o ${_rocketgpu_ispc_obj}
         DEPENDS "${ROCKETGPU_ISPC_EXECUTABLE}" "${_rocketgpu_ispc_real}" ${_rocketgpu_ispc_dir}/rg_pretick.ispc ${_rocketgpu_ispc_dir}/rg_math.isph ${_rocketgpu_ispc_dir}/rg_types.isph ${_rocketgpu_ispc_dir}/rg_layout.isph
         VERBATIM)
+    set(ROCKETGPU_ISPC_TEXT_PAD 1024 CACHE STRING "Padding in front of the ISPC kernels' code, in bytes (ELF; a multiple of 16)")
+    find_program(ROCKETGPU_ISPC_PAD_LD NAMES ld.bfd)
+    if (ROCKETGPU_ISPC_TEXT_PAD GREATER 0 AND UNIX AND NOT APPLE AND ROCKETGPU_ISPC_PAD_LD)
+        set(_rocketgpu_ispc_pad ${CMAKE_CURRENT_BINARY_DIR}/rg_ispc_pad)
+        file(CONFIGURE OUTPUT ${_rocketgpu_ispc_pad}.s CONTENT
+             ".text\n.p2align 4\n.fill ${ROCKETGPU_ISPC_TEXT_PAD}, 1, 0xcc\n.section .note.GNU-stack,\"\",@progbits\n")
+        set(_rocketgpu_ispc_padded ${CMAKE_CURRENT_BINARY_DIR}/rg_pretick_ispc_padded${CMAKE_CXX_OUTPUT_EXTENSION})
+        add_custom_command(
+            OUTPUT ${_rocketgpu_ispc_padded}
+            COMMAND ${CMAKE_CXX_COMPILER} -c -x assembler ${_rocketgpu_ispc_pad}.s -o ${_rocketgpu_ispc_pad}.o
+            COMMAND ${ROCKETGPU_ISPC_PAD_LD} -r ${_rocketgpu_ispc_pad}.o ${_rocketgpu_ispc_obj} -o ${_rocketgpu_ispc_padded}
+            DEPENDS ${_rocketgpu_ispc_obj} ${_rocketgpu_ispc_pad}.s
+            VERBATIM)
+        set(_rocketgpu_ispc_obj ${_rocketgpu_ispc_padded})
+    endif()
     target_sources(rocketgpu PRIVATE ${_rocketgpu_ispc_obj})
     target_compile_definitions(rocketgpu PUBLIC ROCKETGPU_CPU_ISPC=1)
     message(STATUS "RocketGPU CPU ISPC kernels: ${ROCKETGPU_ISPC_TARGET}")

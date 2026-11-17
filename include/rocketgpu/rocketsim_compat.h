@@ -63,6 +63,7 @@ struct BallHitInfoCompat {
     uint64_t tickCountWhenExtraImpulseApplied = ~0ULL;
 };
 
+// GetState of a stepped car: vel and angVel after the speed caps, isSupersonic while that speed is 2200 uu/s or more.
 struct CarStateCompat : PhysState {
     bool isOnGround = true;
     bool wheelsWithContact[4] = {true, true, true, true};
@@ -103,7 +104,7 @@ struct CarStateCompat : PhysState {
     CarControls lastControls{};
     // RLBot v5 fields (CarState in rocketgpu.h). GetState reports them; SetState ignores the derived ones (airState,
     // dodge*), which the next step recomputes. vel, angVel and isSupersonic left as GetState returned them keep the
-    // step's own values (uncapped velocities, the game's supersonic flag).
+    // car's own values (uncapped velocities, the game's supersonic flag).
     uint8_t airState = 0;
     float dodgeTimeout = -1.0f;
     float dodgeElapsed = 0.0f;
@@ -125,7 +126,7 @@ struct CarStateV3 {
     Vec3 vel{};
     Vec3 angVel{};
     CarControls controls{};  // controls for the next step (Car::SetControls)
-    bool hasJumped = false;  // as v3: also set by a double jump or dodge with no jump before it (CarStateCompat: the game's)
+    bool hasJumped = false;  // as v3: also set by a double jump or dodge with no jump before it (CarStateCompat: RLBot's)
     bool hasDoubleJumped = false;
     bool hasFlipped = false;
     Vec3 flipRelTorque{};
@@ -184,6 +185,8 @@ public:
 
     CarStateCompat GetState() const;
     void SetState(const CarStateCompat& state);
+    // The car as the simulator holds it, for the RlbotV5* functions in rocketgpu/rlbotv5.h.
+    CarState GetNativeState() const;
     CarStateV3 GetStateV3() const;
     void SetStateV3(const CarStateV3& state);
     void SetControls(const CarControls& controls);
@@ -200,6 +203,8 @@ class Ball {
 public:
     BallStateCompat GetState() const;
     void SetState(const BallStateCompat& state);
+    // The ball as the simulator holds it, for RlbotV5BallPhysics in rocketgpu/rlbotv5.h.
+    BallState GetNativeState() const;
 
 private:
     friend class Arena;
@@ -240,6 +245,10 @@ public:
     void Step(int ticks_to_simulate = 1);
     // game_countdown: the game's round countdown (cars held about 4 s); by default the kickoff starts at once.
     void ResetToRandomKickoff(int seed = -1, bool game_countdown = false);
+    // The match's next kickoff, as the game sets it up after a goal: the cars on the spots the match's kickoff order
+    // gives them, the score, the tick count and the boost pads kept. The first call after a ResetToRandomKickoff
+    // follows that kickoff. game_countdown as above.
+    void ResetToKickoff(bool game_countdown = false);
     // The bodies' side of a goal reset alone (EnvCommand::new_round_bodies), e.g. replaying a recorded goal.
     void StartNewRoundBodies();
 
@@ -314,6 +323,7 @@ public:
     void SetFullState(const std::map<std::string, std::vector<uint8_t>>& state);
 
 private:
+    void ResetKickoff(int seed, bool game_countdown, bool match_kickoff);
     friend class Car;
     friend class Ball;
     Arena() = default;

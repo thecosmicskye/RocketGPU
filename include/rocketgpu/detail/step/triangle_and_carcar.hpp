@@ -2840,7 +2840,7 @@ ROCKETGPU_HD bool BumpCone(
         }
     }
     if (is_demo) {
-        DemolishCar(victim, mutator);
+        DemolishCar(victim, mutator, tick_dt);
     } else if (bumper) {
         const float speed = SqrtScalar(LengthSq(hitter_start_vel));
         const Vec3 vel_dir = hitter_start_vel * (1.0f / speed);
@@ -2949,7 +2949,7 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool ResolveCarCarDirectionalCo
                 cal_is_demo = hitter_team != victim_team;
             }
             if (cal_is_demo) {
-                DemolishCar(victim, mutator);
+                DemolishCar(victim, mutator, tick_dt);
                 RecordCarHit(hitter, hitter_id, victim_id, true);
                 if (mutator.physics_events.windows) {
                     PhysicsEvent event;
@@ -2996,7 +2996,7 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool ResolveCarCarDirectionalCo
             cal_is_demo = hitter_team != victim_team;
         }
         if (cal_is_demo) {
-            DemolishCar(victim, mutator);
+            DemolishCar(victim, mutator, tick_dt);
             RecordCarHit(hitter, hitter_id, victim_id, true);
             if (mutator.physics_events.windows) {
                 PhysicsEvent event;
@@ -3037,7 +3037,7 @@ ROCKETGPU_HD ROCKETGPU_TRIANGLE_CONTACT_NOINLINE bool ResolveCarCarDirectionalCo
     }
 
     if (is_demo) {
-        DemolishCar(victim, mutator);
+        DemolishCar(victim, mutator, tick_dt);
     } else {
         const bool ground_hit = victim.is_on_ground != 0;
 

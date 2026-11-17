@@ -3,7 +3,7 @@ import os, re, subprocess, sys, tempfile
 GROUPS = [
     ("pose", "rot pos_bt basis_forward basis_right basis_up pos vel ang_vel vel_bt basis_authoritative is_demoed "
              "just_respawned is_on_ground ext_force_impulse_bt_valid restored_inv_inertia_valid vel_touched_solve_stage "
-             "set_wheel_normals_mask wheels_with_contact handbrake_val"),
+             "set_wheel_normals_mask wheels_with_contact handbrake_val | rlbotv5_dodged boost_amount dodge_elapsed"),
     ("contact", "world_contact ext_force_impulse_bt ext_torque_impulse solve_delta_linear_bt solve_delta_angular car_contact "
                 "tick_count_since_update last_ball_started_with_world boost_pad_touching cal_pre_flags pending_bump_count"),
     ("ticks", "vel_impulse_cache vel_impulse_cache_bt last_ball_contact_start last_world_surface_contact "
@@ -13,7 +13,7 @@ GROUPS = [
              "cal_pre_forward_speed_uu boosting_time time_since_boosted driving_disabled ball_contact_last_tick "
              "ball_contact_this_tick has_jumped has_double_jumped has_flipped is_flipping is_jumping is_boosting is_supersonic "
              "is_auto_flipping demo_no_contact_response flip_timer_live internal_has_double_jumped reported_flags "
-             "game_has_jumped double_jump_ticks supersonic_set_v3"),
+             "game_has_jumped double_jump_ticks supersonic_set_v3 rlbotv5_boost_hold"),
     ("frame", "tick_start_basis_forward tick_start_basis_right tick_start_basis_up"),
 ]
 WIDE = "last_controls ball_hit_info".split()
@@ -57,8 +57,9 @@ by = {f[0]: f for f in fields}
 place = {}
 words = []
 for gname, names in GROUPS:
-    names = names.split()
-    assert all(n in by for n in names), [n for n in names if n not in by]
+    names, _, late = names.partition("|")
+    names, late = names.split(), late.split()
+    assert all(n in by for n in names + late), [n for n in names + late if n not in by]
     big = [n for n in names if by[n][2] > 8]
     small = sorted([n for n in names if by[n][2] <= 8], key=lambda n: -by[n][2])
     gw = []
@@ -73,6 +74,10 @@ for gname, names in GROUPS:
                 words[w][0] = o + s; place[n] = (0, w * LANES * WORD + o); break
         else:
             words.append([s]); gw.append(len(words) - 1); place[n] = (0, (len(words) - 1) * LANES * WORD)
+    for n in late:
+        s, a = by[n][2], by[n][3]
+        w, o = next((w, o) for w in gw for o in [(words[w][0] + a - 1) // a * a] if o + s <= WORD)
+        words[w][0] = o + s; place[n] = (0, w * LANES * WORD + o)
 o = 0
 for n in WIDE:
     s, a = by[n][2], by[n][3]
@@ -119,6 +124,6 @@ for i in range(len(stretches)):
 out.append("")
 open(sys.argv[1], "w").write("\n".join(out) + "\n")
 for gname, names in GROUPS:
-    ws = sorted({place[n][1] // (LANES * WORD) for n in names.split()})
+    ws = sorted({place[n][1] // (LANES * WORD) for n in names.replace("|", " ").split()})
     print(f"{gname}: words {ws[0]}..{ws[-1]}")
 print(f"words {nwords}, wide {wide_bytes}, cold {cold_bytes}, per car {tile_bytes // LANES} (CarState {car_size})")

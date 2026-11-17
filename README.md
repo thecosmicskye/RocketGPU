@@ -12,13 +12,13 @@ CPU (profile-guided build) and RocketSim v3 0.3.5 (`arena_scale_v3`, same record
 
 | Arenas | RocketGPU CUDA | RocketGPU CPU | RocketSim v3 |
 |---|---|---|---|
-| 96 | 0.66M | 4.40M | 2.91M |
-| 256 | 1.49M | 4.57M | 3.54M |
-| 512 | 2.56M | 4.72M | 3.51M |
-| 1,024 | 4.43M | 4.68M | 3.79M |
-| 4,096 | 10.84M | 3.86M | 3.61M |
-| 8,192 | 15.65M | 3.69M | 3.73M |
-| 16,384 | 18.56M | 3.75M | 3.52M |
+| 96 | 0.67M | 4.35M | 2.91M |
+| 256 | 1.52M | 4.53M | 3.54M |
+| 512 | 2.61M | 4.66M | 3.51M |
+| 1,024 | 4.47M | 4.64M | 3.79M |
+| 4,096 | 11.02M | 3.78M | 3.61M |
+| 8,192 | 16.10M | 3.69M | 3.73M |
+| 16,384 | 19.04M | 3.74M | 3.52M |
 
 ## Accuracy
 
@@ -169,12 +169,39 @@ official arena's fast paths, so it steps slower than the official arena.
 
 ## Car state
 
-`CarState` fields that RLBot v5 exposes hold RLBot's value for the tick:
+`CarState` holds the game's own values after each tick:
 
-- `vel` and `ang_vel`, after the speed caps
-- `is_supersonic`: speed >= 2200 uu/s
-- `has_jumped`, `has_double_jumped`, `has_flipped`
-- RLBot-only: `air_state`, `dodge_timeout`, `dodge_elapsed`, `dodge_dir_x` / `dodge_dir_y` and the latest ball touch
+- `vel` and `ang_vel` of the body, before the speed caps (the game applies them when the next tick starts)
+- `is_supersonic`: the game's flag, on at 2200 uu/s and held through `supersonic_time`
+- `has_jumped`: the game's jump flag. A double jump or dodge with no jump before it sets it too, and it stays set on
+  the ground for 0.125 s after a jump
+- `has_double_jumped` and `has_flipped`: the game's one double-jump flag, split by which of the two the car did
+
+RLBot v5 sends the game's network state: speeds capped, locations rounded to 0.01 uu, velocities to 0.01 uu/s, angular
+velocities to 0.0001 rad/s, rotations on a 65536-step turn, and timers on the tick grid. `rocketgpu/rlbotv5.h` gives
+those values bit for bit (Python: methods on the states):
+
+| RLBot v5 | RocketGPU |
+|---|---|
+| `physics` of a car | `RlbotV5CarPhysics(car, mutator)`, Python `car.rlbotv5_physics(mutator)` |
+| `physics` of the ball | `RlbotV5BallPhysics(ball, mutator)`, Python `ball.rlbotv5_physics(mutator)` |
+| `is_supersonic` | `RlbotV5IsSupersonic(car, mutator)`, Python `car.rlbotv5_is_supersonic(mutator)` |
+| `has_jumped`, `has_double_jumped`, `has_dodged` | `RlbotV5HasJumped(car)`, `RlbotV5HasDoubleJumped(car)`, `RlbotV5HasDodged(car)`, Python `car.rlbotv5_has_jumped()`, ... |
+| `air_state`, `dodge_dir` | `CarState.air_state`, `dodge_dir_x` / `dodge_dir_y` |
+| `dodge_timeout` | `RlbotV5DodgeTimeout(car)`, Python `car.rlbotv5_dodge_timeout()` |
+| `dodge_elapsed` | `RlbotV5DodgeElapsed(car)`, Python `car.rlbotv5_dodge_elapsed()` |
+| `demolished_timeout` | `RlbotV5DemolishedTimeout(car)`, Python `car.rlbotv5_demolished_timeout()` |
+| `latest_touch.game_seconds` | `RlbotV5TouchSeconds(car)`, Python `car.rlbotv5_touch_seconds()` |
+| `latest_touch` location, normal | `CarState.latest_touch_location`, `latest_touch_normal` |
+| `seconds_elapsed` | `RlbotV5SecondsElapsed(env)`, Python `env.rlbotv5_seconds_elapsed()` |
+| `boost` | `RlbotV5Boost`, one per car: `Update(car)` after every tick, Python `update(car)` |
+| boost pad `timer` | `BoostPadState.cooldown`: seconds until the pad is back |
+
+`mutator` is the simulator's own (`sim.config.mutator`). With the RocketSim-style arena, `car.get_native_state()` and
+`arena.ball.get_native_state()` return these states, and `arena.get_mutator_config()` the mutator.
+
+`CarState.boost` is the game's own amount. RLBot keeps its own count, up to 1 higher or lower, so `RlbotV5Boost` needs
+every tick, and a new one for each car you reset or write. There is no match clock, so no `game_time_remaining`.
 
 The other timers follow RocketSim v3 (`jump_time` is v3's `jump_ticks / 120`). Written states use the same meanings;
 set `tick_count_since_update = 0` on every car you change. `include/rocketgpu/rocketgpu.h` documents each field.
@@ -182,10 +209,12 @@ set `tick_count_since_update = 0` on every car you change. `include/rocketgpu/ro
 For RocketSim v3's own conventions, use `get_state_v3` / `set_state_v3` (C++ `Car::GetStateV3` / `SetStateV3`).
 `CarStateV3` matches v3's `CarState` field for field:
 
-- velocities before the caps
-- the step's own flags and `jump_ticks`; `has_jumped` is also set by a double jump or dodge with no jump before it
-- `is_supersonic` with v3's grace timer
+- v3's flags and `jump_ticks`; `has_jumped` is also set by a double jump or dodge with no jump before it
+- `is_supersonic` with v3's grace timer, as of the end of the tick
 - `bump_cooldown_victim` (a car id) and `last_extra_hit_tick` (`None`: no earlier hit)
+
+The RocketSim-style `get_state` / `set_state` keep `vel` and `ang_vel` after the speed caps, and their
+`is_supersonic` tests that speed on each tick.
 
 `Arena.get_full_state()` returns the whole simulation state, including contact manifolds and timers, as
 `{"array.field": bytes}`. `set_full_state` writes the fields it is given and keeps the rest.

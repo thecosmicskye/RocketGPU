@@ -46,7 +46,7 @@ inline bool RgIspcLayoutOk() {
     if (got[k++] != (int)offsetof(rocketgpu::CarState, supersonic_time)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, handbrake_val)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, auto_flip_timer)) ++bad;
-    if (got[k++] != (int)offsetof(rocketgpu::CarState, auto_flip_torque_scale)) ++bad;
+    if (got[k++] != (int)offsetof(rocketgpu::CarState, boost_amount)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, demo_respawn_timer)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, tick_count_since_update)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, ball_contact_last_tick)) ++bad;
@@ -65,6 +65,7 @@ inline bool RgIspcLayoutOk() {
     if (got[k++] != (int)offsetof(rocketgpu::CarState, just_respawned)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, demo_no_contact_response)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, respawn_slot_override_plus1)) ++bad;
+    if (got[k++] != (int)offsetof(rocketgpu::CarState, rlbotv5_boost_hold)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, world_contact)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, car_contact)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, vel_impulse_cache)) ++bad;
@@ -124,6 +125,7 @@ inline bool RgIspcLayoutOk() {
     if (got[k++] != (int)offsetof(rocketgpu::CarState, double_jump_ticks)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, jump_hold_broken)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, supersonic_set_v3)) ++bad;
+    if (got[k++] != (int)offsetof(rocketgpu::CarState, rlbotv5_dodged)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, set_wheel_normals)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, set_wheel_normals_mask)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, cal_pre_flags)) ++bad;
@@ -138,6 +140,7 @@ inline bool RgIspcLayoutOk() {
     if (got[k++] != (int)offsetof(rocketgpu::CarState, pending_bump_bt)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, pending_bump_hitter)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::CarState, pending_bump_count)) ++bad;
+    if (got[k++] != (int)offsetof(rocketgpu::CarState, auto_flip_torque_scale)) ++bad;
     if (got[k++] != (int)sizeof(rocketgpu::BallState)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::BallState, hs_info)) ++bad;
     if (got[k++] != (int)offsetof(rocketgpu::BallState, ds_info)) ++bad;

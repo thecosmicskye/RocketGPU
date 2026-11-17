@@ -128,7 +128,7 @@ std::vector<Arena::DevField> Arena::DevLayouts() {
     RG_DEV_S(CarState);
     RG_DEV_F(CarState, pos); RG_DEV_F(CarState, rot); RG_DEV_F(CarState, vel); RG_DEV_F(CarState, ang_vel);
     RG_DEV_F(CarState, flip_rel_torque); RG_DEV_F(CarState, jump_time); RG_DEV_F(CarState, flip_time);
-    RG_DEV_F(CarState, air_time); RG_DEV_F(CarState, air_time_since_jump); RG_DEV_F(CarState, boost);
+    RG_DEV_F(CarState, air_time); RG_DEV_F(CarState, air_time_since_jump); RG_DEV_F(CarState, boost); RG_DEV_F(CarState, boost_amount);
     RG_DEV_F(CarState, time_since_boosted); RG_DEV_F(CarState, boosting_time); RG_DEV_F(CarState, supersonic_time);
     RG_DEV_F(CarState, handbrake_val); RG_DEV_F(CarState, auto_flip_timer); RG_DEV_F(CarState, auto_flip_torque_scale);
     RG_DEV_F(CarState, demo_respawn_timer); RG_DEV_F(CarState, tick_count_since_update);
@@ -150,7 +150,7 @@ std::vector<Arena::DevField> Arena::DevLayouts() {
     RG_DEV_F(CarState, internal_has_jumped); RG_DEV_F(CarState, internal_has_double_jumped);
     RG_DEV_F(CarState, internal_has_flipped); RG_DEV_F(CarState, internal_is_supersonic);
     RG_DEV_F(CarState, reported_flags); RG_DEV_F(CarState, game_has_jumped); RG_DEV_F(CarState, double_jump_ticks);
-    RG_DEV_F(CarState, jump_hold_broken); RG_DEV_F(CarState, supersonic_set_v3); RG_DEV_F(CarState, set_wheel_normals);
+    RG_DEV_F(CarState, jump_hold_broken); RG_DEV_F(CarState, supersonic_set_v3); RG_DEV_F(CarState, rlbotv5_dodged); RG_DEV_F(CarState, rlbotv5_boost_hold); RG_DEV_F(CarState, set_wheel_normals);
     RG_DEV_F(CarState, set_wheel_normals_mask); RG_DEV_F(CarState, cal_tick_start_ang_vel);
     RG_DEV_F(CarState, restored_inv_inertia_bt); RG_DEV_F(CarState, restored_inv_inertia_valid);
     RG_DEV_F(CarState, ball_hit_info.is_valid); RG_DEV_F(CarState, ball_hit_info.tick_count_when_hit);
@@ -172,6 +172,7 @@ std::vector<Arena::DevField> Arena::DevLayouts() {
     RG_DEV_F(EnvState, tick); RG_DEV_F(EnvState, car_visit_order_mode); RG_DEV_F(EnvState, car_visit_order_packed);
     RG_DEV_F(EnvState, countdown_phase); RG_DEV_F(EnvState, countdown_fires); RG_DEV_F(EnvState, frame_ticks);
     RG_DEV_F(EnvState, countdown_count); RG_DEV_F(EnvState, frame_frac_prev);
+    RG_DEV_F(EnvState, kickoff_match_order); RG_DEV_F(EnvState, kickoff_match_index);
 
     RG_DEV_S(WheelRuntimeState);
     RG_DEV_F(WheelRuntimeState, event_world_ids); RG_DEV_F(WheelRuntimeState, event_world_normals);

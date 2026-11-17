@@ -49,7 +49,7 @@ export void rg_ispc_layout(uniform int32 out[]) {
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->supersonic_time - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->handbrake_val - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->auto_flip_timer - (uniform int8 * uniform)p);
-      out[k++] = (uniform int32)((uniform int8 * uniform)&p->auto_flip_torque_scale - (uniform int8 * uniform)p);
+      out[k++] = (uniform int32)((uniform int8 * uniform)&p->boost_amount - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->demo_respawn_timer - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->tick_count_since_update - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->ball_contact_last_tick - (uniform int8 * uniform)p);
@@ -68,6 +68,7 @@ export void rg_ispc_layout(uniform int32 out[]) {
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->just_respawned - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->demo_no_contact_response - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->respawn_slot_override_plus1 - (uniform int8 * uniform)p);
+      out[k++] = (uniform int32)((uniform int8 * uniform)&p->rlbotv5_boost_hold - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->world_contact - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->car_contact - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->vel_impulse_cache - (uniform int8 * uniform)p);
@@ -127,6 +128,7 @@ export void rg_ispc_layout(uniform int32 out[]) {
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->double_jump_ticks - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->jump_hold_broken - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->supersonic_set_v3 - (uniform int8 * uniform)p);
+      out[k++] = (uniform int32)((uniform int8 * uniform)&p->rlbotv5_dodged - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->set_wheel_normals - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->set_wheel_normals_mask - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->cal_pre_flags - (uniform int8 * uniform)p);
@@ -141,6 +143,7 @@ export void rg_ispc_layout(uniform int32 out[]) {
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->pending_bump_bt - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->pending_bump_hitter - (uniform int8 * uniform)p);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->pending_bump_count - (uniform int8 * uniform)p);
+      out[k++] = (uniform int32)((uniform int8 * uniform)&p->auto_flip_torque_scale - (uniform int8 * uniform)p);
     }
     { uniform BallState * uniform p = (uniform BallState * uniform)0; out[k++] = sizeof(uniform BallState);
       out[k++] = (uniform int32)((uniform int8 * uniform)&p->hs_info - (uniform int8 * uniform)p);

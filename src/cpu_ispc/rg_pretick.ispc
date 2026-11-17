@@ -224,7 +224,7 @@ static inline void PreTickFinish(uniform CarState cars[], uniform const float ri
         if (CAR_GETB(cars, ci, supersonic_set_v3)) {
             CAR_SETB(cars, ci, supersonic_set_v3, 0);
         } else {
-            const float speed_sq = LengthSq(h.vel);
+            const float speed_sq = LengthSq(snap_vel);
             if (speed_sq >= (p.supersonic_start_speed * p.supersonic_start_speed)) {
                 CAR_SETB(cars, ci, is_supersonic, 1);
                 h.supersonic_time = 0.0f;

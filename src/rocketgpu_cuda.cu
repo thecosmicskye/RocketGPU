@@ -1030,7 +1030,7 @@ __device__ __forceinline__ void StagedEnvTailOne(
                 for (int k = count - 1; k >= 0; --k) {
                     const int i = CarVisitSlot(env, k, count);
                     const int car_eligible = __shfl_sync(group, eligible, i, kEnvTailLanes);
-                    CarCRefT car = cars[base + i];
+                    CarRefT car = cars[base + i];
                     const int touching = car.boost_pad_touching;
                     if (touching != 0 && ((share >> (touching - 1)) & 1u)) {
                         BoostPadTouchListStep(pads[pad_base + touching - 1], touching - 1, car,

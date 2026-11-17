@@ -1,5 +1,6 @@
 #include <cstring>
 #include <rocketgpu/rocketsim_compat.h>
+#include <rocketgpu/rlbotv5.h>
 #include <rocketgpu/detail/math.hpp>
 #include <rocketgpu/detail/constants.hpp>
 #include <rocketgpu/detail/cuda_api.hpp>
@@ -541,6 +542,14 @@ void Arena::Step(int ticks_to_simulate) {
 }
 
 void Arena::ResetToRandomKickoff(int seed, bool game_countdown) {
+    ResetKickoff(seed, game_countdown, false);
+}
+
+void Arena::ResetToKickoff(bool game_countdown) {
+    ResetKickoff(0, game_countdown, true);
+}
+
+void Arena::ResetKickoff(int seed, bool game_countdown, bool match_kickoff) {
     const bool has_holes = cars.size() != static_cast<size_t>(car_count_);
     const int32_t active_count = static_cast<int32_t>(cars.size());
     const int32_t slot_count = car_count_;
@@ -592,6 +601,12 @@ void Arena::ResetToRandomKickoff(int seed, bool game_countdown) {
     }
     command.kickoff_seed_mode = 1;
     command.kickoff_seed = kickoff_seed;
+    if (match_kickoff) {
+        command.reset_scoreboard = 0;
+        command.kickoff_seed_mode = 0;
+        command.kickoff_seed = 0;
+        command.keep_boost_pads = 1;
+    }
     command.kickoff_countdown_ticks = game_countdown ? kKickoffCountdownGameTimers : 0;
     sim_->apply_env_commands(&command, 1);
     sim_->download_env_states(env_states_.data(), env_states_.size());
@@ -697,6 +712,12 @@ uint8_t Arena::GetCarVisitOrderMode() const {
 }
 
 namespace {
+bool SpeedAfterCapsIsSupersonic(const CarState& s, const MutatorConfig& m) {
+    Vec3 vel, ang_vel;
+    detail::CarVelAfterCaps(s, m, vel, ang_vel);
+    return detail::LengthSq(vel) >= m.supersonic_start_speed * m.supersonic_start_speed;
+}
+
 BallHitInfoCompat BallHitInfoFromState(const BallHitInfo& in) {
     BallHitInfoCompat out;
     out.isValid = in.is_valid != 0;
@@ -717,11 +738,17 @@ CarStateCompat Car::GetState() const {
     out.rotMat = PublicRotMatFromCarState(s);
     out.vel = s.vel;
     out.angVel = s.ang_vel;
+    out.isSupersonic = s.is_supersonic != 0;
+    if (s.reported_flags & CarState::kReportedValid) {
+        const MutatorConfig& m = arena_->GetMutatorConfig();
+        detail::CarVelAfterCaps(s, m, out.vel, out.angVel);
+        out.isSupersonic = SpeedAfterCapsIsSupersonic(s, m);
+    }
     out.isOnGround = s.is_on_ground != 0;
     for (int w = 0; w < 4; ++w) out.wheelsWithContact[w] = s.wheels_with_contact[w] != 0;
-    out.hasJumped = s.has_jumped != 0;
-    out.hasDoubleJumped = s.has_double_jumped != 0;
-    out.hasFlipped = s.has_flipped != 0;
+    out.hasJumped = RlbotV5HasJumped(s);
+    out.hasDoubleJumped = RlbotV5HasDoubleJumped(s);
+    out.hasFlipped = RlbotV5HasDodged(s);
     out.flipRelTorque = s.flip_rel_torque;
     out.jumpTime = s.jump_time;
     out.flipTime = s.flip_time;
@@ -733,7 +760,6 @@ CarStateCompat Car::GetState() const {
     out.timeSinceBoosted = s.time_since_boosted;
     out.isBoosting = s.is_boosting != 0;
     out.boostingTime = s.boosting_time;
-    out.isSupersonic = s.is_supersonic != 0;
     out.supersonicTime = s.supersonic_time;
     out.handbrakeVal = s.handbrake_val;
     out.isAutoFlipping = s.is_auto_flipping != 0;
@@ -768,13 +794,26 @@ void Car::SetState(const CarStateCompat& state) {
     s.set_wheel_normals_mask = 0;
     const bool reported = (s.reported_flags & CarState::kReportedValid) != 0;
     const auto same = [](const Vec3& a, const Vec3& b) { return a.x == b.x && a.y == b.y && a.z == b.z; };
-    s.vel = (reported && same(state.vel, s.reported_vel)) ? s.internal_vel : state.vel;
-    s.ang_vel = (reported && same(state.angVel, s.reported_ang_vel)) ? s.internal_ang_vel : state.angVel;
+    Vec3 got_vel = s.vel, got_ang_vel = s.ang_vel;
+    bool got_supersonic = s.is_supersonic != 0;
+    if (reported) {
+        const MutatorConfig& m = arena_->GetMutatorConfig();
+        detail::CarVelAfterCaps(s, m, got_vel, got_ang_vel);
+        got_supersonic = SpeedAfterCapsIsSupersonic(s, m);
+    }
+    if (!(reported && same(state.vel, got_vel))) s.vel = state.vel;
+    if (!(reported && same(state.angVel, got_ang_vel))) s.ang_vel = state.angVel;
     s.is_on_ground = state.isOnGround ? 1 : 0;
     for (int w = 0; w < 4; ++w) s.wheels_with_contact[w] = state.wheelsWithContact[w] ? 1 : 0;
-    s.has_jumped = state.hasJumped ? 1 : 0;
-    s.has_double_jumped = state.hasDoubleJumped ? 1 : 0;
-    s.has_flipped = state.hasFlipped ? 1 : 0;
+    const auto set_flag = [&](uint8_t& field, bool got, bool want, uint8_t bit) {
+        if (want == got) return;
+        field = want ? 1 : 0;
+        s.reported_flags = static_cast<uint8_t>((s.reported_flags & ~bit) | (want ? 0 : bit));
+    };
+    set_flag(s.has_jumped, RlbotV5HasJumped(s), state.hasJumped, CarState::kReportedHasJumped);
+    set_flag(s.has_double_jumped, RlbotV5HasDoubleJumped(s), state.hasDoubleJumped, CarState::kReportedHasDoubleJumped);
+    set_flag(s.has_flipped, RlbotV5HasDodged(s), state.hasFlipped, CarState::kReportedHasFlipped);
+    if (!state.hasFlipped) s.rlbotv5_dodged = 0;
     s.flip_rel_torque = state.flipRelTorque;
     if (!(state.isJumping && s.is_jumping && state.jumpTime == s.jump_time)) s.jump_hold_broken = 0;
     s.jump_time = state.jumpTime;
@@ -788,8 +827,7 @@ void Car::SetState(const CarStateCompat& state) {
     s.time_since_boosted = state.timeSinceBoosted;
     s.is_boosting = state.isBoosting ? 1 : 0;
     s.boosting_time = state.boostingTime;
-    s.is_supersonic = (reported && state.isSupersonic == ((s.reported_flags & CarState::kReportedIsSupersonic) != 0))
-        ? s.internal_is_supersonic : (state.isSupersonic ? 1 : 0);
+    if (!(reported && state.isSupersonic == got_supersonic)) s.is_supersonic = state.isSupersonic ? 1 : 0;
     s.supersonic_time = state.supersonicTime;
     s.handbrake_val = state.handbrakeVal;
     s.is_auto_flipping = state.isAutoFlipping ? 1 : 0;
@@ -820,6 +858,11 @@ void Car::SetState(const CarStateCompat& state) {
     s.vel_impulse_cache_bt = Vec3(0.0f, 0.0f, 0.0f);
     s.last_controls = state.lastControls;
     arena_->PushCarState(slot_);
+}
+
+CarState Car::GetNativeState() const {
+    arena_->PullStates();
+    return arena_->car_states_[slot_];
 }
 
 CarStateV3 Car::GetStateV3() const {
@@ -858,7 +901,7 @@ CarStateV3 Car::GetStateV3() const {
     out.controls = arena_->controls_[slot_];
     out.hasDoubleJumped = s.has_double_jumped != 0;
     out.hasFlipped = s.has_flipped != 0;
-    out.hasJumped = s.has_jumped != 0 || out.hasDoubleJumped || out.hasFlipped;
+    out.hasJumped = s.has_jumped != 0 || ((out.hasDoubleJumped || out.hasFlipped) && !s.is_on_ground);
     out.flipRelTorque = s.flip_rel_torque;
     out.jumpTicks = static_cast<uint32_t>(rintf(s.jump_time / arena_->GetTickTime()));
     out.flipTime = s.flip_time;
@@ -909,6 +952,7 @@ void Car::SetStateV3(const CarStateV3& state) {
                               (s.has_double_jumped || s.has_flipped);
     s.has_jumped = (keeps_jumped ? s.has_jumped != 0 : state.hasJumped) && !jump_starts ? 1 : 0;
     s.has_double_jumped = state.hasDoubleJumped && !flip_starts ? 1 : 0;
+    if (s.has_flipped && !(state.hasFlipped && !flip_starts)) s.rlbotv5_dodged = 0;
     s.has_flipped = state.hasFlipped && !flip_starts ? 1 : 0;
     s.flip_rel_torque = state.flipRelTorque;
     float jump_time = 0.0f;
@@ -1009,6 +1053,11 @@ BallStateCompat Ball::GetState() const {
         out.lastHitCarID = arena_->CompatIdFromDeviceId(arena_->car_states_[last_slot].ball_hit_info.hit_car_id);
     }
     return out;
+}
+
+BallState Ball::GetNativeState() const {
+    arena_->PullStates();
+    return arena_->ball_states_[0];
 }
 
 void Ball::SetState(const BallStateCompat& state) {

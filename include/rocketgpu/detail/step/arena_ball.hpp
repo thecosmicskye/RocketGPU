@@ -2482,6 +2482,7 @@ ROCKETGPU_HD void ResetCarCommonState(CarRefT car, const MutatorConfig& mutator,
     car.world_contact = {};
     car.flip_rel_torque = Vec3(0.0f, 0.0f, 0.0f);
     car.boost = spawn_boost;
+    car.boost_amount = spawn_boost / 100.0f;
     car.jump_time = 0.0f;
     car.flip_time = 0.0f;
     car.internal_jump_time = 0.0f;
@@ -2499,6 +2500,8 @@ ROCKETGPU_HD void ResetCarCommonState(CarRefT car, const MutatorConfig& mutator,
     car.tick_count_since_update = 0;
     car.is_on_ground = 1;
     car.air_state = 0;
+    car.rlbotv5_dodged = 0;
+    car.rlbotv5_boost_hold = 0;
     car.dodge_timeout = -1.0f;
     car.dodge_elapsed = 0.0f;
     car.dodge_dir_x = 0.0f;
@@ -2514,6 +2517,7 @@ ROCKETGPU_HD void ResetCarCommonState(CarRefT car, const MutatorConfig& mutator,
     car.has_flipped = 0;
     car.is_flipping = 0;
     car.is_jumping = 0;
+    car.jump_hold_broken = 0;
     car.is_boosting = 0;
     car.is_supersonic = 0;
     car.is_auto_flipping = 0;
@@ -3080,9 +3084,9 @@ ROCKETGPU_HD void ResetEnvToKickoff(
     }
 }
 
-ROCKETGPU_HD void DemolishCar(CarRefT car, const MutatorConfig& mutator) {
+ROCKETGPU_HD void DemolishCar(CarRefT car, const MutatorConfig& mutator, float tick_dt) {
     car.is_demoed = 1;
-    car.demo_respawn_timer = mutator.demo_respawn_time;
+    car.demo_respawn_timer = mutator.demo_respawn_time + tick_dt;
 }
 
 ROCKETGPU_HD int RespawnStartIndex(uint64_t seed, int env_idx, uint64_t current_tick, uint32_t car_id) {
@@ -3125,6 +3129,7 @@ ROCKETGPU_HD void RespawnCar(CarRefT car, Team team, int slot, const MutatorConf
         RespawnPlace(team, slot % 4, offset_dir, rules, ground, yaw);
         PlaceCarAtWorldSpawn(car, ground, yaw, spawn_z, mutator, mutator.boost_spawn_amount);
         car.vel_impulse_cache = Vec3(0.0f, 0.0f, 0.0f);
+        car.is_on_ground = 0;
         return;
     }
     SpawnPos spawn = SoccarRespawnSpawn(slot % 4);
@@ -3137,6 +3142,7 @@ ROCKETGPU_HD void RespawnCar(CarRefT car, Team team, int slot, const MutatorConf
     }
     PlaceCarAtRespawnSpawn(car, team, spawn, spawn_z, mutator, mutator.boost_spawn_amount);
     car.vel_impulse_cache = Vec3(0.0f, 0.0f, 0.0f);
+    car.is_on_ground = 0;
 }
 
 ROCKETGPU_HD void KickoffSpawnCar(CarRefT car, Team team, int spot, const MutatorConfig& mutator, float spawn_z,
@@ -3159,8 +3165,8 @@ ROCKETGPU_HD void KickoffSpawnCar(CarRefT car, Team team, int spot, const Mutato
     car.vel_impulse_cache = Vec3(0.0f, 0.0f, 0.0f);
 }
 
-ROCKETGPU_HD void UpdateSupersonicCalDemo(CarRefT car, const MutatorConfig& mutator, float dt) {
-    const float speed_sq = LengthSq(car.vel);
+ROCKETGPU_HD void UpdateSupersonicCalDemo(CarRefT car, const Vec3& vel_uu, const MutatorConfig& mutator, float dt) {
+    const float speed_sq = LengthSq(vel_uu);
     if (speed_sq >= (mutator.supersonic_start_speed * mutator.supersonic_start_speed)) {
         car.is_supersonic = 1;
         car.supersonic_time = 0.0f;

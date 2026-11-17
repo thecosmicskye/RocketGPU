@@ -2356,7 +2356,7 @@ ROCKETGPU_HD Vec3 BoostPadFramePos(const SimConfig& cfg, int env_idx, CarCRefT c
 
 ROCKETGPU_HD void BoostPadFrameAxes(const SimConfig& cfg, int env_idx, CarCRefT car, Vec3 axes[3]) {
     CarBasisColumns(car, axes[0], axes[1], axes[2]);
-    const Vec3 ang_vel = ((car.reported_flags & CarState::kReportedValid) != 0 || car.is_demoed)
+    const Vec3 ang_vel = car.is_demoed
         ? car.ang_vel
         : NativeSseClampLength(car.ang_vel, cfg.mutator.car_max_ang_speed,
                                cfg.mutator.native_sphere_rsqrt_table, cfg.mutator.native_sphere_rsqrt_shift);
@@ -2553,18 +2553,20 @@ ROCKETGPU_HD void BoostPadRespawnStep(
 }
 
 ROCKETGPU_HD void BoostPadTouchListStep(
-    BoostPadState& pad, int p, CarCRefT car, uint32_t car_id, bool eligible) {
+    BoostPadState& pad, int p, CarRefT car, uint32_t car_id, bool eligible) {
     if (pad.is_active && pad.cur_locked_car_id == 0 && car.boost_pad_touching == p + 1 && eligible) {
         pad.cur_locked_car_id = car_id;
+        const int whole = static_cast<int>(car.boost);
+        car.rlbotv5_boost_hold =
+            static_cast<uint8_t>(Min(254, whole + (static_cast<float>(whole) < car.boost ? 1 : 0)) + 1);
     }
 }
 
 ROCKETGPU_HD void BoostPadGive(int env_idx, const SimConfig& cfg, CarSpanT cars, BoostPadState& pad, int p,
                                uint32_t car_id) {
     CarRefT car = cars[car_id - 1u];
-    const float boost_amount = pad.is_big ? 100.0f : 12.0f;
     const float event_boost_before = car.boost;
-    car.boost = Min(cfg.mutator.boost_max, car.boost + boost_amount);
+    SetCarBoostAmount(car, Min(cfg.mutator.boost_max / 100.0f, CarBoostAmount(car) + (pad.is_big ? 1.0f : 0.12f)));
     pad.is_active = 0;
     pad.cooldown = (pad.is_big ? cfg.mutator.boost_pad_cooldown_big : cfg.mutator.boost_pad_cooldown_small) -
                    cfg.tick_dt;
@@ -2817,7 +2819,7 @@ ROCKETGPU_HD void BoostPadTouchPassForEnv(
 #else
         const int i = CarVisitSlot(env, k, count);
 #endif
-        CarCRefT car = cars[base + i];
+        CarRefT car = cars[base + i];
         if (car.boost_pad_touching != 0) {
             const int p = car.boost_pad_touching - 1;
             BoostPadTouchListStep(pads[pad_base + p], p, car, static_cast<uint32_t>(base + i + 1),
@@ -3010,7 +3012,7 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCarPrePhysics(
     if (car.supersonic_set_v3) {
         car.supersonic_set_v3 = 0;
     } else {
-        UpdateSupersonicCalDemo(car, mutator, dt);
+        UpdateSupersonicCalDemo(car, tick_start_snapshot.vel_uu, mutator, dt);
     }
 
     car.vel_touched_solve_stage = 0;
@@ -3018,6 +3020,8 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCarPrePhysics(
     bool flip_started = false;
 
     const bool jump_pressed = controls.jump && !start_last_jump;
+    const bool flip_over_starts = jump_pressed && !start_is_flipping && !car.is_auto_flipping && AutoFlipGate(car);
+    const bool flip_over_takes_press = jump_pressed && !start_is_flipping && (car.is_auto_flipping || flip_over_starts);
     const bool need_pre_frame =
         cfg.three_wheels != 0 || car.is_auto_flipping != 0 ||
         (jump_pressed && car.world_contact.has_contact && car.world_contact.contact_normal.z > 0.707f);
@@ -3039,6 +3043,7 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCarPrePhysics(
 
     const bool cal_jump = wheel_runtime_state != nullptr;
     const bool cal_jump_g = cal_jump && start_wheel_contacts >= 3;
+    bool cal_jump_blocked = false;
     if (cal_jump) {
         WheelRuntimeState& jw = *wheel_runtime_state;
         if (start_tick_count_since_update == 0 && !jw.cal_restored) {
@@ -3056,6 +3061,7 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCarPrePhysics(
             }
             jw.cal_cached_ground = cal_jump_g ? 1 : 0;
         }
+        cal_jump_blocked = jw.cal_game_jumped != 0;
         if (jw.cal_game_jumped && cal_jump_g && !start_is_jumping && jw.cal_jump_inactive_time >= 0.125f) {
             jw.cal_game_jumped = 0;
             jw.cal_game_double_jumped = 0;
@@ -3063,10 +3069,9 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCarPrePhysics(
         }
         jw.cal_frame_open = frame_frac < 0.0f ? 1 : 0;
     }
-    const bool cal_jump_blocked = cal_jump && wheel_runtime_state->cal_game_jumped;
     const uint8_t was_jumping = start_is_jumping;
     float forward_speed_uu = SnapshotForwardSpeed(tick_start_snapshot);
-    if (jump_pressed && start_is_on_ground && !start_is_jumping && !cal_jump_blocked) {
+    if (jump_pressed && start_is_on_ground && !start_is_jumping && !cal_jump_blocked && !flip_over_takes_press) {
         StartJump(car, cfg, mutator, frame);
         cal_air_jump_started = true;
     }
@@ -3074,8 +3079,10 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCarPrePhysics(
     const bool cal_air_window_closed = cal_jump &&
         (wheel_runtime_state->cal_game_double_jumped ||
          (wheel_runtime_state->cal_game_jumped && wheel_runtime_state->cal_jump_inactive_time > mutator.doublejump_max_delay));
-    const bool air_jump_pressed = jump_pressed && !(cal_jump && cal_jump_g) && !cal_air_window_closed;
-    const bool cal_press_as_air = cal_jump && !cal_jump_g && jump_pressed && !cal_air_window_closed;
+    const bool air_jump_pressed =
+        jump_pressed && !(cal_jump && cal_jump_g) && !cal_air_window_closed && !flip_over_takes_press;
+    const bool cal_press_as_air =
+        cal_jump && !cal_jump_g && jump_pressed && !cal_air_window_closed && !flip_over_takes_press;
     const uint8_t air_jump_used_before = (car.has_double_jumped || car.has_flipped) ? 1 : 0;
 
     bool cal_flip_before_wheels_vel_changed = false;
@@ -3094,7 +3101,7 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCarPrePhysics(
             car.vel_bt.x != fbw_vel_bt.x || car.vel_bt.y != fbw_vel_bt.y || car.vel_bt.z != fbw_vel_bt.z;
     }
 
-    ApplyAutoFlip(car, controls, cfg, mutator, dt, frame);
+    ApplyAutoFlip(car, cfg, mutator, dt, flip_over_starts, frame);
     car.cal_pre_flags = static_cast<uint8_t>(
         (cal_air_jump_started ? kCalPreAirJumpStarted : 0) | (flip_started ? kCalPreFlipStarted : 0) |
         (cal_flip_before_wheels_vel_changed ? kCalPreFlipVelChanged : 0) |
@@ -3344,9 +3351,9 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE void PreTickCar(
     if (flip_changed || !car.just_respawned) {
         car.flip_time = flip_changed ? dt : car.flip_time + dt;
     }
-    if (cal_air_jump_started || !car.is_jumping) {
+    if (cal_air_jump_started) {
         car.jump_hold_broken = 0;
-    } else if (!controls.jump) {
+    } else if (was_jumping && !controls.jump) {
         car.jump_hold_broken = 1;
     }
 
@@ -5842,7 +5849,7 @@ ROCKETGPU_HD void AdvanceRLBotCarFields(CarRefT car, const WheelRuntimeState* jw
     if (car.is_jumping) {
         car.game_has_jumped = 1;
     } else if (on_ground_state && (!car.has_jumped ||
-               car.internal_jump_time > mutator.jump_min_time + mutator.jump_reset_time_pad)) {
+               car.internal_jump_time - dt > mutator.jump_min_time + mutator.jump_reset_time_pad)) {
         car.game_has_jumped = 0;
     }
 }
@@ -5866,33 +5873,32 @@ ROCKETGPU_HD void ReportRLBotCarFields(CarRefT car, const WheelRuntimeState* jw,
     if (car.is_jumping) {
         car.game_has_jumped = 1;
     } else if (on_ground_state && (!car.has_jumped ||
-               car.internal_jump_time > mutator.jump_min_time + mutator.jump_reset_time_pad)) {
+               car.internal_jump_time - dt > mutator.jump_min_time + mutator.jump_reset_time_pad)) {
         car.game_has_jumped = 0;
     }
 
-    const float max_speed_bt = mutator.car_max_speed * UnitsUUToBT();
-    if (!car.is_demoed && LengthSq(car.vel_bt) > max_speed_bt * max_speed_bt) {
-        const Vec3 vel_bt_normalized = mutator.native_sphere_rsqrt_table
-            ? NativeSseSphereNormalizer{mutator.native_sphere_rsqrt_table, mutator.native_sphere_rsqrt_shift}(car.vel_bt)
-            : car.vel_bt * RsqrtScalar(LengthSq(car.vel_bt));
-        car.vel = (vel_bt_normalized * max_speed_bt) * 50.0f;
+    bool game_jumped = jw ? jw->cal_game_jumped != 0 : car.has_jumped != 0;
+    bool game_double_jumped = jw ? jw->cal_game_double_jumped != 0 : (car.has_double_jumped || car.has_flipped);
+    if (jw && !jw->cal_frame_open && !jw->cal_cached_ground &&
+        static_cast<int>(car.wheels_with_contact[0] != 0) + static_cast<int>(car.wheels_with_contact[1] != 0) +
+        static_cast<int>(car.wheels_with_contact[2] != 0) + static_cast<int>(car.wheels_with_contact[3] != 0) >= 3) {
+        game_jumped = game_double_jumped = false;
     }
-    if (!car.is_demoed) {
-        car.ang_vel = NativeSseClampLength(car.ang_vel, mutator.car_max_ang_speed,
-            mutator.native_sphere_rsqrt_table, mutator.native_sphere_rsqrt_shift);
-    }
-    car.has_jumped = car.game_has_jumped;
-    car.has_double_jumped = car.internal_has_double_jumped && !on_ground_state;
-    car.has_flipped = car.internal_has_flipped && !on_ground_state;
-    car.is_supersonic = LengthSq(car.vel) >= mutator.supersonic_start_speed * mutator.supersonic_start_speed;
+    car.has_jumped = game_jumped;
+    car.has_double_jumped = game_double_jumped && car.internal_has_double_jumped;
+    car.has_flipped = game_double_jumped && !car.has_double_jumped;
 
-    car.air_state = car.is_jumping ? 1 : (car.is_flipping ? 3 : (car.is_on_ground ? 0 :
+    const uint8_t air_state = car.is_jumping ? 1 : (car.is_flipping ? 3 : (car.is_on_ground ? 0 :
         (car.double_jump_ticks < 13 ? 2 : 4)));
+    car.air_state = air_state;
+    const bool flipped = car.internal_has_flipped != 0;
+    const bool dodged = (car.rlbotv5_dodged || flipped) && air_state != 0;
+    car.rlbotv5_dodged = dodged ? 1 : 0;
     const float jump_inactive = jw ? jw->cal_jump_inactive_time : car.air_time_since_jump;
-    const bool dodge_window = !car.is_on_ground && !car.is_jumping && car.has_jumped && !car.internal_has_double_jumped &&
-        !car.internal_has_flipped && jump_inactive < mutator.doublejump_max_delay - 0.5f * dt;
+    const bool dodge_window = !car.is_on_ground && !car.is_jumping && car.game_has_jumped && !car.internal_has_double_jumped &&
+        !dodged && jump_inactive < mutator.doublejump_max_delay - 0.5f * dt;
     car.dodge_timeout = dodge_window ? mutator.doublejump_max_delay - jump_inactive : -1.0f;
-    car.dodge_elapsed = (car.internal_has_flipped && !on_ground_state) ? car.internal_flip_time : 0.0f;
+    car.dodge_elapsed = (flipped && !on_ground_state) ? car.internal_flip_time : (dodged ? car.dodge_elapsed + dt : 0.0f);
     car.dodge_dir_x = car.flip_rel_torque.y;
     car.dodge_dir_y = -car.flip_rel_torque.x;
 
@@ -6571,7 +6577,8 @@ ROCKETGPU_HD ROCKETGPU_NOINLINE bool RespawnPlaceTaken(const Vec3& ground, int s
             CarBasisColumns(other, fwd, right, up);
             pos = other.pos_bt * 50.0f;
         } else {
-            if (j > self || ((due >> j) & 1u) == 0u) continue;
+            const bool back_now = !(Max(0.0f, cars[base + j].demo_respawn_timer - cfg.tick_dt) > 0.0f);
+            if (!back_now && (j > self || ((due >> j) & 1u) == 0u)) continue;
             const int code = cars[base + j].respawn_slot_override_plus1;
             int s = -1;
             int d = -1;
@@ -6673,11 +6680,13 @@ ROCKETGPU_HD void StepEnvPreTickEnvState(
             const int base = env_idx * cfg.max_cars_per_env;
             uint32_t due = 0;
             for (int i = 0; i < count && i < 32; ++i) {
-                if (((demoed >> i) & 1u) != 0u && !(Max(0.0f, cars[base + i].demo_respawn_timer - cfg.tick_dt) > 0.0f)) {
+                if (((demoed >> i) & 1u) == 0u) continue;
+                const float left = Max(0.0f, cars[base + i].demo_respawn_timer - cfg.tick_dt);
+                if (!(Max(0.0f, left - cfg.tick_dt) > 0.0f)) {
                     due |= 1u << i;
                 }
             }
-            if (due != 0) {
+            if (due != 0 && !cfg.mirror_official_respawn_rng) {
                 PickRespawnSpotsForEnv(env_idx, cfg, teams, count, cars, balls[env_idx], env, seed, car_configs,
                                        respawn_slot_overrides, demoed, due);
             }
@@ -6793,6 +6802,11 @@ ROCKETGPU_HD ROCKETGPU_ALWAYS_INLINE bool StepEnvPreTickCarStart(
                 RespawnCar(car, teams[base + i], respawn_slot, cfg.mutator, car_cfg.spawn_z, cfg.arena_rules);
             }
             respawned = true;
+        } else if (!(Max(0.0f, car.demo_respawn_timer - cfg.tick_dt) > 0.0f) &&
+                   !(car.respawn_slot_override_plus1 >= kKickoffSpawnOverridePlus1 &&
+                     car.respawn_slot_override_plus1 < kKickoffSpawnOverridePlus1 + 5)) {
+            car.boost = cfg.mutator.boost_spawn_amount;
+            car.boost_amount = car.boost / 100.0f;
         }
     }
     spawn_rot = car.rot;
