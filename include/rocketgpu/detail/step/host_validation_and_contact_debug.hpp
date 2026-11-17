@@ -1564,7 +1564,11 @@ inline bool HostRayCastArenaMeshBlocks(
             memcpy(&qb, blk.quant[1], sizeof(qb));
             memcpy(&qc, blk.quant[2], sizeof(qc));
             const I16x8 m = reinterpret_cast<I16x8>((qa <= qtest[0]) & (qb <= qtest[1]) & (qc <= qtest[2]));
+#if defined(__clang__) || __GNUC__ >= 12
             const I16x4 pass16 = __builtin_shufflevector(m, m, 0, 1, 2, 3) & __builtin_shufflevector(m, m, 4, 5, 6, 7);
+#else
+            const I16x4 pass16 = I16x4{m[0], m[1], m[2], m[3]} & I16x4{m[4], m[5], m[6], m[7]};
+#endif
             unsigned hits = LaneMask4(__builtin_convertvector(pass16, I4));
             if (hits == 0) {
                 continue;

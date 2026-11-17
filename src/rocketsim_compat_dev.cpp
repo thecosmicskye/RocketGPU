@@ -108,18 +108,38 @@ void Arena::DevSetRaw(const std::string& what, const std::vector<uint8_t>& bytes
     dirty_ = true;
 }
 
+template <class T>
+void DevType(Arena::DevField& out) {
+    if constexpr (std::is_array_v<T>) {
+        out.shape.push_back(std::extent_v<T>);
+        DevType<std::remove_extent_t<T>>(out);
+    } else if constexpr (std::is_same_v<T, ::rocketgpu::Vec3> || std::is_same_v<T, ::rocketgpu::Quat>) {
+        out.typestr = "<f4";
+        out.shape.push_back(sizeof(T) / sizeof(float));
+    } else if constexpr (std::is_floating_point_v<T>) {
+        out.typestr = "<f" + std::to_string(sizeof(T));
+    } else if constexpr (std::is_integral_v<T> || std::is_enum_v<T>) {
+        out.typestr = std::string(sizeof(T) == 1 ? "|" : "<") + (std::is_signed_v<T> ? "i" : "u") +
+                      std::to_string(sizeof(T));
+    } else {
+        out.typestr = "|u1";
+        out.shape.push_back(sizeof(T));
+    }
+}
+
 template <class S, class F>
 void DevAdd(std::vector<Arena::DevField>& out, const char* name, F f) {
     if constexpr (std::is_invocable_v<F, S*>) {
         alignas(S) static unsigned char buf[sizeof(S)];
         S* s = reinterpret_cast<S*>(buf);
         const auto* m = f(s);
-        out.push_back({name, static_cast<size_t>(reinterpret_cast<const unsigned char*>(m) - buf), sizeof(*m)});
+        out.push_back({name, static_cast<size_t>(reinterpret_cast<const unsigned char*>(m) - buf), sizeof(*m), {}, {}});
+        DevType<std::remove_cv_t<std::remove_reference_t<decltype(*m)>>>(out.back());
     }
 }
 
 #define RG_DEV_F(S, path) DevAdd<S>(out, #S "." #path, [](auto* p) -> decltype(&p->path) { return &p->path; })
-#define RG_DEV_S(S) out.push_back({#S, 0, sizeof(S)})
+#define RG_DEV_S(S) out.push_back({#S, 0, sizeof(S), {}, {}})
 
 std::vector<Arena::DevField> Arena::DevLayouts() {
     static const std::vector<DevField> cached = [] {
@@ -173,6 +193,7 @@ std::vector<Arena::DevField> Arena::DevLayouts() {
     RG_DEV_F(EnvState, countdown_phase); RG_DEV_F(EnvState, countdown_fires); RG_DEV_F(EnvState, frame_ticks);
     RG_DEV_F(EnvState, countdown_count); RG_DEV_F(EnvState, frame_frac_prev);
     RG_DEV_F(EnvState, kickoff_match_order); RG_DEV_F(EnvState, kickoff_match_index);
+    RG_DEV_F(EnvState, goal_latched); RG_DEV_F(EnvState, respawn_match_order);
 
     RG_DEV_S(WheelRuntimeState);
     RG_DEV_F(WheelRuntimeState, event_world_ids); RG_DEV_F(WheelRuntimeState, event_world_normals);
@@ -292,6 +313,39 @@ void FullStateFields(const std::string& type, const std::vector<size_t>& starts,
     }
 }
 
+void FullStateLayoutFields(const char* array, const std::string& type, const std::string& prefix, size_t offset,
+                           const std::vector<size_t>& shape, const std::vector<size_t>& strides,
+                           std::vector<Arena::FullStateField>& out) {
+    const std::vector<Arena::DevField>& layouts = Arena::DevLayouts();
+    const std::string head = type + ".";
+    for (const Arena::DevField& f : layouts) {
+        if (f.name.compare(0, head.size(), head) != 0) continue;
+        const std::string path = f.name.substr(head.size());
+        const char* nested = nullptr;
+        for (const auto& [field, elem] : kNestedFields) {
+            if (f.name == field) nested = elem;
+        }
+        size_t elem_size = 0;
+        for (const Arena::DevField& g : layouts) {
+            if (nested != nullptr && g.name == nested) elem_size = g.size;
+        }
+        Arena::FullStateField o{array, prefix + path, f.typestr, offset + f.offset, shape, strides};
+        if (elem_size == 0) {
+            size_t stride = f.size;
+            for (size_t n : f.shape) {
+                stride /= n;
+                o.shape.push_back(n);
+                o.strides.push_back(stride);
+            }
+            out.push_back(std::move(o));
+            continue;
+        }
+        o.shape.push_back(f.size / elem_size);
+        o.strides.push_back(elem_size);
+        FullStateLayoutFields(array, nested, prefix + path + ".", o.offset, o.shape, o.strides, out);
+    }
+}
+
 std::vector<FieldSlice> ArrayFields(const char* array, const char* type, size_t bytes) {
     size_t size = 0;
     for (const Arena::DevField& g : Arena::DevLayouts()) {
@@ -304,6 +358,12 @@ std::vector<FieldSlice> ArrayFields(const char* array, const char* type, size_t 
     return out;
 }
 
+}
+
+std::vector<Arena::FullStateField> Arena::FullStateLayouts() {
+    std::vector<FullStateField> out;
+    for (const auto& [array, type] : kFullStateArrays) FullStateLayoutFields(array, type, "", 0, {}, {}, out);
+    return out;
 }
 
 std::map<std::string, std::vector<uint8_t>> Arena::GetFullState(const std::vector<std::string>& arrays) const {

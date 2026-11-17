@@ -218,6 +218,45 @@ The RocketSim-style `get_state` / `set_state` keep `vel` and `ang_vel` after the
 
 `Arena.get_full_state()` returns the whole simulation state, including contact manifolds and timers, as
 `{"array.field": bytes}`. `set_full_state` writes the fields it is given and keeps the rest.
+`views.field_arrays(sim, array, by_env=True)[field]` is the same field of every arena of a `BatchSim` as a zero-copy
+`(env, element[, dims])` view; `sim.device_arrays()[array]` gives the element and its `per_env` count.
+
+The game's contacts between cars and the order its solver visits contacts in, zero-copy on any build:
+
+- `views.car_car_contacts(sim)` (C++ `DeviceView::car_car`, `CarCarContact`): for car slots `lo < hi`, pair
+  `hi * (hi - 1) / 2 + lo` has `count` contact points (at most 4), each with its point on either car in that car's
+  body frame (`points.local_a_bt`, `points.local_b_bt`; a is the lower slot), the world `points.normal` from a to b
+  and `points.distance_bt` (negative when the cars overlap), in Bullet units (uu / 50).
+- `views.contact_order(sim)` (C++ `DeviceView::contact_order`): each arena's contact list, 96 entries, and the number
+  in use. An entry holds what touches in bits 0-1 (0 ball and arena, 1 ball and car, 2 car and arena, 3 two cars), a
+  car's slot + 1 in bits 2-5 (the lower slot of two cars) and the other car's slot + 1 in bits 6-9.
+
+## Rust
+
+`rust/` is a crate with RocketSim v3's Rust API (the `rocketsim` crate, 0.3.6) on RocketGPU's arena: the same
+type, field and method names, and `CarState` in v3's conventions. A v3 project keeps its `use rocketsim::...` lines:
+
+```toml
+[dependencies]
+rocketsim = { package = "rocketgpu", git = "https://github.com/thecosmicskye/RocketGPU" }
+```
+
+```rust
+use rocketsim::{Arena, CarBodyConfig, CarControls, GameMode, Team};
+
+rocketsim::init("/path/to/collision_meshes", true).unwrap();
+let mut arena = Arena::new(GameMode::Soccar);
+let car = arena.add_car(Team::Blue, CarBodyConfig::OCTANE);
+arena.reset_to_random_kickoff(Some(7));
+arena.set_car_controls(car, CarControls { throttle: 1.0, boost: true, ..Default::default() });
+for _ in 0..120 {
+    arena.step_tick();
+}
+println!("{:?}", arena.get_car_state(car).phys.pos);
+```
+
+`cargo build` builds the simulator with CMake (it needs CMake, a C++20 compiler and `ispc`; `--features cuda` for
+the CUDA build). The crate's documentation lists the parts of v3's API it leaves out.
 
 ## Usage & Legal Notice
 RocketGPU does not contain any code from the Rocket League. This project is not affiliated with Epic Games or Psyonix.

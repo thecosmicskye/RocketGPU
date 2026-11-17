@@ -7214,6 +7214,50 @@ ROCKETGPU_HD ROCKETGPU_NOINLINE void StepEnv(
 #endif
 }
 
+ROCKETGPU_HD void BallPathEnv(
+    int env_idx,
+    const SimConfig& cfg,
+    Team* teams,
+    int32_t* env_car_count,
+    CarSpanT cars,
+    WheelRuntimeState* wheel_runtime_states,
+    WorldSolverScratch* solver_scratch,
+    const WorldSolverScratchRowPool& row_pool,
+    CarControls* controls,
+    CarConfig* car_configs,
+    BallState* balls,
+    EnvState* env_states,
+    BoostPadState* pads,
+    uint64_t seed,
+    int samples,
+    int ticks,
+    float goal_y,
+    float* out,
+    int32_t* result) {
+    const BallState& ball = balls[env_idx];
+    bool scored = fabsf(ball.pos.y) >= goal_y;
+    int goal_tick = 0;
+    for (int s = 0; s < samples; ++s) {
+        for (int k = 0; k < ticks && !scored; ++k) {
+            StepEnv(env_idx, cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls,
+                    car_configs, balls, env_states, pads, nullptr, seed, 1);
+            if (fabsf(ball.pos.y) >= goal_y) {
+                scored = true;
+                goal_tick = s * ticks + k + 1;
+            }
+        }
+        float* const o = out + 6 * s;
+        o[0] = ball.pos.x;
+        o[1] = ball.pos.y;
+        o[2] = ball.pos.z;
+        o[3] = ball.vel.x;
+        o[4] = ball.vel.y;
+        o[5] = ball.vel.z;
+    }
+    result[0] = scored ? (ball.pos.y > 0.0f ? 1 : 2) : 0;
+    result[1] = goal_tick;
+}
+
 ROCKETGPU_HD void StepEnvWithControlStream(
     int env_idx,
     const SimConfig& cfg,

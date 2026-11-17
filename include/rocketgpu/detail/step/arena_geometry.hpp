@@ -561,19 +561,8 @@ struct CarWorldMeshRetainedManifold {
     CarWorldMeshRetainedPoint points[4] = {};
 };
 
-struct CarCarRetainedPoint {
-    ::rocketgpu::Vec3 local_a_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-    ::rocketgpu::Vec3 local_b_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-    ::rocketgpu::Vec3 pos_a_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-    ::rocketgpu::Vec3 pos_b_bt = ::rocketgpu::Vec3(0.0f, 0.0f, 0.0f);
-    ::rocketgpu::Vec3 normal = ::rocketgpu::Vec3(0.0f, 0.0f, 1.0f);
-    float distance_bt = 0.0f;
-};
-
-struct CarCarRetainedManifold {
-    uint8_t count = 0;
-    CarCarRetainedPoint points[4] = {};
-};
+using CarCarRetainedPoint = ::rocketgpu::CarCarContactPoint;
+using CarCarRetainedManifold = ::rocketgpu::CarCarContact;
 
 constexpr int kMaxCarCarRetainedManifolds = 28;
 
@@ -683,7 +672,7 @@ struct BulletBroadphaseProxy {
     uint8_t is_ball = 0;
 };
 
-constexpr int kMaxBulletManifoldEntries = 96;
+constexpr int kMaxBulletManifoldEntries = ::rocketgpu::kMaxContactOrder;
 constexpr int kAxisSweepMaxHandles = 40;
 constexpr int kAxisSweepMaxEdges = 2 * kAxisSweepMaxHandles + 2;
 

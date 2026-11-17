@@ -1,0 +1,20 @@
+[package]
+name = "rocketgpu"
+version = "1.4.1"
+edition = "2021"
+rust-version = "1.83"
+description = "RocketGPU's arena with RocketSim v3's Rust API"
+license = "MIT"
+repository = "https://github.com/thecosmicskye/RocketGPU"
+build = "build.rs"
+links = "rocketgpu"
+
+[features]
+# Build the simulator with its CUDA kernels (needs the CUDA toolkit).
+cuda = []
+
+[dependencies]
+glam = "0.34"
+
+[build-dependencies]
+cmake = "0.1"

@@ -1818,6 +1818,18 @@ struct BatchSim::Impl {
         v.env_states = const_cast<EnvState*>(env_states.data());
         v.boost_pad_states = const_cast<BoostPadState*>(boost_pad_states.data());
         v.env_car_count = const_cast<int32_t*>(env_car_count.data());
+        v.wheel_runtime = wheel_runtime_states.data();
+        v.solver_scratch = solver_scratch.data();
+        v.car_world_plane = rows_car_world_plane.data();
+        v.car_world_mesh = rows_car_world_mesh.data();
+        v.car_car = rows_car_car_retained.data();
+        v.ball_car = rows_ball_car_retained.data();
+        const auto* scratch_bytes = reinterpret_cast<const uint8_t*>(v.solver_scratch);
+        const size_t bp = offsetof(detail::WorldSolverScratch, bp);
+        v.contact_order = reinterpret_cast<const uint32_t*>(
+            scratch_bytes + bp + offsetof(detail::BulletBroadphaseHistory, bp_manifolds));
+        v.contact_order_count = scratch_bytes + bp + offsetof(detail::BulletBroadphaseHistory, bp_manifold_count);
+        v.contact_order_stride = sizeof(detail::WorldSolverScratch);
         return v;
     }
 
@@ -2373,6 +2385,27 @@ struct BatchSim::Impl {
             });
         }
         (void)stream;
+#endif
+    }
+
+    void ball_path(int32_t samples, int32_t ticks, float goal_y, float* out, int32_t* result, cudaStream_t stream) {
+        if (samples <= 0 || ticks <= 0) {
+            return;
+        }
+#if defined(ROCKETGPU_USE_CUDA)
+        detail::LaunchBallPath(cfg, teams.data(), env_car_count.data(), car_states.data(), wheel_runtime_states.data(),
+                               solver_scratch.data(), solver_row_pool, controls.data(), car_configs.data(),
+                               ball_states.data(), env_states.data(), boost_pad_states.data(), seed, samples, ticks,
+                               goal_y, out, result, stream);
+#else
+        (void)stream;
+        cpu_envs().run(cfg.env_count, [&](int env_idx) {
+            detail::BallPathEnv(env_idx, cfg, teams.data(), env_car_count.data(), car_states.data(),
+                                wheel_runtime_states.data(), solver_scratch.data(), solver_row_pool, controls.data(),
+                                car_configs.data(), ball_states.data(), env_states.data(), boost_pad_states.data(), seed,
+                                samples, ticks, goal_y, out + static_cast<size_t>(env_idx) * samples * 6,
+                                result + static_cast<size_t>(env_idx) * 2);
+        });
 #endif
     }
 
@@ -3203,6 +3236,10 @@ void BatchSim::apply_env_commands_device(const EnvCommand* device_commands, size
 
 void BatchSim::step(int32_t ticks, cudaStream_t stream) {
     impl_->step(ticks, stream);
+}
+
+void BatchSim::ball_path(int32_t samples, int32_t ticks, float goal_y, float* out, int32_t* result, cudaStream_t stream) {
+    impl_->ball_path(samples, ticks, goal_y, out, result, stream);
 }
 
 void BatchSim::step_with_device_controls(const CarControls* device_controls_by_tick, int32_t ticks, int32_t control_stride, cudaStream_t stream) {

@@ -6,7 +6,7 @@ import re
 import sys
 
 MODULES = {
-    "step": ["StepKernel"],
+    "step": ["StepKernel", "BallPathKernel"],
     "post": [
         "PreTickKernel", "StagedVehicleIndependenceKernel", "StagedCarPreKernel", "StagedCarPostKernel", "StagedPadPreKernel",
         "StagedEnvTailKernel", "StagedPostFusedKernel", "StagedPostPreFusedKernel",

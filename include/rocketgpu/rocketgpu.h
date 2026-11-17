@@ -21,6 +21,9 @@ struct WheelRuntimeState;
 struct KickoffSettledRow;
 struct WorldSolverScratch;
 struct WorldSolverScratchRowPoolHost;
+struct CarWorldPlaneRetainedManifold;
+struct CarWorldMeshRetainedManifold;
+struct BallCarRetainedManifold;
 struct RespawnRngState;
 struct ArenaRules;
 #if !defined(ROCKETGPU_USE_CUDA)
@@ -631,6 +634,52 @@ constexpr uint16_t kKickoffCountdownTicks = 480;
 // 482 with every tick its own frame of exactly 1/120 s, the default fraction).
 constexpr uint16_t kKickoffCountdownGameTimers = 0xFFFF;
 
+// A contact point the game keeps between two cars after a tick, in Bullet units (uu / 50). a is the car in the lower
+// slot, b the other.
+struct CarCarContactPoint {
+    Vec3 local_a_bt = Vec3(0.0f, 0.0f, 0.0f);  // on a, in a's body frame
+    Vec3 local_b_bt = Vec3(0.0f, 0.0f, 0.0f);  // on b, in b's body frame
+    Vec3 pos_a_bt = Vec3(0.0f, 0.0f, 0.0f);    // the two points in the world
+    Vec3 pos_b_bt = Vec3(0.0f, 0.0f, 0.0f);
+    Vec3 normal = Vec3(0.0f, 0.0f, 1.0f);      // world, from a's point toward b's when the two are apart
+    float distance_bt = 0.0f;                  // from a's point to b's along the normal: negative when the cars overlap
+};
+
+// The game's contact between two cars: its first `count` points. An env holds one for every pair of car slots
+// lo < hi, at CarCarContactIndex(lo, hi).
+struct CarCarContact {
+    uint8_t count = 0;
+    CarCarContactPoint points[4] = {};
+};
+
+constexpr int CarCarContactIndex(int lo, int hi) {
+    return hi * (hi - 1) / 2 + lo;
+}
+
+// The game keeps one list of the body pairs in contact and its solver visits them in that order. An entry holds
+// what touches in bits 0-1, a car's slot + 1 in bits 2-5 (the lower slot of two cars) and the other car's slot + 1
+// in bits 6-9.
+enum class ContactKind : uint8_t {
+    BallWorld = 0,
+    BallCar = 1,
+    CarWorld = 2,
+    CarCar = 3,
+};
+
+constexpr int kMaxContactOrder = 96;
+
+constexpr ContactKind ContactOrderKind(uint32_t entry) {
+    return static_cast<ContactKind>(entry & 3u);
+}
+// -1: no car (the ball against the world).
+constexpr int ContactOrderCar(uint32_t entry) {
+    return static_cast<int>((entry >> 2) & 15u) - 1;
+}
+// The higher slot of ContactKind::CarCar; -1 otherwise.
+constexpr int ContactOrderOtherCar(uint32_t entry) {
+    return static_cast<int>((entry >> 6) & 15u) - 1;
+}
+
 struct EnvCommand {
     uint8_t reset_to_kickoff = 0;
     uint8_t reset_scoreboard = 0;
@@ -922,6 +971,18 @@ struct DeviceView {
     EnvState* env_states = nullptr;
     BoostPadState* boost_pad_states = nullptr;
     int32_t* env_car_count = nullptr;
+    // The rest of Arena::GetFullState's arrays: per car slot, per env, then each env's retained manifolds.
+    const detail::WheelRuntimeState* wheel_runtime = nullptr;
+    const detail::WorldSolverScratch* solver_scratch = nullptr;
+    const detail::CarWorldPlaneRetainedManifold* car_world_plane = nullptr;
+    const detail::CarWorldMeshRetainedManifold* car_world_mesh = nullptr;
+    const CarCarContact* car_car = nullptr;
+    const detail::BallCarRetainedManifold* ball_car = nullptr;
+    // Env 0's contact order (kMaxContactOrder entries) and the number in use; the next env's are
+    // contact_order_stride bytes on.
+    const uint32_t* contact_order = nullptr;
+    const uint8_t* contact_order_count = nullptr;
+    size_t contact_order_stride = 0;
 };
 
 class BatchSim {
@@ -1005,6 +1066,11 @@ public:
     void apply_env_commands(const EnvCommand* host_commands, size_t count, cudaStream_t stream = nullptr);
     void apply_env_commands_device(const EnvCommand* device_commands, size_t count, cudaStream_t stream = nullptr);
     void step(int32_t ticks = 1, cudaStream_t stream = nullptr);
+    // Every env's ball stepped alone for samples * ticks ticks (the envs must hold no cars): pos and vel after every
+    // `ticks` ticks into out[env][sample][6], and into result[env][2] the goal it enters (0 none, 1 the +y goal, 2 the
+    // -y goal) and the tick it crosses goal_y on, after which it is not stepped and the samples hold that state. One
+    // kernel launch on CUDA builds, where out and result are device pointers and the first call must not be captured.
+    void ball_path(int32_t samples, int32_t ticks, float goal_y, float* out, int32_t* result, cudaStream_t stream = nullptr);
 
     void step_with_device_controls(const CarControls* device_controls_by_tick, int32_t ticks, int32_t control_stride, cudaStream_t stream = nullptr);
 

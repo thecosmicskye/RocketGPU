@@ -48,17 +48,20 @@ def state_dtype(name):
 class DeviceFieldArray:
 
 
-    def __init__(self, array_name, field, typestr, base_ptr, count, itemsize, offset, shape, owner=None, lanes=None):
+    def __init__(self, array_name, field, typestr, base_ptr, count, itemsize, offset, shape, owner=None, lanes=None,
+                 strides=None, per_env=None, read_only=False):
         import numpy as np
 
         elem = np.dtype(typestr)
-        inner = []
+        inner = list(strides or ())
         stride = elem.itemsize
-        for dim in reversed(tuple(shape)):
+        for dim in reversed(() if strides else tuple(shape)):
             inner.insert(0, stride)
             stride *= dim
         lead = (count,) if lanes is None else (count, lanes[0])
         lead_strides = (itemsize,) if lanes is None else (itemsize, lanes[1])
+        if per_env:
+            lead, lead_strides = (count // per_env, per_env), (itemsize * per_env, itemsize)
         full_shape = lead + tuple(shape)
         full_strides = lead_strides + tuple(inner)
         self._owner = owner
@@ -67,23 +70,27 @@ class DeviceFieldArray:
         self.shape = full_shape
         self.strides = full_strides
         self.__cuda_array_interface__ = {
-            "data": (base_ptr + offset, False),
+            "data": (base_ptr + offset, read_only),
             "shape": full_shape,
             "typestr": typestr,
             "strides": full_strides,
             "version": 3,
         }
+        if not _rs.is_cuda_build:
+            self.__array_interface__ = dict(self.__cuda_array_interface__, data=(base_ptr + offset, True))
 
     def __repr__(self):
         return f"DeviceFieldArray({self.name}, shape={self.shape}, dtype={self.dtype}, strides={self.strides})"
 
 
-def field_arrays(sim, array_name):
+def field_arrays(sim, array_name, by_env=False):
     entry = sim.device_arrays()[array_name]
-    base_ptr = entry["__cuda_array_interface__"]["data"][0]
+    base_ptr, read_only = entry["__cuda_array_interface__"]["data"]
     count = entry["count"]
     layout = state_layout(array_name)
     if "device" in layout and _rs.is_cuda_build:
+        if by_env:
+            raise ValueError(f"{array_name} is stored in tiles: env e's element k is car e * per_env + k")
         dev = layout["device"]
         assert dev["tile_bytes"] == entry["itemsize"], (array_name, dev["tile_bytes"], entry["itemsize"])
         return {
@@ -93,10 +100,22 @@ def field_arrays(sim, array_name):
         }
     itemsize = layout["itemsize"]
     assert itemsize == entry["itemsize"], (array_name, itemsize, entry["itemsize"])
+    per_env = entry["per_env"] if by_env else None
+    fields = [(*f, None) for f in layout["fields"]] + layout.get("nested", [])
     return {
-        field: DeviceFieldArray(array_name, field, typestr, base_ptr, count, itemsize, offset, shape, sim)
-        for field, typestr, offset, shape in layout["fields"]
+        field: DeviceFieldArray(array_name, field, typestr, base_ptr, count, itemsize, offset, shape, sim,
+                                strides=strides, per_env=per_env, read_only=read_only)
+        for field, typestr, offset, shape, strides in fields
     }
+
+
+def car_car_contacts(sim):
+    return field_arrays(sim, "car_car", by_env=True)
+
+
+def contact_order(sim):
+    fields = field_arrays(sim, "solver_scratch")
+    return fields["bp.bp_manifolds"], fields["bp.bp_manifold_count"]
 
 
 def host_struct_array(sim, array_name):

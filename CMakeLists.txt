@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.21)
-project(RocketGPU VERSION 1.4.0 LANGUAGES CXX)
+project(RocketGPU VERSION 1.4.1 LANGUAGES CXX)
 
 option(ROCKETGPU_USE_CUDA "Build CUDA kernels" OFF)
 option(ROCKETGPU_BUILD_PYTHON "Build Python bindings" OFF)
 option(ROCKETGPU_BUILD_BENCH "Build tools/bench_cpp (throughput benchmark)" OFF)
+option(ROCKETGPU_BUILD_RUST "Build the C layer of the Rust crate (rust/; cargo sets this)" OFF)
 if (MSVC)
     set(_rocketgpu_cuda_split_default OFF)
 else()
@@ -239,6 +240,10 @@ endif()
 
 if (ROCKETGPU_BUILD_PYTHON)
     add_subdirectory(python)
+endif()
+
+if (ROCKETGPU_BUILD_RUST)
+    add_subdirectory(rust/shim)
 endif()
 
 if (ROCKETGPU_BUILD_BENCH)

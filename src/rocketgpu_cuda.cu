@@ -657,6 +657,34 @@ ROCKETGPU_GLOBAL void StepKernel(
     }
 }
 
+ROCKETGPU_GLOBAL void BallPathKernel(
+    const __grid_constant__ SimConfig cfg,
+    Team* teams,
+    int32_t* env_car_count,
+    CarSpanT cars,
+    WheelRuntimeState* wheel_runtime_states,
+    WorldSolverScratch* solver_scratch,
+    const __grid_constant__ WorldSolverScratchRowPool row_pool,
+    CarControls* controls,
+    CarConfig* car_configs,
+    BallState* balls,
+    EnvState* env_states,
+    BoostPadState* pads,
+    uint64_t seed,
+    int samples,
+    int ticks,
+    float goal_y,
+    float* out,
+    int32_t* result) {
+    const int env_idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (env_idx >= cfg.env_count) {
+        return;
+    }
+    BallPathEnv(env_idx, cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls,
+                car_configs, balls, env_states, pads, seed, samples, ticks, goal_y,
+                out + static_cast<size_t>(env_idx) * samples * 6, result + static_cast<size_t>(env_idx) * 2);
+}
+
 constexpr int kArenaMeshSlots = 4;
 ROCKETGPU_SPLIT_STATIC __constant__ ArenaMeshBvhMeshInfo g_arena_mesh_slots[kArenaMeshSlots][kCarWorldMeshStageMeshes];
 
@@ -3982,6 +4010,54 @@ static bool StreamIsCapturing(cudaStream_t stream) {
         return false;
     }
     return status != cudaStreamCaptureStatusNone;
+}
+
+void LaunchBallPath(
+    const SimConfig& cfg,
+    Team* teams,
+    int32_t* env_car_count,
+    CarSpanT cars,
+    WheelRuntimeState* wheel_runtime_states,
+    WorldSolverScratch* solver_scratch,
+    const WorldSolverScratchRowPool& row_pool,
+    CarControls* controls,
+    CarConfig* car_configs,
+    BallState* balls,
+    EnvState* env_states,
+    BoostPadState* pads,
+    uint64_t seed,
+    int32_t samples,
+    int32_t ticks,
+    float goal_y,
+    float* out,
+    int32_t* result,
+    cudaStream_t stream) {
+    if (cfg.env_count <= 0 || samples <= 0 || ticks <= 0) {
+        return;
+    }
+    const StepResourcesGuard guard(stream);
+    static bool configured = false;
+    if (!configured) {
+        if (StreamIsCapturing(stream)) {
+            throw std::runtime_error("ball_path: the first call must not be under stream capture");
+        }
+        EnsureEpaScratchPool();
+        cudaFuncAttributes attr{};
+        CheckCuda(cudaFuncGetAttributes(&attr, BallPathKernel), "cudaFuncGetAttributes(BallPathKernel)");
+        size_t current_limit = 0;
+        CheckCuda(cudaDeviceGetLimit(&current_limit, cudaLimitStackSize), "cudaDeviceGetLimit(cudaLimitStackSize)");
+        if (current_limit < static_cast<size_t>(attr.localSizeBytes)) {
+            CheckCuda(cudaDeviceSetLimit(cudaLimitStackSize, static_cast<size_t>(attr.localSizeBytes)),
+                      "cudaDeviceSetLimit(cudaLimitStackSize)");
+        }
+        configured = true;
+    }
+    constexpr int block_size = 8;
+    const int blocks = (cfg.env_count + block_size - 1) / block_size;
+    BallPathKernel<<<blocks, block_size, 0, stream>>>(
+        cfg, teams, env_car_count, cars, wheel_runtime_states, solver_scratch, row_pool, controls, car_configs, balls,
+        env_states, pads, seed, samples, ticks, goal_y, out, result);
+    CheckCuda(cudaGetLastError(), "BallPathKernel launch");
 }
 
 void LaunchStep(

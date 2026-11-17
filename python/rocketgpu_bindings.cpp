@@ -558,6 +558,31 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
             d["fields"] = fields;
             out[name] = d;
         };
+        auto finish_full = [&](const char* name, size_t itemsize, py::list& f) {
+            py::list nested;
+            for (const auto& g : rocketgpu::compat::Arena::FullStateLayouts()) {
+                bool listed = g.array != name;
+                for (const py::handle item : f) {
+                    listed = listed || item.cast<py::tuple>()[0].cast<std::string>() == g.field;
+                }
+                if (listed) continue;
+                size_t packed = std::stoul(g.typestr.substr(2));
+                for (size_t n : g.shape) packed *= n;
+                bool is_packed = true;
+                for (size_t k = 0; k < g.shape.size(); ++k) {
+                    packed /= g.shape[k];
+                    is_packed = is_packed && g.strides[k] == packed;
+                }
+                if (is_packed) {
+                    f.append(py::make_tuple(g.field, g.typestr, g.offset, py::tuple(py::cast(g.shape))));
+                } else {
+                    nested.append(py::make_tuple(g.field, g.typestr, g.offset, py::tuple(py::cast(g.shape)),
+                                                 py::tuple(py::cast(g.strides))));
+                }
+            }
+            finish(name, itemsize, f);
+            if (py::len(nested) != 0) out[name]["nested"] = nested;
+        };
         auto controls_fields = [&](const std::string& prefix, size_t base, py::list& f) {
             using S = rocketgpu::CarControls;
             scalar((prefix + "throttle").c_str(), "<f4", base + offsetof(S, throttle), f);
@@ -674,7 +699,7 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
             scalar("latest_touch_tick", "<u8", offsetof(S, latest_touch_tick), f);
             vec3("latest_touch_location", offsetof(S, latest_touch_location), f);
             vec3("latest_touch_normal", offsetof(S, latest_touch_normal), f);
-            finish("car_states", sizeof(S), f);
+            finish_full("car_states", sizeof(S), f);
 #if defined(ROCKETGPU_CAR_TILES)
             {
                 namespace d = rocketgpu::detail;
@@ -734,7 +759,7 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
             scalar("sleeping", "<u4", offsetof(S, sleeping), f);
             scalar("deactivation_time", "<f4", offsetof(S, deactivation_time), f);
             scalar("constrained_2d", "<u2", offsetof(S, constrained_2d), f);
-            finish("ball_states", sizeof(S), f);
+            finish_full("ball_states", sizeof(S), f);
         }
         {
             using S = rocketgpu::BoostPadState;
@@ -763,7 +788,19 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
             scalar("frame_ticks", "<u2", offsetof(S, frame_ticks), f);
             scalar("countdown_count", "<f4", offsetof(S, countdown_count), f);
             scalar("frame_frac_prev", "<f4", offsetof(S, frame_frac_prev), f);
-            finish("env_states", sizeof(S), f);
+            finish_full("env_states", sizeof(S), f);
+        }
+        {
+            namespace d = rocketgpu::detail;
+            const std::pair<const char*, size_t> arrays[] = {
+                {"wheel_runtime", sizeof(d::WheelRuntimeState)}, {"solver_scratch", sizeof(d::WorldSolverScratch)},
+                {"car_world_plane", sizeof(d::CarWorldPlaneRetainedManifold)},
+                {"car_world_mesh", sizeof(d::CarWorldMeshRetainedManifold)},
+                {"car_car", sizeof(d::CarCarRetainedManifold)}, {"ball_car", sizeof(d::BallCarRetainedManifold)}};
+            for (const auto& [name, itemsize] : arrays) {
+                py::list f;
+                finish_full(name, itemsize, f);
+            }
         }
         return out;
     });
@@ -776,7 +813,16 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
         .def_property_readonly("ball_states", [](const rocketgpu::DeviceView& view) { return RocketGpuPtrToInt(view.ball_states); })
         .def_property_readonly("env_states", [](const rocketgpu::DeviceView& view) { return RocketGpuPtrToInt(view.env_states); })
         .def_property_readonly("boost_pad_states", [](const rocketgpu::DeviceView& view) { return RocketGpuPtrToInt(view.boost_pad_states); })
-        .def_property_readonly("env_car_count", [](const rocketgpu::DeviceView& view) { return RocketGpuPtrToInt(view.env_car_count); });
+        .def_property_readonly("env_car_count", [](const rocketgpu::DeviceView& view) { return RocketGpuPtrToInt(view.env_car_count); })
+        .def_property_readonly("wheel_runtime", [](const rocketgpu::DeviceView& view) { return RocketGpuPtrToInt(view.wheel_runtime); })
+        .def_property_readonly("solver_scratch", [](const rocketgpu::DeviceView& view) { return RocketGpuPtrToInt(view.solver_scratch); })
+        .def_property_readonly("car_world_plane", [](const rocketgpu::DeviceView& view) { return RocketGpuPtrToInt(view.car_world_plane); })
+        .def_property_readonly("car_world_mesh", [](const rocketgpu::DeviceView& view) { return RocketGpuPtrToInt(view.car_world_mesh); })
+        .def_property_readonly("car_car", [](const rocketgpu::DeviceView& view) { return RocketGpuPtrToInt(view.car_car); })
+        .def_property_readonly("ball_car", [](const rocketgpu::DeviceView& view) { return RocketGpuPtrToInt(view.ball_car); })
+        .def_property_readonly("contact_order", [](const rocketgpu::DeviceView& view) { return RocketGpuPtrToInt(view.contact_order); })
+        .def_property_readonly("contact_order_count", [](const rocketgpu::DeviceView& view) { return RocketGpuPtrToInt(view.contact_order_count); })
+        .def_readonly("contact_order_stride", &rocketgpu::DeviceView::contact_order_stride);
 
     py::class_<rocketgpu::BatchSim>(m, "BatchSim")
         .def(py::init<const rocketgpu::SimConfig&>(), py::arg("config"))
@@ -801,9 +847,11 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
              [](rocketgpu::BatchSim& sim) {
                  const rocketgpu::DeviceView v = sim.device_view();
                  py::dict out;
-                 auto add = [&](const char* name, const void* ptr, size_t count, size_t elem) {
+                 const size_t envs = sim.env_count(), cars = envs == 0 ? 0 : sim.car_capacity() / envs;
+                 auto add = [&](const char* name, const void* ptr, size_t count, size_t elem, size_t per_env,
+                                const char* element, bool read_only = false) {
                      py::dict cai;
-                     cai["data"] = py::make_tuple(RocketGpuPtrToInt(ptr), false);
+                     cai["data"] = py::make_tuple(RocketGpuPtrToInt(ptr), read_only);
                      cai["shape"] = py::make_tuple(count);
                      cai["typestr"] = "|V" + std::to_string(elem);
                      cai["strides"] = py::none();
@@ -812,22 +860,39 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
                      entry["__cuda_array_interface__"] = cai;
                      entry["itemsize"] = elem;
                      entry["count"] = count;
+                     entry["per_env"] = per_env;
+                     entry["element"] = element;
                      out[name] = entry;
                  };
 #if defined(ROCKETGPU_CAR_TILES)
                  add("car_states", v.car_states,
                      (sim.car_capacity() + rocketgpu::detail::kCarTileLanes - 1) / rocketgpu::detail::kCarTileLanes,
-                     rocketgpu::detail::kCarTileBytes);
+                     rocketgpu::detail::kCarTileBytes, cars, "car slot");
 #else
-                 add("car_states", v.car_states, sim.car_capacity(), sizeof(rocketgpu::CarState));
+                 add("car_states", v.car_states, sim.car_capacity(), sizeof(rocketgpu::CarState), cars, "car slot");
 #endif
-                 add("controls", v.controls, sim.car_capacity(), sizeof(rocketgpu::CarControls));
-                 add("car_configs", v.car_configs, sim.car_capacity(), sizeof(rocketgpu::CarConfig));
-                 add("teams", v.teams, sim.car_capacity(), sizeof(rocketgpu::Team));
-                 add("ball_states", v.ball_states, sim.env_count(), sizeof(rocketgpu::BallState));
-                 add("env_states", v.env_states, sim.env_count(), sizeof(rocketgpu::EnvState));
-                 add("boost_pad_states", v.boost_pad_states, sim.boost_pad_capacity(), sizeof(rocketgpu::BoostPadState));
-                 add("env_car_count", v.env_car_count, sim.env_count(), sizeof(int32_t));
+                 add("controls", v.controls, sim.car_capacity(), sizeof(rocketgpu::CarControls), cars, "car slot");
+                 add("car_configs", v.car_configs, sim.car_capacity(), sizeof(rocketgpu::CarConfig), cars, "car slot");
+                 add("teams", v.teams, sim.car_capacity(), sizeof(rocketgpu::Team), cars, "car slot");
+                 add("ball_states", v.ball_states, envs, sizeof(rocketgpu::BallState), 1, "env");
+                 add("env_states", v.env_states, envs, sizeof(rocketgpu::EnvState), 1, "env");
+                 add("boost_pad_states", v.boost_pad_states, sim.boost_pad_capacity(), sizeof(rocketgpu::BoostPadState),
+                     envs == 0 ? 0 : sim.boost_pad_capacity() / envs, "boost pad");
+                 add("env_car_count", v.env_car_count, envs, sizeof(int32_t), 1, "env");
+                 namespace d = rocketgpu::detail;
+                 const d::WorldSolverScratchRowCaps caps = d::MakeWorldSolverScratchRowCaps(static_cast<int>(cars));
+                 const auto full = [&](const char* name, const void* ptr, size_t elem, int per_env, const char* element) {
+                     add(name, ptr, envs * static_cast<size_t>(per_env), elem, static_cast<size_t>(per_env), element, true);
+                 };
+                 full("wheel_runtime", v.wheel_runtime, sizeof(d::WheelRuntimeState), static_cast<int>(cars), "car slot");
+                 full("solver_scratch", v.solver_scratch, sizeof(d::WorldSolverScratch), 1, "env");
+                 full("car_world_plane", v.car_world_plane, sizeof(d::CarWorldPlaneRetainedManifold), caps.car_world_plane,
+                      "car slot * 6 + plane slot");
+                 full("car_world_mesh", v.car_world_mesh, sizeof(d::CarWorldMeshRetainedManifold), caps.car_world_mesh,
+                      "car slot * 2 + mesh slot");
+                 full("car_car", v.car_car, sizeof(d::CarCarRetainedManifold), caps.car_car_retained,
+                      "car slot pair lo < hi: hi * (hi - 1) / 2 + lo");
+                 full("ball_car", v.ball_car, sizeof(d::BallCarRetainedManifold), caps.ball_car_retained, "car slot");
                  return out;
              },
              "Zero-copy CUDA array interface dicts (per state array) for CuPy/PyTorch/Numba")
@@ -1060,6 +1125,15 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
                 sim.step(ticks, StreamFromInt(stream));
             },
             py::arg("ticks") = 1,
+            py::arg("stream") = 0)
+        .def(
+            "ball_path",
+            [](rocketgpu::BatchSim& sim, int32_t samples, int32_t ticks, float goal_y, uintptr_t out, uintptr_t result,
+               uintptr_t stream) {
+                sim.ball_path(samples, ticks, goal_y, reinterpret_cast<float*>(out), reinterpret_cast<int32_t*>(result),
+                              StreamFromInt(stream));
+            },
+            py::arg("samples"), py::arg("ticks"), py::arg("goal_y"), py::arg("out"), py::arg("result"),
             py::arg("stream") = 0)
         .def(
             "step_with_device_controls",
@@ -1347,6 +1421,8 @@ PYBIND11_MODULE(ROCKETGPU_PY_MODULE_NAME, m) {
             .def("set_mutator_config", &rc::Arena::SetMutatorConfig, py::arg("config"),
                  "RocketSim Arena::SetMutatorConfig: replace the mutators between steps")
             .def("get_mutator_config", &rc::Arena::GetMutatorConfig, py::return_value_policy::copy)
+            .def_property_readonly("sim", &rc::Arena::sim, py::return_value_policy::reference_internal,
+                                   "The arena's one-env BatchSim")
             .def("dev_get_raw", [](const rc::Arena& a, const std::string& what) {
                      const std::vector<uint8_t> v = a.DevGetRaw(what);
                      return py::bytes(reinterpret_cast<const char*>(v.data()), v.size());

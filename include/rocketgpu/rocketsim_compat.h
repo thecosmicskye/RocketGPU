@@ -311,6 +311,8 @@ public:
         std::string name;
         size_t offset;
         size_t size;
+        std::string typestr;        // of a field: NumPy typestr of its elements, and their shape
+        std::vector<size_t> shape;
     };
     static std::vector<DevField> DevLayouts();
 
@@ -320,6 +322,14 @@ public:
     // lacks, or one whose size differs, throws. Cars, boost pads and mutators are set through their own calls first.
     // arrays: only those arrays' fields (all when empty).
     std::map<std::string, std::vector<uint8_t>> GetFullState(const std::vector<std::string>& arrays = {}) const;
+    // Where each GetFullState key "array.field" sits in one element of its array: byte offset, and the shape and byte
+    // strides of the field's values in that element.
+    struct FullStateField {
+        std::string array, field, typestr;
+        size_t offset;
+        std::vector<size_t> shape, strides;
+    };
+    static std::vector<FullStateField> FullStateLayouts();
     void SetFullState(const std::map<std::string, std::vector<uint8_t>>& state);
 
 private:

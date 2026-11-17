@@ -336,6 +336,7 @@ Car* Arena::GetCar(uint32_t id) {
 Arena* Arena::Clone(bool copy_callbacks) const {
     PullStates();
     Arena* a = Create(mode_, arena_config_, tick_rate_);
+    a->sim_->set_mutator_config(sim_->config().mutator);
     a->tick_count_ = tick_count_;
     a->car_count_ = car_count_;
     a->next_car_id_ = next_car_id_;
@@ -910,6 +911,14 @@ CarStateV3 Car::GetStateV3() const {
     out.jumpHoldBroken = s.jump_hold_broken != 0;
     out.airTime = s.air_time;
     out.airTimeSinceJump = s.air_time_since_jump;
+    const bool no_jump_before = !s.has_jumped && s.air_time_since_jump == 0.0f;
+    if (no_jump_before && s.has_flipped) {
+        out.airTimeSinceJump = s.internal_flip_time;
+    } else if (no_jump_before && s.has_double_jumped && s.double_jump_ticks < 255) {
+        float t = 0.0f;
+        for (int i = 0; i < s.double_jump_ticks; ++i) t += arena_->GetTickTime();
+        out.airTimeSinceJump = t;
+    }
     out.boost = s.boost;
     out.handbrakeVal = s.handbrake_val;
     out.isSupersonic = s.is_supersonic != 0;
@@ -968,7 +977,7 @@ void Car::SetStateV3(const CarStateV3& state) {
     s.is_jumping = state.isJumping && !jump_starts ? 1 : 0;
     s.jump_hold_broken = state.jumpHoldBroken ? 1 : 0;
     s.air_time = state.airTime;
-    s.air_time_since_jump = state.airTimeSinceJump;
+    if (!(keeps_jumped && !s.has_jumped)) s.air_time_since_jump = state.airTimeSinceJump;
     s.boost = state.boost;
     s.handbrake_val = state.handbrakeVal;
     s.is_supersonic = state.isSupersonic ? 1 : 0;

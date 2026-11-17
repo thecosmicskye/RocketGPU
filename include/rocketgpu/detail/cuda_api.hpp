@@ -88,6 +88,27 @@ void LaunchStep(
     const int32_t* respawn_order = nullptr,
     uint8_t* writable_respawn_slots = nullptr);
 
+void LaunchBallPath(
+    const SimConfig& cfg,
+    Team* teams,
+    int32_t* env_car_count,
+    CarSpanT cars,
+    WheelRuntimeState* wheel_runtime_states,
+    WorldSolverScratch* solver_scratch,
+    const WorldSolverScratchRowPool& row_pool,
+    CarControls* controls,
+    CarConfig* car_configs,
+    BallState* balls,
+    EnvState* env_states,
+    BoostPadState* pads,
+    uint64_t seed,
+    int32_t samples,
+    int32_t ticks,
+    float goal_y,
+    float* out,
+    int32_t* result,
+    cudaStream_t stream);
+
 void LaunchStepWithControlStream(
     const SimConfig& cfg,
     Team* teams,
